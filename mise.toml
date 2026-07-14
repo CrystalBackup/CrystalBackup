@@ -1,0 +1,5 @@
+# Tool versions for CrystalBackup (portable across machines / CI via mise).
+# Matches the versions the project is developed and built with.
+[tools]
+node = "24.18.0"
+pnpm = "10.33.2"

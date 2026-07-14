@@ -1,0 +1,50 @@
+---
+const title = 'CrystalBackup';
+const tagline = 'CrystalBackup is a Kubernetes Backup Operator.';
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content={tagline} />
+    <title>{title}</title>
+    <style>
+      :root { color-scheme: light dark; }
+      * { box-sizing: border-box; }
+      html, body { height: 100%; margin: 0; }
+      body {
+        display: grid;
+        place-items: center;
+        min-height: 100vh;
+        padding: 2rem;
+        font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+        background: #0b0e14;
+        color: #e6e9ef;
+      }
+      @media (prefers-color-scheme: light) {
+        body { background: #f7f8fa; color: #1b1f27; }
+      }
+      main { text-align: center; max-width: 34rem; }
+      .logo { width: 3.5rem; height: 3.5rem; margin: 0 auto 1.25rem; color: #5eb3f5; }
+      h1 { font-size: clamp(2rem, 6vw, 3rem); letter-spacing: -0.02em; margin: 0 0 0.75rem; }
+      p { font-size: clamp(1rem, 3vw, 1.2rem); margin: 0; opacity: 0.85; }
+      .badge {
+        margin-top: 1.75rem; display: inline-block;
+        font-size: 0.8rem; letter-spacing: 0.08em; text-transform: uppercase; opacity: 0.55;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <svg class="logo" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+        <path d="M6 3h12l3 6-9 12L3 9l3-6z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" />
+        <path d="M3 9h18M9 3 6 9l6 12 6-12-3-6" stroke="currentColor" stroke-width="0.8" stroke-linejoin="round" opacity="0.5" />
+      </svg>
+      <h1>CrystalBackup</h1>
+      <p>{tagline}</p>
+      <span class="badge">Under active development</span>
+    </main>
+  </body>
+</html>
