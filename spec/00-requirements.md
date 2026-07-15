@@ -94,7 +94,9 @@ backlog (§6) and its number is not reused.
   identity and the `namespace=` tag filter derived from the CR's namespace, never
   user-declared). Privileged pods, if any, are confined to `crystal-backup-system`. See
   [03-security-and-tenancy.md](03-security-and-tenancy.md).
-- **Supply chain / images**: operator and mover images are built with **apko** on a **Wolfi (glibc)** base for a **0-known-CVE** posture (not Alpine/musl), carry an **SBOM**, are **cosign-signed** and **digest-pinned**, and ship with **SLSA L3+** build provenance from GitHub Actions; a CI CVE-scan gate blocks release. See [adr/0012](adr/0012-container-images-apko-wolfi-slsa.md).
+- **Supply chain / images**: operator and mover images are built with **apko** on a **Wolfi (glibc)** base as **multi-arch images (`linux/amd64` + `linux/arm64`)** for a **0-known-CVE** posture (not Alpine/musl), carry an **SBOM**, are **cosign-signed** and **digest-pinned**, published to **GHCR** (`ghcr.io/crystalbackup`), and ship with **SLSA L3+** build provenance from GitHub Actions; a CI CVE-scan gate blocks release. See [adr/0012](adr/0012-container-images-apko-wolfi-slsa.md).
+- **Portability / distribution**: the operator and mover run on **`linux/amd64` and `linux/arm64`**; the `crystalctl` CLI and the v1 UI (a `crystalctl` subcommand) are **cross-platform static binaries** for **linux, windows and darwin on both amd64 and arm64**. See [06-cli.md §7](06-cli.md) and [adr/0014](adr/0014-versioning-and-release.md).
+- **Versioning**: [SemVer 2.0.0](https://semver.org/); roadmap milestones map to **minor** releases on major 0 (`M_n` → `0.n.z`), iterations to **patch**; `1.0.0` is a deliberate API-stability decision after M9. See [adr/0014](adr/0014-versioning-and-release.md).
 - **Open source**: documentation and specs in English; the project is open-source under a
   permissive license, and all dependencies must be permissive-license compatible
   (Apache-2.0/MIT/BSD).

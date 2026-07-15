@@ -142,15 +142,21 @@ the trade-offs).
 Milestones are sequenced so the **core two-plane path + cluster DR** comes first; each milestone
 ends releasable. Full task breakdown and Definition of Done: [spec/90-roadmap.md](spec/90-roadmap.md).
 
+**Versioning** follows [SemVer](https://semver.org/): each milestone is a **minor** release on
+major 0 (`M_n` → `0.n.z`), iterations are **patches**, and `1.0.0` is a deliberate API-stability
+decision **after M9** — the CRD API is `v1alpha1` and can still move until then
+([spec/adr/0014](spec/adr/0014-versioning-and-release.md)). Images ship **multi-arch**
+(`linux/amd64` + `linux/arm64`) on GHCR; the CLI/UI target linux, windows and darwin on amd64 + arm64.
+
 | Milestone | Theme |
 |---|---|
-| **M0** | Scaffolding — kubebuilder layout, CRD skeletons, CI (apko/Wolfi + SLSA L3+), test harness |
+| **M0** | Scaffolding — kubebuilder layout, CRD skeletons, CI (multi-arch apko/Wolfi + SLSA L3+), test harness |
 | **M1** | Core engine & cluster DR — cascade, snapshot exposers, discovery, retention, metrics |
 | **M2** | Restore — self-service, operator-mediated cluster-DR restore, `ClusterRestore`, admission (VAP) |
 | **M3** | Manifests & cluster-scoped DR — sanitization engine, cluster-scoped capture & selective restore |
 | **M4** | Consistency hooks, repository verification (`restic check`) & maintenance |
 | **M5** | Namespace plane, **external sync** & right-to-erasure |
-| **M6** | Observability hardening & GA gate |
+| **M6** | Observability hardening & production beta (0.6) |
 | **M7** | `crystalctl` CLI & local browse UI |
 | **M8** | Immutable locations (S3 Object Lock) |
 | **M9** | Coexistence hardening & DR drills |

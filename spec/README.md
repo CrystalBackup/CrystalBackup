@@ -51,6 +51,7 @@ Architecture Decision Records live in [adr/](adr/). Key ones:
 - [0011 — Cluster-scoped disaster recovery: capture & selective restore](adr/0011-cluster-scoped-dr.md)
 - [0012 — Container images: apko + Wolfi base, SLSA L3+ provenance](adr/0012-container-images-apko-wolfi-slsa.md)
 - [0013 — External backup synchronization to a secondary location](adr/0013-external-backup-sync.md)
+- [0014 — Versioning & release scheme (SemVer; milestone → minor on major 0)](adr/0014-versioning-and-release.md)
 
 ## Research
 

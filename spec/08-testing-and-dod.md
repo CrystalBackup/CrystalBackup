@@ -341,12 +341,12 @@ Run on a dedicated runner or staging cluster (not shared CI runners). Datasets:
 |---|---|---|
 | lint | golangci-lint, `gofmt`, `go vet`, license scan (permissive-only: Apache-2.0/MIT/BSD) | every push |
 | unit | `go test -race` + coverage gates | every push |
-| build | operator + mover images (**apko/Wolfi**, SBOM), chart package, `helm lint`; **container CVE scan** (0-known-CVE gate — [adr/0012](adr/0012-container-images-apko-wolfi-slsa.md)) | every push |
+| build | operator + mover **multi-arch** images (`linux/amd64`+`linux/arm64`, **apko/Wolfi**, SBOM), chart package, `helm lint`; **container CVE scan** (0-known-CVE gate — [adr/0012](adr/0012-container-images-apko-wolfi-slsa.md)) | every push |
 | integration | envtest suite | every PR |
 | e2e-core | §4 core suite on kind | every PR |
 | e2e-full | §4 full suite + §5 fidelity suite | nightly, release tags |
 | bench | §6 (manual trigger; scheduled weekly from M6) | manual / schedule |
-| release | image + chart publish, **cosign sign + SLSA L3+ provenance attest & verify**, release-dry-run on PRs | tags (dry-run: PRs) |
+| release | **multi-arch image index + chart publish to GHCR**, **cosign sign + SLSA L3+ provenance attest & verify**, release-dry-run on PRs | tags (dry-run: PRs) |
 
 - **Coverage gates** (enforced in the unit stage): **≥ 80 %** line coverage on
   `internal/controller/...`; **100 %** on the sanitization rules package (every rule
@@ -378,7 +378,7 @@ verification method that makes each item checkable rather than aspirational:
 | 4 | Security review checklist for anything touching credentials, keys, or cross-namespace logic (two-person review) | CODEOWNERS forces 2 approvals on key-management, tenancy-derivation (repo path + `namespace=` tag filter) and admission (VAP + webhook) packages; checklist embedded in PR template |
 | 5 | No permission widening of tenant RBAC without an ADR | Golden-file test on the chart-rendered `crystal-backup-tenant` ClusterRole (`helm template` diff vs committed golden); changing the golden requires an ADR link in the PR |
 | 6 | Docs updated (user or ops guide); CHANGELOG entry | CI changelog check (entry required unless PR labeled `no-changelog`); docs build job |
-| 7 | CI green (lint, unit, e2e); image + chart publishable from the PR pipeline; **images pass the 0-known-CVE scan, are cosign-signed with an SBOM, and carry verified SLSA L3+ provenance** ([adr/0012](adr/0012-container-images-apko-wolfi-slsa.md)) | `release-dry-run` job runs the full packaging path (incl. CVE scan + provenance verify) on every PR |
+| 7 | CI green (lint, unit, e2e); **multi-arch** (`linux/amd64`+`linux/arm64`) image + chart publishable from the PR pipeline; **images pass the 0-known-CVE scan, are cosign-signed with an SBOM, and carry verified SLSA L3+ provenance** ([adr/0012](adr/0012-container-images-apko-wolfi-slsa.md)) | `release-dry-run` job runs the full packaging path (incl. CVE scan + provenance verify) on every PR |
 
 ## 9. Open questions
 

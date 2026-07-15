@@ -14,6 +14,15 @@ Each milestone ends **releasable**: tagged image + Helm chart, e2e suite green, 
 updated. Definition of Done at the bottom applies to every task. Lessons folded in from
 upstream backup-operator GitHub issues are tagged `delta N`.
 
+**Versioning** ([adr/0014](adr/0014-versioning-and-release.md)): [SemVer 2.0.0](https://semver.org/).
+Each milestone is a **minor** release on major 0 — `M_n` → **`0.n.z`** (M0 → `0.0.z`, M1 →
+`0.1.z`, … M9 → `0.9.z`); iterations *within* a milestone bump the **patch** `z`. While on `0.x`
+the CRD/CLI contract may still change between minors. **`1.0.0` is a deliberate API-stability
+decision expected after M9** — not any milestone's "GA"; M6 reaches a production-usable **beta**
+but stays `0.6.z`. Images publish to **GHCR** (`ghcr.io/crystalbackup`) as multi-arch
+(`linux/amd64` + `linux/arm64`) indexes, signed with SLSA provenance
+([adr/0012](adr/0012-container-images-apko-wolfi-slsa.md)).
+
 ## M0 — Project scaffolding (foundation)
 
 - [ ] kubebuilder project layout, API group `crystalbackup.io/v1alpha1`; CRD skeletons for
@@ -22,9 +31,10 @@ upstream backup-operator GitHub issues are tagged `delta N`.
       `ClusterBackupExternalSync`; namespace plane `BackupLocation`, `BackupSchedule`, `Backup`,
       `Restore`, `BackupExternalSync`; internal `BackupRepository` — deepcopy/CRD generation,
       `make` targets ([02-api.md](02-api.md)).
-- [ ] CI (GitHub Actions): lint (golangci-lint), unit tests + coverage gate, **image build with
-      apko on Wolfi (glibc, 0-known-CVE) + melange-built restic + SBOM + cosign sign + SLSA L3+
-      provenance + container CVE-scan gate** ([adr/0012](adr/0012-container-images-apko-wolfi-slsa.md)),
+- [ ] CI (GitHub Actions): lint (golangci-lint), unit tests + coverage gate, **multi-arch
+      (`linux/amd64` + `linux/arm64`) image build with apko on Wolfi (glibc, 0-known-CVE) +
+      melange-built restic + SBOM + cosign sign + SLSA L3+ provenance + container CVE-scan gate,
+      published to GHCR** ([adr/0012](adr/0012-container-images-apko-wolfi-slsa.md)),
       chart packaging (`crystal-backup`), e2e stage skeleton.
 - [ ] Observability plumbing: zap JSON-lines on stdout, controller-runtime metrics endpoint
       (`crystalbackup_*`), OTel SDK wired behind `OTEL_*` env vars (no-op when unset).
@@ -35,8 +45,9 @@ upstream backup-operator GitHub issues are tagged `delta N`.
       `charts/crystal-backup/dashboards/`.
 
 **Exit criteria**: `make test && make e2e` green in CI on an empty-logic operator; JSON logs
-and `/metrics` verified; every CRD installs and round-trips; **images build via apko (Wolfi),
-signed + SBOM + 0-known-CVE gate green + SLSA L3+ provenance attested**.
+and `/metrics` verified; every CRD installs and round-trips; **multi-arch images
+(`linux/amd64` + `linux/arm64`) build via apko (Wolfi), signed + SBOM + 0-known-CVE gate green +
+SLSA L3+ provenance attested, pushed to GHCR**.
 
 ## M1 — Core engine & cluster DR (R1, R2 partial, R11, R12, R13, R20, R24 partial, R25, R26)
 
@@ -216,13 +227,13 @@ reconstitutes a deleted namespace from the shared repo.
 - [ ] VSC ↔ RBD-image reconciliation + trash monitoring + active pre-check before VS creation
       (VolumeSnapshotClass resolved, secret present, snapshotter sidecar reachable) — delta 9;
       S3 RGW tuning (`s3.connections`, wave test vs `rgw_max_concurrent_requests`) — delta 13.
-- [ ] **GA gate**: e2e restore + checksum comparison to a Rook-Ceph PVC while restic#5543
-      stays open (delta 14).
+- [ ] **Restore-fidelity gate** (the beta bar for `0.6`, not a 1.0/GA claim): e2e restore +
+      checksum comparison to a Rook-Ceph PVC while restic#5543 stays open (delta 14).
 - [ ] NetworkPolicies, PodSecurity review, resource limits/requests; docs (user guide, ops
       guide, DR runbooks); deploy alongside Velero on a staging cluster, soak 2+ weeks.
 
 **Exit criteria**: production rollout on a pilot cluster for pilot namespaces; dashboards +
-alerts live; leak-check and GA restore-checksum gate green.
+alerts live; leak-check and restore-checksum gate green.
 
 ## M7 — CLI & UI v1 (R8, R9 — lower priority, agreed)
 

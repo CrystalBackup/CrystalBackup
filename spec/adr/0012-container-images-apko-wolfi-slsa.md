@@ -41,6 +41,13 @@ Actions.**
   with **cosign** (keyless — Fulcio/Rekor, ephemeral OIDC identity) and referenced **by digest**
   in the Helm chart (no floating tags, no user-facing image field —
   [03-security-and-tenancy.md §11](../03-security-and-tenancy.md)).
+- **Multi-arch, published to GHCR.** apko assembles a **multi-arch image index** for
+  **`linux/amd64` and `linux/arm64`** (`archs: [x86_64, aarch64]`) in one declarative build —
+  it composes per-arch apks, so **no QEMU emulation** is needed. The **index digest** is what
+  gets signed, SBOM'd and provenance-attested, so a single verification covers every
+  architecture. Images publish to **GHCR** (`ghcr.io/crystalbackup/*`) and are pinned by index
+  digest; arm64 lets the operator run on Graviton/Ampere and Arm edge clusters. Adding an arch
+  later is a config line, not a build-system change.
 - **SLSA L3+ in GitHub Actions.** Build on GitHub-hosted runners with an **isolated builder** and
   **non-falsifiable provenance** — the attestation is generated with the SLSA GitHub generator /
   `cosign attest` using the workflow's ephemeral OIDC identity (Fulcio/Rekor) → **Build L3** (L3

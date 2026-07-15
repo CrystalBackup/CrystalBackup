@@ -288,10 +288,11 @@ map to 3, `11` (lock) to 3 with a retry hint, anything else non-zero to 1.
 ## 7. Distribution and versioning
 
 - Targets: `linux/amd64`, `linux/arm64`, `darwin/amd64`, `darwin/arm64`,
-  `windows/amd64`; `CGO_ENABLED=0` static builds.
+  `windows/amd64`, `windows/arm64`; `CGO_ENABLED=0` static builds.
 - Published as release artifacts alongside the operator image and the `crystal-backup` Helm
   chart, with a `SHA256SUMS` file (signature of the sums file: see open questions).
-- The CLI version **equals the operator chart `appVersion`** (single release train).
+- The CLI version **equals the operator chart `appVersion`** (single release train,
+  [adr/0014](adr/0014-versioning-and-release.md)).
   `crystalctl version --output json` → `{version, gitCommit, engineVersion, goVersion}`.
 - Skew policy: `repo` commands work against any repository (format is the contract);
   cluster-mode commands support an operator within ±1 minor version and warn beyond.
@@ -302,6 +303,6 @@ map to 3, `11` (lock) to 3 with a retry hint, anything else non-zero to 1.
    release binaries (matters for the user-facing reversibility story)?
 2. Should `repo` gain a `mount` command (FUSE browse, restic parity)? Excluded from v1:
    platform-specific dependencies conflict with the single-static-binary rule.
-3. Windows: `/dev/fd` password passing needs an equivalent (named pipe with per-user
-   ACL); confirm during M7 implementation whether Windows is a v1-supported target or
-   build-only.
+3. Windows (a **confirmed v1 target**, amd64 + arm64): `/dev/fd` password passing needs an
+   equivalent (named pipe with per-user ACL) — an M7 implementation detail, not a scope
+   question.
