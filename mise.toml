@@ -3,3 +3,10 @@
 [tools]
 node = "24.18.0"
 pnpm = "10.33.2"
+
+# Run the documentation site locally: `mise run doc`
+# Installs deps if needed, then starts the Astro dev server (website/, http://localhost:4321/CrystalBackup/).
+[tasks.doc]
+description = "Serve the documentation site locally (Astro dev server)"
+dir = "website"
+run = "pnpm install && pnpm dev"

@@ -1,0 +1,42 @@
+---
+// The Crystal Backup mark, rendered as SVG so it scales, glows and themes.
+// `uid` namespaces the gradient ids so multiple instances can coexist on one page.
+interface Props {
+  class?: string;
+  uid?: string;
+}
+const { class: className = '', uid = 'c' } = Astro.props;
+---
+<svg
+  class={className}
+  viewBox="0 0 120 200"
+  fill="none"
+  xmlns="http://www.w3.org/2000/svg"
+  aria-hidden="true"
+>
+  <defs>
+    <linearGradient id={`${uid}-strip`} x1="60" y1="6" x2="60" y2="196" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#eafaff" />
+      <stop offset="1" stop-color="#8fd6f6" />
+    </linearGradient>
+    <linearGradient id={`${uid}-left`} x1="24" y1="6" x2="60" y2="196" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#5fcef6" />
+      <stop offset="1" stop-color="#2b74f0" />
+    </linearGradient>
+    <linearGradient id={`${uid}-right`} x1="96" y1="6" x2="60" y2="196" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#2f86ec" />
+      <stop offset="1" stop-color="#123a9e" />
+    </linearGradient>
+  </defs>
+  <!-- left wing -->
+  <polygon points="60,6 24,66 24,150 46,150 46,58" fill={`url(#${uid}-left)`} />
+  <!-- right wing -->
+  <polygon points="60,6 96,66 96,150 74,150 74,58" fill={`url(#${uid}-right)`} />
+  <!-- bright centre column -->
+  <polygon points="60,6 46,58 46,150 60,196 74,150 74,58" fill={`url(#${uid}-strip)`} />
+  <!-- lower facets -->
+  <polygon points="24,150 46,150 60,196" fill={`url(#${uid}-left)`} opacity="0.85" />
+  <polygon points="96,150 74,150 60,196" fill={`url(#${uid}-right)`} opacity="0.9" />
+  <!-- apex highlight -->
+  <polygon points="60,6 46,58 60,64 74,58" fill="#ffffff" opacity="0.28" />
+</svg>

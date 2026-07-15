@@ -1,5 +1,196 @@
-# CrystalBackup
+# Crystal Backup
 
-**CrystalBackup is a Kubernetes Backup Operator.**
+> **Design / specification stage** — this repository is the public design of Crystal Backup
+> (specs, ADRs, roadmap); code starts at milestone M0, and it's being built in the open with AI
+> assistance. Background & disclaimer: [Project status & disclaimer](#-project-status--disclaimer).
 
-🚧 Under active development — documentation and source coming soon.
+**Crystal Backup** is a design for a Kubernetes operator that provides **multi-tenant,
+self-service backup and restore of namespaces** — both **PVC data and Kubernetes manifests** —
+across **two planes**:
+
+- a **cluster plane** where platform administrators back up all (or selected) namespaces into
+  **one shared restic repository** per location (tenancy carried by restic **tags**) for
+  platform **disaster recovery**; and
+- a **namespace plane** where namespace users additionally back up **their own** namespace to
+  **their own object storage, with their own key**, off-platform.
+
+Backups are stored in the plain **restic repository format**, so anyone can read their data
+with upstream `restic` — **reversibility by design, no lock-in**. Discovery is
+**disaster-recovery-first**: point the operator at an existing bucket and it inventories what
+is restorable, with no pre-existing custom resources and no surviving cluster required.
+
+---
+
+## ⚠️ Project status & disclaimer
+
+This repository currently holds **specifications, Architecture Decision Records (ADRs) and a
+roadmap — not software yet**; implementation starts at milestone **M0** (see [Roadmap](#roadmap)).
+It's being built in the open, so you can follow — and shape — the design as it happens.
+
+When code lands it will be **early and experimental for a while**. Please treat it accordingly:
+
+- Try it in a **sandbox**, not on data you can't recreate — and keep your existing backups.
+- **Test your restores** — good practice with any backup tool.
+- Provided **"AS IS", without warranty of any kind**; you use it **at your own risk**, and the
+  authors accept **no liability**. See [LICENSE](LICENSE) (Apache-2.0).
+
+None of this is meant to scare you off — it's an honest "we're early". If the direction resonates,
+**star or watch the repo** and come test it when the first milestones land.
+
+## 🤖 Built with AI assistance
+
+This project is **written with heavy use of AI coding assistants**, under human direction and
+review. The specifications, the ADRs, and the forthcoming implementation are being produced this
+way on purpose — Crystal Backup is partly an **experiment in AI-assisted software engineering**,
+not only a backup tool.
+
+Being candid about it: AI-assisted work still benefits from **human review and real testing**
+before anyone relies on it — which is exactly how it's being built, and one more reason to test in
+a sandbox first. Supply-chain integrity is taken seriously too: images are designed to ship with an
+SBOM and **SLSA L3+ build provenance** ([ADR 0012](spec/adr/0012-container-images-apko-wolfi-slsa.md)).
+
+## Why this project exists
+
+Managed, multi-tenant Kubernetes platforms are typically **tenant-isolated by namespace**: a
+user owns one or more namespaces and is self-service inside them via RBAC. Such platforms
+commonly run a **cluster-wide backup tool** (e.g. Velero, daily, short retention) as an
+**admin-only** safety net.
+
+That leaves namespace users with:
+
+- **no self-service** backup or restore of their own data;
+- **no visibility** into whether (or what) is backed up;
+- **no way to back up off-platform**, under their own key, outside the operator's trust.
+
+A survey of existing open-source and commercial tools found that **none covers this combination**
+on the discriminating axes — multi-tenant *self-service*, per-namespace *isolation*, *off-platform*
+user backups, *reversibility*, snapshot *least-data-movement*, and *disaster recovery straight
+from the repository*. Each tool solves part of the problem; the gaps differ. Crystal Backup is
+designed to target **that specific combination**, while **coexisting** with whatever cluster-wide
+backup tool is already in place — it is **not** a "rip and replace" project.
+
+Full requirements (R1–R28) and rationale: [spec/00-requirements.md](spec/00-requirements.md).
+
+## What makes it different — the main design choices
+
+- **Two planes, cert-manager style** (R2/R5) — a cluster-scoped `ClusterBackupLocation` drives
+  DR into one shared repo (tenancy by restic tags `tenant`/`namespace`/`pvc`); a namespaced
+  `BackupLocation` lets a user back up to **their own bucket with their own key**, *in addition*
+  to cluster DR.
+- **Reversibility by design** (R8) — repositories are plain **restic** repos; you can always read
+  your backups with upstream `restic` given the S3 credentials and key. No proprietary catalog,
+  no lock-in.
+- **The repository is the source of truth** (R26) — `Backup` objects are a *projection* of the
+  restic repository, which survives total cluster loss. A discovery controller inventories a
+  location and projects `Backup`s into existing namespaces, so `kubectl get backups` lists exactly
+  what is restorable — and DR works with **no pre-existing custom resources**.
+- **Server-side tenant isolation** (R2/R14) — a namespaced `Restore` is structurally confined to
+  its own namespace; access to the shared DR repo is mediated by a **non-forgeable server-side
+  `namespace=` tag filter**. On the namespace plane, isolation is by construction (the user's own
+  bucket, credentials and key; `platformAccess: false` by default).
+- **Least-data-movement, Ceph-aware snapshots** (R11) — back up from a read-only snapshot with the
+  cheapest path per CSI driver (CephFS shallow `backingSnapshot`, RBD copy-on-write clone); a CSI
+  that cannot snapshot is **skipped with a reason in status**, never silently dropped.
+- **PVC data *and* sanitized manifests** (R15) — manifests are cleaned for cross-cluster restore
+  (`uid`/`resourceVersion`/`status` stripped, `clusterIP` dropped but `nodePort` preserved,
+  storageClass remapping); **cluster-scoped resources** are captured too for real bare-cluster DR
+  ([ADR 0011](spec/adr/0011-cluster-scoped-dr.md)).
+- **Right to erasure** (R21) — `ClusterErasure` *physically* deletes a tenant / namespace / PVC
+  (`restic forget --tag …` + `prune`); blocked on immutable locations until object-lock expiry.
+- **Immutability as a location mode** (R18) — a location is `Standard` or `Immutable` (S3 Object
+  Lock; no prune, retention by repository rotation).
+- **External sync to a secondary location** (R28) — replicate a repository to a second location
+  via `restic copy`, **re-encrypted to the destination's own key** (independent repo, per-namespace
+  selective, tenant siloing preserved) ([ADR 0013](spec/adr/0013-external-backup-sync.md)).
+- **Coexistence, not replacement** (R22) — distinct API group, namespace, credentials, repositories
+  and snapshot objects; runs **alongside** Velero (or any tool) without interference.
+- **Hardened supply chain** — images built with **apko** on a **Wolfi (glibc)** base for a
+  near-zero CVE surface, signed, with an SBOM and **SLSA L3+** provenance.
+
+## How it compares
+
+Crystal Backup is **design-stage**, so this compares its **intended** capabilities against the
+**current** capabilities of established tools, to the best of our knowledge. Capabilities evolve,
+these tools have **different goals**, and this is **not** a benchmark or an endorsement — verify
+against each project's own docs.
+
+Legend: ✅ yes / core goal · 🟡 partial or possible with effort · ❌ no / not a goal.
+
+| Capability | Crystal Backup *(target)* | Velero | K8up | VolSync | Kasten K10 |
+|---|:--:|:--:|:--:|:--:|:--:|
+| Open source | ✅ | ✅ | ✅ | ✅ | ❌ (commercial; limited free tier) |
+| Namespace-user **self-service** (own schedules/restores) | ✅ | ❌ (admin-oriented) | ✅ | 🟡 | 🟡 |
+| Per-namespace **tenant isolation** (can't read others') | ✅ | ❌ | 🟡 | 🟡 | 🟡 |
+| **Off-platform** backup to the user's own bucket + own key | ✅ | 🟡 | ✅ | ✅ | ❌ |
+| PVC data **+ Kubernetes manifests** | ✅ | ✅ | ❌ (volume data) | ❌ (volumes) | ✅ |
+| **Least-data-movement** CSI snapshots (Ceph-aware) | ✅ | ✅ | 🟡 | ✅ | ✅ |
+| **DR from the repository alone** (no pre-existing CRs) | ✅ | 🟡 | ❌ | ❌ | 🟡 |
+| **Reversibility** — read backups with a standard tool | ✅ (restic) | 🟡 (restic/kopia, wrapped) | ✅ (restic) | ✅ (restic option) | ❌ (proprietary catalog) |
+| **Immutability** (S3 Object Lock) | ✅ | 🟡 | 🟡 | ❌ | ✅ |
+| **Right to erasure** (physical, per tenant/ns/PVC) | ✅ | 🟡 | 🟡 | ❌ | 🟡 |
+| Browse / file-level download **UI** | 🟡 (local CLI/UI, later) | ❌ | 🟡 (via Backrest) | ❌ | ✅ (rich UI) |
+| **Coexistence** with another backup tool (stated goal) | ✅ | 🟡 | 🟡 | 🟡 | 🟡 |
+
+The one-line reading: mature tools like **Velero** excel at **admin cluster-wide DR**, and
+**K8up/VolSync** at **restic/replication per namespace** — but the combination of *multi-tenant
+self-service + reversibility + DR-straight-from-the-repository* is the gap Crystal Backup aims at.
+Commercial suites like **Kasten K10** are feature-rich but proprietary (reversibility and cost are
+the trade-offs).
+
+## Roadmap
+
+Milestones are sequenced so the **core two-plane path + cluster DR** comes first; each milestone
+ends releasable. Full task breakdown and Definition of Done: [spec/90-roadmap.md](spec/90-roadmap.md).
+
+| Milestone | Theme |
+|---|---|
+| **M0** | Scaffolding — kubebuilder layout, CRD skeletons, CI (apko/Wolfi + SLSA L3+), test harness |
+| **M1** | Core engine & cluster DR — cascade, snapshot exposers, discovery, retention, metrics |
+| **M2** | Restore — self-service, operator-mediated cluster-DR restore, `ClusterRestore`, admission (VAP) |
+| **M3** | Manifests & cluster-scoped DR — sanitization engine, cluster-scoped capture & selective restore |
+| **M4** | Consistency hooks, repository verification (`restic check`) & maintenance |
+| **M5** | Namespace plane, **external sync** & right-to-erasure |
+| **M6** | Observability hardening & GA gate |
+| **M7** | `crystalctl` CLI & local browse UI |
+| **M8** | Immutable locations (S3 Object Lock) |
+| **M9** | Coexistence hardening & DR drills |
+
+*(An editable dependency diagram of the roadmap is kept as a local planning artifact and is not
+published in this repository.)*
+
+## Architecture in one paragraph
+
+A Go operator in `crystal-backup-system` reconciles the CRDs of both planes
+(`ClusterBackupLocation`, `ClusterBackupSchedule`, `ClusterBackup`, `ClusterRestore`,
+`ClusterErasure`, `ClusterBackupExternalSync`; `BackupLocation`, `BackupSchedule`, `Backup`,
+`Restore`, `BackupExternalSync`), runs the schedule / backup / restore / discovery / maintenance /
+external-sync controllers, orchestrates CSI `VolumeSnapshot`s, and fans out one **unprivileged
+mover Job per PVC** (`crystal-mover` / `crystal-manifest-mover`) running `restic` against
+`s3://<bucket>/<prefix>/<clusterID>/`. Movers run **only** in `crystal-backup-system` (never in
+tenant namespaces); the shared DR repository's key never leaves that namespace. Architecture and
+flows: [spec/01-architecture.md](spec/01-architecture.md); the naming & field contract:
+[spec/02-api.md](spec/02-api.md); tenancy & threat model:
+[spec/03-security-and-tenancy.md](spec/03-security-and-tenancy.md).
+
+## Documentation
+
+Start with the specification index: **[spec/README.md](spec/README.md)**.
+
+| Doc | Content |
+|---|---|
+| [spec/00-requirements.md](spec/00-requirements.md) | Requirements R1–R28, personas, scope, priorities |
+| [spec/01-architecture.md](spec/01-architecture.md) | Components, two-plane model, cascade, flows, concurrency |
+| [spec/02-api.md](spec/02-api.md) | CRD naming & field contract, validation, RBAC |
+| [spec/03-security-and-tenancy.md](spec/03-security-and-tenancy.md) | Threat model, isolation invariants, keys, supply chain |
+| [spec/04-manifest-backup.md](spec/04-manifest-backup.md) | Manifest dump, sanitization rules, restore transforms |
+| [spec/05-observability.md](spec/05-observability.md) | Metrics, logging, tracing, alerting |
+| [spec/06-cli.md](spec/06-cli.md) | `crystalctl` standalone CLI |
+| [spec/07-ui.md](spec/07-ui.md) | UI strategy |
+| [spec/08-testing-and-dod.md](spec/08-testing-and-dod.md) | Test strategy, fidelity suite, Definition of Done |
+| [spec/90-roadmap.md](spec/90-roadmap.md) | Milestones M0–M9, task breakdown |
+| [spec/adr/](spec/adr/) | 13 Architecture Decision Records (0001–0013) |
+
+## License
+
+Licensed under the **Apache License 2.0** — see [LICENSE](LICENSE). All dependencies must remain
+permissive-license compatible (Apache-2.0 / MIT / BSD).

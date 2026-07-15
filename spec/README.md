@@ -1,5 +1,10 @@
 # Crystal Backup — Specifications
 
+> ⚠️ **Design / specification stage — no software yet.** These documents describe *intended*
+> behaviour. The implementation is being written **with AI assistance** and, when it exists, will
+> be experimental — **use it at your own risk**, and always keep independent, tested backups. Full
+> disclaimer: [project README](../README.md#-project-status--disclaimer).
+
 **Crystal Backup** is a Kubernetes operator for **multi-tenant, self-service backup and
 restore of namespaces** (PVC data + Kubernetes manifests). It works across **two planes**
 (cert-manager `ClusterIssuer`/`Issuer` style): a *cluster plane* for platform **disaster
