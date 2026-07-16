@@ -2,7 +2,9 @@
 artifacts/
 ansible/inventory/
 terraform/.terraform/
-terraform/terraform.tfstate
-terraform/terraform.tfstate.backup
+# All state files (incl. timestamped *.tfstate.<n>.backup from `state rm`) —
+# they contain the RKE2 token. Never commit.
+terraform/*.tfstate
+terraform/*.tfstate.*
 terraform/tfplan
 *.retry
