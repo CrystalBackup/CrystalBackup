@@ -158,7 +158,7 @@ jobs:
 
       - name: trivy — 0-known-CVE gate (amd64)
         if: steps.gate.outputs.proceed == 'true'
-        uses: aquasecurity/trivy-action@0.36.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: image
           input: image-x86_64.tar
@@ -169,7 +169,7 @@ jobs:
 
       - name: trivy — 0-known-CVE gate (arm64)
         if: steps.gate.outputs.proceed == 'true'
-        uses: aquasecurity/trivy-action@0.36.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: image
           input: image-aarch64.tar
@@ -314,7 +314,7 @@ jobs:
 
       - name: trivy — 0-known-CVE release gate (amd64)
         if: steps.gate.outputs.proceed == 'true'
-        uses: aquasecurity/trivy-action@0.36.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: image
           input: image-x86_64.tar
@@ -325,7 +325,7 @@ jobs:
 
       - name: trivy — 0-known-CVE release gate (arm64)
         if: steps.gate.outputs.proceed == 'true'
-        uses: aquasecurity/trivy-action@0.36.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: image
           input: image-aarch64.tar
