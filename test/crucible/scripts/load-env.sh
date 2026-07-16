@@ -14,7 +14,19 @@
 # Values are exported into the environment only — never written to disk,
 # never echoed.
 
-_crucible_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Resolve this file's own path under BOTH bash and zsh. The crucible's tooling
+# sources this from bash, but a human may source it from a zsh prompt — where
+# ${BASH_SOURCE} is unset, so the old math walked one dir too high. `eval` hides
+# zsh's %x syntax from bash's parser.
+if [ -n "${ZSH_VERSION:-}" ]; then
+  eval '_crucible_self="${(%):-%x}"'
+elif [ -n "${BASH_SOURCE:-}" ]; then
+  _crucible_self="${BASH_SOURCE[0]}"
+else
+  _crucible_self="${0}"
+fi
+
+_crucible_dir="$(cd "$(dirname "${_crucible_self}")/.." && pwd)"
 _repo_root="$(cd "${_crucible_dir}/../.." && pwd)"
 _secrets_dir="${CRYSTALBACKUP_SECRETS_DIR:-${_repo_root}/.secrets}"
 
@@ -50,4 +62,4 @@ if [[ -f "${_crucible_dir}/artifacts/crucible.env" ]]; then
   set +a
 fi
 
-unset _crucible_dir _repo_root _secrets_dir
+unset _crucible_dir _repo_root _secrets_dir _crucible_self

@@ -18,7 +18,7 @@ Anyone with a Hetzner Cloud project can run it — see
 ```
                         Hetzner Cloud (fsn1, private net 10.42.0.0/16)
    ┌──────────────────────────────────────────────────────────────────┐
-   │  crucible-master-1..3 (cx32)        crucible-worker-1..3 (cx42)  │
+   │  crucible-master-1..3 (cpx32)       crucible-worker-1..3 (cpx42)  │
    │  ─ RKE2 servers (HA etcd)           ─ RKE2 agents                │
    │  ─ ceph MON + MGR                   ─ ceph OSD (raw 40G volume)  │
    │                                     ─ ceph MDS + RGW + toolbox   │
@@ -47,9 +47,13 @@ Storage classes exercised by the seed and the tests:
 
 ## 💶 Cost & lifetime
 
-Defaults (3× cx32 + 3× cx42 + 3× 40 GB volumes + 6 IPv4) run **≈ €0.15/hour ≈
-€3.50/day** (≈ €105/month if forgotten!). The crucible is built to be
-**created, used, destroyed** — always finish with:
+Defaults (3× cpx32 + 3× cpx42 + 3× 40 GB volumes + 6 IPv4) run **≈ €0.52/hour ≈
+€12.5/day** (≈ €370/month if forgotten!) — a ~2 h validation session is about €1.
+The cheaper Intel `cx` line and the ARM `cax` line aren't creatable in fsn1 today
+(`hcloud datacenter describe fsn1-dc14` → `server_types.available`); override
+`TF_VAR_master_type` / `TF_VAR_worker_type` if your location offers something
+cheaper. The crucible is built to be **created, used, destroyed** — always finish
+with:
 
 ```sh
 CONFIRM=yes mise run down    # terraform destroy

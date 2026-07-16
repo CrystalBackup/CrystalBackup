@@ -10,7 +10,8 @@ Full context: `test/crucible/README.md`.
 
 ## Ground rules
 
-1. **Money**: `mise run up` creates ~€0.15/hour of Hetzner resources (≈€3.5/day).
+1. **Money**: `mise run up` creates ~€0.52/hour of Hetzner resources (≈€12.5/day;
+   a ~2 h validation session ≈ €1).
    Confirm with the user before provisioning unless they just asked for it, and
    always propose `CONFIRM=yes mise run down` when the work is done. If a session
    ends with infrastructure still up, SAY SO explicitly.

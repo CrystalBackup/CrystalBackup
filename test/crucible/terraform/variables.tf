@@ -41,13 +41,16 @@ variable "worker_count" {
 variable "master_type" {
   description = "Server type for masters (mon+mgr land here; 8 GB recommended)."
   type        = string
-  default     = "cx32" # 4 vCPU / 8 GB
+  # cpx32 = 4 vCPU / 8 GB, AMD x86, currently available in fsn1. The newer Intel
+  # cx33/cx43 line is Helsinki-only for now; pick a type your location offers
+  # (`hcloud datacenter describe <dc>` -> server_types.available).
+  default = "cpx32"
 }
 
 variable "worker_type" {
   description = "Server type for workers (osd+mds+rgw+longhorn land here; 16 GB recommended)."
   type        = string
-  default     = "cx42" # 8 vCPU / 16 GB
+  default     = "cpx42" # 8 vCPU / 16 GB, AMD x86
 }
 
 variable "image" {
