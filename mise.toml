@@ -11,6 +11,11 @@ pnpm = "10.33.2"
 # is reproducible and the cache never splits across versions.
 go = "1.26.5"
 kubebuilder = "4.15.0"
+# Security tooling. gitleaks is the secret scanner used by both the pre-commit
+# hook (.pre-commit-config.yaml) and CI (.github/workflows/security.yml) — one
+# pinned version, one ruleset (.gitleaks.toml). pre-commit runs the local hooks.
+gitleaks = "8.30.1"
+pre-commit = "4.6.0"
 
 # Run the documentation site locally: `mise run doc`
 # Installs deps if needed, then starts the Astro dev server (website/, http://localhost:4321/CrystalBackup/).

@@ -1,0 +1,21 @@
+# Gitleaks configuration for Crystal Backup.
+# Extends the built-in ruleset (do not replace it) and adds narrow allowlists
+# for known-safe files. Kept deliberately small: real secrets live in the
+# git-ignored .secrets/ directory and must NEVER be silenced here.
+title = "Crystal Backup gitleaks config"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Credential example/template files carry placeholders, not secrets"
+paths = [
+  '''test/crucible/secrets\.example/.*''',
+]
+
+[[allowlists]]
+description = "Placeholder image digest in the Helm chart (all-zero sha256, not a secret)"
+regexTarget = "line"
+regexes = [
+  '''sha256:0{64}''',
+]

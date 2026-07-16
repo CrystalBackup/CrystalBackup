@@ -207,6 +207,7 @@ cosign download sbom "$IMG"
 | Lint | [`../.github/workflows/lint.yml`](../.github/workflows/lint.yml) | push→main, PR | golangci-lint; **generated code & CRDs up-to-date** check (`make manifests generate` + `git diff`); `helm lint charts/crystal-backup` |
 | Unit tests | [`../.github/workflows/test.yml`](../.github/workflows/test.yml) | push→main, PR | `make test`, uploads the `coverage` artifact |
 | E2E tests | [`../.github/workflows/test-e2e.yml`](../.github/workflows/test-e2e.yml) | push→main, PR | kind-based e2e suite |
+| Security | [`../.github/workflows/security.yml`](../.github/workflows/security.yml) | push→main, PR | **gitleaks over the full git history** + the pre-commit hook suite (`pre-commit run --all-files`) |
 | Images / release | `.github/workflows/images.yml` | (release track) | apko multi-arch build, CVE scan, cosign sign, SBOM, SLSA provenance, GHCR publish |
 | Docs site | [`../.github/workflows/deploy-pages.yml`](../.github/workflows/deploy-pages.yml) | push→main | build & deploy the Astro site (`website/`) |
 
