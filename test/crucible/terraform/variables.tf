@@ -76,15 +76,15 @@ variable "ssh_key_name" {
 # ---------------------------------------------------------------------------
 
 variable "network_cidr" {
-  description = "Private network range."
+  description = "Private network range. MUST NOT overlap RKE2's defaults (pods 10.42.0.0/16, services 10.43.0.0/16) or nodes and pods collide."
   type        = string
-  default     = "10.42.0.0/16"
+  default     = "10.10.0.0/16"
 }
 
 variable "subnet_cidr" {
-  description = "Subnet for the nodes (masters get .11+, workers .21+)."
+  description = "Subnet for the nodes (masters get .11+, workers .21+). Inside network_cidr, clear of 10.42/10.43."
   type        = string
-  default     = "10.42.0.0/24"
+  default     = "10.10.0.0/24"
 }
 
 # ---------------------------------------------------------------------------

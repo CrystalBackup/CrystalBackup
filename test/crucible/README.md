@@ -16,7 +16,7 @@ Anyone with a Hetzner Cloud project can run it — see
 ## What gets built
 
 ```
-                        Hetzner Cloud (fsn1, private net 10.42.0.0/16)
+                        Hetzner Cloud (fsn1, private net 10.10.0.0/16)
    ┌──────────────────────────────────────────────────────────────────┐
    │  crucible-master-1..3 (cpx32)       crucible-worker-1..3 (cpx42)  │
    │  ─ RKE2 servers (HA etcd)           ─ RKE2 agents                │
