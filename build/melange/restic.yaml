@@ -1,0 +1,70 @@
+# melange recipe — pinned restic engine, built from source into a signed apk.
+#
+# Why this exists (spec/adr/0001 + spec/adr/0012): every byte Crystal Backup stores
+# passes through restic, so the mover's engine version must be *reproducible* and
+# *SBOM-attributed*, not pulled ad hoc from a rolling distro. melange builds it from the
+# upstream source release into a cosign/apk-signed package that apko then assembles into
+# the mover image (build/apko/mover.yaml).
+#
+# Version pin: restic >= 0.19.1 (spec/90-roadmap.md M1, "delta 3" stale-lock fixes).
+# Bumping restic = bump `version` + `expected-sha256` here AND the `restic=` pin in
+# build/apko/mover.yaml, in the same PR (deliberate, tested upgrade — adr/0001).
+package:
+  name: restic
+  version: "0.19.1"
+  epoch: 0
+  description: "Fast, secure, efficient backup program — pinned engine for Crystal Backup movers"
+  url: https://restic.net/
+  copyright:
+    - license: BSD-2-Clause
+  dependencies:
+    runtime:
+      # TLS trust store for S3 / object-storage endpoints. glibc is pulled in
+      # automatically by melange's ELF dependency scan.
+      - ca-certificates-bundle
+
+environment:
+  contents:
+    keyring:
+      - https://packages.wolfi.dev/os/wolfi-signing.rsa.pub
+    repositories:
+      - https://packages.wolfi.dev/os
+    packages:
+      # The go toolchain (go-1.25, pinned below), build-base, busybox and
+      # ca-certificates-bundle are added automatically by the go/build pipeline's
+      # `needs.packages`; only the extras go here.
+      - git # module-resolution fallback for any non-proxy dependency
+  environment:
+    CGO_ENABLED: "0"
+    GOFLAGS: "-trimpath -mod=readonly"
+    # Fail loudly instead of silently network-fetching a toolchain: keeps the build
+    # hermetic/reproducible. go-1.25 (>= 1.25.8, restic's go.mod) satisfies it.
+    GOTOOLCHAIN: local
+
+pipeline:
+  - name: Fetch the restic source release tarball
+    uses: fetch
+    with:
+      uri: https://github.com/restic/restic/releases/download/v${{package.version}}/restic-${{package.version}}.tar.gz
+      expected-sha256: bb9b1a19040744d26d8a79be029d4e6b189c45ccc9d8831d7fe367d3c33df725
+      strip-components: 1
+
+  - name: Build restic (CLI)
+    uses: go/build
+    with:
+      go-package: go-1.25 # pin the toolchain minor to restic's go.mod (go 1.25.8); Wolfi go-1.25 = 1.25.12
+      packages: ./cmd/restic
+      output: restic
+      # restic bakes its version into internal/global.Version (a compile-time const), so
+      # no -X is needed; strip symbols for size. The pipeline already passes -trimpath.
+      ldflags: -s -w
+
+  - uses: strip
+
+# Smoke test — runs in a fresh runtime env with only the built apk + its runtime deps.
+test:
+  pipeline:
+    - name: restic reports the pinned version and help
+      runs: |
+        restic version
+        restic help >/dev/null

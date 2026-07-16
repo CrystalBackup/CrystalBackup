@@ -1,0 +1,39 @@
+apiVersion: v2
+name: crystal-backup
+description: >-
+  Crystal Backup — Kubernetes-native, restic-backed backup & disaster-recovery
+  operator. Cluster-plane DR into one shared repository plus per-namespace
+  self-service backup to the tenant's own object storage.
+type: application
+
+# Chart (packaging) version — SemVer. May bump independently of appVersion for
+# packaging-only changes (adr/0014-versioning-and-release.md).
+version: 0.1.0
+
+# One release train: operator image, mover image, crystalctl and this appVersion
+# share one version string (adr/0014). M0 is scaffolding ⇒ appVersion 0.0.0
+# (milestone→minor on major 0; M0 → 0.0.z).
+appVersion: "0.0.0"
+
+# The operator itself runs on any recent cluster; VolumeSnapshot v1 (CSI) and the
+# VAP-first admission model (adr/0010, GA in 1.30) are exercised by later milestones.
+kubeVersion: ">= 1.28.0-0"
+
+home: https://crystalbackup.io
+icon: https://raw.githubusercontent.com/CrystalBackup/CrystalBackup/main/website/public/logo.svg
+sources:
+  - https://github.com/CrystalBackup/CrystalBackup
+keywords:
+  - backup
+  - restore
+  - disaster-recovery
+  - restic
+  - operator
+  - kubernetes
+  - dr
+maintainers:
+  - name: Crystal Backup
+    url: https://github.com/CrystalBackup/CrystalBackup
+annotations:
+  category: Storage
+  licenses: Apache-2.0

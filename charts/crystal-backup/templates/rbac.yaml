@@ -1,0 +1,292 @@
+{{- if .Values.rbac.create }}
+################################################################################
+# Operator (controller-manager) ClusterRole — least privilege, no wildcards.
+# Derived verbatim from spec/03-security-and-tenancy.md §5 and spec/02-api.md
+# "RBAC packaging". Widening this role requires an ADR (spec/08 DoD #5).
+################################################################################
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "crystal-backup.fullname" . }}-operator
+  labels:
+    {{- include "crystal-backup.labels" . | nindent 4 }}
+rules:
+  # All 12 crystalbackup.io kinds (both planes + the internal BackupRepository):
+  # full management of the primary resources ...
+  - apiGroups: ["crystalbackup.io"]
+    resources:
+      - clusterbackuplocations
+      - clusterbackupschedules
+      - clusterbackups
+      - clusterrestores
+      - clustererasures
+      - clusterbackupexternalsyncs
+      - backuplocations
+      - backupschedules
+      - backups
+      - restores
+      - backupexternalsyncs
+      - backuprepositories
+    verbs: ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
+  # ... their /status subresources ...
+  - apiGroups: ["crystalbackup.io"]
+    resources:
+      - clusterbackuplocations/status
+      - clusterbackupschedules/status
+      - clusterbackups/status
+      - clusterrestores/status
+      - clustererasures/status
+      - clusterbackupexternalsyncs/status
+      - backuplocations/status
+      - backupschedules/status
+      - backups/status
+      - restores/status
+      - backupexternalsyncs/status
+      - backuprepositories/status
+    verbs: ["get", "patch", "update"]
+  # ... and their /finalizers subresources.
+  - apiGroups: ["crystalbackup.io"]
+    resources:
+      - clusterbackuplocations/finalizers
+      - clusterbackupschedules/finalizers
+      - clusterbackups/finalizers
+      - clusterrestores/finalizers
+      - clustererasures/finalizers
+      - clusterbackupexternalsyncs/finalizers
+      - backuplocations/finalizers
+      - backupschedules/finalizers
+      - backups/finalizers
+      - restores/finalizers
+      - backupexternalsyncs/finalizers
+      - backuprepositories/finalizers
+    verbs: ["update"]
+  # CSI VolumeSnapshots: created/deleted in USER namespaces during a run (I5), hence
+  # cluster-wide; classes are read-only (adr/0003).
+  - apiGroups: ["snapshot.storage.k8s.io"]
+    resources: ["volumesnapshots", "volumesnapshotcontents"]
+    verbs: ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
+  - apiGroups: ["snapshot.storage.k8s.io"]
+    resources: ["volumesnapshotclasses"]
+    verbs: ["get", "list", "watch"]
+  # PersistentVolumeClaims: temp PVCs + restored PVCs (in user namespaces). PVs read-only.
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get", "list", "watch"]
+  # Namespaces: read + create (ClusterRestore targets).
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["create", "get", "list", "watch"]
+  # Pods: read; pods/exec: create (pre/post-backup hooks, R16 — in-namespace only, by
+  # controller invariant).
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+  # Secrets: get ONLY — no list/watch. The operator reads Secrets by name via a
+  # cache-bypassing client, so no cluster-wide Secret cache ever exists (spec/03 §5).
+  # Secret CREATION is confined to the crystal-backup-system Role below.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+  # Events: emit operational events.
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "crystal-backup.fullname" . }}-operator
+  labels:
+    {{- include "crystal-backup.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "crystal-backup.fullname" . }}-operator
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "crystal-backup.serviceAccountName" . }}
+    namespace: {{ include "crystal-backup.namespace" . }}
+---
+################################################################################
+# Workload + secret management confined to crystal-backup-system (namespaced Role):
+# the operator can create workloads (Jobs) and manage per-mover/DEK Secrets ONLY in
+# its own namespace — never elsewhere (spec/03 §5-6, invariant I5).
+################################################################################
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "crystal-backup.fullname" . }}-operator
+  namespace: {{ include "crystal-backup.namespace" . }}
+  labels:
+    {{- include "crystal-backup.labels" . | nindent 4 }}
+rules:
+  # Mover / maintenance Jobs (workloads live only here).
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
+  # Per-mover S3 creds, wrapped platform DEK (crystal-dek-<location>) and generated
+  # repository passwords — full lifecycle, operator namespace only.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "crystal-backup.fullname" . }}-operator
+  namespace: {{ include "crystal-backup.namespace" . }}
+  labels:
+    {{- include "crystal-backup.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "crystal-backup.fullname" . }}-operator
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "crystal-backup.serviceAccountName" . }}
+    namespace: {{ include "crystal-backup.namespace" . }}
+---
+################################################################################
+# Leader election (--leader-elect) — namespaced to the operator namespace.
+################################################################################
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "crystal-backup.fullname" . }}-leader-election
+  namespace: {{ include "crystal-backup.namespace" . }}
+  labels:
+    {{- include "crystal-backup.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "crystal-backup.fullname" . }}-leader-election
+  namespace: {{ include "crystal-backup.namespace" . }}
+  labels:
+    {{- include "crystal-backup.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "crystal-backup.fullname" . }}-leader-election
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "crystal-backup.serviceAccountName" . }}
+    namespace: {{ include "crystal-backup.namespace" . }}
+---
+################################################################################
+# Metrics endpoint authn/authz (secure :8443). The manager delegates to the API
+# server via TokenReview/SubjectAccessReview.
+################################################################################
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "crystal-backup.fullname" . }}-metrics-auth
+  labels:
+    {{- include "crystal-backup.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+  - apiGroups: ["authorization.k8s.io"]
+    resources: ["subjectaccessreviews"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "crystal-backup.fullname" . }}-metrics-auth
+  labels:
+    {{- include "crystal-backup.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "crystal-backup.fullname" . }}-metrics-auth
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "crystal-backup.serviceAccountName" . }}
+    namespace: {{ include "crystal-backup.namespace" . }}
+---
+# Scrapers bind this to read /metrics (not bound by the chart).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "crystal-backup.fullname" . }}-metrics-reader
+  labels:
+    {{- include "crystal-backup.labels" . | nindent 4 }}
+rules:
+  - nonResourceURLs: ["/metrics"]
+    verbs: ["get"]
+---
+################################################################################
+# Namespace-user (tenant) ClusterRole — aggregated into the platform's per-namespace
+# user roles. Uniform write verbs, no wildcards: CRUD on backupschedules,
+# backuplocations, restores, backupexternalsyncs; READ-ONLY on backups (they are
+# operator/discovery-managed projections). No access to cluster* kinds or to the
+# internal backuprepositories. Pinned by a golden-file test (spec/08 DoD #5).
+################################################################################
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "crystal-backup.fullname" . }}-tenant
+  labels:
+    {{- include "crystal-backup.labels" . | nindent 4 }}
+    # Stable custom label the platform's own namespace roles can aggregate on.
+    crystalbackup.io/aggregate-to-namespace-user: "true"
+    {{- if .Values.rbac.aggregateToDefaultRoles }}
+    # Standard Kubernetes aggregation into the built-in edit/admin roles.
+    rbac.authorization.k8s.io/aggregate-to-edit: "true"
+    rbac.authorization.k8s.io/aggregate-to-admin: "true"
+    {{- end }}
+rules:
+  - apiGroups: ["crystalbackup.io"]
+    resources:
+      - backupschedules
+      - backuplocations
+      - restores
+      - backupexternalsyncs
+    verbs: ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
+  - apiGroups: ["crystalbackup.io"]
+    resources: ["backups"]
+    verbs: ["get", "list", "watch"]
+---
+################################################################################
+# Platform-admin ClusterRole — the cluster* (DR) kinds. Bound by the platform to
+# real administrators (no aggregation, no default binding). Not for tenants.
+################################################################################
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "crystal-backup.fullname" . }}-admin
+  labels:
+    {{- include "crystal-backup.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["crystalbackup.io"]
+    resources:
+      - clusterbackuplocations
+      - clusterbackupschedules
+      - clusterbackups
+      - clusterrestores
+      - clustererasures
+      - clusterbackupexternalsyncs
+    verbs: ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
+  # Operational visibility of internal repository state (admins only, read-only).
+  - apiGroups: ["crystalbackup.io"]
+    resources: ["backuprepositories"]
+    verbs: ["get", "list", "watch"]
+{{- end }}

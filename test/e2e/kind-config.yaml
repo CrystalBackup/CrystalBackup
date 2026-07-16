@@ -1,0 +1,23 @@
+# Kind cluster configuration for the Crystal Backup e2e suite.
+#
+# Goals (see spec/08-testing-and-dod.md §4 and spec/90-roadmap.md M0):
+#   * a control-plane + two workers, so per-node topology spread (R12) and the
+#     node-drain / orphan-reaper scenarios (08-testing case 13, from M1) have real
+#     nodes to schedule across;
+#   * CSI VolumeSnapshot support: the external-snapshotter controller + CRDs and the
+#     csi-driver-host-path driver are installed on top of this cluster by
+#     test/e2e/manifests/install-csi-snapshot.sh. VolumeSnapshot v1 is GA, so no feature
+#     gates are required here — the hostpath driver just needs the standard kubelet
+#     plugin dirs, which kind provides out of the box.
+#
+# Pinned node image: kept OUT of this file so `kind create` uses the node image that
+# ships with the locally-installed kind release (guaranteed compatible). For reproducible
+# CI, pin it explicitly via the Makefile:  `make test-e2e KIND_IMAGE=kindest/node:v1.33.1@sha256:<digest>`
+# (the Makefile passes it through as `kind create cluster --image ...`). Look up the digest
+# that matches your kind version in the kind release notes.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+  - role: worker
+  - role: worker

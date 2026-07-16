@@ -1,0 +1,42 @@
+# melange recipe — package the Crystal Backup mover (crystal-mover) binary into a signed apk.
+#
+# Same rationale as build/melange/operator.yaml: the CI workflow cross-compiles the
+# `crystal-mover` binary and stages it into melange's --source-dir per architecture; this
+# recipe only installs it. The mover shim shells out to restic (spec/adr/0001), which is
+# provided by the separately melange-built `restic` apk (build/melange/restic.yaml) and
+# declared as a runtime dependency below so the coupling is explicit.
+#
+# NOTE (M0): the `crystal-mover` binary lands in M1 (spec/90-roadmap.md). Until cmd/crystal-mover
+# exists the images.yml workflow skips this component; the recipe is ready for that milestone.
+#
+# spec/adr/0012 (apko/Wolfi/melange supply chain), spec/adr/0014 (versioning).
+package:
+  name: crystal-backup-mover
+  version: "0.0.0" # M0 appVersion (adr/0014). CI stamps the release version.
+  epoch: 0
+  description: "Crystal Backup mover (crystal-mover) binary"
+  url: https://github.com/CrystalBackup/CrystalBackup
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    runtime:
+      # The pinned restic engine (>= 0.19.1) the mover shim invokes as /usr/bin/restic.
+      # Resolved from the local melange repo at apko assembly time.
+      - restic
+
+environment:
+  contents:
+    keyring:
+      - https://packages.wolfi.dev/os/wolfi-signing.rsa.pub
+    repositories:
+      - https://packages.wolfi.dev/os
+    packages:
+      - busybox # /bin/sh + coreutils for the pipeline
+
+pipeline:
+  - name: Install the pre-built crystal-mover binary
+    runs: |
+      set -e
+      mkdir -p "${{targets.destdir}}/usr/bin"
+      cp crystal-mover "${{targets.destdir}}/usr/bin/crystal-mover"
+      chmod 0755 "${{targets.destdir}}/usr/bin/crystal-mover"

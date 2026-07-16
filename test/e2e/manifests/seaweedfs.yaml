@@ -1,0 +1,194 @@
+# Single-pod SeaweedFS exposing the S3 API — the object-storage backend for the e2e suite
+# (spec/08-testing-and-dod.md §4, spec/90-roadmap.md M0 "SeaweedFS fast loop").
+#
+# `weed server -s3` runs master + volume + filer + the S3 gateway in one process, which is
+# ideal for a disposable test backend. Storage is an emptyDir (ephemeral, recreated per
+# cluster). A bootstrap Job pre-creates the buckets used by the two-plane fixtures so the
+# data-path suites (M1+) can write immediately. The M0 CRD round-trip does NOT touch S3 —
+# it only references these Secret names in specs — so the suite stays green even before any
+# object is written.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: crystalbackup-e2e
+  labels:
+    app.kubernetes.io/part-of: crystal-backup-e2e
+---
+# SeaweedFS S3 identities/credentials (-s3.config). A single admin identity is enough for a
+# test backend; the per-tenant isolation cases (08-testing case 6, M5) add scoped identities.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: seaweedfs-s3-config
+  namespace: crystalbackup-e2e
+stringData:
+  s3.json: |
+    {
+      "identities": [
+        {
+          "name": "crystal-e2e",
+          "credentials": [
+            { "accessKey": "crystalbackup", "secretKey": "crystalbackup-secret" }
+          ],
+          "actions": ["Admin", "Read", "Write", "List", "Tagging"]
+        }
+      ]
+    }
+---
+# Convenience Secret in the AWS-CLI/restic env-var shape, mirroring the identity above.
+# Namespace-plane and cluster-plane BackupLocation CRs can point their credentialsSecretRef
+# here in the data-path suites.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: seaweedfs-s3-credentials
+  namespace: crystalbackup-e2e
+stringData:
+  AWS_ACCESS_KEY_ID: crystalbackup
+  AWS_SECRET_ACCESS_KEY: crystalbackup-secret
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: seaweedfs
+  namespace: crystalbackup-e2e
+  labels:
+    app: seaweedfs
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: seaweedfs
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: seaweedfs
+    spec:
+      containers:
+        - name: seaweedfs
+          # Pinned SeaweedFS release; override at will. Multi-arch (amd64/arm64) image.
+          image: chrislusf/seaweedfs:3.80
+          args:
+            - server
+            - -dir=/data
+            - -ip.bind=0.0.0.0
+            - -master.volumeSizeLimitMB=256
+            - -volume.max=100
+            - -filer
+            - -s3
+            - -s3.port=8333
+            - -s3.config=/etc/seaweedfs/s3.json
+          ports:
+            - name: s3
+              containerPort: 8333
+            - name: master
+              containerPort: 9333
+            - name: filer
+              containerPort: 8888
+          readinessProbe:
+            tcpSocket:
+              port: s3
+            initialDelaySeconds: 3
+            periodSeconds: 3
+          livenessProbe:
+            tcpSocket:
+              port: master
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: s3-config
+              mountPath: /etc/seaweedfs
+              readOnly: true
+      volumes:
+        - name: data
+          emptyDir: {}
+        - name: s3-config
+          secret:
+            secretName: seaweedfs-s3-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: seaweedfs
+  namespace: crystalbackup-e2e
+  labels:
+    app: seaweedfs
+spec:
+  selector:
+    app: seaweedfs
+  ports:
+    - name: s3
+      port: 8333
+      targetPort: s3
+    - name: master
+      port: 9333
+      targetPort: master
+    - name: filer
+      port: 8888
+      targetPort: filer
+---
+# Pre-create the buckets the two-plane fixtures use. Idempotent (`|| true`) and waits for
+# the S3 gateway to answer before issuing CreateBucket.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: seaweedfs-bucket-init
+  namespace: crystalbackup-e2e
+  labels:
+    app: seaweedfs
+spec:
+  backoffLimit: 6
+  template:
+    metadata:
+      labels:
+        app: seaweedfs-bucket-init
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: awscli
+          image: amazon/aws-cli:2.15.30
+          env:
+            - name: AWS_ACCESS_KEY_ID
+              value: crystalbackup
+            - name: AWS_SECRET_ACCESS_KEY
+              value: crystalbackup-secret
+            - name: AWS_DEFAULT_REGION
+              value: us-east-1
+            - name: AWS_EC2_METADATA_DISABLED
+              value: "true"
+            - name: ENDPOINT
+              value: http://seaweedfs.crystalbackup-e2e.svc.cluster.local:8333
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              echo "waiting for the SeaweedFS S3 endpoint at ${ENDPOINT} ..."
+              for i in $(seq 1 60); do
+                if aws --endpoint-url "${ENDPOINT}" s3 ls >/dev/null 2>&1; then
+                  echo "S3 endpoint is up"; break
+                fi
+                sleep 2
+              done
+              for b in e2e-dr tenant-a-backups tenant-b-backups tenant-a-offsite-2; do
+                echo "creating bucket ${b}"
+                aws --endpoint-url "${ENDPOINT}" s3 mb "s3://${b}" || true
+              done
+              echo "buckets present:"
+              aws --endpoint-url "${ENDPOINT}" s3 ls

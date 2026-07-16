@@ -1,0 +1,163 @@
+# Default values for the crystal-backup chart.
+#
+# Crystal Backup is a SINGLETON cluster operator. Install it into the
+# crystal-backup-system namespace, where all platform credentials, the cluster
+# KEK and the wrapped platform DEK live and never leave (spec/03-security-and-tenancy.md,
+# invariants I3/I5). Recommended install:
+#
+#   helm install crystal-backup ./charts/crystal-backup -n crystal-backup-system --create-namespace
+#
+# (the chart also creates the namespace itself by default; see `namespace.create`).
+
+# -- Override the generated resource base name (default "crystal-backup"). The
+# cluster-scoped RBAC object names derive from this base (crystal-backup-operator,
+# crystal-backup-tenant, crystal-backup-admin). Keep it STABLE: a golden-file test
+# pins the rendered `crystal-backup-tenant` ClusterRole (spec/08 DoD #5).
+fullnameOverride: ""
+nameOverride: ""
+
+namespace:
+  # -- Create the operator namespace.
+  create: true
+  # -- Operator namespace. Platform credentials, KEK and wrapped DEK live here only.
+  name: crystal-backup-system
+  # -- Pod Security Admission labels for the operator namespace. Enforce `baseline`
+  # (not `restricted`): the operator is restricted-compliant, but data movers run
+  # `runAsUser: 0` + DAC_OVERRIDE here (spec/03 §6), which restricted would deny.
+  # audit/warn stay `restricted` for visibility.
+  podSecurityLabels:
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+
+image:
+  # -- Operator image repository on GHCR. Published multi-arch (linux/amd64 +
+  # linux/arm64), built with apko on a Wolfi/glibc base, 0-known-CVE, cosign
+  # keyless-signed with an SBOM and SLSA L3+ provenance (adr/0012).
+  repository: ghcr.io/crystalbackup/operator
+  # -- Image digest — the immutable pin (production references images BY DIGEST,
+  # never by floating tag). PLACEHOLDER for M0 scaffolding; the release pipeline
+  # substitutes the real index digest at publish time.
+  digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  # -- Fallback tag, used ONLY when `image.digest` is empty (e.g. local dev).
+  # Defaults to .Chart.AppVersion when left blank.
+  tag: ""
+  # -- Image pull policy.
+  pullPolicy: IfNotPresent
+
+# -- Pull secrets for private registries. GHCR images are public — none needed.
+imagePullSecrets: []
+
+# -- Operator replicas. More than one is safe: leader election (--leader-elect)
+# keeps exactly one active; the rest are warm standbys.
+replicaCount: 1
+
+# -- Extra CLI flags appended to the manager. M0 keeps only the three baseline flags
+# (--health-probe-bind-address, --metrics-bind-address, --leader-elect).
+extraArgs: []
+
+serviceAccount:
+  # -- Create the operator ServiceAccount.
+  create: true
+  # -- Name of the operator ServiceAccount (defaults to "<fullname>-operator",
+  # i.e. crystal-backup-operator — the SA named in spec/03 §5).
+  name: ""
+  # -- Annotations for the ServiceAccount (e.g. IRSA / Workload Identity).
+  annotations: {}
+  # -- Automount the SA token — the operator needs it to reach the API server.
+  automount: true
+
+rbac:
+  # -- Install RBAC: the operator ClusterRole (+binding), the crystal-backup-system
+  # Role for workloads/secrets, leader-election, metrics-auth, and the tenant + admin
+  # ClusterRoles.
+  create: true
+  # -- Also stamp the standard Kubernetes aggregation labels
+  # (rbac.authorization.k8s.io/aggregate-to-edit and -admin) onto the namespace-user
+  # ClusterRole so the platform's per-namespace edit/admin roles pick it up. A stable
+  # custom label (crystalbackup.io/aggregate-to-namespace-user) is ALWAYS present too.
+  aggregateToDefaultRoles: true
+
+# Pod-level security context — restricted-PSA compliant, non-root (adr/0012).
+# 65532 is the "nonroot" uid on the Wolfi/distroless base image.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+# Container-level security context — restricted PSA.
+securityContext:
+  runAsNonRoot: true
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+# -- Operator resource requests/limits. Movers get their own (benchmark-derived)
+# resources in later milestones; these are for the controller only.
+resources:
+  requests:
+    cpu: 10m
+    memory: 64Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+health:
+  # -- Health-probe bind port (--health-probe-bind-address). Serves /healthz + /readyz.
+  port: 8081
+
+metrics:
+  # -- Metrics bind port (--metrics-bind-address). Secure by default: HTTPS with
+  # API-server authn/authz (kubebuilder v4 default). Prometheus series use the
+  # `crystalbackup_` prefix (spec/05-observability.md).
+  port: 8443
+  service:
+    # -- Create the metrics Service.
+    create: true
+    type: ClusterIP
+  serviceMonitor:
+    # -- Create a Prometheus Operator ServiceMonitor (requires the monitoring.coreos.com
+    # CRDs to be present in the cluster).
+    enabled: false
+    interval: 30s
+    scrapeTimeout: 10s
+    # -- Extra labels for the ServiceMonitor (e.g. to match a Prometheus selector).
+    labels: {}
+
+livenessProbe:
+  initialDelaySeconds: 15
+  periodSeconds: 20
+  timeoutSeconds: 1
+  failureThreshold: 3
+
+readinessProbe:
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  timeoutSeconds: 1
+  failureThreshold: 3
+
+# -- Node selector for the operator pod.
+nodeSelector: {}
+# -- Tolerations for the operator pod.
+tolerations: []
+# -- Affinity for the operator pod (e.g. spread standbys across nodes/zones).
+affinity: {}
+# -- Extra pod annotations.
+podAnnotations: {}
+# -- Extra pod labels.
+podLabels: {}
+# -- PriorityClass for the operator pod.
+priorityClassName: ""
+# -- Graceful shutdown window.
+terminationGracePeriodSeconds: 10
+
+# -- Cluster identity: used as the restic snapshot `host` and as the `cluster`
+# label on metrics/backups for multi-cluster fleets (R20). RESERVED for M0 — it is
+# not yet wired into the manager flags; a later milestone consumes it.
+clusterID: ""

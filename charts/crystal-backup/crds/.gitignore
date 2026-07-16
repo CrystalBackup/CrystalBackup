@@ -1,0 +1,4 @@
+# CRDs are copied in from config/crd/bases at package time by `make chart-crds`.
+# Keep the directory (via .gitkeep) but do not commit the generated CRD YAML.
+*.yaml
+!.gitkeep

@@ -1,0 +1,23 @@
+Crystal Backup operator {{ .Chart.AppVersion }} installed as release "{{ .Release.Name }}".
+
+  Namespace : {{ include "crystal-backup.namespace" . }}
+  Image     : {{ include "crystal-backup.image" . }}
+  Metrics   : https, port {{ .Values.metrics.port }} (authn/authz)  Health: port {{ .Values.health.port }} (/healthz, /readyz)
+
+Check the operator is up:
+
+  kubectl -n {{ include "crystal-backup.namespace" . }} rollout status deploy/{{ include "crystal-backup.fullname" . }}
+
+{{- if eq .Values.image.digest "sha256:0000000000000000000000000000000000000000000000000000000000000000" }}
+
+WARNING: image.digest is the M0 placeholder — the pod will not pull a real image.
+         Set image.digest to a published ghcr.io/crystalbackup/operator index digest.
+{{- end }}
+
+RBAC installed (cluster-scoped names are stable):
+  - {{ include "crystal-backup.fullname" . }}-operator  (controller ClusterRole, bound to the operator SA)
+  - {{ include "crystal-backup.fullname" . }}-tenant    (namespace-user, aggregated{{ if .Values.rbac.aggregateToDefaultRoles }} into edit/admin{{ end }})
+  - {{ include "crystal-backup.fullname" . }}-admin     (cluster* DR kinds; bind to your admins)
+
+CRDs: packaged under crds/ (installed by Helm on first install). Regenerate/refresh
+      them into the chart with `make chart-crds` before packaging.

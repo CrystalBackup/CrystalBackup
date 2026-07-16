@@ -1,0 +1,86 @@
+name: Lint
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# No token scopes granted by default; each job opts in to the minimum it needs.
+permissions: {}
+
+jobs:
+  golangci-lint:
+    name: golangci-lint
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # `make lint` builds the custom golangci-lint binary declared in .custom-gcl.yml
+      # (adds the logcheck module plugin) before running it.
+      - name: Verify linter configuration
+        run: make lint-config
+
+      - name: Run golangci-lint
+        run: make lint
+
+  verify-generated:
+    name: Generated code & CRDs up to date
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Regenerate CRDs/RBAC (config/) and DeepCopy code (api/) from the +kubebuilder
+      # markers. The tree must already contain the up-to-date output.
+      - name: Regenerate manifests and deepcopy
+        run: make manifests generate
+
+      # `git add -N` promotes any *new* generated-but-uncommitted file into the diff,
+      # so this also catches a freshly scaffolded CRD that was never committed.
+      - name: Verify api/ and config/ are committed
+        run: |
+          git add -N api config
+          if ! git diff --exit-code -- api config; then
+            echo "::error::Generated code / CRDs are out of date. Run 'make manifests generate' and commit the resulting changes under api/ and config/."
+            exit 1
+          fi
+
+  helm-lint:
+    name: helm lint
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Helm
+        uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
+        with:
+          version: v3.21.3
+
+      - name: Lint chart
+        run: helm lint charts/crystal-backup

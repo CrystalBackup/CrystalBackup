@@ -1,0 +1,15 @@
+## Append samples of your project ##
+resources:
+- v1alpha1_clusterbackuplocation.yaml
+- v1alpha1_clusterbackupschedule.yaml
+- v1alpha1_clusterbackup.yaml
+- v1alpha1_clusterrestore.yaml
+- v1alpha1_clustererasure.yaml
+- v1alpha1_clusterbackupexternalsync.yaml
+- v1alpha1_backuplocation.yaml
+- v1alpha1_backupschedule.yaml
+- v1alpha1_backup.yaml
+- v1alpha1_restore.yaml
+- v1alpha1_backupexternalsync.yaml
+- v1alpha1_backuprepository.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples

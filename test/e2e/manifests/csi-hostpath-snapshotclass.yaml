@@ -1,0 +1,15 @@
+# VolumeSnapshotClass for the csi-driver-host-path driver used by the e2e suite.
+#
+# Recent csi-driver-host-path releases ship a VolumeSnapshotClass with this exact name as
+# part of their deploy manifests; applying this file is therefore idempotent and simply
+# guarantees the class exists (and is our canonical reference) regardless of the pinned
+# hostpath version. The backup data-path e2e cases (from M1) reference this class name and
+# the `csi-hostpath-sc` StorageClass created by the hostpath deploy.
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshotClass
+metadata:
+  name: csi-hostpath-snapclass
+  labels:
+    app.kubernetes.io/part-of: crystal-backup-e2e
+driver: hostpath.csi.k8s.io
+deletionPolicy: Delete

@@ -3,6 +3,14 @@
 [tools]
 node = "24.18.0"
 pnpm = "10.33.2"
+# Operator toolchain (M0+). controller-gen, kustomize, setup-envtest and golangci-lint
+# are pinned and installed into ./bin by the kubebuilder Makefile, so they are not listed here.
+# Go 1.26+ is required by the Kubernetes 1.36 client libraries (k8s.io/apimachinery v0.36).
+# The exact toolchain is pinned in go.mod (`toolchain go1.26.5`); with GOTOOLCHAIN=auto (default)
+# any host go >= 1.26.0 — including the system go — resolves to that same 1.26.5, so the build
+# is reproducible and the cache never splits across versions.
+go = "1.26.5"
+kubebuilder = "4.15.0"
 
 # Run the documentation site locally: `mise run doc`
 # Installs deps if needed, then starts the Astro dev server (website/, http://localhost:4321/CrystalBackup/).
