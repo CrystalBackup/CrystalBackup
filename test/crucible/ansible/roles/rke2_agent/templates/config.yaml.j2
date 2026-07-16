@@ -2,6 +2,8 @@
 token: "{{ rke2_token }}"
 server: https://{{ first_master_private_ip }}:9345
 node-ip: {{ private_ip }}
+# Pin flannel's VXLAN to the private NIC (see the server config for why).
+flannel-iface: {{ private_iface }}
 node-label:
   - crystalbackup.io/node-role=worker
   # Longhorn only creates disks on labeled nodes (see deploy/manifests/longhorn-values.yaml)

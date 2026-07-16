@@ -21,7 +21,7 @@ Anyone with a Hetzner Cloud project can run it — see
    │  crucible-master-1..3 (cpx32)       crucible-worker-1..3 (cpx42)  │
    │  ─ RKE2 servers (HA etcd)           ─ RKE2 agents                │
    │  ─ ceph MON + MGR                   ─ ceph OSD (raw 40G volume)  │
-   │                                     ─ ceph MDS + RGW + toolbox   │
+   │                                     ─ ceph MDS + toolbox         │
    │                                     ─ longhorn disks             │
    └──────────────────────────────────────────────────────────────────┘
         + S3 bucket on Hetzner Object Storage (backup target)

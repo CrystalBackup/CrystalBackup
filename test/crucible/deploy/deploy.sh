@@ -2,7 +2,7 @@
 # Crucible — deploy the storage stack + crystal-backup onto the RKE2 cluster.
 #
 #   1. external-snapshotter (CSI snapshot CRDs + controller — RKE2 ships none)
-#   2. rook-ceph operator + CephCluster (mon/mgr on masters, osd/mds/rgw on workers)
+#   2. rook-ceph operator + CephCluster (mon/mgr on masters, osd/mds on workers)
 #      + StorageClasses/VolumeSnapshotClasses + toolbox
 #   3. longhorn (snapshot-capable CSI, disks on workers only)
 #   4. local-path-provisioner (NON-snapshottable class — exercises the skip path)
@@ -66,7 +66,7 @@ helm upgrade --install rook-ceph rook-release/rook-ceph \
   --version "${ROOK_CHART_VERSION}" \
   --wait --timeout 10m
 
-step "CephCluster + pools + filesystem + object store + toolbox"
+step "CephCluster + pools + filesystem + toolbox"
 kubectl apply -f "${SCRIPT_DIR}/manifests/ceph-cluster.yaml"
 kubectl apply -f "${SCRIPT_DIR}/manifests/ceph-toolbox.yaml"
 

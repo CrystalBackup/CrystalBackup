@@ -1,8 +1,11 @@
 # Rook Ceph cluster for crucible.
 # Placement per the crucible contract:
-#   mon + mgr        -> masters  (crystalbackup.io/node-role=master)
-#   osd + mds + rgw  -> workers  (crystalbackup.io/node-role=worker)
+#   mon + mgr    -> masters  (crystalbackup.io/node-role=master)
+#   osd + mds    -> workers  (crystalbackup.io/node-role=worker)
 # OSDs consume the raw hcloud volume attached to each worker (/dev/sdb).
+# No CephObjectStore/RGW here — production (core/argocd-bseufr) runs none, and
+# it isn't exercised until a milestone tests object-store backup; keeping the
+# pool count low keeps 3x 40 GB OSDs comfortably at HEALTH_OK.
 apiVersion: ceph.rook.io/v1
 kind: CephCluster
 metadata:
@@ -84,33 +87,6 @@ spec:
   metadataServer:
     activeCount: 1
     activeStandby: true
-    placement:
-      nodeAffinity:
-        requiredDuringSchedulingIgnoredDuringExecution:
-          nodeSelectorTerms:
-            - matchExpressions:
-                - key: crystalbackup.io/node-role
-                  operator: In
-                  values: ["worker"]
----
-apiVersion: ceph.rook.io/v1
-kind: CephObjectStore
-metadata:
-  name: objectstore
-  namespace: rook-ceph
-spec:
-  metadataPool:
-    failureDomain: host
-    replicated:
-      size: 3
-  dataPool:
-    failureDomain: host
-    replicated:
-      size: 3
-  preservePoolsOnDelete: false
-  gateway:
-    port: 80
-    instances: 1
     placement:
       nodeAffinity:
         requiredDuringSchedulingIgnoredDuringExecution:
