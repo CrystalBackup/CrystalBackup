@@ -30,3 +30,5 @@ charts/crystal-backup/crds/*.yaml
 *.swp
 *.swo
 *~
+
+.secrets/
