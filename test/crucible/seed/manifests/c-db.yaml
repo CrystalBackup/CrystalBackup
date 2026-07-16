@@ -1,0 +1,79 @@
+# c-db — StatefulSet with volumeClaimTemplates on ceph-block (RWO).
+# Each replica writes deterministic data once and records a MANIFEST.sha256
+# so future restore tests can verify integrity byte-for-byte.
+apiVersion: v1
+kind: Service
+metadata:
+  name: db
+  namespace: c-db
+  labels:
+    app.kubernetes.io/part-of: crucible-seed
+spec:
+  clusterIP: None
+  selector:
+    app: db
+  ports:
+    - port: 5432
+      name: placeholder
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: db
+  namespace: c-db
+  labels:
+    app.kubernetes.io/part-of: crucible-seed
+spec:
+  serviceName: db
+  replicas: 2
+  selector:
+    matchLabels:
+      app: db
+  template:
+    metadata:
+      labels:
+        app: db
+        app.kubernetes.io/part-of: crucible-seed
+    spec:
+      initContainers:
+        - name: seed-data
+          image: busybox:1.36
+          command:
+            - /bin/sh
+            - -ec
+            - |
+              if [ -f /data/MANIFEST.sha256 ]; then echo "already seeded"; exit 0; fi
+              mkdir -p /data/rows
+              i=1
+              while [ "$i" -le 20 ]; do
+                dd if=/dev/urandom of=/data/rows/segment-$i.bin bs=64k count="$i" 2>/dev/null
+                i=$((i + 1))
+              done
+              echo "crucible seed for $(hostname)" > /data/README.txt
+              cd /data
+              find . -type f ! -name MANIFEST.sha256 -exec sha256sum {} + > /tmp/manifest
+              mv /tmp/manifest /data/MANIFEST.sha256
+              echo "seeded $(wc -l < /data/MANIFEST.sha256) files"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      containers:
+        - name: app
+          image: busybox:1.36
+          command: ["/bin/sh", "-c", "sleep infinity"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: ceph-block
+        resources:
+          requests:
+            storage: 1Gi

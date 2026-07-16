@@ -194,7 +194,8 @@ Start with the specification index: **[spec/README.md](spec/README.md)**.
 | [spec/07-ui.md](spec/07-ui.md) | UI strategy |
 | [spec/08-testing-and-dod.md](spec/08-testing-and-dod.md) | Test strategy, fidelity suite, Definition of Done |
 | [spec/90-roadmap.md](spec/90-roadmap.md) | Milestones M0–M9, task breakdown |
-| [spec/adr/](spec/adr/) | 13 Architecture Decision Records (0001–0013) |
+| [spec/adr/](spec/adr/) | 14 Architecture Decision Records (0001–0014) |
+| [test/crucible/](test/crucible/README.md) | Real-conditions e2e on Hetzner Cloud (bring your own project) |
 
 ## License
 

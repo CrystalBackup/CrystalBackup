@@ -1,0 +1,10 @@
+# CSI snapshots for Longhorn volumes, kept in-cluster (`type: snap`) — no
+# Longhorn backupstore needed for the crucible tests.
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshotClass
+metadata:
+  name: longhorn
+driver: driver.longhorn.io
+deletionPolicy: Delete
+parameters:
+  type: snap

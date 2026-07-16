@@ -1,0 +1,39 @@
+---
+- name: Write RKE2 server config
+  ansible.builtin.template:
+    src: config.yaml.j2
+    dest: /etc/rancher/rke2/config.yaml
+    mode: "0600"
+
+- name: Download the RKE2 installer
+  ansible.builtin.get_url:
+    url: https://get.rke2.io
+    dest: /tmp/rke2-install.sh
+    mode: "0755"
+
+- name: Install RKE2 server
+  ansible.builtin.command:
+    cmd: /tmp/rke2-install.sh
+    creates: /usr/local/bin/rke2
+  environment:
+    INSTALL_RKE2_TYPE: server
+    INSTALL_RKE2_CHANNEL: "{{ rke2_channel }}"
+    INSTALL_RKE2_VERSION: "{{ rke2_version }}"
+
+- name: Enable and start rke2-server (first boot pulls images — takes a while)
+  ansible.builtin.systemd:
+    name: rke2-server
+    enabled: true
+    state: started
+
+- name: Wait for this server's node to register
+  ansible.builtin.command:
+    cmd: >
+      /var/lib/rancher/rke2/bin/kubectl
+      --kubeconfig /etc/rancher/rke2/rke2.yaml
+      get node {{ inventory_hostname }}
+  register: node_registered
+  retries: 40
+  delay: 15
+  until: node_registered.rc == 0
+  changed_when: false

@@ -1,0 +1,147 @@
+# c-edge — the awkward cases:
+#   * longhorn PVC filled with EXOTIC data: hardlinks, symlinks (incl. broken
+#     ones), sparse files, unicode names, odd permissions, xattrs (R10 —
+#     restore fidelity must preserve all of it)
+#   * a scaled-to-ZERO Deployment whose PVC is Bound but detached
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: edge-data
+  namespace: c-edge
+  labels:
+    app.kubernetes.io/part-of: crucible-seed
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: longhorn
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: edge-dormant
+  namespace: c-edge
+  labels:
+    app.kubernetes.io/part-of: crucible-seed
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: longhorn
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: edge-app
+  namespace: c-edge
+  labels:
+    app.kubernetes.io/part-of: crucible-seed
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: edge-app
+  template:
+    metadata:
+      labels:
+        app: edge-app
+        app.kubernetes.io/part-of: crucible-seed
+    spec:
+      initContainers:
+        - name: seed-exotic-data
+          # alpine (not busybox): setfattr comes from the `attr` package.
+          image: alpine:3.20
+          command:
+            - /bin/sh
+            - -ec
+            - |
+              if [ -f /data/MANIFEST.sha256 ]; then echo "already seeded"; exit 0; fi
+              apk add --no-cache attr >/dev/null 2>&1 || echo "WARN: no attr package (xattrs skipped)"
+              mkdir -p /data/exotic
+
+              # regular content
+              echo "edge case corpus" > /data/exotic/plain.txt
+
+              # hardlink (link count 2 must survive restore)
+              ln /data/exotic/plain.txt /data/exotic/plain.hardlink
+
+              # symlinks — one valid, one dangling
+              ln -s plain.txt /data/exotic/plain.symlink
+              ln -s /nonexistent/target /data/exotic/broken.symlink
+
+              # sparse file: 100MB apparent, ~64KB real
+              dd if=/dev/urandom of=/data/exotic/sparse.bin bs=64k count=1 seek=1600 2>/dev/null
+
+              # unicode + spaces in names
+              echo "éclair" > "/data/exotic/éclair ☃ übergroß.txt"
+
+              # permission edges
+              echo "private" > /data/exotic/secret-0400.txt
+              chmod 0400 /data/exotic/secret-0400.txt
+              mkdir -p /data/exotic/setgid-dir
+              chmod 2755 /data/exotic/setgid-dir
+
+              # xattrs (best effort)
+              if command -v setfattr >/dev/null 2>&1; then
+                setfattr -n user.crystalbackup -v "must-survive-restore" /data/exotic/plain.txt \
+                  || echo "WARN: xattr not supported by this filesystem"
+              fi
+
+              cd /data
+              find . -type f ! -name MANIFEST.sha256 -exec sha256sum {} + > /tmp/manifest
+              mv /tmp/manifest /data/MANIFEST.sha256
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      containers:
+        - name: app
+          image: busybox:1.36
+          command: ["/bin/sh", "-c", "sleep infinity"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: edge-data
+---
+# Scaled to zero on purpose: Bound PVC, no consumer, workload definition only.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: edge-dormant
+  namespace: c-edge
+  labels:
+    app.kubernetes.io/part-of: crucible-seed
+spec:
+  replicas: 0
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: edge-dormant
+  template:
+    metadata:
+      labels:
+        app: edge-dormant
+        app.kubernetes.io/part-of: crucible-seed
+    spec:
+      containers:
+        - name: app
+          image: busybox:1.36
+          command: ["/bin/sh", "-c", "sleep infinity"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: edge-dormant

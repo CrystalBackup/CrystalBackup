@@ -1,0 +1,37 @@
+---
+# Base packages + kernel bits every node needs (Longhorn wants open-iscsi
+# and NFS client bits; curl fetches the RKE2 installer).
+
+- name: Install required packages
+  ansible.builtin.apt:
+    name:
+      - curl
+      - open-iscsi
+      - nfs-common
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Enable and start iscsid (Longhorn requirement)
+  ansible.builtin.systemd:
+    name: iscsid
+    enabled: true
+    state: started
+
+# Plain command: keeps the playbook runnable with bare ansible-core
+# (no community.general collection required).
+- name: Load iscsi_tcp kernel module now
+  ansible.builtin.command: modprobe iscsi_tcp
+  changed_when: false
+
+- name: Persist iscsi_tcp module across reboots
+  ansible.builtin.copy:
+    dest: /etc/modules-load.d/crucible-iscsi.conf
+    content: "iscsi_tcp\n"
+    mode: "0644"
+
+- name: Create RKE2 config directory
+  ansible.builtin.file:
+    path: /etc/rancher/rke2
+    state: directory
+    mode: "0755"

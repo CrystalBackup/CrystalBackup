@@ -141,6 +141,22 @@ Never run e2e against a real dev/prod cluster. e2e is namespace-isolated with un
 must pass under `-count=2`; there are **no automatic retries** (retries hide the races we can't
 afford — [../spec/08-testing-and-dod.md §7](../spec/08-testing-and-dod.md)).
 
+### Real conditions (Hetzner crucible)
+
+[`test/crucible/`](../test/crucible/README.md) provisions a **real disposable platform on
+Hetzner Cloud** (RKE2 + rook-ceph + longhorn + local-path + S3 bucket), seeds tenant
+workloads, and runs milestone-labeled Ginkgo specs (build tag `crucible`, so `make test`
+never touches it):
+
+```bash
+cd test/crucible && mise install
+make up seed test          # ≈ €0.15/h while it lives
+make down CONFIRM=yes      # ALWAYS tear down
+```
+
+Bring your own Hetzner project — credentials layout in
+[`test/crucible/secrets.example/`](../test/crucible/secrets.example/README.md).
+
 ## 5. Linting
 
 ```bash

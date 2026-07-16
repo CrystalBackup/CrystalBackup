@@ -1,0 +1,121 @@
+# Rook Ceph cluster for crucible.
+# Placement per the crucible contract:
+#   mon + mgr        -> masters  (crystalbackup.io/node-role=master)
+#   osd + mds + rgw  -> workers  (crystalbackup.io/node-role=worker)
+# OSDs consume the raw hcloud volume attached to each worker (/dev/sdb).
+apiVersion: ceph.rook.io/v1
+kind: CephCluster
+metadata:
+  name: rook-ceph
+  namespace: rook-ceph
+spec:
+  cephVersion:
+    # Pinned; bump together with ROOK_CHART_VERSION in ../deploy.sh.
+    image: quay.io/ceph/ceph:v19.2.2
+  dataDirHostPath: /var/lib/rook
+  mon:
+    count: 3
+    allowMultiplePerNode: false
+  mgr:
+    count: 2
+    allowMultiplePerNode: false
+  dashboard:
+    enabled: false
+  monitoring:
+    enabled: false
+  crashCollector:
+    disable: true
+  placement:
+    mon:
+      nodeAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms:
+            - matchExpressions:
+                - key: crystalbackup.io/node-role
+                  operator: In
+                  values: ["master"]
+    mgr:
+      nodeAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms:
+            - matchExpressions:
+                - key: crystalbackup.io/node-role
+                  operator: In
+                  values: ["master"]
+    osd:
+      nodeAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms:
+            - matchExpressions:
+                - key: crystalbackup.io/node-role
+                  operator: In
+                  values: ["worker"]
+  storage:
+    useAllNodes: true
+    useAllDevices: false
+    # The hcloud volume shows up as /dev/sdb on the workers (masters have none).
+    deviceFilter: "^sd[bc]$"
+---
+apiVersion: ceph.rook.io/v1
+kind: CephBlockPool
+metadata:
+  name: blockpool
+  namespace: rook-ceph
+spec:
+  failureDomain: host
+  replicated:
+    size: 3
+---
+apiVersion: ceph.rook.io/v1
+kind: CephFilesystem
+metadata:
+  name: cephfs
+  namespace: rook-ceph
+spec:
+  metadataPool:
+    replicated:
+      size: 3
+  dataPools:
+    - name: data0
+      failureDomain: host
+      replicated:
+        size: 3
+  preserveFilesystemOnDelete: false
+  metadataServer:
+    activeCount: 1
+    activeStandby: true
+    placement:
+      nodeAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms:
+            - matchExpressions:
+                - key: crystalbackup.io/node-role
+                  operator: In
+                  values: ["worker"]
+---
+apiVersion: ceph.rook.io/v1
+kind: CephObjectStore
+metadata:
+  name: objectstore
+  namespace: rook-ceph
+spec:
+  metadataPool:
+    failureDomain: host
+    replicated:
+      size: 3
+  dataPool:
+    failureDomain: host
+    replicated:
+      size: 3
+  preservePoolsOnDelete: false
+  gateway:
+    port: 80
+    instances: 1
+    placement:
+      nodeAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms:
+            - matchExpressions:
+                - key: crystalbackup.io/node-role
+                  operator: In
+                  values: ["worker"]

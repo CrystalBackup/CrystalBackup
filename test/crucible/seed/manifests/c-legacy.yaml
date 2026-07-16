@@ -1,0 +1,73 @@
+# c-legacy — PVC on local-path: a provisioner with NO snapshot support.
+# From M7 on, backups here must take the "no CSI snapshot" path
+# (status.volumes[].phase: Skipped / direct read — per spec).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: legacy-data
+  namespace: c-legacy
+  labels:
+    app.kubernetes.io/part-of: crucible-seed
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: legacy-app
+  namespace: c-legacy
+  labels:
+    app.kubernetes.io/part-of: crucible-seed
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate # RWO on local-path: never two pods at once
+  selector:
+    matchLabels:
+      app: legacy-app
+  template:
+    metadata:
+      labels:
+        app: legacy-app
+        app.kubernetes.io/part-of: crucible-seed
+    spec:
+      initContainers:
+        - name: seed-data
+          image: busybox:1.36
+          command:
+            - /bin/sh
+            - -ec
+            - |
+              if [ -f /data/MANIFEST.sha256 ]; then echo "already seeded"; exit 0; fi
+              mkdir -p /data/exports
+              i=1
+              while [ "$i" -le 5 ]; do
+                dd if=/dev/urandom of=/data/exports/dump-$i.csv bs=32k count="$i" 2>/dev/null
+                i=$((i + 1))
+              done
+              echo "legacy app on local-path (no snapshots possible)" > /data/README.txt
+              cd /data
+              find . -type f ! -name MANIFEST.sha256 -exec sha256sum {} + > /tmp/manifest
+              mv /tmp/manifest /data/MANIFEST.sha256
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      containers:
+        - name: app
+          image: busybox:1.36
+          command: ["/bin/sh", "-c", "sleep infinity"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: legacy-data
