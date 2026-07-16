@@ -6,11 +6,9 @@ server: https://{{ first_master_private_ip }}:9345
 # Cluster traffic rides the private network.
 node-ip: {{ private_ip }}
 advertise-address: {{ private_ip }}
-# Pin flannel's VXLAN to the private NIC (detected in the common role) — the
-# public 8472/udp is firewall-blocked and the public 1500 MTU oversizes the
-# overlay for the 1450 private path. Without this, cross-node pod traffic (and
-# thus Ceph mon quorum) fails.
-flannel-iface: {{ private_iface }}
+# NB: flannel's interface is pinned to the private NIC via a HelmChartConfig for
+# rke2-canal (see the rke2_server role) — the `flannel-iface` server flag does
+# NOT propagate to canal, so it lives there, not here.
 tls-san:
 {% for h in groups['masters'] %}
   - {{ hostvars[h].ansible_host }}

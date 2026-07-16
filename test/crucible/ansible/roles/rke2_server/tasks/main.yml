@@ -20,6 +20,36 @@
     INSTALL_RKE2_CHANNEL: "{{ rke2_channel }}"
     INSTALL_RKE2_VERSION: "{{ rke2_version }}"
 
+# Pin canal's flannel to the private NIC. RKE2's `flannel-iface` flag does NOT
+# reach canal (it reads canal_iface from its own chart values), so override the
+# bundled rke2-canal HelmChart via a HelmChartConfig dropped in the auto-deploy
+# manifests dir BEFORE the first server boots. Without this, flannel's VXLAN
+# rides the public NIC: 8472/udp is firewall-blocked between nodes and the
+# overlay MTU is sized for the public 1500 NIC (too large for the 1450 private
+# path), so cross-node pod traffic — and Ceph mon quorum — silently fails.
+- name: Ensure the RKE2 auto-deploy manifests dir exists (first master)
+  ansible.builtin.file:
+    path: /var/lib/rancher/rke2/server/manifests
+    state: directory
+    mode: "0755"
+  when: inventory_hostname == groups['masters'][0]
+
+- name: Pin canal flannel to the private NIC via HelmChartConfig (first master)
+  ansible.builtin.copy:
+    dest: /var/lib/rancher/rke2/server/manifests/rke2-canal-config.yaml
+    mode: "0644"
+    content: |
+      apiVersion: helm.cattle.io/v1
+      kind: HelmChartConfig
+      metadata:
+        name: rke2-canal
+        namespace: kube-system
+      spec:
+        valuesContent: |-
+          flannel:
+            iface: "{{ private_iface }}"
+  when: inventory_hostname == groups['masters'][0]
+
 - name: Enable and start rke2-server (first boot pulls images — takes a while)
   ansible.builtin.systemd:
     name: rke2-server
