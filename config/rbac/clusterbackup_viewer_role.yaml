@@ -1,0 +1,29 @@
+# This rule is not used by the project bs-k8s-backup itself.
+# It is provided to allow the cluster admin to help manage permissions for users.
+#
+# Grants read-only access to crystalbackup.io resources.
+# This role is intended for users who need visibility into these resources
+# without permissions to modify them. It is ideal for monitoring purposes and limited-access viewing.
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/name: bs-k8s-backup
+    app.kubernetes.io/managed-by: kustomize
+  name: clusterbackup-viewer-role
+rules:
+- apiGroups:
+  - crystalbackup.io
+  resources:
+  - clusterbackups
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - crystalbackup.io
+  resources:
+  - clusterbackups/status
+  verbs:
+  - get

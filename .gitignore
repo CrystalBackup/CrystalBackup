@@ -1,3 +1,32 @@
 # Local roadmap diagram — planning artifact (regenerated from tooling), not published
 spec/roadmap.drawio.svg
 *.drawio.svg
+
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+# Locally-installed build tools + downloaded envtest binaries (controller-gen, kustomize, setup-envtest, k8s/)
+bin/
+Dockerfile.cross
+
+# Test binary, built with `go test -c`
+*.test
+# Output of the go coverage tool
+*.out
+cover.out
+
+# Go workspace files
+go.work
+go.work.sum
+
+# Vendored copies of the generated CRDs (populated at chart-package time by `make chart-crds`)
+charts/crystal-backup/crds/*.yaml
+
+# env / editor
+.env
+*.swp
+*.swo
+*~

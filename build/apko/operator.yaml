@@ -1,0 +1,47 @@
+# apko image config — Crystal Backup operator (manager).
+#
+# spec/adr/0012: Wolfi (glibc, NOT musl) base, declarative apk assembly (no Dockerfile),
+# minimal (no shell / package manager at runtime), runs as non-root. apko builds a
+# multi-arch index (linux/amd64 + linux/arm64) with no QEMU (it composes per-arch apks).
+# The image is signed (cosign keyless), SBOM'd and referenced by digest — see
+# .github/workflows/images.yml and spec/03-security-and-tenancy.md §11.
+contents:
+  keyring:
+    - https://packages.wolfi.dev/os/wolfi-signing.rsa.pub
+  repositories:
+    - https://packages.wolfi.dev/os
+  packages:
+    - wolfi-baselayout         # /etc skeleton, os-release, nsswitch
+    - glibc                    # adr/0012: glibc base (NOT musl)
+    - ca-certificates-bundle   # TLS to the API server / webhooks / OIDC
+    - tzdata                   # IANA zones for schedule timezones (BackupSchedule.spec)
+    - crystal-backup-operator  # local apk (build/melange/operator.yaml); CI stages it into ./packages
+
+# Non-root by construction. uid/gid 65532 matches the pod-level runAsNonRoot in
+# config/manager/manager.yaml. readOnlyRootFilesystem is enforced at deploy time.
+accounts:
+  groups:
+    - groupname: nonroot
+      gid: 65532
+  users:
+    - username: nonroot
+      uid: 65532
+      gid: 65532
+  run-as: 65532
+
+entrypoint:
+  command: /usr/bin/manager
+
+work-dir: /
+
+# One declarative build → linux/amd64 + linux/arm64 index (Graviton/Ampere/edge).
+archs:
+  - x86_64
+  - aarch64
+
+annotations:
+  org.opencontainers.image.title: crystal-backup-operator
+  org.opencontainers.image.description: Crystal Backup operator (manager)
+  org.opencontainers.image.vendor: Crystal Backup
+  org.opencontainers.image.source: https://github.com/CrystalBackup/CrystalBackup
+  org.opencontainers.image.licenses: Apache-2.0

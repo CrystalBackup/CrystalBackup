@@ -1,0 +1,9 @@
+apiVersion: crystalbackup.io/v1alpha1
+kind: BackupRepository
+metadata:
+  labels:
+    app.kubernetes.io/name: bs-k8s-backup
+    app.kubernetes.io/managed-by: kustomize
+  name: backuprepository-sample
+spec:
+  # TODO(user): Add fields here

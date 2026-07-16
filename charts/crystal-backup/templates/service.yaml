@@ -1,0 +1,52 @@
+{{- if .Values.metrics.service.create }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "crystal-backup.fullname" . }}-metrics
+  namespace: {{ include "crystal-backup.namespace" . }}
+  labels:
+    {{- include "crystal-backup.labels" . | nindent 4 }}
+    control-plane: controller-manager
+spec:
+  type: {{ .Values.metrics.service.type }}
+  ports:
+    - name: https
+      port: {{ .Values.metrics.port }}
+      targetPort: https
+      protocol: TCP
+  selector:
+    {{- include "crystal-backup.selectorLabels" . | nindent 4 }}
+    control-plane: controller-manager
+{{- end }}
+{{- if .Values.metrics.serviceMonitor.enabled }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "crystal-backup.fullname" . }}
+  namespace: {{ include "crystal-backup.namespace" . }}
+  labels:
+    {{- include "crystal-backup.labels" . | nindent 4 }}
+    {{- with .Values.metrics.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  endpoints:
+    - path: /metrics
+      port: https
+      scheme: https
+      interval: {{ .Values.metrics.serviceMonitor.interval }}
+      scrapeTimeout: {{ .Values.metrics.serviceMonitor.scrapeTimeout }}
+      bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+      tlsConfig:
+        # The metrics server presents a self-signed cert (no cert-manager dependency
+        # in M0). Verify against the in-cluster CA / a provided bundle in production.
+        insecureSkipVerify: true
+  selector:
+    matchLabels:
+      {{- include "crystal-backup.selectorLabels" . | nindent 6 }}
+      control-plane: controller-manager
+  namespaceSelector:
+    matchNames:
+      - {{ include "crystal-backup.namespace" . }}
+{{- end }}

@@ -1,0 +1,9 @@
+apiVersion: crystalbackup.io/v1alpha1
+kind: ClusterBackupLocation
+metadata:
+  labels:
+    app.kubernetes.io/name: bs-k8s-backup
+    app.kubernetes.io/managed-by: kustomize
+  name: clusterbackuplocation-sample
+spec:
+  # TODO(user): Add fields here

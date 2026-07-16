@@ -1,0 +1,553 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.21.0
+  name: clusterbackupschedules.crystalbackup.io
+spec:
+  group: crystalbackup.io
+  names:
+    kind: ClusterBackupSchedule
+    listKind: ClusterBackupScheduleList
+    plural: clusterbackupschedules
+    shortNames:
+    - cbs
+    singular: clusterbackupschedule
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.schedule
+      name: Schedule
+      type: string
+    - jsonPath: .spec.paused
+      name: Paused
+      type: boolean
+    - jsonPath: .status.lastSuccessTime
+      name: Last-Success
+      type: date
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: ClusterBackupSchedule stamps out ClusterBackup DR runs on a cron
+          schedule.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: spec defines the desired state of ClusterBackupSchedule
+            properties:
+              concurrencyPolicy:
+                default: Forbid
+                description: concurrencyPolicy governs overlapping runs.
+                enum:
+                - Forbid
+                - Skip
+                type: string
+              failedRunsHistoryLimit:
+                default: 10
+                description: failedRunsHistoryLimit is the number of failed run records
+                  kept.
+                format: int32
+                type: integer
+              jitter:
+                description: jitter spreads per-namespace fan-out deterministically
+                  (anti thundering herd).
+                type: boolean
+              paused:
+                description: paused suspends new runs.
+                type: boolean
+              schedule:
+                description: schedule is a cron expression.
+                minLength: 1
+                type: string
+              startingDeadlineSeconds:
+                description: startingDeadlineSeconds bounds catch-up after downtime
+                  to one run.
+                format: int64
+                type: integer
+              successfulRunsHistoryLimit:
+                default: 10
+                description: |-
+                  successfulRunsHistoryLimit is the number of ClusterBackup run records kept
+                  (distinct from snapshot retention).
+                format: int32
+                type: integer
+              template:
+                description: template is the ClusterBackup run configuration (jobTemplate
+                  analogue).
+                properties:
+                  spec:
+                    description: spec is the ClusterBackup run configuration.
+                    properties:
+                      backoffLimit:
+                        description: backoffLimit for mover Jobs.
+                        format: int32
+                        type: integer
+                      clusterResources:
+                        description: clusterResources captures cluster-scoped objects
+                          for full DR (adr/0011).
+                        properties:
+                          enabled:
+                            default: true
+                            description: enabled turns on cluster-scoped capture (default
+                              true on the cluster plane).
+                            type: boolean
+                          exclude:
+                            description: 'exclude is a denylist applied after include
+                              (default: system:* names).'
+                            items:
+                              type: string
+                            type: array
+                          include:
+                            description: |-
+                              include is an allowlist; empty selects a curated default (CRDs, StorageClasses,
+                              IngressClasses, PriorityClasses, RuntimeClasses, non-system ClusterRoles/Bindings, PVs).
+                            items:
+                              type: string
+                            type: array
+                          labelSelector:
+                            description: labelSelector is an optional extra filter.
+                            properties:
+                              matchExpressions:
+                                description: matchExpressions is a list of label selector
+                                  requirements. The requirements are ANDed.
+                                items:
+                                  description: |-
+                                    A label selector requirement is a selector that contains values, a key, and an operator that
+                                    relates the key and values.
+                                  properties:
+                                    key:
+                                      description: key is the label key that the selector
+                                        applies to.
+                                      type: string
+                                    operator:
+                                      description: |-
+                                        operator represents a key's relationship to a set of values.
+                                        Valid operators are In, NotIn, Exists and DoesNotExist.
+                                      type: string
+                                    values:
+                                      description: |-
+                                        values is an array of string values. If the operator is In or NotIn,
+                                        the values array must be non-empty. If the operator is Exists or DoesNotExist,
+                                        the values array must be empty. This array is replaced during a strategic
+                                        merge patch.
+                                      items:
+                                        type: string
+                                      type: array
+                                      x-kubernetes-list-type: atomic
+                                  required:
+                                  - key
+                                  - operator
+                                  type: object
+                                type: array
+                                x-kubernetes-list-type: atomic
+                              matchLabels:
+                                additionalProperties:
+                                  type: string
+                                description: |-
+                                  matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+                                  map is equivalent to an element of matchExpressions, whose key field is "key", the
+                                  operator is "In", and the values array contains only "value". The requirements are ANDed.
+                                type: object
+                            type: object
+                            x-kubernetes-map-type: atomic
+                        type: object
+                      hooks:
+                        description: hooks are exec hooks around snapshotting (R16).
+                        properties:
+                          honorAnnotations:
+                            description: honorAnnotations enables crystalbackup.io/pre-backup-*
+                              pod annotations.
+                            type: boolean
+                          post:
+                            description: post hooks run after snapshotting.
+                            items:
+                              description: Hook is an exec hook run in a selected
+                                pod around snapshotting (R16).
+                              properties:
+                                command:
+                                  description: command to run.
+                                  items:
+                                    type: string
+                                  type: array
+                                container:
+                                  description: container name to exec into.
+                                  type: string
+                                onError:
+                                  default: Fail
+                                  description: onError governs whether a failure fails
+                                    the backup or is tolerated.
+                                  enum:
+                                  - Fail
+                                  - Continue
+                                  type: string
+                                podSelector:
+                                  description: podSelector selects the pod(s) to exec
+                                    into.
+                                  properties:
+                                    matchExpressions:
+                                      description: matchExpressions is a list of label
+                                        selector requirements. The requirements are
+                                        ANDed.
+                                      items:
+                                        description: |-
+                                          A label selector requirement is a selector that contains values, a key, and an operator that
+                                          relates the key and values.
+                                        properties:
+                                          key:
+                                            description: key is the label key that
+                                              the selector applies to.
+                                            type: string
+                                          operator:
+                                            description: |-
+                                              operator represents a key's relationship to a set of values.
+                                              Valid operators are In, NotIn, Exists and DoesNotExist.
+                                            type: string
+                                          values:
+                                            description: |-
+                                              values is an array of string values. If the operator is In or NotIn,
+                                              the values array must be non-empty. If the operator is Exists or DoesNotExist,
+                                              the values array must be empty. This array is replaced during a strategic
+                                              merge patch.
+                                            items:
+                                              type: string
+                                            type: array
+                                            x-kubernetes-list-type: atomic
+                                        required:
+                                        - key
+                                        - operator
+                                        type: object
+                                      type: array
+                                      x-kubernetes-list-type: atomic
+                                    matchLabels:
+                                      additionalProperties:
+                                        type: string
+                                      description: |-
+                                        matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+                                        map is equivalent to an element of matchExpressions, whose key field is "key", the
+                                        operator is "In", and the values array contains only "value". The requirements are ANDed.
+                                      type: object
+                                  type: object
+                                  x-kubernetes-map-type: atomic
+                                timeout:
+                                  description: timeout for the hook.
+                                  type: string
+                              required:
+                              - command
+                              type: object
+                            type: array
+                          pre:
+                            description: pre hooks run before snapshotting.
+                            items:
+                              description: Hook is an exec hook run in a selected
+                                pod around snapshotting (R16).
+                              properties:
+                                command:
+                                  description: command to run.
+                                  items:
+                                    type: string
+                                  type: array
+                                container:
+                                  description: container name to exec into.
+                                  type: string
+                                onError:
+                                  default: Fail
+                                  description: onError governs whether a failure fails
+                                    the backup or is tolerated.
+                                  enum:
+                                  - Fail
+                                  - Continue
+                                  type: string
+                                podSelector:
+                                  description: podSelector selects the pod(s) to exec
+                                    into.
+                                  properties:
+                                    matchExpressions:
+                                      description: matchExpressions is a list of label
+                                        selector requirements. The requirements are
+                                        ANDed.
+                                      items:
+                                        description: |-
+                                          A label selector requirement is a selector that contains values, a key, and an operator that
+                                          relates the key and values.
+                                        properties:
+                                          key:
+                                            description: key is the label key that
+                                              the selector applies to.
+                                            type: string
+                                          operator:
+                                            description: |-
+                                              operator represents a key's relationship to a set of values.
+                                              Valid operators are In, NotIn, Exists and DoesNotExist.
+                                            type: string
+                                          values:
+                                            description: |-
+                                              values is an array of string values. If the operator is In or NotIn,
+                                              the values array must be non-empty. If the operator is Exists or DoesNotExist,
+                                              the values array must be empty. This array is replaced during a strategic
+                                              merge patch.
+                                            items:
+                                              type: string
+                                            type: array
+                                            x-kubernetes-list-type: atomic
+                                        required:
+                                        - key
+                                        - operator
+                                        type: object
+                                      type: array
+                                      x-kubernetes-list-type: atomic
+                                    matchLabels:
+                                      additionalProperties:
+                                        type: string
+                                      description: |-
+                                        matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+                                        map is equivalent to an element of matchExpressions, whose key field is "key", the
+                                        operator is "In", and the values array contains only "value". The requirements are ANDed.
+                                      type: object
+                                  type: object
+                                  x-kubernetes-map-type: atomic
+                                timeout:
+                                  description: timeout for the hook.
+                                  type: string
+                              required:
+                              - command
+                              type: object
+                            type: array
+                        type: object
+                      includeManifests:
+                        default: true
+                        description: includeManifests also captures namespace manifests
+                          (default true).
+                        type: boolean
+                      locationRef:
+                        description: locationRef is the ClusterBackupLocation to write
+                          to.
+                        properties:
+                          name:
+                            description: name of the referent.
+                            minLength: 1
+                            type: string
+                        required:
+                        - name
+                        type: object
+                      maxConcurrentMovers:
+                        description: maxConcurrentMovers caps parallel mover Jobs.
+                        format: int32
+                        type: integer
+                      namespaces:
+                        description: 'namespaces selects the namespaces to back up
+                          (rule 8: one positive form + optional exclude).'
+                        properties:
+                          exclude:
+                            description: exclude is a list of glob patterns removed
+                              after the positive match.
+                            items:
+                              type: string
+                            type: array
+                          matchExpressions:
+                            description: matchExpressions selects namespaces by label
+                              expressions.
+                            items:
+                              description: |-
+                                A label selector requirement is a selector that contains values, a key, and an operator that
+                                relates the key and values.
+                              properties:
+                                key:
+                                  description: key is the label key that the selector
+                                    applies to.
+                                  type: string
+                                operator:
+                                  description: |-
+                                    operator represents a key's relationship to a set of values.
+                                    Valid operators are In, NotIn, Exists and DoesNotExist.
+                                  type: string
+                                values:
+                                  description: |-
+                                    values is an array of string values. If the operator is In or NotIn,
+                                    the values array must be non-empty. If the operator is Exists or DoesNotExist,
+                                    the values array must be empty. This array is replaced during a strategic
+                                    merge patch.
+                                  items:
+                                    type: string
+                                  type: array
+                                  x-kubernetes-list-type: atomic
+                              required:
+                              - key
+                              - operator
+                              type: object
+                            type: array
+                          matchLabels:
+                            additionalProperties:
+                              type: string
+                            description: matchLabels selects namespaces by label.
+                            type: object
+                          matchNames:
+                            description: matchNames is a list of glob patterns on
+                              namespace names.
+                            items:
+                              type: string
+                            type: array
+                          regexp:
+                            description: regexp matches namespace names (power tool;
+                              see adr/0009).
+                            type: string
+                        type: object
+                      pvcSelector:
+                        description: pvcSelector selects PVCs per namespace (default
+                          all).
+                        properties:
+                          exclude:
+                            description: exclude is a list of PVC-name globs to remove.
+                            items:
+                              type: string
+                            type: array
+                          include:
+                            description: include is a list of PVC-name globs to add.
+                            items:
+                              type: string
+                            type: array
+                          matchLabels:
+                            additionalProperties:
+                              type: string
+                            description: matchLabels selects PVCs by label.
+                            type: object
+                        type: object
+                      retention:
+                        description: retention is applied per PVC (R24).
+                        properties:
+                          keepDaily:
+                            format: int32
+                            type: integer
+                          keepHourly:
+                            format: int32
+                            type: integer
+                          keepLast:
+                            format: int32
+                            type: integer
+                          keepMonthly:
+                            format: int32
+                            type: integer
+                          keepWeekly:
+                            format: int32
+                            type: integer
+                          keepYearly:
+                            format: int32
+                            type: integer
+                        type: object
+                    required:
+                    - locationRef
+                    type: object
+                required:
+                - spec
+                type: object
+              timezone:
+                description: timezone for the cron expression (IANA name).
+                type: string
+            required:
+            - schedule
+            - template
+            type: object
+          status:
+            description: status defines the observed state of ClusterBackupSchedule
+            properties:
+              conditions:
+                description: conditions represent the current state.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              lastRunName:
+                description: lastRunName is the most recent ClusterBackup run.
+                type: string
+              lastSuccessTime:
+                description: lastSuccessTime is when the last run completed successfully.
+                format: date-time
+                type: string
+              nextScheduleTime:
+                description: nextScheduleTime is the next planned run.
+                format: date-time
+                type: string
+              phase:
+                description: phase is a short human-readable summary.
+                type: string
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

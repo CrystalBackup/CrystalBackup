@@ -1,0 +1,375 @@
+# Supply-chain image build for Crystal Backup (spec/adr/0012, spec/adr/0014).
+#
+# For BOTH images (operator, mover):
+#   * cross-compile the Go binary for linux/amd64 + linux/arm64 (`go build`, no QEMU);
+#   * melange-build the pinned restic engine from source (mover) + wrap each binary into a
+#     signed local apk (build/melange/*.yaml) — the "context" apko assembles from;
+#   * apko assembles a multi-arch INDEX on a Wolfi (glibc) base — one build, no emulation;
+#   * generate an SPDX SBOM, run a trivy 0-known-CVE release gate (scan BEFORE push);
+#   * cosign keyless-sign the index (Fulcio/Rekor) + attest the SBOM;
+#   * attach SLSA build provenance (GitHub OIDC identity → SLSA L3);
+#   * push to ghcr.io/crystalbackup/{operator,mover} by digest.
+#
+# `image-dry-run` runs the whole build + CVE scan on PRs but never signs or pushes.
+# Action versions are pinned; each job requests the minimum permissions it needs.
+#
+# The ONLY emulated step is melange cross-building restic's aarch64 apk from source (QEMU
+# binfmt); apko/Go cross-compile natively. To drop that emulation, split the melange builds
+# onto a native `ubuntu-24.04-arm` runner and merge the per-arch ./packages before apko.
+name: images
+
+on:
+  push:
+    tags:
+      - "v*" # releases: git tag vX.Y.Z (adr/0014, SemVer; M_n -> 0.n.z, M0 -> 0.0.z)
+  pull_request:
+    paths:
+      - "build/apko/**"
+      - "build/melange/**"
+      - ".github/workflows/images.yml"
+      - "cmd/**"
+      - "api/**"
+      - "internal/**"
+      - "go.mod"
+      - "go.sum"
+
+# Least privilege by default; jobs widen only where required.
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAMESPACE: crystalbackup
+  # Pinned toolchain — bump deliberately (see adr/0012 scheduled-rebuild note).
+  GO_VERSION: "1.26.5" # matches mise.toml
+  APKO_VERSION: "v1.2.25"
+  MELANGE_VERSION: "v0.56.2"
+
+jobs:
+  # ===========================================================================
+  # PR gate: build both images for both arches and CVE-scan them. Never sign,
+  # never push. Read-only permissions (release-dry-run — DoD item 7, testing §7).
+  # ===========================================================================
+  image-dry-run:
+    name: build + scan (${{ matrix.component }})
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - component: operator
+            binary: manager
+            source: ./cmd
+            apko: build/apko/operator.yaml
+            melange: build/melange/operator.yaml
+            with_restic: "false"
+          - component: mover
+            binary: crystal-mover
+            source: ./cmd/crystal-mover
+            apko: build/apko/mover.yaml
+            melange: build/melange/mover.yaml
+            with_restic: "true"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Gate — skip components whose binary is not in the tree yet
+        id: gate
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.component }}" = "operator" ] || [ -e "cmd/crystal-mover" ]; then
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Skipping mover::cmd/crystal-mover lands in M1 (spec/90-roadmap.md); mover image build deferred."
+          fi
+
+      - uses: actions/setup-go@v6
+        if: steps.gate.outputs.proceed == 'true'
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Set up QEMU (aarch64 melange build sandbox)
+        if: steps.gate.outputs.proceed == 'true'
+        uses: docker/setup-qemu-action@v4
+
+      - name: Install apko + melange (pinned)
+        if: steps.gate.outputs.proceed == 'true'
+        run: |
+          set -euo pipefail
+          go install "chainguard.dev/apko@${APKO_VERSION}"
+          go install "chainguard.dev/melange@${MELANGE_VERSION}"
+          echo "${HOME}/go/bin" >> "$GITHUB_PATH"
+
+      - name: Build Go binary (linux/amd64 + linux/arm64)
+        if: steps.gate.outputs.proceed == 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p stage-x86_64 stage-aarch64
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+            go build -trimpath -ldflags="-s -w" -o "stage-x86_64/${{ matrix.binary }}" "${{ matrix.source }}"
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
+            go build -trimpath -ldflags="-s -w" -o "stage-aarch64/${{ matrix.binary }}" "${{ matrix.source }}"
+
+      - name: melange — build pinned restic apk from source (mover only)
+        if: steps.gate.outputs.proceed == 'true' && matrix.with_restic == 'true'
+        run: |
+          set -euo pipefail
+          melange keygen
+          melange build build/melange/restic.yaml \
+            --arch x86_64,aarch64 --runner docker \
+            --signing-key melange.rsa --out-dir ./packages
+
+      - name: melange — wrap the pre-built binary into a signed apk (per arch)
+        if: steps.gate.outputs.proceed == 'true'
+        run: |
+          set -euo pipefail
+          [ -f melange.rsa ] || melange keygen
+          for a in x86_64 aarch64; do
+            melange build "${{ matrix.melange }}" \
+              --arch "$a" --runner docker \
+              --source-dir "stage-${a}" \
+              --signing-key melange.rsa --out-dir ./packages
+          done
+
+      - name: apko — lock package versions (reproducible build)
+        if: steps.gate.outputs.proceed == 'true'
+        run: |
+          set -euo pipefail
+          apko lock "${{ matrix.apko }}" \
+            --arch x86_64,aarch64 \
+            -r ./packages -k "${PWD}/melange.rsa.pub" \
+            --output apko.lock.json
+
+      - name: apko — build images locally (no push)
+        if: steps.gate.outputs.proceed == 'true'
+        run: |
+          set -euo pipefail
+          REF="${REGISTRY}/${IMAGE_NAMESPACE}/${{ matrix.component }}:pr-${GITHUB_SHA}"
+          for a in x86_64 aarch64; do
+            apko build "${{ matrix.apko }}" "$REF" "image-${a}.tar" \
+              --arch "$a" --lockfile apko.lock.json \
+              -r ./packages -k "${PWD}/melange.rsa.pub" \
+              --sbom-path ./sbom
+          done
+
+      - name: trivy — 0-known-CVE gate (amd64)
+        if: steps.gate.outputs.proceed == 'true'
+        uses: aquasecurity/trivy-action@0.36.0
+        with:
+          scan-type: image
+          input: image-x86_64.tar
+          severity: CRITICAL,HIGH
+          ignore-unfixed: false
+          vuln-type: os,library
+          exit-code: "1"
+
+      - name: trivy — 0-known-CVE gate (arm64)
+        if: steps.gate.outputs.proceed == 'true'
+        uses: aquasecurity/trivy-action@0.36.0
+        with:
+          scan-type: image
+          input: image-aarch64.tar
+          severity: CRITICAL,HIGH
+          ignore-unfixed: false
+          vuln-type: os,library
+          exit-code: "1"
+
+  # ===========================================================================
+  # Release: on git tag vX.Y.Z, build + scan (gate) then publish the multi-arch
+  # index by digest, cosign-sign it, attest the SBOM, and attach SLSA provenance.
+  # ===========================================================================
+  images:
+    name: release (${{ matrix.component }})
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # checkout
+      packages: write # push to GHCR
+      id-token: write # cosign keyless + provenance (Fulcio/Rekor OIDC)
+      attestations: write # actions/attest-build-provenance
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - component: operator
+            binary: manager
+            source: ./cmd
+            apko: build/apko/operator.yaml
+            melange: build/melange/operator.yaml
+            with_restic: "false"
+          - component: mover
+            binary: crystal-mover
+            source: ./cmd/crystal-mover
+            apko: build/apko/mover.yaml
+            melange: build/melange/mover.yaml
+            with_restic: "true"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Gate — skip components whose binary is not in the tree yet
+        id: gate
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.component }}" = "operator" ] || [ -e "cmd/crystal-mover" ]; then
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Skipping mover::cmd/crystal-mover lands in M1 (spec/90-roadmap.md); mover image release deferred."
+          fi
+
+      - name: Resolve release version from tag (adr/0014)
+        if: steps.gate.outputs.proceed == 'true'
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-go@v6
+        if: steps.gate.outputs.proceed == 'true'
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Set up QEMU (aarch64 melange build sandbox)
+        if: steps.gate.outputs.proceed == 'true'
+        uses: docker/setup-qemu-action@v4
+
+      - name: Install apko + melange (pinned)
+        if: steps.gate.outputs.proceed == 'true'
+        run: |
+          set -euo pipefail
+          go install "chainguard.dev/apko@${APKO_VERSION}"
+          go install "chainguard.dev/melange@${MELANGE_VERSION}"
+          echo "${HOME}/go/bin" >> "$GITHUB_PATH"
+
+      - uses: sigstore/cosign-installer@v3.10.1
+        if: steps.gate.outputs.proceed == 'true'
+
+      - name: Log in to GHCR
+        if: steps.gate.outputs.proceed == 'true'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build Go binary (linux/amd64 + linux/arm64)
+        if: steps.gate.outputs.proceed == 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p stage-x86_64 stage-aarch64
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+            go build -trimpath -ldflags="-s -w" -o "stage-x86_64/${{ matrix.binary }}" "${{ matrix.source }}"
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
+            go build -trimpath -ldflags="-s -w" -o "stage-aarch64/${{ matrix.binary }}" "${{ matrix.source }}"
+
+      - name: Stamp the release version into the wrapper apk (SBOM accuracy)
+        if: steps.gate.outputs.proceed == 'true'
+        run: |
+          set -euo pipefail
+          sed -i "0,/^  version:/ s|^  version:.*|  version: \"${VERSION}\"|" "${{ matrix.melange }}"
+
+      - name: melange — build pinned restic apk from source (mover only)
+        if: steps.gate.outputs.proceed == 'true' && matrix.with_restic == 'true'
+        run: |
+          set -euo pipefail
+          melange keygen
+          melange build build/melange/restic.yaml \
+            --arch x86_64,aarch64 --runner docker \
+            --signing-key melange.rsa --out-dir ./packages
+
+      - name: melange — wrap the pre-built binary into a signed apk (per arch)
+        if: steps.gate.outputs.proceed == 'true'
+        run: |
+          set -euo pipefail
+          [ -f melange.rsa ] || melange keygen
+          for a in x86_64 aarch64; do
+            melange build "${{ matrix.melange }}" \
+              --arch "$a" --runner docker \
+              --source-dir "stage-${a}" \
+              --signing-key melange.rsa --out-dir ./packages
+          done
+
+      - name: apko — lock package versions (reproducible build)
+        if: steps.gate.outputs.proceed == 'true'
+        run: |
+          set -euo pipefail
+          apko lock "${{ matrix.apko }}" \
+            --arch x86_64,aarch64 \
+            -r ./packages -k "${PWD}/melange.rsa.pub" \
+            --output apko.lock.json
+
+      - name: apko — build images locally for the CVE gate (same lockfile as publish)
+        if: steps.gate.outputs.proceed == 'true'
+        run: |
+          set -euo pipefail
+          REF="${REGISTRY}/${IMAGE_NAMESPACE}/${{ matrix.component }}:${VERSION}"
+          for a in x86_64 aarch64; do
+            apko build "${{ matrix.apko }}" "$REF" "image-${a}.tar" \
+              --arch "$a" --lockfile apko.lock.json \
+              -r ./packages -k "${PWD}/melange.rsa.pub" \
+              --sbom-path ./sbom
+          done
+
+      - name: trivy — 0-known-CVE release gate (amd64)
+        if: steps.gate.outputs.proceed == 'true'
+        uses: aquasecurity/trivy-action@0.36.0
+        with:
+          scan-type: image
+          input: image-x86_64.tar
+          severity: CRITICAL,HIGH
+          ignore-unfixed: false
+          vuln-type: os,library
+          exit-code: "1"
+
+      - name: trivy — 0-known-CVE release gate (arm64)
+        if: steps.gate.outputs.proceed == 'true'
+        uses: aquasecurity/trivy-action@0.36.0
+        with:
+          scan-type: image
+          input: image-aarch64.tar
+          severity: CRITICAL,HIGH
+          ignore-unfixed: false
+          vuln-type: os,library
+          exit-code: "1"
+
+      - name: apko — publish multi-arch index to GHCR (by digest)
+        if: steps.gate.outputs.proceed == 'true'
+        run: |
+          set -euo pipefail
+          apko publish "${{ matrix.apko }}" \
+            "${REGISTRY}/${IMAGE_NAMESPACE}/${{ matrix.component }}:${VERSION}" \
+            --arch x86_64,aarch64 --lockfile apko.lock.json \
+            -r ./packages -k "${PWD}/melange.rsa.pub" \
+            --sbom-path ./sbom --image-refs image-refs.txt
+          REF="$(head -n1 image-refs.txt)"
+          NAME="${REGISTRY}/${IMAGE_NAMESPACE}/${{ matrix.component }}"
+          DIGEST="${REF##*@}"        # sha256:... of the multi-arch index
+          echo "IMAGE_NAME=${NAME}" >> "$GITHUB_ENV"
+          echo "IMAGE_DIGEST=${DIGEST}" >> "$GITHUB_ENV"
+          echo "IMAGE_REF=${NAME}@${DIGEST}" >> "$GITHUB_ENV"
+
+      - name: cosign — keyless-sign the index
+        if: steps.gate.outputs.proceed == 'true'
+        env:
+          COSIGN_YES: "true"
+        run: cosign sign --yes "${IMAGE_REF}"
+
+      - name: cosign — attest the SPDX SBOM (keyless)
+        if: steps.gate.outputs.proceed == 'true'
+        env:
+          COSIGN_YES: "true"
+        run: |
+          set -euo pipefail
+          PRED="$(ls ./sbom/*index*.spdx.json 2>/dev/null | head -n1 || true)"
+          [ -n "$PRED" ] || PRED="$(ls ./sbom/*.spdx.json | head -n1)"
+          cosign attest --yes --type spdxjson --predicate "$PRED" "${IMAGE_REF}"
+
+      - name: SLSA build provenance (SLSA L3, keyless) → GHCR
+        if: steps.gate.outputs.proceed == 'true'
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-name: ${{ env.IMAGE_NAME }}
+          subject-digest: ${{ env.IMAGE_DIGEST }}
+          push-to-registry: true

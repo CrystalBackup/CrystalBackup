@@ -1,0 +1,38 @@
+# melange recipe — package the Crystal Backup operator (manager) binary into a signed apk.
+#
+# apko composes images from apk packages only (it has no loose-file copy), so the Go
+# binary the CI workflow cross-compiles (`go build`, GOARCH per arch) is packaged here and
+# then assembled into build/apko/operator.yaml. This recipe does NOT compile anything: the
+# workflow (.github/workflows/images.yml) stages the pre-built `manager` binary into
+# melange's --source-dir per architecture, and the pipeline below only installs it.
+#
+# spec/adr/0012 (apko/Wolfi/melange supply chain), spec/adr/0014 (versioning).
+package:
+  name: crystal-backup-operator
+  version: "0.0.0" # M0 appVersion (adr/0014: milestone -> minor on major 0). CI stamps the release version.
+  epoch: 0
+  description: "Crystal Backup operator (manager) binary"
+  url: https://github.com/CrystalBackup/CrystalBackup
+  copyright:
+    - license: Apache-2.0
+
+environment:
+  contents:
+    keyring:
+      - https://packages.wolfi.dev/os/wolfi-signing.rsa.pub
+    repositories:
+      - https://packages.wolfi.dev/os
+    packages:
+      - busybox # /bin/sh + coreutils (mkdir/cp/chmod/ln) for the pipeline
+
+pipeline:
+  - name: Install the pre-built manager binary
+    runs: |
+      set -e
+      mkdir -p "${{targets.destdir}}/usr/bin"
+      cp manager "${{targets.destdir}}/usr/bin/manager"
+      chmod 0755 "${{targets.destdir}}/usr/bin/manager"
+      # Compatibility symlink: the kubebuilder-default Deployment
+      # (config/manager/manager.yaml) runs "/manager"; the image ENTRYPOINT is
+      # /usr/bin/manager (build/apko/operator.yaml). Both resolve to the same binary.
+      ln -sf /usr/bin/manager "${{targets.destdir}}/manager"

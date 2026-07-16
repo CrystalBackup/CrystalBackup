@@ -1,0 +1,45 @@
+name: Unit tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# No token scopes granted by default; each job opts in to the minimum it needs.
+permissions: {}
+
+jobs:
+  unit:
+    name: Unit tests + coverage
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      # Go 1.25 per mise.toml (go = "1.25.6") and the toolchain the project targets.
+      # GOTOOLCHAIN stays at its default (auto), so the module's own `go` directive is
+      # honoured if it asks for a newer toolchain.
+      - name: Set up Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # `make test` regenerates manifests + deepcopy, runs fmt/vet, provisions envtest
+      # binaries, then runs the unit suite writing coverage to ./cover.out (see Makefile).
+      - name: Run unit tests
+        run: make test
+
+      # Publish coverage even when tests fail, so a red run is still diagnosable.
+      - name: Upload coverage report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: coverage
+          path: cover.out
+          if-no-files-found: warn
+          retention-days: 14

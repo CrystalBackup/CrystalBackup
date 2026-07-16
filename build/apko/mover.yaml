@@ -1,0 +1,42 @@
+# apko image config — Crystal Backup mover (crystal-mover shim + pinned restic engine).
+#
+# spec/adr/0012: Wolfi (glibc, NOT musl) base, declarative apk assembly, minimal
+# (no shell / package manager at runtime). glibc matters here specifically: restic is the
+# data path, and musl's DNS/NSS edge cases are an avoidable fidelity risk (adr/0012).
+# Multi-arch index (linux/amd64 + linux/arm64), signed + SBOM'd + digest-pinned in CI.
+contents:
+  keyring:
+    - https://packages.wolfi.dev/os/wolfi-signing.rsa.pub
+  repositories:
+    - https://packages.wolfi.dev/os
+  packages:
+    - wolfi-baselayout         # /etc skeleton, os-release, nsswitch
+    - glibc                    # adr/0012: glibc base (NOT musl) — DNS/NSS fidelity for the data path
+    - ca-certificates-bundle   # TLS to S3 / object storage
+    - tzdata                   # IANA zones (consistent time handling in the mover)
+    - restic=0.19.1-r0         # pinned engine from build/melange/restic.yaml (local apk); exact pin selects our build
+    - crystal-backup-mover     # local apk (build/melange/mover.yaml); CI stages it into ./packages
+
+# No `accounts` block: the image default user is root (uid 0). This is intentional — the
+# mover Pod's deploy-time securityContext governs privilege (spec/03-security-and-tenancy.md §6):
+#   backup : drop ALL caps, add DAC_OVERRIDE (read arbitrary-uid files; snapshot is readOnly)
+#   restore: drop ALL caps, add CHOWN, DAC_OVERRIDE, FOWNER, SETFCAP, MKNOD (restore R10 metadata)
+# with runAsUser: 0, allowPrivilegeEscalation: false, seccompProfile: RuntimeDefault,
+# readOnlyRootFilesystem: true (restic cache on a scratch emptyDir). The image itself
+# carries no shell, no package manager and no setuid binaries.
+
+entrypoint:
+  command: /usr/bin/crystal-mover
+
+work-dir: /
+
+archs:
+  - x86_64
+  - aarch64
+
+annotations:
+  org.opencontainers.image.title: crystal-backup-mover
+  org.opencontainers.image.description: Crystal Backup mover (crystal-mover + restic)
+  org.opencontainers.image.vendor: Crystal Backup
+  org.opencontainers.image.source: https://github.com/CrystalBackup/CrystalBackup
+  org.opencontainers.image.licenses: Apache-2.0

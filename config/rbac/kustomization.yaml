@@ -1,0 +1,61 @@
+resources:
+# All RBAC will be applied under this service account in
+# the deployment namespace. You may comment out this resource
+# if your manager will use a service account that exists at
+# runtime. Be sure to update RoleBinding and ClusterRoleBinding
+# subjects if changing service account names.
+- service_account.yaml
+- role.yaml
+- role_binding.yaml
+- leader_election_role.yaml
+- leader_election_role_binding.yaml
+# The following RBAC configurations are used to protect
+# the metrics endpoint with authn/authz. These configurations
+# ensure that only authorized users and service accounts
+# can access the metrics endpoint. Comment the following
+# permissions if you want to disable this protection.
+# More info: https://book.kubebuilder.io/reference/metrics.html
+- metrics_auth_role.yaml
+- metrics_auth_role_binding.yaml
+- metrics_reader_role.yaml
+# For each CRD, "Admin", "Editor" and "Viewer" roles are scaffolded by
+# default, aiding admins in cluster management. Those roles are
+# not used by the bs-k8s-backup itself. You can comment the following lines
+# if you do not want those helpers be installed with your Project.
+- backuprepository_admin_role.yaml
+- backuprepository_editor_role.yaml
+- backuprepository_viewer_role.yaml
+- backupexternalsync_admin_role.yaml
+- backupexternalsync_editor_role.yaml
+- backupexternalsync_viewer_role.yaml
+- restore_admin_role.yaml
+- restore_editor_role.yaml
+- restore_viewer_role.yaml
+- backup_admin_role.yaml
+- backup_editor_role.yaml
+- backup_viewer_role.yaml
+- backupschedule_admin_role.yaml
+- backupschedule_editor_role.yaml
+- backupschedule_viewer_role.yaml
+- backuplocation_admin_role.yaml
+- backuplocation_editor_role.yaml
+- backuplocation_viewer_role.yaml
+- clusterbackupexternalsync_admin_role.yaml
+- clusterbackupexternalsync_editor_role.yaml
+- clusterbackupexternalsync_viewer_role.yaml
+- clustererasure_admin_role.yaml
+- clustererasure_editor_role.yaml
+- clustererasure_viewer_role.yaml
+- clusterrestore_admin_role.yaml
+- clusterrestore_editor_role.yaml
+- clusterrestore_viewer_role.yaml
+- clusterbackup_admin_role.yaml
+- clusterbackup_editor_role.yaml
+- clusterbackup_viewer_role.yaml
+- clusterbackupschedule_admin_role.yaml
+- clusterbackupschedule_editor_role.yaml
+- clusterbackupschedule_viewer_role.yaml
+- clusterbackuplocation_admin_role.yaml
+- clusterbackuplocation_editor_role.yaml
+- clusterbackuplocation_viewer_role.yaml
+

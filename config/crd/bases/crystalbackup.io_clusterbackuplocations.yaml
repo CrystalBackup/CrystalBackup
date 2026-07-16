@@ -1,0 +1,284 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.21.0
+  name: clusterbackuplocations.crystalbackup.io
+spec:
+  group: crystalbackup.io
+  names:
+    kind: ClusterBackupLocation
+    listKind: ClusterBackupLocationList
+    plural: clusterbackuplocations
+    shortNames:
+    - cbl
+    singular: clusterbackuplocation
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.mode
+      name: Mode
+      type: string
+    - jsonPath: .spec.default
+      name: Default
+      type: boolean
+    - jsonPath: .status.namespacesProtected
+      name: Protected
+      type: integer
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          ClusterBackupLocation is the platform disaster-recovery object storage: one
+          shared restic repository for all (or selected) namespaces, tenancy by tag.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: spec defines the desired state of ClusterBackupLocation
+            properties:
+              clusterID:
+                description: |-
+                  clusterID is the snapshot host and repository path segment (R20, multi-cluster):
+                  the shared repo lives at <s3.prefix>/<clusterID>/.
+                minLength: 1
+                type: string
+              default:
+                description: |-
+                  default marks this as the default location; exactly one may be default
+                  (enforced by the operator webhook — admission rule 4).
+                type: boolean
+              discovery:
+                description: discovery inventories the repository and projects Backup
+                  objects on add and periodically.
+                properties:
+                  enabled:
+                    default: true
+                    description: enabled turns on inventory and projection of Backup
+                      objects from the repository.
+                    type: boolean
+                  interval:
+                    default: 1h
+                    description: interval between periodic discovery passes.
+                    type: string
+                type: object
+              encryption:
+                description: encryption configures the platform key (age KEK wrapping
+                  the platform DEK).
+                properties:
+                  clusterKEKSecretRef:
+                    description: clusterKEKSecretRef references the age identity wrapping
+                      the platform DEK.
+                    properties:
+                      name:
+                        description: name of the referent.
+                        minLength: 1
+                        type: string
+                    required:
+                    - name
+                    type: object
+                required:
+                - clusterKEKSecretRef
+                type: object
+              immutable:
+                description: immutable configures object-lock and window rotation
+                  (Immutable mode only).
+                properties:
+                  objectLockMode:
+                    default: Governance
+                    description: objectLockMode selects the WORM enforcement.
+                    enum:
+                    - Governance
+                    - Compliance
+                    - AppendOnlyProxy
+                    type: string
+                  rotationPeriod:
+                    default: 720h
+                    description: rotationPeriod is the window-repo rotation period
+                      (object-lock repos cannot prune).
+                    type: string
+                type: object
+              maintenance:
+                description: maintenance configures prune/check windows (Standard
+                  mode only).
+                properties:
+                  checkReadDataSubset:
+                    description: checkReadDataSubset is the fraction of pack data
+                      to verify (e.g. "5%").
+                    type: string
+                  checkSchedule:
+                    description: checkSchedule (cron) for restic check.
+                    type: string
+                  pruneMaxRepackSize:
+                    description: pruneMaxRepackSize caps repacking per prune run (e.g.
+                      "50G").
+                    type: string
+                  pruneSchedule:
+                    description: pruneSchedule (cron) for the repository-wide exclusive
+                      prune window.
+                    type: string
+                type: object
+              mode:
+                default: Standard
+                description: mode selects Standard (prunable) or Immutable (object-lock;
+                  no prune).
+                enum:
+                - Standard
+                - Immutable
+                type: string
+              s3:
+                description: s3 is the object storage backing the shared repository.
+                properties:
+                  bucket:
+                    description: bucket name.
+                    minLength: 1
+                    type: string
+                  caBundle:
+                    description: caBundle is an optional PEM CA bundle for the endpoint.
+                    type: string
+                  credentialsSecretRef:
+                    description: |-
+                      credentialsSecretRef references a Secret holding the S3 credentials (same
+                      namespace as a BackupLocation, or crystal-backup-system for a ClusterBackupLocation).
+                    properties:
+                      name:
+                        description: name of the referent.
+                        minLength: 1
+                        type: string
+                    required:
+                    - name
+                    type: object
+                  endpoint:
+                    description: endpoint URL of the S3-compatible service.
+                    minLength: 1
+                    type: string
+                  forcePathStyle:
+                    description: forcePathStyle selects path-style addressing (required
+                      by most non-AWS gateways).
+                    type: boolean
+                  prefix:
+                    description: prefix under which the single shared repository lives
+                      (<prefix>/<clusterID>/).
+                    type: string
+                  region:
+                    description: region of the bucket.
+                    type: string
+                required:
+                - bucket
+                - credentialsSecretRef
+                - endpoint
+                type: object
+            required:
+            - clusterID
+            - encryption
+            - s3
+            type: object
+          status:
+            description: status defines the observed state of ClusterBackupLocation
+            properties:
+              conditions:
+                description: conditions represent the current state (e.g. Ready, Reachable).
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              lastDiscoveryTime:
+                description: lastDiscoveryTime is when the repository was last inventoried.
+                format: date-time
+                type: string
+              namespacesProtected:
+                description: namespacesProtected counts distinct namespaces present
+                  in the repository.
+                format: int32
+                type: integer
+              phase:
+                description: phase is a short human-readable summary.
+                type: string
+              repositoryRef:
+                description: repositoryRef names the BackupRepository backing this
+                  location.
+                type: string
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
