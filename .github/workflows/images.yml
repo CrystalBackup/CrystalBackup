@@ -148,6 +148,7 @@ jobs:
         if: steps.gate.outputs.proceed == 'true'
         run: |
           set -euo pipefail
+          mkdir -p ./sbom   # apko moves per-arch SBOMs here; it does not create the dir
           REF="${REGISTRY}/${IMAGE_NAMESPACE}/${{ matrix.component }}:pr-${GITHUB_SHA}"
           for a in x86_64 aarch64; do
             apko build "${{ matrix.apko }}" "$REF" "image-${a}.tar" \
@@ -304,6 +305,7 @@ jobs:
         if: steps.gate.outputs.proceed == 'true'
         run: |
           set -euo pipefail
+          mkdir -p ./sbom   # apko moves per-arch SBOMs here; it does not create the dir
           REF="${REGISTRY}/${IMAGE_NAMESPACE}/${{ matrix.component }}:${VERSION}"
           for a in x86_64 aarch64; do
             apko build "${{ matrix.apko }}" "$REF" "image-${a}.tar" \

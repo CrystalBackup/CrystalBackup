@@ -34,14 +34,23 @@ import (
 	cbv1 "github.com/CrystalBackup/CrystalBackup/api/v1alpha1"
 )
 
-const ns = "default"
+const (
+	ns        = "default"
+	drPrimary = "dr-primary"
+	cTeamX    = "c-team-x"
+	myOffsite = "my-offsite"
+)
 
 // samples returns one minimal, schema-valid CR for each of the twelve kinds.
 func samples() []client.Object {
-	s3 := cbv1.S3Spec{Endpoint: "https://s3.example.test", Bucket: "b", CredentialsSecretRef: cbv1.LocalObjectReference{Name: "s3-creds"}}
+	s3 := cbv1.S3Spec{
+		Endpoint:             "https://s3.example.test",
+		Bucket:               "b",
+		CredentialsSecretRef: cbv1.LocalObjectReference{Name: "s3-creds"},
+	}
 	return []client.Object{
 		&cbv1.ClusterBackupLocation{
-			ObjectMeta: metav1.ObjectMeta{Name: "dr-primary"},
+			ObjectMeta: metav1.ObjectMeta{Name: drPrimary},
 			Spec: cbv1.ClusterBackupLocationSpec{
 				ClusterID:  "test-cluster",
 				S3:         s3,
@@ -53,19 +62,21 @@ func samples() []client.Object {
 			Spec: cbv1.ClusterBackupScheduleSpec{
 				Schedule: "0 2 * * *",
 				Template: cbv1.ClusterBackupTemplate{Spec: cbv1.ClusterBackupRunSpec{
-					LocationRef: cbv1.LocalObjectReference{Name: "dr-primary"},
+					LocationRef: cbv1.LocalObjectReference{Name: drPrimary},
 					Namespaces:  cbv1.NamespaceSelector{Regexp: "^c-.+$"},
 				}},
 			},
 		},
 		&cbv1.ClusterBackup{
 			ObjectMeta: metav1.ObjectMeta{Name: "dr-run-1"},
-			Spec:       cbv1.ClusterBackupSpec{ClusterBackupRunSpec: cbv1.ClusterBackupRunSpec{LocationRef: cbv1.LocalObjectReference{Name: "dr-primary"}}},
+			Spec: cbv1.ClusterBackupSpec{ClusterBackupRunSpec: cbv1.ClusterBackupRunSpec{
+				LocationRef: cbv1.LocalObjectReference{Name: drPrimary},
+			}},
 		},
 		&cbv1.ClusterRestore{
 			ObjectMeta: metav1.ObjectMeta{Name: "recover-x"},
 			Spec: cbv1.ClusterRestoreSpec{
-				Source:       cbv1.ClusterRestoreSource{LocationRef: cbv1.LocalObjectReference{Name: "dr-primary"}, Namespace: "c-team-x"},
+				Source:       cbv1.ClusterRestoreSource{LocationRef: cbv1.LocalObjectReference{Name: drPrimary}, Namespace: cTeamX},
 				Target:       cbv1.ClusterRestoreTarget{Namespace: "c-team-x-restored", CreateNamespace: true},
 				Confirmation: "c-team-x-restored",
 			},
@@ -73,29 +84,29 @@ func samples() []client.Object {
 		&cbv1.ClusterErasure{
 			ObjectMeta: metav1.ObjectMeta{Name: "gdpr-x"},
 			Spec: cbv1.ClusterErasureSpec{
-				LocationRef:  cbv1.LocalObjectReference{Name: "dr-primary"},
-				Target:       cbv1.ErasureTarget{Namespace: "c-team-x"},
-				Confirmation: "c-team-x",
+				LocationRef:  cbv1.LocalObjectReference{Name: drPrimary},
+				Target:       cbv1.ErasureTarget{Namespace: cTeamX},
+				Confirmation: cTeamX,
 			},
 		},
 		&cbv1.ClusterBackupExternalSync{
 			ObjectMeta: metav1.ObjectMeta{Name: "dr-to-b"},
 			Spec: cbv1.ClusterBackupExternalSyncSpec{
-				SourceLocationRef:      cbv1.LocalObjectReference{Name: "dr-primary"},
+				SourceLocationRef:      cbv1.LocalObjectReference{Name: drPrimary},
 				DestinationLocationRef: cbv1.LocalObjectReference{Name: "dr-secondary"},
 			},
 		},
 		&cbv1.BackupLocation{
-			ObjectMeta: metav1.ObjectMeta{Name: "my-offsite", Namespace: ns},
+			ObjectMeta: metav1.ObjectMeta{Name: myOffsite, Namespace: ns},
 			Spec:       cbv1.BackupLocationSpec{S3: s3, Encryption: cbv1.NamespaceEncryptionSpec{}},
 		},
 		&cbv1.BackupSchedule{
 			ObjectMeta: metav1.ObjectMeta{Name: "daily", Namespace: ns},
-			Spec:       cbv1.BackupScheduleSpec{LocationRef: cbv1.LocalObjectReference{Name: "my-offsite"}, Schedule: "0 1 * * *"},
+			Spec:       cbv1.BackupScheduleSpec{LocationRef: cbv1.LocalObjectReference{Name: myOffsite}, Schedule: "0 1 * * *"},
 		},
 		&cbv1.Backup{
 			ObjectMeta: metav1.ObjectMeta{Name: "daily-1", Namespace: ns},
-			Spec:       cbv1.BackupSpec{LocationRef: cbv1.LocationReference{Name: "my-offsite"}},
+			Spec:       cbv1.BackupSpec{LocationRef: cbv1.LocationReference{Name: myOffsite}},
 		},
 		&cbv1.Restore{
 			ObjectMeta: metav1.ObjectMeta{Name: "recover-uploads", Namespace: ns},
@@ -104,7 +115,7 @@ func samples() []client.Object {
 		&cbv1.BackupExternalSync{
 			ObjectMeta: metav1.ObjectMeta{Name: "offsite-mirror", Namespace: ns},
 			Spec: cbv1.BackupExternalSyncSpec{
-				SourceLocationRef:      cbv1.LocalObjectReference{Name: "my-offsite"},
+				SourceLocationRef:      cbv1.LocalObjectReference{Name: myOffsite},
 				DestinationLocationRef: cbv1.LocalObjectReference{Name: "my-offsite-2"},
 			},
 		},
