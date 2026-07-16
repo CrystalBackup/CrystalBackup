@@ -20,13 +20,15 @@ mise run doc                 # serve the docs site (Astro dev server, website/)
 
 | Tool | Version | Used for |
 |---|---|---|
-| Go | 1.25.6 | operator toolchain |
+| Go | 1.26.5 | operator toolchain |
 | kubebuilder | 4.15.0 | `kubebuilder create api/webhook` scaffolding |
 | node / pnpm | 24.18.0 / 10.33.2 | the docs website (`website/`) |
 
-> **Go version note.** The project targets **Go 1.25** (mise pin `1.25.6`); CI sets up Go 1.25 via
-> `actions/setup-go`. Keep the `go` directive in `go.mod` and the mise pin consistent — a mismatch
-> makes the toolchain auto-download a second Go at build time.
+> **Go version note.** The project targets **Go 1.26** (mise pin `1.26.5`); `go.mod` pins
+> `toolchain go1.26.5` and CI resolves the version from it (`actions/setup-go` with
+> `go-version-file: go.mod`). The Kubernetes 1.36 client libraries require Go ≥ 1.26, so 1.26 is a
+> hard floor. Keep the mise pin and the `go.mod` `toolchain` directive consistent — with
+> `GOTOOLCHAIN=auto`, any host Go ≥ 1.26.0 resolves to the pinned 1.26.5 at build time.
 
 ### Makefile-managed (installed into `./bin` on demand)
 
