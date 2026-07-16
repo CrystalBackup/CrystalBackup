@@ -16,7 +16,23 @@ rules:
   resources:
   - secrets
   verbs:
+  - create
+  - delete
   - get
+  - patch
+  - update
+- apiGroups:
+  - batch
+  resources:
+  - jobs
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
 - apiGroups:
   - crystalbackup.io
   resources:
@@ -32,6 +48,22 @@ rules:
 - apiGroups:
   - crystalbackup.io
   resources:
+  - backuprepositories/finalizers
+  - clusterbackuplocations/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - crystalbackup.io
+  resources:
+  - backuprepositories/status
+  - clusterbackuplocations/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - crystalbackup.io
+  resources:
   - clusterbackuplocations
   verbs:
   - get
@@ -39,17 +71,3 @@ rules:
   - patch
   - update
   - watch
-- apiGroups:
-  - crystalbackup.io
-  resources:
-  - clusterbackuplocations/finalizers
-  verbs:
-  - update
-- apiGroups:
-  - crystalbackup.io
-  resources:
-  - clusterbackuplocations/status
-  verbs:
-  - get
-  - patch
-  - update

@@ -39,6 +39,7 @@ import (
 
 	cbv1 "github.com/CrystalBackup/CrystalBackup/api/v1alpha1"
 	"github.com/CrystalBackup/CrystalBackup/internal/client/secrets"
+	"github.com/CrystalBackup/CrystalBackup/internal/repo/queue"
 )
 
 // suiteOperatorNamespace stands in for apiconst.DefaultOperatorNamespace ("crystal-backup-system")
@@ -66,7 +67,17 @@ var (
 	testEnv   *envtest.Environment
 	ctx       context.Context
 	cancel    context.CancelFunc
+	// repoQueue is the process-wide per-repository exclusive work queue the BackupRepository
+	// reconciler drives init through. It is created in BeforeSuite (bound to the suite ctx) and
+	// Stop()ped in AfterSuite so its worker goroutines are joined — a leaked worker would keep
+	// the suite process alive and mask a shutdown bug.
+	repoQueue *queue.Manager
 )
+
+// suiteMoverImage is the placeholder mover image the envtest BackupRepository reconciler builds
+// its init Jobs with. envtest has no kubelet, so the image is never pulled or run — the tests
+// SIMULATE the Job's outcome by patching its status.
+const suiteMoverImage = "crystal-mover:test"
 
 var _ = BeforeSuite(func() {
 	logf.SetLogger(zap.New(zap.WriteTo(GinkgoWriter), zap.UseDevMode(true)))
@@ -102,6 +113,9 @@ var _ = BeforeSuite(func() {
 	By("starting the manager")
 	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
 		Scheme: scheme,
+		// Mirror production (cmd/main.go): never cache Secrets (tenancy invariant I3), so the
+		// tests exercise the same uncached Secret reads as the real operator.
+		Client: client.Options{Cache: &client.CacheOptions{DisableFor: []client.Object{&corev1.Secret{}}}},
 		// Metrics and health/readiness endpoints are pure overhead in envtest — no scraper,
 		// no probe, ever reads them here — so both are switched off.
 		Metrics:                metricsserver.Options{BindAddress: "0"},
@@ -122,6 +136,19 @@ var _ = BeforeSuite(func() {
 		Recorder:          mgr.GetEventRecorderFor("clusterbackuplocation"),
 	}).SetupWithManager(mgr)).To(Succeed())
 
+	// The per-repository exclusive queue, bound to the suite ctx (cancel() also stops it) and
+	// explicitly Stop()ped in AfterSuite.
+	repoQueue = queue.NewManager(ctx)
+	Expect(NewBackupRepositoryReconciler(
+		mgr.GetClient(),
+		mgr.GetScheme(),
+		secrets.NewByNameReader(mgr.GetAPIReader()),
+		repoQueue,
+		suiteOperatorNamespace,
+		suiteMoverImage,
+		mgr.GetEventRecorderFor("backuprepository"),
+	).SetupWithManager(mgr)).To(Succeed())
+
 	go func() {
 		defer GinkgoRecover()
 		Expect(mgr.Start(ctx)).To(Succeed())
@@ -129,6 +156,12 @@ var _ = BeforeSuite(func() {
 })
 
 var _ = AfterSuite(func() {
+	By("stopping the repository queue and joining its workers")
+	// Stop() cancels every in-flight init op and joins the worker goroutines before returning,
+	// so no queue goroutine outlives the suite.
+	if repoQueue != nil {
+		repoQueue.Stop()
+	}
 	cancel()
 	By("tearing down the envtest control plane")
 	Expect(testEnv.Stop()).To(Succeed())

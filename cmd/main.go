@@ -25,10 +25,12 @@ import (
 	// to ensure that exec-entrypoint and run can make use of them.
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
@@ -39,6 +41,7 @@ import (
 	"github.com/CrystalBackup/CrystalBackup/internal/apiconst"
 	"github.com/CrystalBackup/CrystalBackup/internal/client/secrets"
 	"github.com/CrystalBackup/CrystalBackup/internal/controller"
+	"github.com/CrystalBackup/CrystalBackup/internal/repo/queue"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -65,6 +68,7 @@ func main() {
 	var enableHTTP2 bool
 	var tlsOpts []func(*tls.Config)
 	var operatorNamespace string
+	var moverImage string
 	// defaultOperatorNamespace resolves the operator's own namespace before flags are parsed:
 	// $POD_NAMESPACE (set via the downward API in the Helm chart / manifest) if present, else
 	// the Helm chart's own default, apiconst.DefaultOperatorNamespace. This is where every
@@ -76,6 +80,10 @@ func main() {
 	flag.StringVar(&operatorNamespace, "operator-namespace", defaultOperatorNamespace,
 		"Namespace where cluster-plane platform Secrets (the cluster KEK, DR S3 credentials, wrapped DEKs) live. "+
 			"Defaults to $POD_NAMESPACE (downward API) or, if unset, "+apiconst.DefaultOperatorNamespace+".")
+	flag.StringVar(&moverImage, "mover-image", "",
+		"Container image for the mover Jobs (repository init and, later, backup/restore/maintenance). "+
+			"REQUIRED for real backups — the Helm chart and the crucible set it; an empty value is tolerated "+
+			"only because envtest never runs a mover Job.")
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
@@ -169,7 +177,14 @@ func main() {
 	}
 
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
-		Scheme:                 scheme,
+		Scheme: scheme,
+		// The operator must never build a cluster-wide Secret cache/informer (tenancy
+		// invariant I3): it holds Secrets GET-only, no list/watch. Bypassing the cache for
+		// Secrets makes every manager-client Get(Secret) a direct API read, so the
+		// controllers and internal/keys.DEKManager can read Secrets through mgr.GetClient()
+		// without starting a Secret informer (which needs list/watch RBAC and would cache
+		// other namespaces' Secrets).
+		Client:                 client.Options{Cache: &client.CacheOptions{DisableFor: []client.Object{&corev1.Secret{}}}},
 		Metrics:                metricsServerOptions,
 		WebhookServer:          webhookServer,
 		HealthProbeBindAddress: probeAddr,
@@ -192,6 +207,18 @@ func main() {
 		os.Exit(1)
 	}
 
+	// The process shutdown signal, obtained ONCE (SetupSignalHandler must not be called twice)
+	// and shared by the repository queue and the manager: a SIGINT/SIGTERM cancels this context,
+	// which shuts the queue's workers down alongside the manager.
+	signalCtx := ctrl.SetupSignalHandler()
+
+	// One per-repository exclusive work queue for the whole process (adr/0010): it serialises
+	// init/forget/prune/check/erase per repository so a single leader never races itself (the
+	// K8up #1055 init race). Bound to signalCtx so shutdown cancels in-flight ops; Stop is
+	// deferred to join the worker goroutines on a clean exit.
+	repoQueue := queue.NewManager(signalCtx)
+	defer repoQueue.Stop()
+
 	if err := (&controller.ClusterBackupLocationReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
@@ -203,6 +230,19 @@ func main() {
 		Recorder:          mgr.GetEventRecorderFor("clusterbackuplocation"),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Unable to create controller", "controller", "ClusterBackupLocation")
+		os.Exit(1)
+	}
+	if err := controller.NewBackupRepositoryReconciler(
+		mgr.GetClient(),
+		mgr.GetScheme(),
+		// Same uncached Secret reader (the cluster KEK + DR S3 credentials); never GetClient().
+		secrets.NewByNameReader(mgr.GetAPIReader()),
+		repoQueue,
+		operatorNamespace,
+		moverImage,
+		mgr.GetEventRecorderFor("backuprepository"),
+	).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Unable to create controller", "controller", "BackupRepository")
 		os.Exit(1)
 	}
 	// +kubebuilder:scaffold:builder
@@ -217,7 +257,7 @@ func main() {
 	}
 
 	setupLog.Info("Starting manager")
-	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
+	if err := mgr.Start(signalCtx); err != nil {
 		setupLog.Error(err, "Failed to run manager")
 		os.Exit(1)
 	}
