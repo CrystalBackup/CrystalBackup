@@ -11,7 +11,7 @@ Anyone with a Hetzner Cloud project can run it — see
 [secrets.example/](secrets.example/README.md).
 
 > A [Claude Code skill](../../.claude/skills/crucible/SKILL.md) wraps this
-> workflow — `/crucible` in a Claude session drives the same Makefile.
+> workflow — `/crucible` in a Claude session drives the same mise tasks.
 
 ## What gets built
 
@@ -52,9 +52,9 @@ Defaults (3× cx32 + 3× cx42 + 3× 40 GB volumes + 6 IPv4) run **≈ €0.15/ho
 **created, used, destroyed** — always finish with:
 
 ```sh
-make down CONFIRM=yes        # terraform destroy
+CONFIRM=yes mise run down    # terraform destroy
 # tfstate lost? label-based fallback:
-make nuke                    # asks for typed confirmation
+mise run nuke                # asks for typed confirmation
 ```
 
 ## Quickstart
@@ -63,17 +63,23 @@ make nuke                    # asks for typed confirmation
 cd test/crucible
 mise install
 
-make up      # ~15-25 min: servers -> RKE2 -> ceph/longhorn/local-path -> crystal-backup
-make seed    # tenant namespaces + checksummed data
-make test    # full suite        (make test LABELS=m0  for one milestone)
+mise run up      # ~15-25 min: servers -> RKE2 -> ceph/longhorn/local-path -> crystal-backup
+mise run seed    # tenant namespaces + checksummed data
+mise run test    # full suite        (mise run test m0  for one milestone)
 
-make down CONFIRM=yes
+CONFIRM=yes mise run down
 ```
 
-Granular phases: `make infra` (tofu) → `make cluster` (ansible/RKE2) →
-`make components` (deploy.sh) → `make seed`. All idempotent — re-run any phase
-after fixing something. `make status`, `make ssh HOST=crucible-master-1`,
-`make kubeconfig` help while debugging.
+`mise run` with no task lists them all. Granular phases: `mise run infra`
+(tofu) → `mise run cluster` (ansible/RKE2) → `mise run components` (deploy.sh)
+→ `mise run seed`. All idempotent — re-run any phase after fixing something.
+`mise run status`, `mise run ssh crucible-master-1`, `mise run kubeconfig`
+help while debugging.
+
+`mise run test` ends with a **plain-language report** (verdict, per-area
+checks, failures with a next step, and an interpretation) — also saved to
+`artifacts/crucible-report.md`. Filter to one area with `mise run test infra`
+or `mise run test m0`; add full Ginkgo output with `mise run test-verbose`.
 
 ## The test suite
 
@@ -123,12 +129,12 @@ restore tests verify integrity against it, byte for byte.
 
 ## Troubleshooting
 
-- **Ceph stuck short of `HEALTH_OK`** — `make ssh HOST=crucible-worker-1`,
+- **Ceph stuck short of `HEALTH_OK`** — `mise run ssh crucible-worker-1`,
   check `/dev/sdb` exists and is raw; then
   `kubectl -n rook-ceph logs -l app=rook-ceph-operator --tail=100` and
   `kubectl -n rook-ceph exec deploy/rook-ceph-tools -- ceph -s`.
 - **A phase failed mid-way** — every phase is idempotent; fix and re-run it.
-- **Orphaned cloud resources** (lost tfstate) — `make nuke` deletes everything
+- **Orphaned cloud resources** (lost tfstate) — `mise run nuke` deletes everything
   labeled `project=crystalbackup-crucible`. The S3 bucket is never auto-deleted.
-- **SSH refused right after `make infra`** — cloud-init may still be running;
-  retry `make cluster` after a minute.
+- **SSH refused right after `mise run infra`** — cloud-init may still be running;
+  retry `mise run cluster` after a minute.

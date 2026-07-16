@@ -34,7 +34,7 @@ export KUBECONFIG="${KUBECONFIG:-${CRUCIBLE_DIR}/artifacts/kubeconfig}"
 step() { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
 
 if [[ ! -f "${KUBECONFIG}" ]]; then
-  echo "FATAL: kubeconfig not found at ${KUBECONFIG} — run 'make cluster' first." >&2
+  echo "FATAL: kubeconfig not found at ${KUBECONFIG} — run 'mise run cluster' first." >&2
   exit 1
 fi
 
@@ -95,7 +95,12 @@ kubectl -n local-path-storage rollout status deploy/local-path-provisioner --tim
 
 # ---------------------------------------------------------------------------
 step "crystal-backup (CRDs + operator chart)"
-make -C "${REPO_ROOT}" chart-crds
+# Sync the generated CRDs into the chart's crds/ dir (the chart keeps them
+# git-ignored). Equivalent to the repo's `chart-crds` make target, inlined so the
+# crucible has no build-time dependency on make.
+mkdir -p "${REPO_ROOT}/charts/crystal-backup/crds"
+rm -f "${REPO_ROOT}/charts/crystal-backup/crds"/*.yaml
+cp "${REPO_ROOT}/config/crd/bases"/*.yaml "${REPO_ROOT}/charts/crystal-backup/crds/"
 # Create the namespace ourselves (with the chart's PSA labels) so helm's release
 # secret has a home, then tell the chart not to create it a second time.
 kubectl create namespace crystal-backup-system --dry-run=client -o yaml | kubectl apply -f -
@@ -114,4 +119,4 @@ echo
 echo "Deployed. Storage classes:"
 kubectl get storageclass
 echo
-echo "Next: 'make seed' then 'make test'."
+echo "Next: 'mise run seed' then 'mise run test'."

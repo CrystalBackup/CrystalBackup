@@ -1,17 +1,127 @@
-# Crucible tool versions — activated automatically when you cd into
-# test/crucible (mise reads config upward from $PWD). `mise install` once.
+# Crucible — tool versions + task runner (replaces the old Makefile).
 #
-# Fuzzy pins resolve to the latest matching release; tighten to exact versions
-# if a tool update ever breaks the suite.
+# mise activates this config when you cd into test/crucible (it reads configs
+# upward from $PWD, so the repo-root mise.toml — which pins Go — is merged in
+# too). Run `mise install` once here, then drive everything with `mise run`:
+#
+#   mise run check-env            # credentials sanity (never prints values)
+#   mise run up                   # infra -> cluster (RKE2) -> components (storage + operator)
+#   mise run seed                 # tenant namespaces + checksummed data
+#   mise run test                 # whole suite, prints a readable report
+#   mise run test m0              # one milestone label (infra, m0, m1, ...)
+#   CONFIRM=yes mise run down     # destroy everything
+#
+# `mise run` with no task lists them all. Credentials come from <repo>/.secrets/
+# via scripts/load-env.sh; the suite's Go toolchain comes from the repo-root
+# mise.toml (Go 1.26.5).
 [tools]
-opentofu = "1.9"       # `tofu` — terraform-compatible, Apache-2.0
+opentofu = "1.9"        # `tofu` — terraform-compatible, Apache-2.0
 ansible-core = "latest" # ansible-playbook (builtin modules only — no collections needed)
 kubectl = "1.34"
 helm = "3"
-awscli = "2"           # S3 smoke checks against Hetzner Object Storage
-hcloud = "latest"      # only needed by scripts/nuke.sh (state-less teardown)
+awscli = "2"            # S3 smoke checks against Hetzner Object Storage
+hcloud = "latest"       # only needed by scripts/nuke.sh (state-less teardown)
 jq = "latest"
 
 [env]
 # Everything in this directory talks to the crucible cluster by default.
 KUBECONFIG = "{{config_root}}/artifacts/kubeconfig"
+
+# ── Tasks ────────────────────────────────────────────────────────────────────
+# `dir` pins each task to this directory so `mise run` works from anywhere.
+# Tasks that source scripts/load-env.sh need bash (the script uses BASH_SOURCE).
+
+[tasks.check-env]
+description = "Verify the .secrets/ credentials load (no values printed)"
+dir = "{{config_root}}"
+run = "scripts/check-env.sh"
+
+[tasks.init]
+description = "tofu init (download providers)"
+dir = "{{config_root}}"
+shell = "bash -c"
+run = "source scripts/load-env.sh && tofu -chdir=terraform init"
+
+[tasks.plan]
+description = "Preview the Hetzner infrastructure changes"
+dir = "{{config_root}}"
+shell = "bash -c"
+run = "source scripts/load-env.sh && tofu -chdir=terraform init && tofu -chdir=terraform plan"
+
+[tasks.infra]
+description = "Provision Hetzner servers, network, volumes, S3 bucket (tofu apply)"
+dir = "{{config_root}}"
+depends = ["check-env"]
+shell = "bash -c"
+run = "source scripts/load-env.sh && tofu -chdir=terraform init && tofu -chdir=terraform apply -auto-approve"
+
+[tasks.cluster]
+description = "Install RKE2 (ansible) and fetch the kubeconfig"
+dir = "{{config_root}}"
+shell = "bash -c"
+run = "source scripts/load-env.sh && cd ansible && ansible-playbook site.yml"
+
+[tasks.components]
+description = "Deploy snapshot-controller, rook-ceph, longhorn, local-path, crystal-backup"
+dir = "{{config_root}}"
+shell = "bash -c"
+run = "source scripts/load-env.sh && deploy/deploy.sh"
+
+[tasks.up]
+description = "Full bring-up: infra -> cluster -> components (~15-25 min)"
+dir = "{{config_root}}"
+run = "mise run infra && mise run cluster && mise run components"
+
+[tasks.seed]
+description = "Populate tenant namespaces (c-web, c-db, c-media, c-legacy, c-edge, c-empty)"
+dir = "{{config_root}}"
+shell = "bash -c"
+run = "source scripts/load-env.sh && seed/seed.sh"
+
+[tasks.test]
+description = "Run the Ginkgo suite + print a readable report (filter: mise run test m0)"
+dir = "{{config_root}}"
+run = "scripts/run-tests.sh"
+
+[tasks.test-verbose]
+description = "Like `test` but streams full Ginkgo output (debugging)"
+dir = "{{config_root}}"
+shell = "bash -c"
+run = "CRUCIBLE_VERBOSE=1 scripts/run-tests.sh"
+
+[tasks.status]
+description = "Show terraform outputs + cluster nodes"
+dir = "{{config_root}}"
+shell = "bash -c"
+run = """
+source scripts/load-env.sh
+tofu -chdir=terraform output 2>/dev/null || echo "(no terraform state yet)"
+[[ -f "${KUBECONFIG}" ]] && kubectl get nodes -o wide 2>/dev/null || echo "(cluster not reachable yet)"
+"""
+
+[tasks.kubeconfig]
+description = "Print the export line for manual kubectl use"
+dir = "{{config_root}}"
+shell = "bash -c"
+run = 'echo "export KUBECONFIG=${KUBECONFIG}"'
+
+[tasks.ssh]
+description = "SSH into a node: mise run ssh crucible-master-1"
+dir = "{{config_root}}"
+run = "scripts/ssh-node.sh"
+
+[tasks.down]
+description = "Destroy ALL crucible infra (guarded: CONFIRM=yes mise run down)"
+dir = "{{config_root}}"
+run = "scripts/down.sh"
+
+[tasks.nuke]
+description = "Label-based teardown when the tfstate is lost (typed confirmation)"
+dir = "{{config_root}}"
+shell = "bash -c"
+run = "source scripts/load-env.sh && scripts/nuke.sh"
+
+[tasks.clean]
+description = "Remove local artifacts only (does NOT touch cloud resources)"
+dir = "{{config_root}}"
+run = "rm -rf artifacts ansible/inventory terraform/.terraform terraform/tfplan"

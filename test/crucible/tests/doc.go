@@ -18,12 +18,11 @@ limitations under the License.
 // live Hetzner cluster provisioned by test/crucible (RKE2 + rook-ceph +
 // longhorn + local-path + a Hetzner Object Storage bucket).
 //
-// Every test file carries the `crucible` build tag so `go test ./...` (and
-// `make test`) never tries to reach a live cluster. Run through the crucible
-// Makefile instead:
+// Every test file carries the `crucible` build tag so `go test ./...` never
+// tries to reach a live cluster. Run through the crucible mise tasks instead:
 //
-//	cd test/crucible && make test            # everything
-//	cd test/crucible && make test LABELS=m0  # one milestone
+//	cd test/crucible && mise run test        # everything
+//	cd test/crucible && mise run test m0     # one milestone
 //
 // Specs are labeled by milestone (infra, m0, m1, ...); each new milestone adds
 // its own file with its own label — see test/crucible/README.md.

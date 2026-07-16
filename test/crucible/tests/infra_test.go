@@ -95,7 +95,7 @@ var _ = Describe("Infrastructure", Label("infra"), func() {
 	It("reaches the Hetzner Object Storage backup bucket", func() {
 		bucket, endpoint := os.Getenv("S3_BUCKET"), os.Getenv("S3_ENDPOINT")
 		if bucket == "" || endpoint == "" {
-			Skip("S3_BUCKET / S3_ENDPOINT not set (run via `make test` so terraform facts are loaded)")
+			Skip("S3_BUCKET / S3_ENDPOINT not set (run via `mise run test` so terraform facts are loaded)")
 		}
 		if _, err := exec.LookPath("aws"); err != nil {
 			Skip("aws CLI not on PATH (provided by test/crucible/mise.toml)")

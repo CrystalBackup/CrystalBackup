@@ -55,7 +55,7 @@ func TestCrucible(t *testing.T) {
 var _ = BeforeSuite(func() {
 	kubeconfig := os.Getenv("KUBECONFIG")
 	Expect(kubeconfig).NotTo(BeEmpty(),
-		"KUBECONFIG must point at the crucible cluster (run via `make test` in test/crucible)")
+		"KUBECONFIG must point at the crucible cluster (run via `mise run test` in test/crucible)")
 	Expect(kubeconfig).To(BeAnExistingFile())
 
 	cfg, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
