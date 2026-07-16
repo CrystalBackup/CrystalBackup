@@ -36,6 +36,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
 	crystalbackupiov1alpha1 "github.com/CrystalBackup/CrystalBackup/api/v1alpha1"
+	"github.com/CrystalBackup/CrystalBackup/internal/apiconst"
+	"github.com/CrystalBackup/CrystalBackup/internal/client/secrets"
+	"github.com/CrystalBackup/CrystalBackup/internal/controller"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -61,6 +64,18 @@ func main() {
 	var secureMetrics bool
 	var enableHTTP2 bool
 	var tlsOpts []func(*tls.Config)
+	var operatorNamespace string
+	// defaultOperatorNamespace resolves the operator's own namespace before flags are parsed:
+	// $POD_NAMESPACE (set via the downward API in the Helm chart / manifest) if present, else
+	// the Helm chart's own default, apiconst.DefaultOperatorNamespace. This is where every
+	// cluster-plane platform Secret (the KEK, DR S3 credentials, wrapped DEKs) lives.
+	defaultOperatorNamespace := os.Getenv("POD_NAMESPACE")
+	if defaultOperatorNamespace == "" {
+		defaultOperatorNamespace = apiconst.DefaultOperatorNamespace
+	}
+	flag.StringVar(&operatorNamespace, "operator-namespace", defaultOperatorNamespace,
+		"Namespace where cluster-plane platform Secrets (the cluster KEK, DR S3 credentials, wrapped DEKs) live. "+
+			"Defaults to $POD_NAMESPACE (downward API) or, if unset, "+apiconst.DefaultOperatorNamespace+".")
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
@@ -177,6 +192,19 @@ func main() {
 		os.Exit(1)
 	}
 
+	if err := (&controller.ClusterBackupLocationReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+		// The uncached, GET-by-name reader — never mgr.GetClient() — per
+		// internal/client/secrets' package doc (tenancy invariant I3).
+		Secrets:           secrets.NewByNameReader(mgr.GetAPIReader()),
+		Prober:            controller.NewHTTPS3Prober(),
+		OperatorNamespace: operatorNamespace,
+		Recorder:          mgr.GetEventRecorderFor("clusterbackuplocation"),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Unable to create controller", "controller", "ClusterBackupLocation")
+		os.Exit(1)
+	}
 	// +kubebuilder:scaffold:builder
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {

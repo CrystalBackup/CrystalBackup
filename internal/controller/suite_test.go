@@ -1,0 +1,153 @@
+/*
+Copyright 2026.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controller
+
+import (
+	"context"
+	"fmt"
+	"path/filepath"
+	"testing"
+
+	. "github.com/onsi/ginkgo/v2" //nolint:revive,staticcheck
+	. "github.com/onsi/gomega"    //nolint:revive,staticcheck
+
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/envtest"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
+
+	cbv1 "github.com/CrystalBackup/CrystalBackup/api/v1alpha1"
+	"github.com/CrystalBackup/CrystalBackup/internal/client/secrets"
+)
+
+// suiteOperatorNamespace stands in for apiconst.DefaultOperatorNamespace ("crystal-backup-system")
+// across every controller test in this package: the one namespace where cluster-plane
+// platform Secrets (the KEK, DR S3 credentials, wrapped DEKs) live. It is created once here,
+// in BeforeSuite, because it is shared infrastructure every future controller's tests will
+// also need — not a per-spec concern.
+const suiteOperatorNamespace = "crystal-backup-system"
+
+// TestControllers is the single entry point `go test` (and so `make test`) drives for every
+// Ginkgo spec in this package — one envtest API server, started once in BeforeSuite and
+// stopped once in AfterSuite, shared by every controller's *_test.go file.
+func TestControllers(t *testing.T) {
+	RegisterFailHandler(Fail)
+	RunSpecs(t, "Controller Suite")
+}
+
+// Package-level so every *_test.go file in this package (present and future) can drive the
+// same envtest API server without re-deriving a client or a context: cfg/k8sClient are the
+// direct (uncached) envtest wiring specs assert through, and ctx/cancel bound the manager
+// goroutine's lifetime to the suite.
+var (
+	cfg       *rest.Config
+	k8sClient client.Client
+	testEnv   *envtest.Environment
+	ctx       context.Context
+	cancel    context.CancelFunc
+)
+
+var _ = BeforeSuite(func() {
+	logf.SetLogger(zap.New(zap.WriteTo(GinkgoWriter), zap.UseDevMode(true)))
+
+	ctx, cancel = context.WithCancel(context.Background())
+
+	By("starting the envtest control plane")
+	testEnv = &envtest.Environment{
+		// Mirrors test/crd/roundtrip_test.go's relative path, two levels up from
+		// internal/controller/ to the repo root, then into config/crd/bases.
+		CRDDirectoryPaths:     []string{filepath.Join("..", "..", "config", "crd", "bases")},
+		ErrorIfCRDPathMissing: true,
+	}
+
+	var err error
+	cfg, err = testEnv.Start()
+	Expect(err).NotTo(HaveOccurred())
+	Expect(cfg).NotTo(BeNil())
+
+	scheme := runtime.NewScheme()
+	Expect(clientgoscheme.AddToScheme(scheme)).To(Succeed())
+	Expect(cbv1.AddToScheme(scheme)).To(Succeed())
+
+	k8sClient, err = client.New(cfg, client.Options{Scheme: scheme})
+	Expect(err).NotTo(HaveOccurred())
+	Expect(k8sClient).NotTo(BeNil())
+
+	By("creating the operator namespace")
+	Expect(k8sClient.Create(ctx, &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{Name: suiteOperatorNamespace},
+	})).To(Succeed())
+
+	By("starting the manager")
+	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
+		Scheme: scheme,
+		// Metrics and health/readiness endpoints are pure overhead in envtest — no scraper,
+		// no probe, ever reads them here — so both are switched off.
+		Metrics:                metricsserver.Options{BindAddress: "0"},
+		HealthProbeBindAddress: "0",
+	})
+	Expect(err).NotTo(HaveOccurred())
+
+	Expect((&ClusterBackupLocationReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+		// The uncached API reader, per internal/client/secrets' package doc — GetClient()
+		// here would silently stand up a cluster-wide Secret informer.
+		Secrets: secrets.NewByNameReader(mgr.GetAPIReader()),
+		// A stub: envtest has no real S3 to probe. See its doc for how a spec can still
+		// exercise the Reachable=False path deterministically.
+		Prober:            stubS3Prober{},
+		OperatorNamespace: suiteOperatorNamespace,
+		Recorder:          mgr.GetEventRecorderFor("clusterbackuplocation"),
+	}).SetupWithManager(mgr)).To(Succeed())
+
+	go func() {
+		defer GinkgoRecover()
+		Expect(mgr.Start(ctx)).To(Succeed())
+	}()
+})
+
+var _ = AfterSuite(func() {
+	cancel()
+	By("tearing down the envtest control plane")
+	Expect(testEnv.Stop()).To(Succeed())
+})
+
+// unreachableTestEndpoint is a magic Spec.S3.Endpoint value stubS3Prober treats as
+// unreachable. Keying the stub's answer off the endpoint value (rather than off a shared
+// mutable flag) means a spec can deterministically exercise Reachable=False for ONE location
+// without affecting any other spec's locations running concurrently in the same suite.
+const unreachableTestEndpoint = "https://unreachable.invalid.test"
+
+// stubS3Prober is the envtest S3Prober: reachable for every endpoint except
+// unreachableTestEndpoint, so most specs get an unconditional Reachable=True while a spec
+// that specifically wants Reachable=False can opt in by name.
+type stubS3Prober struct{}
+
+func (stubS3Prober) Reachable(_ context.Context, s3 cbv1.S3Spec) error {
+	if s3.Endpoint == unreachableTestEndpoint {
+		return fmt.Errorf("stub: %q is marked unreachable for this test", s3.Endpoint)
+	}
+	return nil
+}

@@ -1,11 +1,55 @@
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  labels:
-    app.kubernetes.io/name: bs-k8s-backup
-    app.kubernetes.io/managed-by: kustomize
   name: manager-role
 rules:
-- apiGroups: [""]
-  resources: ["pods"]
-  verbs: ["get", "list", "watch"]
+- apiGroups:
+  - ""
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
+- apiGroups:
+  - ""
+  resources:
+  - secrets
+  verbs:
+  - get
+- apiGroups:
+  - crystalbackup.io
+  resources:
+  - backuprepositories
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - crystalbackup.io
+  resources:
+  - clusterbackuplocations
+  verbs:
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - crystalbackup.io
+  resources:
+  - clusterbackuplocations/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - crystalbackup.io
+  resources:
+  - clusterbackuplocations/status
+  verbs:
+  - get
+  - patch
+  - update
