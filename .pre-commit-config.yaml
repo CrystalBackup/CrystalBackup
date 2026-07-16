@@ -1,0 +1,41 @@
+# Pre-commit hooks — security & hygiene.
+#
+# First-time setup (tools are pinned in ./mise.toml):
+#   mise install
+#   pre-commit install
+#
+# Run on demand against everything:  pre-commit run --all-files
+#
+# These local hooks are a fast feedback loop; the authoritative secret gate is
+# the full-history gitleaks scan in .github/workflows/security.yml (CI runs even
+# when a contributor hasn't installed the hooks).
+minimum_pre_commit_version: "3.5.0"
+default_install_hook_types: [pre-commit]
+
+repos:
+  # --- Secret scanning (primary gate) -------------------------------------
+  # Uses the mise-pinned gitleaks binary so local commits and CI share ONE
+  # version (mise.toml) and ONE ruleset (.gitleaks.toml). Scans the staged
+  # diff only — fast, and exactly what is about to be committed.
+  - repo: local
+    hooks:
+      - id: gitleaks
+        name: gitleaks (scan staged changes for secrets)
+        entry: gitleaks git --pre-commit --redact --staged --verbose
+        language: system
+        pass_filenames: false
+
+  # --- General security & hygiene -----------------------------------------
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: detect-private-key # refuse committed PEM/OpenSSH private keys
+      - id: check-added-large-files # block accidental blobs / key dumps
+        args: [--maxkb=1024]
+      - id: check-merge-conflict # leftover <<<<<<< markers
+      - id: check-case-conflict # names clashing on case-insensitive FS
+      - id: check-yaml
+        args: [--allow-multiple-documents]
+        # Helm templates are Go-templated, not valid standalone YAML.
+        exclude: ^charts/crystal-backup/templates/.*$
+      - id: check-json

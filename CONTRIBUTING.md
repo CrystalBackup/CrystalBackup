@@ -30,6 +30,22 @@ You do **not** install controller-gen / kustomize / golangci-lint yourself — t
 `make` targets download the pinned versions into `./bin` (`make lint` even builds a *custom*
 golangci-lint binary with the `logcheck` plugin from [`.custom-gcl.yml`](.custom-gcl.yml)).
 
+### Pre-commit hooks (secret scanning)
+
+Install the git hooks once — they block secrets and common mistakes before they are committed:
+
+```bash
+mise install          # provides gitleaks + pre-commit (pinned in mise.toml)
+pre-commit install    # wires .pre-commit-config.yaml into .git/hooks
+```
+
+On every commit this runs [gitleaks](https://github.com/gitleaks/gitleaks) over the staged diff
+plus `detect-private-key`, `check-added-large-files`, and YAML/JSON validation. Run it against the
+whole tree at any time with `pre-commit run --all-files`. The hooks are a convenience — the
+**authoritative** secret gate is CI ([`.github/workflows/security.yml`](.github/workflows/security.yml)),
+which scans the full git history on every PR. Real credentials belong only in the git-ignored
+`.secrets/` directory; never commit them (or force a scan past the hooks).
+
 ## The development loop
 
 Everything goes through the Makefile so local runs match CI. Run tools through `mise exec` so
@@ -94,6 +110,8 @@ the full test pyramid (unit → envtest integration → e2e → fidelity) is in
    - **Unit tests** ([`.github/workflows/test.yml`](.github/workflows/test.yml)) — `make test`
      with a coverage artifact.
    - **E2E** ([`.github/workflows/test-e2e.yml`](.github/workflows/test-e2e.yml)) — kind suite.
+   - **Security** ([`.github/workflows/security.yml`](.github/workflows/security.yml)) — gitleaks
+     over the full history plus the pre-commit hook suite.
 5. Satisfy the **Definition of Done** ([spec/08-testing-and-dod.md §8](spec/08-testing-and-dod.md)) —
    it applies to every task. Highlights:
    - Unit tests for new logic; envtest for controller behaviour; e2e when you touch the data path.
