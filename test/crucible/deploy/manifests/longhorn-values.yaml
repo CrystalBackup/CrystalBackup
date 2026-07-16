@@ -1,0 +1,17 @@
+# Longhorn for crucible — second snapshot-capable CSI, independent of Ceph.
+persistence:
+  # ceph-block is the cluster default; longhorn is opt-in per PVC.
+  defaultClass: false
+  defaultClassReplicaCount: 3
+
+defaultSettings:
+  # Only nodes labeled node.longhorn.io/create-default-disk=true get a disk —
+  # the RKE2 agents set that label (workers only, keeps masters clean).
+  createDefaultDiskLabeledNodes: true
+  defaultDataPath: /var/lib/longhorn
+
+preUpgradeChecker:
+  jobEnabled: false
+
+ingress:
+  enabled: false

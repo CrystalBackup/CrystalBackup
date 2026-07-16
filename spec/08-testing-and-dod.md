@@ -274,6 +274,18 @@ Full suite (nightly + release tags), in addition:
     in another namespace is **denied** (rule 2), and a sync whose `sourceLocationRef ==
     destinationLocationRef` is **denied** (rule 9).
 
+### Real-conditions suite (the crucible)
+
+Complementing the kind e2e, [`test/crucible/`](../test/crucible/README.md) provisions a
+**disposable real platform on Hetzner Cloud** (RKE2 HA, rook-ceph with mon/mgr on masters and
+osd/mds/rgw on workers, longhorn, local-path, an Object Storage bucket) and seeds tenant
+namespaces covering the storage case matrix (RWO/RWX, unmounted and detached PVCs,
+non-snapshottable classes, exotic file metadata with recorded `MANIFEST.sha256` checksums).
+Its Ginkgo specs are **labeled per milestone** (`infra`, `m0`, `m1`, …) and only ever grow:
+the suite is the field acceptance gate at each milestone delivery, the non-regression harness
+for everything already shipped, and a reproducible arena for issue reports. It runs on
+demand (it costs real money), never in PR CI.
+
 ## 5. Metadata fidelity suite (R10 gate)
 
 Runs inside the e2e full suite, and is the **acceptance gate for any mover engine

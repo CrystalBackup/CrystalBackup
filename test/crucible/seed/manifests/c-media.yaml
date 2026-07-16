@@ -1,0 +1,116 @@
+# c-media — RWX on cephfs, shared across nodes, plus an UNMOUNTED block PVC
+# (a restorable volume nobody currently consumes).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: media-shared
+  namespace: c-media
+  labels:
+    app.kubernetes.io/part-of: crucible-seed
+spec:
+  accessModes: ["ReadWriteMany"]
+  storageClassName: ceph-filesystem
+  resources:
+    requests:
+      storage: 2Gi
+---
+# Bound (Immediate binding) but mounted by nothing — the "cold volume" case.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: media-archive-unmounted
+  namespace: c-media
+  labels:
+    app.kubernetes.io/part-of: crucible-seed
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: ceph-block
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: media-writer
+  namespace: c-media
+  labels:
+    app.kubernetes.io/part-of: crucible-seed
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/part-of: crucible-seed
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: writer
+          image: busybox:1.36
+          command:
+            - /bin/sh
+            - -ec
+            - |
+              if [ -f /media/MANIFEST.sha256 ]; then echo "already seeded"; exit 0; fi
+              mkdir -p /media/albums/2026
+              i=1
+              while [ "$i" -le 10 ]; do
+                dd if=/dev/urandom of=/media/albums/2026/photo-$i.raw bs=128k count=4 2>/dev/null
+                i=$((i + 1))
+              done
+              echo "shared media library (RWX cephfs)" > /media/README.txt
+              cd /media
+              find . -type f ! -name MANIFEST.sha256 -exec sha256sum {} + > /tmp/manifest
+              mv /tmp/manifest /media/MANIFEST.sha256
+          volumeMounts:
+            - name: media
+              mountPath: /media
+      volumes:
+        - name: media
+          persistentVolumeClaim:
+            claimName: media-shared
+---
+# Two replicas spread across nodes, both mounting the SAME RWX volume.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: media-readers
+  namespace: c-media
+  labels:
+    app.kubernetes.io/part-of: crucible-seed
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: media-readers
+  template:
+    metadata:
+      labels:
+        app: media-readers
+        app.kubernetes.io/part-of: crucible-seed
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app: media-readers
+      containers:
+        - name: reader
+          image: busybox:1.36
+          command: ["/bin/sh", "-c", "sleep infinity"]
+          volumeMounts:
+            - name: media
+              mountPath: /media
+              readOnly: true
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+      volumes:
+        - name: media
+          persistentVolumeClaim:
+            claimName: media-shared

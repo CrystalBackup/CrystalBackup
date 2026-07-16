@@ -1,0 +1,50 @@
+# Seed tenant namespaces — one per storage/workload archetype.
+#
+#   c-web     manifests only (Deployment/Service/Ingress/ConfigMap/Secret/NetPol), no PVC
+#   c-db      StatefulSet + volumeClaimTemplates on ceph-block (RWO), checksummed data
+#   c-media   RWX cephfs shared by 2 pods + one UNMOUNTED ceph-block PVC
+#   c-legacy  local-path PVC (storage WITHOUT snapshot support)
+#   c-edge    longhorn PVC with exotic data (hardlinks/symlinks/sparse/unicode/xattrs)
+#             + a scaled-to-zero Deployment with a detached PVC
+#   c-empty   namespace with only policy objects (no workload, no PVC)
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: c-web
+  labels:
+    crystalbackup.io/seed: crucible
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: c-db
+  labels:
+    crystalbackup.io/seed: crucible
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: c-media
+  labels:
+    crystalbackup.io/seed: crucible
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: c-legacy
+  labels:
+    crystalbackup.io/seed: crucible
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: c-edge
+  labels:
+    crystalbackup.io/seed: crucible
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: c-empty
+  labels:
+    crystalbackup.io/seed: crucible
