@@ -42,10 +42,21 @@ step "Cluster reachability"
 kubectl get nodes -o wide
 
 # ---------------------------------------------------------------------------
-step "external-snapshotter ${SNAPSHOTTER_REF} (CRDs + controller)"
-kubectl apply -k "https://github.com/kubernetes-csi/external-snapshotter/client/config/crd?ref=${SNAPSHOTTER_REF}"
-kubectl apply -k "https://github.com/kubernetes-csi/external-snapshotter/deploy/kubernetes/snapshot-controller?ref=${SNAPSHOTTER_REF}"
-kubectl -n kube-system rollout status deploy/snapshot-controller --timeout=300s
+# CSI snapshot support: VolumeSnapshot CRDs + a snapshot-controller. Some
+# distros already ship these (RKE2 bundles rke2-snapshot-controller and the
+# CRDs) — re-applying them clashes, so install external-snapshotter only when
+# the cluster has no VolumeSnapshot CRD yet.
+step "CSI snapshot support (VolumeSnapshot CRDs + controller)"
+if kubectl get crd volumesnapshots.snapshot.storage.k8s.io >/dev/null 2>&1; then
+  echo "  VolumeSnapshot CRDs already present — using the cluster's snapshot-controller (external-snapshotter ${SNAPSHOTTER_REF} skipped)"
+  # Ready-check whichever controller the distro provides (RKE2: rke2-snapshot-controller).
+  ctrl="$(kubectl -n kube-system get deploy -o name 2>/dev/null | grep -iE 'snapshot-controller' | head -1)"
+  [[ -n "${ctrl}" ]] && kubectl -n kube-system rollout status "${ctrl}" --timeout=300s || true
+else
+  kubectl apply -k "https://github.com/kubernetes-csi/external-snapshotter/client/config/crd?ref=${SNAPSHOTTER_REF}"
+  kubectl apply -k "https://github.com/kubernetes-csi/external-snapshotter/deploy/kubernetes/snapshot-controller?ref=${SNAPSHOTTER_REF}"
+  kubectl -n kube-system rollout status deploy/snapshot-controller --timeout=300s
+fi
 
 # ---------------------------------------------------------------------------
 step "rook-ceph operator ${ROOK_CHART_VERSION}"
