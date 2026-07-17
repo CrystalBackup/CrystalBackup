@@ -906,12 +906,16 @@ func exposureLabels(backup *cbv1.Backup, pvcName string) map[string]string {
 // the backup subcommand, the single backup path, the --host, one --tag per identity tag, then the
 // tuning flags. Secrets never appear here — the repository, password and S3 creds reach restic
 // via env and the mounted Secret (internal/mover).
+//
+// --pack-size takes a BARE INTEGER of MiB (restic parses it as a uint), not a human-readable size:
+// "64" means 64 MiB. Passing "64M" makes restic exit 1 with `invalid argument "64M" for
+// "--pack-size" flag`, which failed every real data backup on the crucible.
 func resticBackupArgs(id restic.Identity) []string {
 	args := []string{"backup", id.Path, "--host", id.Host}
 	for _, tag := range id.Tags {
 		args = append(args, "--tag", tag)
 	}
-	return append(args, "--pack-size", "64M", "--retry-lock", "5m")
+	return append(args, "--pack-size", "64", "--retry-lock", "5m")
 }
 
 // moverNamePrefix is the deterministic per-PVC NamePrefix "<backup>-<pvc>", sanitized to a
