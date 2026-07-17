@@ -43,6 +43,7 @@ import (
 	cbv1 "github.com/CrystalBackup/CrystalBackup/api/v1alpha1"
 	"github.com/CrystalBackup/CrystalBackup/internal/apiconst"
 	"github.com/CrystalBackup/CrystalBackup/internal/client/secrets"
+	"github.com/CrystalBackup/CrystalBackup/internal/concurrency"
 	"github.com/CrystalBackup/CrystalBackup/internal/exposer"
 	"github.com/CrystalBackup/CrystalBackup/internal/keys"
 	"github.com/CrystalBackup/CrystalBackup/internal/mover"
@@ -153,6 +154,10 @@ type backupRunContext struct {
 	dek           string // the platform DEK == the restic repository password
 	s3CredsSecret string // location.spec.s3.credentialsSecretRef.name (operator ns)
 	backoffLimit  int32  // run.backoffLimit -> the mover Job's spec.backoffLimit
+	// maxConcurrentMovers caps how many mover Jobs may run at once across the whole cascade
+	// (0 == unlimited). Enforced as a best-effort cluster-wide semaphore before a mover is created
+	// (internal/concurrency), so a wide fan-out paces its data movement instead of stampeding.
+	maxConcurrentMovers int32
 }
 
 // +kubebuilder:rbac:groups=crystalbackup.io,resources=backups,verbs=get;list;watch;update;patch
@@ -254,14 +259,15 @@ func (r *BackupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	}
 
 	rc := &backupRunContext{
-		scheduleRef:   backup.Spec.ScheduleRef,
-		run:           backup.Name,
-		clusterID:     loc.Spec.ClusterID,
-		tenant:        r.tenantFor(ctx, backup.Namespace),
-		repoURL:       repo.Status.RepositoryURL,
-		dek:           dek,
-		s3CredsSecret: loc.Spec.S3.CredentialsSecretRef.Name,
-		backoffLimit:  run.BackoffLimit,
+		scheduleRef:         backup.Spec.ScheduleRef,
+		run:                 backup.Name,
+		clusterID:           loc.Spec.ClusterID,
+		tenant:              r.tenantFor(ctx, backup.Namespace),
+		repoURL:             repo.Status.RepositoryURL,
+		dek:                 dek,
+		s3CredsSecret:       loc.Spec.S3.CredentialsSecretRef.Name,
+		backoffLimit:        run.BackoffLimit,
+		maxConcurrentMovers: run.MaxConcurrentMovers,
 	}
 
 	// (9) Enumerate matching PVCs and (idempotently) seed one VolumeStatus each.
@@ -546,6 +552,16 @@ func (r *BackupReconciler) advanceSnapshotting(ctx context.Context, backup *cbv1
 	moverName := prefix + "-mover"
 	labels := exposureLabels(backup, vol.Pvc)
 
+	// Cluster-wide mover concurrency gate. If this volume's mover Job does not exist yet and the
+	// cascade is already at maxConcurrentMovers, hold the volume in Snapshotting (its exposure stays
+	// ready) and requeue for a free slot. An already-existing Job means we are re-adopting after a
+	// restart, never blocking — so an in-flight mover is never counted out of its own slot.
+	if blocked, err := r.moverSlotBlocked(ctx, moverName, rc.maxConcurrentMovers); err != nil {
+		return err
+	} else if blocked {
+		return nil
+	}
+
 	if err := r.ensureMoverCredsSecret(ctx, moverName, rc.dek, rc.s3CredsSecret, labels); err != nil {
 		return err
 	}
@@ -562,6 +578,9 @@ func (r *BackupReconciler) advanceSnapshotting(ctx context.Context, backup *cbv1
 		BackoffLimit: rc.backoffLimit,
 		TTLSeconds:   moverJobTTLSeconds,
 		Labels:       labels,
+		// Soft-spread the cascade's movers across nodes so a wide fan-out does not pile its data
+		// movement onto one kubelet.
+		SpreadOverLabels: map[string]string{apiconst.LabelManagedBy: apiconst.ManagedByValue},
 	})
 	// No ownerReference: the mover Job is in the operator namespace and the Backup in a tenant
 	// namespace, so a cross-namespace ownerRef is illegal. The Job is tracked by its
@@ -572,6 +591,37 @@ func (r *BackupReconciler) advanceSnapshotting(ctx context.Context, backup *cbv1
 
 	vol.Phase = status.VolumePhaseUploading
 	return nil
+}
+
+// moverSlotBlocked implements the cluster-wide mover concurrency gate for one PVC's mover. It never
+// blocks when maxConcurrentMovers is unset, or when this PVC's mover Job already exists (a
+// re-adoption, which must proceed). Otherwise it counts the running mover Jobs — those carrying the
+// managed-by AND per-PVC labels, so repository-init Jobs (managed-by but no PVC) are not miscounted
+// — and blocks if the cascade is at its limit.
+func (r *BackupReconciler) moverSlotBlocked(ctx context.Context, moverName string, limit int32) (bool, error) {
+	if limit <= 0 {
+		return false, nil
+	}
+	err := r.Get(ctx, client.ObjectKey{Namespace: r.OperatorNamespace, Name: moverName}, &batchv1.Job{})
+	if err == nil {
+		return false, nil // our Job already exists — re-adopting, never blocked.
+	}
+	if !apierrors.IsNotFound(err) {
+		return false, fmt.Errorf("get mover Job %s/%s for the concurrency gate: %w", r.OperatorNamespace, moverName, err)
+	}
+
+	var jobs batchv1.JobList
+	if err := r.List(ctx, &jobs, client.InNamespace(r.OperatorNamespace),
+		client.MatchingLabels{apiconst.LabelManagedBy: apiconst.ManagedByValue}); err != nil {
+		return false, fmt.Errorf("list mover Jobs for the concurrency gate: %w", err)
+	}
+	movers := jobs.Items[:0]
+	for _, j := range jobs.Items {
+		if j.Labels[apiconst.LabelPVC] != "" { // per-PVC ⇒ a mover, not a repository-init Job
+			movers = append(movers, j)
+		}
+	}
+	return !concurrency.CanStartMover(concurrency.RunningMoverJobs(movers), limit), nil
 }
 
 // advanceUploading polls the mover Job and, once it is terminal, RECORDS the result on the

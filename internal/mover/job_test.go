@@ -24,6 +24,27 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 )
 
+func TestBuildJobTopologySpread(t *testing.T) {
+	withSpread := BuildJob(JobRequest{Operation: OpBackup, SpreadOverLabels: map[string]string{"app": "mover"}})
+	tsc := withSpread.Spec.Template.Spec.TopologySpreadConstraints
+	if len(tsc) != 1 {
+		t.Fatalf("want 1 topology-spread constraint, got %d", len(tsc))
+	}
+	if tsc[0].MaxSkew != 1 || tsc[0].TopologyKey != corev1.LabelHostname || tsc[0].WhenUnsatisfiable != corev1.ScheduleAnyway {
+		t.Fatalf("unexpected constraint shape: %+v", tsc[0])
+	}
+	if tsc[0].LabelSelector == nil || tsc[0].LabelSelector.MatchLabels["app"] != "mover" {
+		t.Fatalf("constraint selector not the given labels: %+v", tsc[0].LabelSelector)
+	}
+
+	// A soft (ScheduleAnyway) constraint must never keep a mover from scheduling: without
+	// SpreadOverLabels there is no constraint at all, so the scheduler's defaults apply.
+	without := BuildJob(JobRequest{Operation: OpBackup})
+	if got := without.Spec.Template.Spec.TopologySpreadConstraints; len(got) != 0 {
+		t.Fatalf("want no constraint without SpreadOverLabels, got %d", len(got))
+	}
+}
+
 // --- small lookup helpers so the assertions read by NAME, independent of slice order -----
 
 func findEnv(t *testing.T, env []corev1.EnvVar, name string) corev1.EnvVar {

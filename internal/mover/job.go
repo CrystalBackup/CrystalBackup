@@ -99,6 +99,10 @@ type JobRequest struct {
 	ExtraEnv []corev1.EnvVar
 	// Resources are the container's requests/limits, passed through as-is.
 	Resources corev1.ResourceRequirements
+	// SpreadOverLabels, when non-empty, adds a SOFT topology-spread constraint (maxSkew 1 over
+	// kubernetes.io/hostname, whenUnsatisfiable=ScheduleAnyway) selecting pods by these labels, so a
+	// wide fan-out's movers prefer distinct nodes instead of piling onto one. Empty ⇒ no constraint.
+	SpreadOverLabels map[string]string
 }
 
 // BuildJob assembles the batchv1.Job for one mover run, exactly per the package's runtime
@@ -165,12 +169,29 @@ func BuildJob(req JobRequest) *batchv1.Job {
 					SecurityContext: &corev1.PodSecurityContext{
 						SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 					},
-					Containers: []corev1.Container{container},
-					Volumes:    volumes,
+					TopologySpreadConstraints: spreadConstraints(req.SpreadOverLabels),
+					Containers:                []corev1.Container{container},
+					Volumes:                   volumes,
 				},
 			},
 		},
 	}
+}
+
+// spreadConstraints returns the soft topology-spread constraint selecting pods by labels, or nil
+// when no labels are given. It is soft (ScheduleAnyway) on purpose: a mover must still schedule
+// even onto a busy node when the cluster cannot honour the skew, because completing the backup
+// matters more than spreading it.
+func spreadConstraints(labels map[string]string) []corev1.TopologySpreadConstraint {
+	if len(labels) == 0 {
+		return nil
+	}
+	return []corev1.TopologySpreadConstraint{{
+		MaxSkew:           1,
+		TopologyKey:       corev1.LabelHostname,
+		WhenUnsatisfiable: corev1.ScheduleAnyway,
+		LabelSelector:     &metav1.LabelSelector{MatchLabels: copyLabels(labels)},
+	}}
 }
 
 // moverEnv builds the container environment in a fixed order: the restic repo/password/
