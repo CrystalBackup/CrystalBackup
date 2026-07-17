@@ -283,6 +283,17 @@ func main() {
 		setupLog.Error(err, "Unable to create controller", "controller", "ClusterBackupSchedule")
 		os.Exit(1)
 	}
+
+	// The orphan reaper is a periodic Runnable (not a reconciler): it sweeps the operator namespace
+	// for leftover native per-PVC exposure objects (temp clone PVCs, mover Jobs, creds Secrets) a
+	// crashed teardown left behind, backstopping the leak-check invariant.
+	if err := mgr.Add(&controller.OrphanReaper{
+		Client:            mgr.GetClient(),
+		OperatorNamespace: operatorNamespace,
+	}); err != nil {
+		setupLog.Error(err, "Unable to add the orphan reaper")
+		os.Exit(1)
+	}
 	// +kubebuilder:scaffold:builder
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
