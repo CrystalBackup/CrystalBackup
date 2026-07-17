@@ -115,6 +115,46 @@ func TestBuildResultInitSuccess(t *testing.T) {
 	}
 }
 
+// TestBuildResultInitAlreadyInitialized proves repository init is idempotent: restic exiting
+// non-zero because the shared repository already carries a master key + config is a SUCCESS for
+// the init op (the repo pre-exists — adr/0009), so the BackupRepository converges to Initialized
+// instead of looping. The exact message mirrors restic's own epilogue.
+func TestBuildResultInitAlreadyInitialized(t *testing.T) {
+	resticErr := errors.New("exit status 1: Fatal: create key in repository at s3:... failed: " +
+		"repository master key and config already initialized")
+	got := buildResult(string(mover.OpInit), nil, resticErr)
+	if !got.OK || got.Operation != "init" {
+		t.Fatalf("buildResult(init, already-initialized) = %+v, want OK==true Operation==init", got)
+	}
+	if got.Error != "" {
+		t.Errorf("an idempotent init success must carry no Error, got %q", got.Error)
+	}
+}
+
+// TestBuildResultInitOtherErrorStillFails guards the scope of the idempotency: an init that failed
+// for any OTHER reason (here, no S3 reachability) is still a hard failure — only the
+// "already initialized" sentinel is swallowed.
+func TestBuildResultInitOtherErrorStillFails(t *testing.T) {
+	got := buildResult(string(mover.OpInit), nil,
+		errors.New("exit status 1: Fatal: unable to open config file: Stat: RequestError: send request failed"))
+	if got.OK {
+		t.Fatalf("buildResult(init, s3-error) = %+v, want OK==false (only 'already initialized' is benign)", got)
+	}
+	if got.Error == "" {
+		t.Error("want a non-empty Error on a genuine init failure")
+	}
+}
+
+// TestBuildResultBackupAlreadyInitializedStillFails proves the idempotency is init-only: the same
+// sentinel on a non-init op is NOT swallowed (a backup can never legitimately emit it, and must
+// never be reported as a phantom success).
+func TestBuildResultBackupAlreadyInitializedStillFails(t *testing.T) {
+	got := buildResult(string(mover.OpBackup), nil, errors.New("already initialized"))
+	if got.OK {
+		t.Fatalf("buildResult(backup, 'already initialized') = %+v, want OK==false (init-only idempotency)", got)
+	}
+}
+
 // TestBuildResultPruneExitError covers a maintenance op that failed: a non-zero prune is OK==false
 // with the operation echoed and an Error set.
 func TestBuildResultPruneExitError(t *testing.T) {

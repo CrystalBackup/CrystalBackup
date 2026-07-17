@@ -89,6 +89,16 @@ func ensureBackupJSON(operation string, resticArgv []string) []string {
 // operation carries no payload, so a clean exit is simply OK with just the operation echoed.
 func buildResult(operation string, resticStdout []byte, resticErr error) mover.MoverResult {
 	if resticErr != nil {
+		// Repository init is IDEMPOTENT against a shared repository (adr/0009): `restic init`
+		// on a repo that already holds a master key + config is not a failure — the repo simply
+		// pre-exists (another location sharing it, a prior operator, or a re-init after a lost
+		// status update). restic reports this as a non-zero exit whose message ends in "already
+		// initialized"; treat it as success so the BackupRepository converges to Initialized
+		// instead of looping forever on a repo it already created. init never clobbers an
+		// existing repo, so this can lose nothing.
+		if operation == string(mover.OpInit) && isAlreadyInitialized(resticErr) {
+			return mover.MoverResult{OK: true, Operation: operation}
+		}
 		return mover.MoverResult{
 			OK:        false,
 			Operation: operation,
@@ -127,6 +137,18 @@ func writeResult(path string, result mover.MoverResult) error {
 		return fmt.Errorf("write termination message to %q: %w", path, err)
 	}
 	return nil
+}
+
+// isAlreadyInitialized reports whether err is restic's "repository already initialized"
+// condition — the benign outcome of initialising a shared repository that another location (or a
+// previous run) already created. It matches restic's stable sentinel substring
+// ("already initialized") case-insensitively; the mover pins restic from source (adr/0012), so
+// the wording is fixed for a given build. Only ever consulted for the init operation.
+func isAlreadyInitialized(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "already initialized")
 }
 
 // clampError normalises an error into a compact, single-line, length-bounded reason safe to
