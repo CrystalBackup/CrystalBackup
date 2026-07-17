@@ -269,7 +269,16 @@ jobs:
         if: steps.gate.outputs.proceed == 'true'
         run: |
           set -euo pipefail
-          sed -i "0,/^  version:/ s|^  version:.*|  version: \"${VERSION}\"|" "${{ matrix.melange }}"
+          # apk (and thus melange) versions are NOT SemVer: a pre-release like
+          # "0.1.0-alpha.1" is rejected by melange's parser. Map SemVer -> apk for the apk
+          # package version only: drop +build metadata, and rewrite the pre-release
+          # (-alpha.1 -> _alpha1) into apk's suffix form (alpha/beta/pre/rc are valid apk
+          # suffixes). The immutable OCI image tag keeps the full SemVer ${VERSION}; only the
+          # apk package version (SBOM cosmetic) is sanitized here.
+          APK_VERSION="${VERSION%%+*}"
+          APK_VERSION="$(printf '%s' "$APK_VERSION" | sed -E 's/-([A-Za-z]+)\.?([0-9]*)/_\1\2/g; s/[^A-Za-z0-9._]/_/g')"
+          echo "apk package version: ${APK_VERSION} (OCI tag stays ${VERSION})"
+          sed -i "0,/^  version:/ s|^  version:.*|  version: \"${APK_VERSION}\"|" "${{ matrix.melange }}"
 
       - name: melange — build pinned restic apk from source (mover only)
         if: steps.gate.outputs.proceed == 'true' && matrix.with_restic == 'true'
