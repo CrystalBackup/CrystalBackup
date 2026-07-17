@@ -34,6 +34,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
@@ -43,6 +44,7 @@ import (
 	"github.com/CrystalBackup/CrystalBackup/internal/client/secrets"
 	"github.com/CrystalBackup/CrystalBackup/internal/controller"
 	"github.com/CrystalBackup/CrystalBackup/internal/exposer"
+	"github.com/CrystalBackup/CrystalBackup/internal/metrics"
 	"github.com/CrystalBackup/CrystalBackup/internal/repo/queue"
 	// +kubebuilder:scaffold:imports
 )
@@ -292,6 +294,13 @@ func main() {
 		OperatorNamespace: operatorNamespace,
 	}); err != nil {
 		setupLog.Error(err, "Unable to add the orphan reaper")
+		os.Exit(1)
+	}
+
+	// The crystalbackup_ metric collector derives its series from live Backup/ClusterBackup state on
+	// each scrape (restart-safe), served on the controller-runtime metrics endpoint.
+	if err := ctrlmetrics.Registry.Register(metrics.NewCollector(mgr.GetClient())); err != nil {
+		setupLog.Error(err, "Unable to register the crystalbackup metrics collector")
 		os.Exit(1)
 	}
 	// +kubebuilder:scaffold:builder
