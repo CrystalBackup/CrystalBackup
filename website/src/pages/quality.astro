@@ -1,0 +1,290 @@
+---
+import Crystal from '../components/Crystal.astro';
+import '../styles/site.css';
+
+const base = import.meta.env.BASE_URL.replace(/\/$/, '');
+const gh = 'https://github.com/CrystalBackup/CrystalBackup';
+const links = {
+  gh,
+  home: `${base}/`,
+  why: `${base}/#why`,
+  how: `${base}/#how`,
+  compare: `${base}/#compare`,
+  roadmap: `${base}/#roadmap`,
+  testing: `${gh}/blob/main/spec/08-testing-and-dod.md`,
+  security: `${gh}/blob/main/spec/03-security-and-tenancy.md`,
+  adr: `${gh}/tree/main/spec/adr`,
+  crucible: `${gh}/tree/main/test/crucible`,
+  license: `${gh}/blob/main/LICENSE`,
+};
+
+const layers = [
+  { layer: 'Unit', harness: 'go&nbsp;test&nbsp;-race — pure Go, no cluster', runs: 'every push', gate: 'merge' },
+  { layer: 'Integration', harness: 'envtest — real API server + etcd, no kubelet', runs: 'every PR', gate: 'merge' },
+  { layer: 'e2e core', harness: 'kind + csi-driver-hostpath + SeaweedFS', runs: 'every PR', gate: 'merge' },
+  { layer: 'e2e full + fidelity', harness: 'same, extended matrix + metadata corpus', runs: 'nightly + release tags', gate: 'release' },
+  { layer: 'Crucible', harness: 'disposable real platform — Ceph, Longhorn, Object Storage', runs: 'on demand', gate: 'milestone acceptance' },
+];
+
+const gates = [
+  {
+    icon: '<svg viewBox="0 0 24 24"><path d="M4 7.5 9 4l5 3.5 5-3.5v9L14 20l-5-3.5L4 20Z"/><path d="M9 4v12.5M14 7.5V20"/></svg>',
+    title: 'Reversibility is a CI gate (R8)',
+    body: 'Every backup produced in CI is read back with a <strong>pinned upstream <code>restic</code></strong> binary — never our own tooling alone: <code>restic&nbsp;snapshots</code>, <code>restic&nbsp;check</code>, and a <code>restic&nbsp;dump</code> byte-comparison against the source. If our on-disk format ever drifts, the build breaks. Reversibility is a fact, not a slogan.',
+  },
+  {
+    icon: '<svg viewBox="0 0 24 24"><path d="M12 3v18M4 8l8-5 8 5-8 5-8-5Z"/><path d="m4 8 8 5 8-5"/></svg>',
+    title: 'Metadata fidelity, four directions (R10)',
+    body: 'A deterministic corpus — xattrs, POSIX ACLs, hardlinks, sparse files, setuid bits, unicode in <strong>NFC and NFD</strong>, paths past 255&nbsp;bytes — is backed up and restored, then diffed on SHA-256 content, allocated blocks, mode, xattrs, ACLs and hardlink classes, in <strong>all four</strong> backup/restore directions. This gates any change to the mover engine.',
+  },
+];
+
+const guards = [
+  ['Coverage gates', 'At least 80% on the controllers and 100% on the sanitization rules — an unreached rule fails CI, so no rule can rot untested.'],
+  ['No flaky retries', 'No automatic retries — they hide the very races we cannot afford. Tests must pass under <code>-count=2</code>; two flakes within 7 days quarantines a test with a tracked fix SLA.'],
+  ['Hardened supply chain', 'Images built with <strong>apko</strong> on <strong>Wolfi</strong> for a near-zero CVE surface, a 0-known-CVE scan gate, cosign signatures, an SBOM, and verified <strong>SLSA&nbsp;L3+</strong> provenance — re-attested on a scheduled rebuild.'],
+  ['Two-person review', 'CODEOWNERS forces two approvals on anything that touches encryption keys, the server-side tenancy derivation, or admission.'],
+];
+
+const title = 'Quality & testing — Crystal Backup';
+const description =
+  'How Crystal Backup guarantees the one thing that matters in a backup tool: a restore that works. A restore-centric test pyramid, upstream-restic reversibility gates, metadata fidelity, and a real-conditions crucible — all in the open.';
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="icon" type="image/svg+xml" href={`${base}/favicon.svg`} />
+    <title>{title}</title>
+    <meta name="description" content={description} />
+    <meta name="theme-color" content="#060912" />
+    <meta property="og:type" content="article" />
+    <meta property="og:title" content={title} />
+    <meta property="og:description" content={description} />
+    <meta property="og:url" content="https://crystalbackup.github.io/CrystalBackup/quality/" />
+    <meta name="twitter:card" content="summary" />
+  </head>
+  <body>
+    <div class="orbs" aria-hidden="true"></div>
+
+    <!-- ───────────────────────── nav ───────────────────────── -->
+    <header class="nav">
+      <a class="brand" href={links.home} aria-label="Crystal Backup — home">
+        <Crystal class="brand-mark" uid="nav" />
+        <span class="brand-name">Crystal<span>Backup</span></span>
+      </a>
+      <nav class="nav-links">
+        <a href={links.why}>Why</a>
+        <a href={links.how}>How it works</a>
+        <a href={links.compare}>Compare</a>
+        <a href={links.roadmap}>Roadmap</a>
+        <a class="current" href="#top" aria-current="page">Quality</a>
+        <a class="btn btn-ghost btn-sm" href={links.gh} target="_blank" rel="noopener">
+          <span class="star">★</span> Star on GitHub
+        </a>
+      </nav>
+    </header>
+
+    <main id="top">
+      <!-- ───────────────────────── intro ───────────────────────── -->
+      <section class="section intro">
+        <p class="eyebrow">Quality &amp; testing</p>
+        <h1 class="page-title">
+          A backup tool has one unforgivable failure: <span class="grad">a restore that doesn’t work.</span>
+        </h1>
+        <p class="section-lead">
+          So the whole test strategy is <strong>restore-centric</strong>: every backup produced in CI
+          is restored and verified, and the reversibility promise is checked with the <strong>upstream
+          <code>restic</code></strong> binary — never our own tooling alone. Here is exactly what stands
+          between a change and your data, all of it public.
+        </p>
+        <div class="hero-cta">
+          <a class="btn btn-primary" href={links.testing} target="_blank" rel="noopener">
+            Read the full test strategy →
+          </a>
+          <a class="btn btn-ghost" href={links.crucible} target="_blank" rel="noopener">
+            The crucible harness
+          </a>
+        </div>
+      </section>
+
+      <!-- ───────────────────── test pyramid ──────────────────── -->
+      <section class="section">
+        <p class="eyebrow">The pyramid</p>
+        <h2>Five layers, each with a job</h2>
+        <p class="section-lead">
+          Fast checks run on every push; expensive, real-world checks gate releases and milestones.
+          A change earns its way up.
+        </p>
+        <div class="table-wrap">
+          <table class="layers">
+            <thead>
+              <tr><th>Layer</th><th>Harness</th><th>Runs on</th><th>Gate</th></tr>
+            </thead>
+            <tbody>
+              {
+                layers.map((l) => (
+                  <tr>
+                    <td class="lname">{l.layer}</td>
+                    <td set:html={l.harness} />
+                    <td class="nowrap">{l.runs}</td>
+                    <td><span class="gate">{l.gate}</span></td>
+                  </tr>
+                ))
+              }
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- ───────────────────── the hard gates ────────────────── -->
+      <section class="section">
+        <p class="eyebrow">The load-bearing gates</p>
+        <h2>Two promises we refuse to fake</h2>
+        <div class="cards">
+          {
+            gates.map((g) => (
+              <article class="card gate-card">
+                <span class="ico" set:html={g.icon} />
+                <h3>{g.title}</h3>
+                <p set:html={g.body} />
+              </article>
+            ))
+          }
+        </div>
+      </section>
+
+      <!-- ───────────────────── the crucible ──────────────────── -->
+      <section class="section">
+        <p class="eyebrow">Real conditions</p>
+        <h2>The crucible</h2>
+        <p class="section-lead">
+          Kind and hostpath can’t vouch for Ceph’s xattr and ACL behaviour, or for a real object store.
+          So the crucible provisions a <strong>disposable, real platform</strong> on Hetzner Cloud — RKE2
+          HA, Rook-Ceph, Longhorn, an Object Storage bucket — and seeds tenant namespaces spanning the
+          whole storage matrix: RWO and RWX, unmounted and detached volumes, non-snapshottable classes,
+          and files with exotic metadata whose checksums are recorded in a <code>MANIFEST.sha256</code>.
+        </p>
+        <p class="flow-note">
+          Its scenarios are <strong>labelled per milestone and only ever grow</strong>: the field
+          acceptance gate at each delivery, the non-regression harness for everything already shipped,
+          and a reproducible arena for issue reports. It runs on demand — it costs real money — never in
+          the PR pipeline. Each milestone’s acceptance suite is written <strong>before</strong> its
+          controllers, so a missing feature shows up as a failing real-world scenario, not a hopeful
+          unit test.
+        </p>
+        <p class="section-foot">
+          Included from M1: an <strong>off-cluster restore</strong> scenario that restores a backup
+          straight from the bucket with nothing but the stock <code>restic</code> CLI and verifies it
+          byte-for-byte against the seed — no operator, no custom resources, no surviving cluster
+          needed. See <a href={links.crucible} target="_blank" rel="noopener">test/crucible</a>.
+        </p>
+      </section>
+
+      <!-- ───────────────────── the guardrails ────────────────── -->
+      <section class="section">
+        <p class="eyebrow">The guardrails</p>
+        <h2>What keeps it honest between the gates</h2>
+        <div class="guards">
+          {
+            guards.map(([h, b]) => (
+              <div class="guard">
+                <h3>{h}</h3>
+                <p set:html={b} />
+              </div>
+            ))
+          }
+        </div>
+      </section>
+
+      <!-- ───────────────────────── cta ───────────────────────── -->
+      <section class="cta">
+        <h2>Every check is in the open</h2>
+        <p>The test strategy, the coverage gates and the crucible are all public — read them, run them, poke holes in them.</p>
+        <div class="hero-cta">
+          <a class="btn btn-primary" href={links.testing} target="_blank" rel="noopener">
+            Testing &amp; Definition of Done →
+          </a>
+          <a class="btn btn-ghost" href={links.gh} target="_blank" rel="noopener">
+            <span class="star">★</span> Star / watch on GitHub
+          </a>
+        </div>
+      </section>
+    </main>
+
+    <!-- ───────────────────────── footer ────────────────────── -->
+    <footer class="footer">
+      <div class="foot-brand">
+        <Crystal class="brand-mark" uid="foot" />
+        <span class="brand-name">Crystal<span>Backup</span></span>
+      </div>
+      <nav class="foot-links">
+        <a href={links.home}>Home</a>
+        <a href={links.testing} target="_blank" rel="noopener">Testing &amp; DoD</a>
+        <a href={links.security} target="_blank" rel="noopener">Security &amp; tenancy</a>
+        <a href={links.crucible} target="_blank" rel="noopener">Crucible</a>
+        <a href={links.adr} target="_blank" rel="noopener">Decision records</a>
+        <a href={links.license} target="_blank" rel="noopener">License</a>
+        <a href={links.gh} target="_blank" rel="noopener">GitHub</a>
+      </nav>
+      <p class="foot-fine">
+        Apache-2.0 · built in the open with AI assistance · provided as-is, without warranty — use
+        it at your own risk.
+      </p>
+    </footer>
+
+    <style>
+      /* Page-specific styling; the shared design system lives in src/styles/site.css. */
+      .nav-links a.current { color: var(--text); font-weight: 650; }
+      .intro { padding-top: clamp(40px, 8vw, 84px); }
+      .page-title {
+        font-size: clamp(2rem, 5vw, 3.2rem);
+        font-weight: 850;
+        max-width: 20ch;
+        margin: 14px 0 0;
+      }
+
+      table.layers { width: 100%; border-collapse: collapse; min-width: 640px; }
+      .layers th, .layers td { padding: 14px 16px; text-align: left; border-bottom: 1px solid var(--brd); vertical-align: top; }
+      .layers thead th { font-size: 0.9rem; font-weight: 700; color: var(--muted); background: rgba(255, 255, 255, 0.02); }
+      .layers tbody td { color: var(--muted); font-size: 0.96rem; }
+      .layers td.lname { color: var(--text); font-weight: 650; white-space: nowrap; }
+      .layers td.nowrap { white-space: nowrap; }
+      .layers tbody tr:last-child td { border-bottom: none; }
+      .layers tbody tr:last-child { background: linear-gradient(90deg, rgba(63, 200, 245, 0.08), transparent); }
+      .gate {
+        display: inline-block;
+        font-size: 0.78rem;
+        font-weight: 700;
+        color: #b9e8fb;
+        background: rgba(63, 200, 245, 0.1);
+        border: 1px solid rgba(63, 200, 245, 0.22);
+        padding: 3px 10px;
+        border-radius: 999px;
+        white-space: nowrap;
+      }
+
+      .gate-card { display: flex; flex-direction: column; }
+      .cards { grid-template-columns: repeat(2, 1fr); }
+
+      .guards { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; margin-top: 34px; }
+      .guard {
+        border: 1px solid var(--brd);
+        background: var(--panel);
+        border-radius: var(--radius);
+        padding: 22px 24px;
+        border-left: 3px solid var(--cyan);
+      }
+      .guard h3 { font-size: 1.02rem; font-weight: 700; margin-bottom: 8px; }
+      .guard p { margin: 0; color: var(--muted); font-size: 0.95rem; }
+      .guard strong { color: var(--text); font-weight: 650; }
+
+      @media (max-width: 900px) {
+        .cards { grid-template-columns: 1fr; }
+        .guards { grid-template-columns: 1fr; }
+      }
+    </style>
+  </body>
+</html>
