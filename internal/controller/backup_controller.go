@@ -187,18 +187,21 @@ func (r *BackupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		return r.finalize(ctx, &backup)
 	}
 
+	// A discovery projection (M1 task #21) is a read-only materialized view of snapshots that
+	// already exist in the repository, never a unit of execution. Never re-execute it — and,
+	// checked BEFORE the finalizer is added, never even attach the execution finalizer: a
+	// projection has no exposure or mover Job to tear down, and discovery owns its whole lifecycle
+	// (it deletes the projection outright when the snapshots are gone), so an execution finalizer
+	// would only delay that GC by a needless finalize round-trip.
+	if backup.Annotations[apiconst.AnnotationProjected] == apiconst.AnnotationProjectedValue {
+		return ctrl.Result{}, nil
+	}
+
 	if controllerutil.AddFinalizer(&backup, apiconst.FinalizerBackup) {
 		if err := r.Update(ctx, &backup); err != nil {
 			return ctrl.Result{}, fmt.Errorf("add finalizer to Backup %s/%s: %w", backup.Namespace, backup.Name, err)
 		}
 		return ctrl.Result{Requeue: true}, nil
-	}
-
-	// A discovery projection (M1 task #21) is a read-only materialized view of snapshots that
-	// already exist in the repository, never a unit of execution. Never re-execute it. No
-	// projections exist in M1 yet; this is the forward-compat guard.
-	if backup.Annotations[apiconst.AnnotationProjected] == apiconst.AnnotationProjectedValue {
-		return ctrl.Result{}, nil
 	}
 
 	// Terminal Backups are done: they neither re-execute nor requeue. Re-entry (e.g. a stray

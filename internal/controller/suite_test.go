@@ -78,6 +78,9 @@ var (
 	// schedule specs drive cron activations deterministically. A BeforeEach in the schedule Describe
 	// resets it to real-time-ish before each spec (it is shared process-wide).
 	scheduleClock *clocktesting.FakeClock
+	// discoveryLister is the stub inventory the DiscoveryReconciler reads; the discovery specs feed
+	// it canned snapshots (mutex-guarded, since the manager reconciles on another goroutine).
+	discoveryLister *stubSnapshotLister
 )
 
 // suiteMoverImage is the placeholder mover image the envtest BackupRepository reconciler builds
@@ -189,6 +192,17 @@ var _ = BeforeSuite(func() {
 		mgr.GetScheme(),
 		scheduleClock,
 		mgr.GetEventRecorderFor("clusterbackupschedule"),
+	).SetupWithManager(mgr)).To(Succeed())
+
+	// The discovery reconciler, reading the repository inventory from a stub lister the specs feed
+	// canned snapshots to (production runs a restic Job — internal/controller's jobSnapshotLister,
+	// wired with the mover image in M1 task #24 — which envtest cannot exercise).
+	discoveryLister = &stubSnapshotLister{}
+	Expect(NewDiscoveryReconciler(
+		mgr.GetClient(),
+		mgr.GetScheme(),
+		discoveryLister,
+		mgr.GetEventRecorderFor("discovery"),
 	).SetupWithManager(mgr)).To(Succeed())
 
 	go func() {
