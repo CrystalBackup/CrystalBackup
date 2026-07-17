@@ -267,6 +267,10 @@ func main() {
 		operatorNamespace,
 		moverImage,
 		mgr.GetEventRecorderFor("backup"),
+		// The SAME per-repository exclusive queue the BackupRepository controller uses: the Backup
+		// controller enqueues retention-forget and stale-lock-unlock on it, serialised per repository
+		// against init and each other.
+		repoQueue,
 	).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Unable to create controller", "controller", "Backup")
 		os.Exit(1)

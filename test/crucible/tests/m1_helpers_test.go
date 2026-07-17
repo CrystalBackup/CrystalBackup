@@ -148,6 +148,14 @@ func m1CreateLocation(name string, isDefault bool) *cbv1.ClusterBackupLocation {
 			Encryption: cbv1.ClusterEncryptionSpec{
 				ClusterKEKSecretRef: cbv1.LocalObjectReference{Name: m1KEKSecretName},
 			},
+			// Discover on a tight cadence (the controller's 1-minute floor) instead of the 1h default:
+			// projection is nudged promptly by a ClusterBackup completion, but GC AFTER a retention
+			// forget only happens on a periodic re-inventory, so the reliability/discovery windows need
+			// the repository re-listed within minutes of a forget, not within the hour.
+			Discovery: cbv1.DiscoverySpec{
+				Enabled:  true,
+				Interval: metav1.Duration{Duration: time.Minute},
+			},
 		},
 	}
 	Expect(k8s.Create(ctx, loc)).To(Succeed(), "create ClusterBackupLocation %s", name)

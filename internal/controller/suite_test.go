@@ -171,6 +171,10 @@ var _ = BeforeSuite(func() {
 		suiteOperatorNamespace,
 		suiteMoverImage,
 		mgr.GetEventRecorderFor("backup"),
+		// The same shared exclusive queue as the BackupRepository controller. In envtest no backup
+		// sets a retention policy and no mover is simulated as hard-killed, so the forget/unlock
+		// triggers stay inert here; the real ops are crucible-validated.
+		repoQueue,
 	).SetupWithManager(mgr)).To(Succeed())
 
 	// The ClusterBackup fan-out reconciler. It creates child Backups (which the registered Backup

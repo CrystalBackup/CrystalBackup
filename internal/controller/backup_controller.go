@@ -47,6 +47,7 @@ import (
 	"github.com/CrystalBackup/CrystalBackup/internal/exposer"
 	"github.com/CrystalBackup/CrystalBackup/internal/keys"
 	"github.com/CrystalBackup/CrystalBackup/internal/mover"
+	"github.com/CrystalBackup/CrystalBackup/internal/repo/queue"
 	"github.com/CrystalBackup/CrystalBackup/internal/restic"
 	"github.com/CrystalBackup/CrystalBackup/internal/status"
 )
@@ -118,6 +119,13 @@ type BackupReconciler struct {
 	// only because envtest simulates the Job outcome and never runs it.
 	MoverImage string
 	Recorder   record.EventRecorder
+	// Queue is the per-repository exclusive work queue, SHARED with the BackupRepository controller
+	// (main.go constructs one and passes it to both). The Backup controller enqueues the two
+	// repository maintenance ops it triggers — retention forget after a successful backup, and a
+	// stale-lock unlock after a hard-killed mover — on the repository's lane (keyed by the
+	// BackupRepository name == the location name), so they can never race an init or another
+	// maintenance op on the same repository (adr/0010).
+	Queue *queue.Manager
 }
 
 // NewBackupReconciler builds a BackupReconciler. Callers (main.go, the envtest suite) go through
@@ -129,6 +137,7 @@ func NewBackupReconciler(
 	exposers ExposerRegistry,
 	operatorNamespace, moverImage string,
 	recorder record.EventRecorder,
+	q *queue.Manager,
 ) *BackupReconciler {
 	return &BackupReconciler{
 		Client:            c,
@@ -138,6 +147,7 @@ func NewBackupReconciler(
 		OperatorNamespace: operatorNamespace,
 		MoverImage:        moverImage,
 		Recorder:          recorder,
+		Queue:             q,
 	}
 }
 
@@ -150,10 +160,14 @@ type backupRunContext struct {
 	run           string // the run == parent ClusterBackup name == Backup.name -> restic "run=" tag
 	clusterID     string // location.spec.clusterID -> restic --host
 	tenant        string // resolved tenant -> restic "tenant=" tag (security-load-bearing)
+	repoName      string // BackupRepository name (== location name) -> the exclusive queue's repoKey
 	repoURL       string // BackupRepository.status.repositoryURL -> RESTIC_REPOSITORY
 	dek           string // the platform DEK == the restic repository password
 	s3CredsSecret string // location.spec.s3.credentialsSecretRef.name (operator ns)
-	backoffLimit  int32  // run.backoffLimit -> the mover Job's spec.backoffLimit
+	// retention is the run's per-PVC keep policy (R24); a `restic forget` applying it is enqueued
+	// once, on the repository's exclusive queue, after the Backup finishes successfully.
+	retention    cbv1.RetentionSpec
+	backoffLimit int32 // run.backoffLimit -> the mover Job's spec.backoffLimit
 	// maxConcurrentMovers caps how many mover Jobs may run at once across the whole cascade
 	// (0 == unlimited). Enforced as a best-effort cluster-wide semaphore before a mover is created
 	// (internal/concurrency), so a wide fan-out paces its data movement instead of stampeding.
@@ -263,9 +277,11 @@ func (r *BackupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		run:                 backup.Name,
 		clusterID:           loc.Spec.ClusterID,
 		tenant:              r.tenantFor(ctx, backup.Namespace),
+		repoName:            loc.Name,
 		repoURL:             repo.Status.RepositoryURL,
 		dek:                 dek,
 		s3CredsSecret:       loc.Spec.S3.CredentialsSecretRef.Name,
+		retention:           run.Retention,
 		backoffLimit:        run.BackoffLimit,
 		maxConcurrentMovers: run.MaxConcurrentMovers,
 	}
@@ -298,6 +314,14 @@ func (r *BackupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	// down (best-effort; idempotent).
 	if teardownPVC != "" {
 		r.teardownVolume(ctx, &backup, teardownPVC)
+	}
+	// (12) Retention: once the Backup has reached a successful terminal phase, apply the run's
+	// per-PVC keep policy with one `restic forget` on the repository's exclusive queue. This is
+	// reached at most once per Backup — the already-terminal early-return at the top of Reconcile
+	// bars re-entry once writeStatus has persisted the terminal phase — so no marker is needed to
+	// keep it from re-enqueuing.
+	if backupSucceeded(backup.Status.Phase) {
+		r.maybeEnqueueRetentionForget(ctx, &backup, rc)
 	}
 	return res, nil
 }
@@ -668,6 +692,14 @@ func (r *BackupReconciler) advanceUploading(ctx context.Context, backup *cbv1.Ba
 		vol.Reason = moverFailureReason(result, rerr)
 		r.Recorder.Eventf(backup, corev1.EventTypeWarning, "VolumeFailed",
 			"backup of PVC %s failed: %s", vol.Pvc, vol.Reason)
+		// A BLANK or unparseable termination message (rerr != nil) is the load-bearing signal that
+		// the mover was hard-killed (OOMKilled / SIGKILL) before it could report — so it may have
+		// died holding the repository lock. Clear that stale lock so the next backup is not wedged.
+		// A clean ok=false result (rerr == nil) needs no unlock: restic releases its own lock on any
+		// orderly exit, a handled failure included.
+		if rerr != nil {
+			r.enqueueStaleLockUnlock(ctx, backup, rc)
+		}
 	}
 	return vol.Pvc, nil // request teardown once Reconcile has persisted this terminal result
 }

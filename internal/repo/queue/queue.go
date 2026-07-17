@@ -101,6 +101,11 @@ const (
 	// OpErase performs scoped erasure (ClusterErasure); it mutates the repository
 	// and so shares the single exclusive lane.
 	OpErase OpKind = "erase"
+	// OpUnlock removes a stale repository lock a hard-killed mover (OOMKilled/SIGKILL)
+	// left behind. It shares the exclusive lane so it never runs mid-init/forget/prune,
+	// and restic's own unlock only removes locks past its staleness window, so it is safe
+	// to run opportunistically after a crash.
+	OpUnlock OpKind = "unlock"
 )
 
 // ErrStopped is returned by [Manager.Enqueue] once the Manager has been stopped
