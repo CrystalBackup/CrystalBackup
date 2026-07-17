@@ -28,6 +28,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/utils/clock"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -180,7 +181,12 @@ func main() {
 		metricsServerOptions.KeyName = metricsCertKey
 	}
 
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+	// The REST config is captured (not passed inline to NewManager) so the discovery lister can build
+	// a client-go clientset from it: reading a pod's log is a subresource STREAM the controller-runtime
+	// client does not support, so that one path needs a raw clientset alongside the manager's client.
+	restConfig := ctrl.GetConfigOrDie()
+
+	mgr, err := ctrl.NewManager(restConfig, ctrl.Options{
 		Scheme: scheme,
 		// The operator must never build a cluster-wide Secret cache/informer (tenancy
 		// invariant I3): it holds Secrets GET-only, no list/watch. Bypassing the cache for
@@ -283,6 +289,32 @@ func main() {
 		mgr.GetEventRecorderFor("clusterbackupschedule"),
 	).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Unable to create controller", "controller", "ClusterBackupSchedule")
+		os.Exit(1)
+	}
+
+	// The discovery reconciler projects a shared repository's snapshots back into read-only Backup
+	// CRs so a DR repository is restorable with no pre-existing objects. Its production lister runs a
+	// real `restic snapshots` mover Job and reads the inventory off the pod log via the clientset;
+	// the uncached Secret reader (I3) resolves the cluster KEK + DR S3 credentials for that Job.
+	clientset, err := kubernetes.NewForConfig(restConfig)
+	if err != nil {
+		setupLog.Error(err, "Unable to build the clientset for the discovery pod-log reader")
+		os.Exit(1)
+	}
+	if err := controller.NewDiscoveryReconciler(
+		mgr.GetClient(),
+		mgr.GetScheme(),
+		controller.NewJobSnapshotLister(
+			mgr.GetClient(),
+			clientset,
+			secrets.NewByNameReader(mgr.GetAPIReader()),
+			mgr.GetScheme(),
+			operatorNamespace,
+			moverImage,
+		),
+		mgr.GetEventRecorderFor("discovery"),
+	).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Unable to create controller", "controller", "Discovery")
 		os.Exit(1)
 	}
 

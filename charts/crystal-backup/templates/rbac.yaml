@@ -80,13 +80,17 @@ rules:
     resources: ["namespaces"]
     verbs: ["create", "get", "list", "watch"]
   # Pods: read; pods/exec: create (pre/post-backup hooks, R16 — in-namespace only, by
-  # controller invariant).
+  # controller invariant); pods/log: get (discovery reads a `restic snapshots` mover Job's
+  # inventory off the completed pod's log — the one subresource the cached client cannot stream).
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "watch"]
   - apiGroups: [""]
     resources: ["pods/exec"]
     verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
   # Secrets: get ONLY — no list/watch. The operator reads Secrets by name via a
   # cache-bypassing client, so no cluster-wide Secret cache ever exists (spec/03 §5).
   # Secret CREATION is confined to the crystal-backup-system Role below.

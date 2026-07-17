@@ -92,6 +92,13 @@ func NewDiscoveryReconciler(c client.Client, scheme *runtime.Scheme, lister Snap
 // +kubebuilder:rbac:groups=crystalbackup.io,resources=clusterbackups,verbs=get;list;watch
 // +kubebuilder:rbac:groups=crystalbackup.io,resources=backups,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch
+// The production JobSnapshotLister (discovery_lister.go) runs a `restic snapshots` mover Job and
+// reads the inventory off the completed pod's log, so discovery also needs Jobs, the job-scoped
+// creds Secret, and the pod log (pods/log) — the one subresource the cached client cannot stream.
+// +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=pods/log,verbs=get
 
 // Reconcile inventories the repository and reconciles the projected Backups against it.
 func (r *DiscoveryReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
