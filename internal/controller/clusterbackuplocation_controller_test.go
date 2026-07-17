@@ -228,6 +228,34 @@ var _ = Describe("ClusterBackupLocationReconciler", func() {
 		}, eventuallyTimeout, eventuallyPoll).Should(Succeed())
 	})
 
+	It("flags RetentionIgnored on an Immutable location with a retention policy, not on a Standard one", func() {
+		createKEKSecret("kek-retention", generateAgeIdentity())
+		createS3CredsSecret("s3-retention")
+
+		By("an Immutable location whose spec.retention requests keep* reports RetentionIgnored=True")
+		immutable := newTestLocation("cbl-retention-immutable", "kek-retention", "s3-retention", false)
+		immutable.Spec.Mode = cbv1.LocationModeImmutable
+		immutable.Spec.Retention = cbv1.RetentionSpec{KeepDaily: 7}
+		createTestLocation(immutable)
+		Eventually(func(g Gomega) {
+			var got cbv1.ClusterBackupLocation
+			g.Expect(k8sClient.Get(ctx, client.ObjectKey{Name: immutable.Name}, &got)).To(Succeed())
+			g.Expect(apimeta.IsStatusConditionTrue(got.Status.Conditions, ConditionRetentionIgnored)).To(BeTrue())
+		}, eventuallyTimeout, eventuallyPoll).Should(Succeed())
+
+		By("a Standard location with the same retention reports RetentionIgnored=False (retention is applied)")
+		standard := newTestLocation("cbl-retention-standard", "kek-retention", "s3-retention", false)
+		standard.Spec.Mode = cbv1.LocationModeStandard
+		standard.Spec.Retention = cbv1.RetentionSpec{KeepDaily: 7}
+		createTestLocation(standard)
+		Eventually(func(g Gomega) {
+			var got cbv1.ClusterBackupLocation
+			g.Expect(k8sClient.Get(ctx, client.ObjectKey{Name: standard.Name}, &got)).To(Succeed())
+			// Present AND False (not merely absent): the advisory is actively evaluated and cleared.
+			g.Expect(apimeta.IsStatusConditionFalse(got.Status.Conditions, ConditionRetentionIgnored)).To(BeTrue())
+		}, eventuallyTimeout, eventuallyPoll).Should(Succeed())
+	})
+
 	It("removes the finalizer and deletes the object on delete, without erasing the owned BackupRepository", func() {
 		const name = "cbl-delete"
 		createKEKSecret("kek-delete", generateAgeIdentity())

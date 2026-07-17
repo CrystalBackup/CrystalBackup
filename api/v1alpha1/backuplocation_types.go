@@ -44,6 +44,14 @@ type BackupLocationSpec struct {
 	// discovery projects Backup objects from this repository into this namespace.
 	// +optional
 	Discovery DiscoverySpec `json:"discovery,omitempty"`
+
+	// retention is the snapshot retention policy for this location's repository,
+	// applied per PVC by a `restic forget` after each successful backup. It lives on
+	// the location (not on BackupSchedules) so a single authoritative policy governs
+	// the repository, mirroring ClusterBackupLocation. Standard mode only (reported
+	// ignored on an Immutable location).
+	// +optional
+	Retention RetentionSpec `json:"retention,omitempty"`
 }
 
 // BackupLocationStatus is the observed state of a BackupLocation.

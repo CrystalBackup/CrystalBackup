@@ -122,6 +122,11 @@ spec:
     pruneMaxRepackSize: "50G"
     checkSchedule: "0 5 * * 0"
     checkReadDataSubset: "5%"
+  retention:                         # R24, restic granularity, applied per-PVC; Standard mode only
+    keepLast: 7                      # ONE authoritative policy per location/repository (adr/0009):
+    keepDaily: 14                    #   applied by a `restic forget` after each successful backup,
+    keepMonthly: 12                  #   NOT per-run — several runs share the repo and must not fight
+    keepYearly: 3                    #   over snapshots. Ignored on Immutable (RetentionIgnored cond).
   immutable:                         # Immutable mode only
     objectLockMode: Governance       # Governance | Compliance | AppendOnlyProxy
     rotationPeriod: 720h
@@ -164,11 +169,7 @@ spec:
         exclude: []                            # denylist applied after include (default: system:* names)
         labelSelector: {}                      # optional extra filter
       hooks: { honorAnnotations: true }        # crystalbackup.io/pre-backup-* on pods (R16)
-      retention:                     # R24, restic granularity, applied per-PVC
-        keepLast: 7
-        keepDaily: 14
-        keepMonthly: 12
-        keepYearly: 3
+      # retention is NOT here: it lives on the ClusterBackupLocation — one shared repo, one policy.
       maxConcurrentMovers: 8
       backoffLimit: 2
 status:
@@ -190,7 +191,7 @@ spec:
   scheduleRef: dr-daily              # empty for manual
   locationRef: { name: dr-primary }
   namespaces: { regexp: "^c-.+$", exclude: ["kube-*"] }
-  # (pvcSelector, includeManifests, hooks, retention, ... inherited from the template)
+  # (pvcSelector, includeManifests, hooks, ... inherited from the template; retention lives on the location)
 status:
   phase: PartiallyFailed             # Pending|Running|Completed|PartiallyFailed|Failed
   startTime: "2026-07-12T02:00:03Z"
@@ -324,6 +325,7 @@ spec:
     repositoryPasswordSecretRef: { name: offsite-key } # user-owned restic password (Secret in c-team-x)
     platformAccess: false            # true → operator also holds a key slot (mediated restore/verify)
   discovery: { enabled: true }       # project Backups from this repo into this namespace
+  retention: { keepLast: 5, keepDaily: 10, keepWeekly: 4, keepMonthly: 6 }  # R24; on the location, not the schedule (Standard only)
 status:
   conditions: [...]
   repositoryRef: c-team-x--my-offsite
@@ -356,7 +358,7 @@ spec:
         timeout: 30s
         onError: Fail                # Fail | Continue
     post: []
-  retention: { keepLast: 5, keepDaily: 10, keepWeekly: 4, keepMonthly: 6 }
+  # retention is NOT here: it lives on the BackupLocation — one repo, one policy.
   backoffLimit: 2
 status:
   lastRunName: daily-20260712-010000
@@ -595,7 +597,7 @@ blocking check (single-default uniqueness), is scoped to this project's CRDs, an
 |---|---|---|
 | 1 | **Destructive confirmation (R23)** — enforced as a **conservative superset**: **every** `Restore`/`ClusterRestore` in `Recreate` **or** `Overwrite`, and **every** `ClusterErasure`, requires `spec.confirmation` equal to the target (namespace name for restores; target identity for erasure). Pure static field equality — VAP cannot test whether the target already exists, so it asks unconditionally in those modes (safe over-approximation). | **VAP** (Deny) |
 | 2 | **User isolation** — a user-created `Backup`/`BackupSchedule` must reference a namespaced `BackupLocation`, never a `ClusterBackupLocation`; a `BackupExternalSync`'s `sourceLocationRef` **and** `destinationLocationRef` are both same-namespace `BackupLocation`s (never a `ClusterBackupLocation`); a `Restore` has no target-namespace field. The binding **excludes the operator's ServiceAccount** (`matchConditions`) so the operator's own cluster-origin fan-out `Backup`s are not denied. (Cluster-origin `Backup` read-only to users is **RBAC**, not admission.) | **VAP** (Deny) |
-| 3 | **Retention vs mode** — `Standard`: keep ≥ 1 snapshot (**VAP**). The `Immutable`→`keep*`-ignored warning needs the referenced *location's* mode (cross-object), so it is **not** admission: the schedule controller emits a `Warning` + `RetentionIgnored` condition. | **VAP** (Deny) + **controller** (advisory) |
+| 3 | **Retention (on the location)** — `spec.retention` lives on the `ClusterBackupLocation`/`BackupLocation`, not on schedules/runs: one shared repository has one authoritative policy (adr/0009), so per-run policies cannot fight over the same snapshots. A keep-less policy is a safe no-op (the controller runs no `forget`, so it can never drop every snapshot — no VAP needed). On an `Immutable` location keep* is ignored (object-lock governs expiry); the location knows its own mode, so this is a **controller-side advisory** (`RetentionIgnored` condition on the location) — a same-object check that could be tightened to CEL later if a hard reject is ever wanted. | **controller** (advisory) |
 | 4 | **Single default `ClusterBackupLocation`** — cross-object uniqueness is not expressible in per-object CEL → the operator checks it (**webhook** + `MultipleDefaults` status condition on races). | **webhook** |
 | 5 | `credentialsSecretRef`/`repositoryPasswordSecretRef` on a `BackupLocation` are same-namespace (name-only). | **VAP** (Deny) |
 | 6 | `Immutable` mode forbids `maintenance.pruneSchedule`. | **VAP** (Deny) |

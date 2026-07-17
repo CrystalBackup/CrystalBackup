@@ -63,10 +63,6 @@ type BackupScheduleSpec struct {
 	// +optional
 	Hooks HooksSpec `json:"hooks,omitempty"`
 
-	// retention is applied per PVC (R24).
-	// +optional
-	Retention RetentionSpec `json:"retention,omitempty"`
-
 	// backoffLimit for mover Jobs.
 	// +optional
 	BackoffLimit int32 `json:"backoffLimit,omitempty"`

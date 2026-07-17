@@ -26,7 +26,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/record"
@@ -58,11 +57,6 @@ const (
 	// defaults both to 10; this guards objects that predate the default so a 0 never means "delete
 	// all history").
 	defaultRunsHistoryLimit = 10
-
-	// ConditionRetentionIgnored is the advisory condition set when a schedule requests retention
-	// against an Immutable location, where keep* is ignored (spec rule 3 / adr/0010: controller-side
-	// advisory, not admission — it needs the referenced location's mode).
-	ConditionRetentionIgnored = "RetentionIgnored"
 )
 
 // ClusterBackupScheduleReconciler reconciles a ClusterBackupSchedule: a CronJob-style stamp that
@@ -118,9 +112,6 @@ func (r *ClusterBackupScheduleReconciler) Reconcile(ctx context.Context, req ctr
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("list runs for schedule %s: %w", sched.Name, err)
 	}
-
-	// Advisory (independent of firing): keep* against an Immutable location is ignored.
-	r.reconcileRetentionAdvisory(ctx, &sched)
 
 	if sched.Spec.Paused {
 		return r.writeStatus(ctx, &sched, originalStatus, "Paused", metav1.ConditionFalse, "Paused",
@@ -285,34 +276,6 @@ func (r *ClusterBackupScheduleReconciler) trimHistory(ctx context.Context, sched
 	}
 }
 
-// reconcileRetentionAdvisory sets (or clears) the RetentionIgnored advisory: retention keep* is
-// requested but the referenced location is Immutable, where restic keep* has no effect (object-lock
-// governs expiry). Emits the Warning Event only on the transition into the condition, so a steady
-// misconfiguration is not re-logged every reconcile. Mutates status in memory; the single status
-// write later persists it.
-func (r *ClusterBackupScheduleReconciler) reconcileRetentionAdvisory(ctx context.Context, sched *cbv1.ClusterBackupSchedule) {
-	ignored := false
-	if retentionRequested(sched.Spec.Template.Spec.Retention) {
-		var loc cbv1.ClusterBackupLocation
-		if err := r.Get(ctx, client.ObjectKey{Name: sched.Spec.Template.Spec.LocationRef.Name}, &loc); err == nil {
-			ignored = loc.Spec.Mode == cbv1.LocationModeImmutable
-		}
-	}
-
-	if !ignored {
-		apimeta.RemoveStatusCondition(&sched.Status.Conditions, ConditionRetentionIgnored)
-		return
-	}
-	wasIgnored := apimeta.IsStatusConditionTrue(sched.Status.Conditions, ConditionRetentionIgnored)
-	status.SetCondition(&sched.Status.Conditions, ConditionRetentionIgnored, metav1.ConditionTrue,
-		"ImmutableLocation",
-		"retention keep* is ignored on an Immutable location (object-lock governs expiry)", sched.Generation)
-	if !wasIgnored {
-		r.Recorder.Event(sched, corev1.EventTypeWarning, "RetentionIgnored",
-			"spec.template.spec.retention is set but the location is Immutable; keep* is ignored")
-	}
-}
-
 // applyRunSummary refreshes the run-derived status fields (lastRunName, lastSuccessTime) from the
 // snapshot of runs plus any run just stamped, and sets nextScheduleTime.
 func (r *ClusterBackupScheduleReconciler) applyRunSummary(sched *cbv1.ClusterBackupSchedule, runs []cbv1.ClusterBackup, stampedName string, nextFire time.Time) {
@@ -407,12 +370,6 @@ func concurrencyPolicyOf(sched *cbv1.ClusterBackupSchedule) cbv1.ConcurrencyPoli
 		return cbv1.ConcurrencyPolicy("Forbid")
 	}
 	return sched.Spec.ConcurrencyPolicy
-}
-
-// retentionRequested reports whether any keep* is set.
-func retentionRequested(r cbv1.RetentionSpec) bool {
-	return r.KeepLast > 0 || r.KeepHourly > 0 || r.KeepDaily > 0 ||
-		r.KeepWeekly > 0 || r.KeepMonthly > 0 || r.KeepYearly > 0
 }
 
 // historyLimit resolves a run-history limit, falling back to the default when unset so a 0 never

@@ -80,6 +80,11 @@ const (
 	// ConditionReady rolls up Reachable, EncryptionValid, MultipleDefaults and repository
 	// provisioning into the single top-level verdict.
 	ConditionReady = "Ready"
+	// ConditionRetentionIgnored is the advisory set when spec.retention requests a keep policy but
+	// the location is Immutable, where restic keep*/forget is inert (object-lock governs expiry).
+	// It is controller-side (it needs the location's own mode) and never fail-fast: an Immutable
+	// location with an ignored retention is still Ready.
+	ConditionRetentionIgnored = "RetentionIgnored"
 )
 
 const (
@@ -230,6 +235,11 @@ func (r *ClusterBackupLocationReconciler) Reconcile(ctx context.Context, req ctr
 		return ctrl.Result{}, fmt.Errorf("evaluate MultipleDefaults for ClusterBackupLocation %s: %w", loc.Name, err)
 	}
 
+	// Retention advisory (static, non-fail-fast): flag a spec.retention that an Immutable location
+	// will ignore. Evaluated before the fail-fast checks so it is recorded even on an otherwise
+	// degraded location — it depends only on spec.mode + spec.retention.
+	r.reconcileRetentionAdvisory(&loc)
+
 	// Encryption and reachability are fail-fast: on either failure, stop here, persist what
 	// we know, and retry soon — provisioning a BackupRepository for a location whose
 	// encryption or storage is not yet trustworthy would be premature.
@@ -343,6 +353,35 @@ func (r *ClusterBackupLocationReconciler) evaluateMultipleDefaults(ctx context.C
 			"this is the only default ClusterBackupLocation", loc.Generation)
 		return false, nil
 	}
+}
+
+// reconcileRetentionAdvisory sets ConditionRetentionIgnored on the location: True when
+// spec.retention requests a keep policy but the location is Immutable (object-lock governs expiry,
+// so restic keep*/forget is inert), False otherwise. This is the authoritative home of the advisory
+// now that retention lives on the location, not on schedules/runs: the location knows its own mode,
+// so no cross-object lookup is needed. The Warning Event fires only on the transition INTO the
+// ignored state, so a steady misconfiguration is not re-logged every reconcile.
+func (r *ClusterBackupLocationReconciler) reconcileRetentionAdvisory(loc *cbv1.ClusterBackupLocation) {
+	if loc.Spec.Mode == cbv1.LocationModeImmutable && retentionRequested(loc.Spec.Retention) {
+		wasIgnored := status.IsConditionTrue(loc.Status.Conditions, ConditionRetentionIgnored)
+		status.SetCondition(&loc.Status.Conditions, ConditionRetentionIgnored, metav1.ConditionTrue,
+			"ImmutableLocation",
+			"spec.retention keep* is ignored on an Immutable location (object-lock governs expiry)", loc.Generation)
+		if !wasIgnored {
+			r.Recorder.Event(loc, corev1.EventTypeWarning, "RetentionIgnored",
+				"spec.retention is set but the location is Immutable; keep* is ignored until object-lock expiry")
+		}
+		return
+	}
+	status.SetCondition(&loc.Status.Conditions, ConditionRetentionIgnored, metav1.ConditionFalse,
+		"RetentionActive",
+		"retention (if any) is applied by a restic forget after each successful backup", loc.Generation)
+}
+
+// retentionRequested reports whether a RetentionSpec sets any keep* field.
+func retentionRequested(r cbv1.RetentionSpec) bool {
+	return r.KeepLast > 0 || r.KeepHourly > 0 || r.KeepDaily > 0 ||
+		r.KeepWeekly > 0 || r.KeepMonthly > 0 || r.KeepYearly > 0
 }
 
 // validateEncryption reads the cluster KEK Secret named by

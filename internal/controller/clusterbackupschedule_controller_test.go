@@ -302,26 +302,6 @@ var _ = Describe("ClusterBackupScheduleReconciler", func() {
 		}, 2*time.Second, 500*time.Millisecond).Should(Succeed())
 	})
 
-	It("sets the RetentionIgnored advisory for retention against an Immutable location", func() {
-		const name = "cbs-retention"
-		const loc = "cbs-loc-immutable"
-		l := newTestLocation(loc, "kek-ret", "s3-ret", false)
-		l.Spec.Mode = cbv1.LocationModeImmutable
-		createTestLocation(l)
-
-		s := newSchedule(name, "0 0 * * *", loc)
-		s.Spec.Template.Spec.Retention = cbv1.RetentionSpec{KeepDaily: 7}
-		createSchedule(s)
-		pokeSchedule(name)
-
-		By("the RetentionIgnored condition is set True")
-		Eventually(func(g Gomega) {
-			c := status.FindCondition(getScheduleG(g, name).Status.Conditions, ConditionRetentionIgnored)
-			g.Expect(c).NotTo(BeNil())
-			g.Expect(c.Status).To(Equal(metav1.ConditionTrue))
-		}, eventuallyTimeout, eventuallyPoll).Should(Succeed())
-	})
-
 	It("reports InvalidSchedule for an unparseable cron expression", func() {
 		const name = "cbs-invalid"
 		createSchedule(newSchedule(name, "definitely not a cron", "cbs-loc-invalid"))

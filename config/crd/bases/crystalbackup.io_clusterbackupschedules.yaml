@@ -431,28 +431,6 @@ spec:
                             description: matchLabels selects PVCs by label.
                             type: object
                         type: object
-                      retention:
-                        description: retention is applied per PVC (R24).
-                        properties:
-                          keepDaily:
-                            format: int32
-                            type: integer
-                          keepHourly:
-                            format: int32
-                            type: integer
-                          keepLast:
-                            format: int32
-                            type: integer
-                          keepMonthly:
-                            format: int32
-                            type: integer
-                          keepWeekly:
-                            format: int32
-                            type: integer
-                          keepYearly:
-                            format: int32
-                            type: integer
-                        type: object
                     required:
                     - locationRef
                     type: object

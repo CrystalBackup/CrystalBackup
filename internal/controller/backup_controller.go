@@ -164,9 +164,14 @@ type backupRunContext struct {
 	repoURL       string // BackupRepository.status.repositoryURL -> RESTIC_REPOSITORY
 	dek           string // the platform DEK == the restic repository password
 	s3CredsSecret string // location.spec.s3.credentialsSecretRef.name (operator ns)
-	// retention is the run's per-PVC keep policy (R24); a `restic forget` applying it is enqueued
-	// once, on the repository's exclusive queue, after the Backup finishes successfully.
-	retention    cbv1.RetentionSpec
+	// retention is the LOCATION's per-PVC keep policy (R24), read from the resolved
+	// ClusterBackupLocation — not from the run — because one shared repository has one
+	// authoritative policy (adr/0009). A `restic forget` applying it is enqueued once, on the
+	// repository's exclusive queue, after the Backup finishes successfully (Standard mode only).
+	retention cbv1.RetentionSpec
+	// mode is the location's LocationMode; a retention forget runs in Standard mode only (an
+	// Immutable location forbids prune/forget until object-lock expiry).
+	mode         cbv1.LocationMode
 	backoffLimit int32 // run.backoffLimit -> the mover Job's spec.backoffLimit
 	// maxConcurrentMovers caps how many mover Jobs may run at once across the whole cascade
 	// (0 == unlimited). Enforced as a best-effort cluster-wide semaphore before a mover is created
@@ -281,7 +286,8 @@ func (r *BackupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		repoURL:             repo.Status.RepositoryURL,
 		dek:                 dek,
 		s3CredsSecret:       loc.Spec.S3.CredentialsSecretRef.Name,
-		retention:           run.Retention,
+		retention:           loc.Spec.Retention,
+		mode:                loc.Spec.Mode,
 		backoffLimit:        run.BackoffLimit,
 		maxConcurrentMovers: run.MaxConcurrentMovers,
 	}
@@ -315,11 +321,11 @@ func (r *BackupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	if teardownPVC != "" {
 		r.teardownVolume(ctx, &backup, teardownPVC)
 	}
-	// (12) Retention: once the Backup has reached a successful terminal phase, apply the run's
-	// per-PVC keep policy with one `restic forget` on the repository's exclusive queue. This is
-	// reached at most once per Backup — the already-terminal early-return at the top of Reconcile
-	// bars re-entry once writeStatus has persisted the terminal phase — so no marker is needed to
-	// keep it from re-enqueuing.
+	// (12) Retention: once the Backup has reached a successful terminal phase, apply the LOCATION's
+	// per-PVC keep policy with one `restic forget` on the repository's exclusive queue (skipped on
+	// an Immutable location). This is reached at most once per Backup — the already-terminal
+	// early-return at the top of Reconcile bars re-entry once writeStatus has persisted the terminal
+	// phase — so no marker is needed to keep it from re-enqueuing.
 	if backupSucceeded(backup.Status.Phase) {
 		r.maybeEnqueueRetentionForget(ctx, &backup, rc)
 	}

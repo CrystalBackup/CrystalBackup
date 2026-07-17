@@ -465,9 +465,6 @@ type ClusterBackupRunSpec struct {
 	// hooks are exec hooks around snapshotting (R16).
 	// +optional
 	Hooks HooksSpec `json:"hooks,omitempty"`
-	// retention is applied per PVC (R24).
-	// +optional
-	Retention RetentionSpec `json:"retention,omitempty"`
 	// maxConcurrentMovers caps parallel mover Jobs.
 	// +optional
 	MaxConcurrentMovers int32 `json:"maxConcurrentMovers,omitempty"`

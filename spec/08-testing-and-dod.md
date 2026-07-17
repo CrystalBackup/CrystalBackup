@@ -36,11 +36,11 @@ Pure Go, table-driven, `-race` always on. Key suites:
   controller-managed EndpointSlices are excluded (E4).
   Golden files are the review surface for rule changes — updating one requires the
   corresponding rule change in the same PR.
-- **Retention policy math (R24).** Given a synthetic snapshot timeline and a
-  `spec.retention` (`keepLast/Hourly/Daily/Weekly/Monthly/Yearly`, `keepWithinDuration`),
-  assert the exact `restic forget` argument vector produced (per-PVC,
-  `--group-by host,paths`), and assert the webhook rule "retention must keep ≥ 1 snapshot"
-  on degenerate inputs (all zeros, empty).
+- **Retention policy math (R24).** Given a location's `spec.retention`
+  (`keepLast/Hourly/Daily/Weekly/Monthly/Yearly`), assert the exact `restic forget` argument
+  vector produced (per-PVC, `--group-by host,paths`), and assert that a keep-less policy (all
+  zeros / empty) yields NO command (`ForgetCommand ok=false`) — the controller then runs no
+  forget, so retention can never drop every snapshot, with no admission rule needed.
 - **Server-side tenancy derivation — property-based (R2/R14 cornerstone).** The two
   server-derived tenancy handles — the mediated-restore **tag filter** `namespace=<ns>`
   and the snapshot **path** `/data/<ns>/<pvc>` — are computed from **only**
@@ -110,11 +110,11 @@ inventory. Scenarios:
   - Exactly one `ClusterBackupLocation` with `default: true` (second one denied by the
     **dynamic webhook** — the one cross-object rule; its `failurePolicy: Ignore` path and the
     operator's `MultipleDefaults` reconcile backstop are both covered).
-  - Invalid cron denied; retention keeping 0 snapshots denied on a **Standard**-mode
-    location (empty retention admitted on Immutable). `keep*` on a schedule targeting an
-    **Immutable** location is a **controller-side** advisory (`RetentionIgnored` condition +
-    Warning event), **not** admission — it needs the location's mode (cross-object), so it is
-    asserted in an envtest **controller** test, not a VAP test.
+  - Invalid cron denied. Retention lives on the location (not on schedules/runs), so a keep policy
+    on an **Immutable** location is a **controller-side** advisory (`RetentionIgnored` condition +
+    Warning event) set by the ClusterBackupLocation controller — a same-object check asserted in an
+    envtest **controller** test, not a VAP test. A keep-less policy needs no admission rule at all:
+    the controller simply runs no forget.
   - `mode: Immutable` + `maintenance.pruneSchedule` denied (CEL);
     `credentialsSecretRef`/`repositoryPasswordSecretRef` on a `BackupLocation` must be
     same-namespace; `namespaces` selector must set **exactly one** positive form +

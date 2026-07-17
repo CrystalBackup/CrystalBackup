@@ -89,13 +89,18 @@ func maintenanceJobLabels() map[string]string {
 	}
 }
 
-// maybeEnqueueRetentionForget applies the run's per-PVC retention policy after a Backup finishes
-// successfully, by enqueuing ONE `restic forget` on the repository's exclusive queue. A keep-less
-// policy (ForgetCommand ok=false) is skipped — a forget with no --keep-* would drop every snapshot,
-// so the caller must never run it. Retention converges across runs: a forget lost to a crash, a
-// queue shutdown or a keep-less run is reapplied (idempotently, forget being a pure function of the
-// keep policy) by the next run's forget.
+// maybeEnqueueRetentionForget applies the LOCATION's per-PVC retention policy after a Backup
+// finishes successfully, by enqueuing ONE `restic forget` on the repository's exclusive queue. The
+// policy is read from the resolved location (rc.retention) — one shared repository, one authoritative
+// policy (adr/0009), never the run. It is skipped in two cases: an Immutable location (rc.mode),
+// where object-lock forbids prune/forget until lock expiry, and a keep-less policy (ForgetCommand
+// ok=false), where a forget with no --keep-* would drop every snapshot. Retention converges across
+// runs: a forget lost to a crash, a queue shutdown or an Immutable/keep-less run is reapplied
+// (idempotently, forget being a pure function of the keep policy) by the next run's forget.
 func (r *BackupReconciler) maybeEnqueueRetentionForget(ctx context.Context, backup *cbv1.Backup, rc *backupRunContext) {
+	if rc.mode == cbv1.LocationModeImmutable {
+		return // object-lock repositories cannot prune/forget until lock expiry.
+	}
 	argv, ok := restic.ForgetCommand(rc.retention)
 	if !ok {
 		return // no keep policy set: never run a forget that would delete everything.
