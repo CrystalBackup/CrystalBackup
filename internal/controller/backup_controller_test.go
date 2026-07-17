@@ -370,7 +370,7 @@ var _ = Describe("BackupReconciler", func() {
 		}, initTimeout, initPoll).Should(Succeed())
 	})
 
-	It("marks a volume on unsupported storage Skipped and rolls the Backup up to PartiallyCompleted", func() {
+	It("marks a volume on unsupported storage Skipped without degrading the Backup below Completed", func() {
 		const (
 			location = "bk-skip"
 			ns       = "bk-skip-ns"
@@ -399,10 +399,10 @@ var _ = Describe("BackupReconciler", func() {
 			OK: true, Operation: string(mover.OpBackup), SnapshotID: "snap-ok", SizeBytes: 10, AddedBytes: 5,
 		})
 
-		By("one Skipped + one Completed rolls up to PartiallyCompleted, never Failed")
+		By("one Skipped + one Completed rolls up to Completed (Skipped is neutral), never PartiallyCompleted or Failed")
 		Eventually(func(g Gomega) {
 			b := getBackupG(g, ns, run)
-			g.Expect(b.Status.Phase).To(Equal("PartiallyCompleted"))
+			g.Expect(b.Status.Phase).To(Equal("Completed"))
 			g.Expect(string(volumeByPVC(b, okPVC).Phase)).To(Equal("Completed"))
 			g.Expect(string(volumeByPVC(b, skipPVC).Phase)).To(Equal("Skipped"))
 			g.Expect(apimeta.IsStatusConditionTrue(b.Status.Conditions, ConditionReady)).To(BeTrue())

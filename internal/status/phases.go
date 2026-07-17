@@ -97,20 +97,24 @@ const (
 //	SnapshottingHooks is NEVER produced here — it is a controller-driven
 //	pre-snapshot phase, not a per-volume state.
 //
-//	Otherwise every volume is terminal (Completed, Skipped, or Failed). With
-//	c/s/f the counts of Completed/Skipped/Failed and n the total:
-//	  n == 0                    -> Completed  (a manifests-only backup with no
-//	                                           volumes; the caller may override,
-//	                                           e.g. if the manifests snapshot
-//	                                           itself failed)
-//	  f == 0 && s == 0          -> Completed  (all volumes completed)
-//	  f == 0 && s > 0 && c > 0  -> PartiallyCompleted (some skipped, none failed)
-//	  f == 0 && s > 0 && c == 0 -> Completed  (all volumes skipped; nothing
-//	                                           failed, so this is not a partial
-//	                                           success — there was simply nothing
-//	                                           snapshottable)
-//	  f > 0 && (c > 0 || s > 0) -> PartiallyFailed (some data made it)
-//	  f > 0 && c == 0 && s == 0 -> Failed     (every volume failed)
+//	Otherwise every volume is terminal (Completed, Skipped, or Failed). Skipped
+//	volumes are NEUTRAL — an unsnapshottable PVC (reason CSISnapshotUnsupported)
+//	is a deterministic property of the environment, not a backup degradation — so
+//	only the Completed (c) and Failed (f) counts decide the outcome; the Skipped
+//	count is ignored entirely:
+//	  n == 0          -> Completed  (a manifests-only backup with no volumes; the
+//	                                 caller may override, e.g. manifests failed)
+//	  f == 0          -> Completed  (nothing failed; any Skipped siblings do NOT
+//	                                 lower this to PartiallyCompleted, else a
+//	                                 namespace holding one unsnapshottable PVC
+//	                                 would alarm on every single run, forever)
+//	  f > 0 && c > 0  -> PartiallyFailed (real data made it alongside failures)
+//	  f > 0 && c == 0 -> Failed     (every non-skipped volume failed; a Skipped
+//	                                 volume saved no data, so no partial success)
+//
+//	PartiallyCompleted is retained as a constant for M3 (a FAILED manifests
+//	snapshot beside healthy volumes will produce it), but this roll-up never
+//	produces it from a Skipped volume.
 //
 // Inputs are CRD-enum-validated in practice; any unrecognized phase string is
 // neither in-progress nor counted, which conservatively leaves it out of the
@@ -118,7 +122,7 @@ const (
 func RollUpVolumePhases(volumes []v1alpha1.VolumeStatus) BackupPhase {
 	n := len(volumes)
 
-	var c, s, f int
+	var c, f int
 	var anyUploading, anySnapshotting, anyPending bool
 	for _, v := range volumes {
 		switch v.Phase {
@@ -130,10 +134,11 @@ func RollUpVolumePhases(volumes []v1alpha1.VolumeStatus) BackupPhase {
 			anyPending = true
 		case VolumePhaseCompleted:
 			c++
-		case VolumePhaseSkipped:
-			s++
 		case VolumePhaseFailed:
 			f++
+		case VolumePhaseSkipped:
+			// Neutral: a Skipped volume (CSISnapshotUnsupported) is deliberately not
+			// tallied — it counts neither as success nor failure in the roll-up.
 		}
 	}
 
@@ -150,20 +155,29 @@ func RollUpVolumePhases(volumes []v1alpha1.VolumeStatus) BackupPhase {
 		}
 	}
 
-	// All volumes are terminal from here on.
+	// All volumes are terminal from here on. Skipped volumes are NEUTRAL: a PVC on
+	// a CSI with no VolumeSnapshotClass (Skipped, reason CSISnapshotUnsupported) is
+	// a deterministic property of the environment, not a backup degradation, so it
+	// counts neither for nor against the outcome — only the Completed (c) and Failed
+	// (f) tallies decide it.
 	if n == 0 {
+		// A manifests-only backup; the caller may override (e.g. manifests failed).
 		return BackupPhaseCompleted
 	}
 	switch {
-	case f == 0 && s == 0:
+	case f == 0:
+		// Nothing failed: full success. Any Skipped siblings never lower this to
+		// PartiallyCompleted — otherwise a namespace holding one unsnapshottable PVC
+		// would alarm on every run, forever. Skipped stays visible only per-volume
+		// (status.volumes[].phase + reason). PartiallyCompleted is kept for M3 (a
+		// FAILED manifests snapshot beside healthy volumes), never a skip.
 		return BackupPhaseCompleted
-	case f == 0 && s > 0 && c > 0:
-		return BackupPhasePartiallyCompleted
-	case f == 0 && s > 0 && c == 0:
-		return BackupPhaseCompleted
-	case f > 0 && (c > 0 || s > 0):
+	case c > 0:
+		// At least one real data snapshot landed alongside the failure(s).
 		return BackupPhasePartiallyFailed
-	default: // f > 0 && c == 0 && s == 0
+	default: // f > 0 && c == 0
+		// Every non-skipped volume failed; a Skipped volume saved no data, so there
+		// is no partial success to report.
 		return BackupPhaseFailed
 	}
 }

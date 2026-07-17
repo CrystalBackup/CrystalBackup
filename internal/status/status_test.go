@@ -102,13 +102,17 @@ func TestRollUpVolumePhases(t *testing.T) {
 		{"single-completed", vols(VolumePhaseCompleted), BackupPhaseCompleted},
 		{"all-completed", vols(VolumePhaseCompleted, VolumePhaseCompleted), BackupPhaseCompleted},
 
-		// Terminal: skipped variants (nothing failed).
+		// Terminal: Skipped is NEUTRAL — it never lowers the outcome. With nothing
+		// failed (f == 0) the result is always Completed, whatever the skipped/completed mix.
 		{"all-skipped", vols(VolumePhaseSkipped, VolumePhaseSkipped), BackupPhaseCompleted},
-		{"mixed-skipped-completed", vols(VolumePhaseCompleted, VolumePhaseSkipped), BackupPhasePartiallyCompleted},
+		{"mixed-skipped-completed", vols(VolumePhaseCompleted, VolumePhaseSkipped), BackupPhaseCompleted},
 
-		// Terminal: failures present.
+		// Terminal: failures present. A Skipped volume saved no data, so it neither
+		// softens a failure (failed+skipped stays Failed) nor is needed for a partial
+		// (only a real Completed volume beside a failure yields PartiallyFailed).
 		{"mixed-failed-completed", vols(VolumePhaseCompleted, VolumePhaseFailed), BackupPhasePartiallyFailed},
-		{"mixed-failed-skipped", vols(VolumePhaseSkipped, VolumePhaseFailed), BackupPhasePartiallyFailed},
+		{"failed-completed-skipped", vols(VolumePhaseFailed, VolumePhaseCompleted, VolumePhaseSkipped), BackupPhasePartiallyFailed},
+		{"mixed-failed-skipped", vols(VolumePhaseSkipped, VolumePhaseFailed), BackupPhaseFailed},
 		{"single-failed", vols(VolumePhaseFailed), BackupPhaseFailed},
 		{"all-failed", vols(VolumePhaseFailed, VolumePhaseFailed), BackupPhaseFailed},
 

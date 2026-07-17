@@ -57,8 +57,12 @@ least-data-movement path per PVC, defaulting to `csi-generic`.**
 - **A CSI that cannot snapshot → the volume is skipped**, never silently: the operator checks
   snapshot capability (a `VolumeSnapshotClass` for the driver / advertised capability) before
   exposing, and on failure sets `Backup.status.volumes[].phase: Skipped` with
-  `reason: CSISnapshotUnsupported`, emits an Event and logs it; the `Backup` ends
-  `PartiallyCompleted` (manifests are still captured), never a false success or a hard failure.
+  `reason: CSISnapshotUnsupported`, emits an Event and logs it. The Skipped volume is **neutral**
+  in the phase roll-up: it stays visibly `Skipped` (never dressed up as a successful backup), yet it
+  never degrades the aggregate phase — the `Backup` ends `Completed` (manifests still captured),
+  never a hard failure. An unsnapshottable PVC is a deterministic property of the environment, so
+  degrading every such run to `PartiallyCompleted` would be permanent alarm noise; per-volume
+  visibility (phase + reason) is the right signal instead.
 
 Selection is by StorageClass provisioner (operator config maps provisioner→exposer, extensible;
 an explicit per-location/annotation override is the escape hatch).

@@ -257,8 +257,10 @@ Full suite (nightly + release tags), in addition:
 17. **Exposer selection & unsupported-CSI skip (R11, [adr/0003](adr/0003-snapshot-exposure-csi-generic-first.md))**:
     with a StorageClass whose provisioner advertises **no** `VolumeSnapshotClass`, a PVC is
     **skipped** — `Backup.status.volumes[].phase: Skipped`, `reason: CSISnapshotUnsupported`, an
-    Event and log line — the `Backup` ends `PartiallyCompleted` (never a false success or hard
-    failure) and its manifests are still captured. Ceph exposers are covered on the staging run (§5).
+    Event and log line. The Skipped volume is **neutral** in the roll-up: it is never dressed up as
+    a successful backup (it stays `Skipped` with its reason), yet it never drags the `Backup` down
+    either — the `Backup` ends `Completed` (manifests still captured), never a hard failure. Ceph
+    exposers are covered on the staging run (§5).
 18. **External sync — snapshot copy, re-keyed, siloed (R28, [adr/0013](adr/0013-external-backup-sync.md))**:
     give `tenant-a` a **second** `BackupLocation` (`my-offsite-2`, its **own** bucket + **own**
     password) and a `BackupExternalSync` (`sourceLocationRef: my-offsite`,
