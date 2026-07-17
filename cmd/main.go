@@ -262,6 +262,16 @@ func main() {
 		setupLog.Error(err, "Unable to create controller", "controller", "Backup")
 		os.Exit(1)
 	}
+
+	if err := controller.NewClusterBackupReconciler(
+		mgr.GetClient(),
+		mgr.GetScheme(),
+		operatorNamespace,
+		mgr.GetEventRecorderFor("clusterbackup"),
+	).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Unable to create controller", "controller", "ClusterBackup")
+		os.Exit(1)
+	}
 	// +kubebuilder:scaffold:builder
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {

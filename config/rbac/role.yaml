@@ -78,6 +78,7 @@ rules:
   - backuprepositories/status
   - backups/status
   - clusterbackuplocations/status
+  - clusterbackups/status
   verbs:
   - get
   - patch
@@ -86,8 +87,8 @@ rules:
   - crystalbackup.io
   resources:
   - backups
-  - clusterbackuplocations
   verbs:
+  - create
   - get
   - list
   - patch
@@ -96,10 +97,13 @@ rules:
 - apiGroups:
   - crystalbackup.io
   resources:
+  - clusterbackuplocations
   - clusterbackups
   verbs:
   - get
   - list
+  - patch
+  - update
   - watch
 - apiGroups:
   - snapshot.storage.k8s.io

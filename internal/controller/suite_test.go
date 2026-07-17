@@ -164,6 +164,16 @@ var _ = BeforeSuite(func() {
 		mgr.GetEventRecorderFor("backup"),
 	).SetupWithManager(mgr)).To(Succeed())
 
+	// The ClusterBackup fan-out reconciler. It creates child Backups (which the registered Backup
+	// reconciler above then drives via the stub exposer), so a ClusterBackup spec exercises the
+	// whole cascade end-to-end in envtest.
+	Expect(NewClusterBackupReconciler(
+		mgr.GetClient(),
+		mgr.GetScheme(),
+		suiteOperatorNamespace,
+		mgr.GetEventRecorderFor("clusterbackup"),
+	).SetupWithManager(mgr)).To(Succeed())
+
 	go func() {
 		defer GinkgoRecover()
 		Expect(mgr.Start(ctx)).To(Succeed())
