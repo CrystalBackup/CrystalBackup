@@ -663,3 +663,32 @@ func TestGroupByNamespaceRun(t *testing.T) {
 		t.Errorf("buckets hold %d snapshots, want %d (nothing dropped or duplicated)", total, len(snaps))
 	}
 }
+
+func TestSnapshotsArgs(t *testing.T) {
+	if got, want := SnapshotsArgs(), []string{"snapshots", "--json", "--tag", TagBase}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("SnapshotsArgs() = %v, want %v", got, want)
+	}
+}
+
+func TestUnlockArgs(t *testing.T) {
+	if got, want := UnlockArgs(), []string{"unlock"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("UnlockArgs() = %v, want %v", got, want)
+	}
+}
+
+func TestForgetCommand(t *testing.T) {
+	argv, ok := ForgetCommand(v1alpha1.RetentionSpec{KeepDaily: 7})
+	if !ok {
+		t.Fatal("ForgetCommand with a keep policy must return ok=true")
+	}
+	if len(argv) == 0 || argv[0] != "forget" {
+		t.Fatalf("ForgetCommand argv must start with the forget subcommand, got %v", argv)
+	}
+	if !reflect.DeepEqual(argv[1:], ForgetArgs(v1alpha1.RetentionSpec{KeepDaily: 7})) {
+		t.Fatalf("ForgetCommand flags must equal ForgetArgs, got %v", argv)
+	}
+	// An empty (keep-less) policy must NOT produce a command: a keep-less forget drops everything.
+	if _, ok := ForgetCommand(v1alpha1.RetentionSpec{}); ok {
+		t.Fatal("ForgetCommand with no keep policy must return ok=false")
+	}
+}

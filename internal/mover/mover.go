@@ -24,8 +24,8 @@ limitations under the License.
 //
 // One image, two shapes. A mover is the crystal-mover binary (MoverBinaryPath) run from
 // the CrystalBackup image as `crystal-mover --operation <op> -- <restic argv>`. A
-// MAINTENANCE job (OpInit/OpForget/OpPrune/OpCheck) mounts only the repository
-// credentials and scratch; a DATA job (OpBackup) additionally mounts the source PVC
+// MAINTENANCE job (OpInit/OpForget/OpPrune/OpCheck/OpSnapshots/OpUnlock) mounts only the
+// repository credentials and scratch; a DATA job (OpBackup) additionally mounts the source PVC
 // read-only at the very path restic will store the snapshot under, so the snapshot's
 // on-disk path equals its restic identity (see internal/restic). BuildJob assembles both
 // from one JobRequest, differing only by whether JobRequest.PVC is set.
@@ -60,10 +60,15 @@ package mover
 // canonical coupling here is only Operation -> the --operation flag.
 type Operation string
 
-// The five operations a mover can run. OpBackup is the sole DATA operation (it reads a
-// PVC); the other four are MAINTENANCE operations against the repository alone. Splitting
-// them as named constants (rather than free strings at call sites) keeps the --operation
-// value and the MoverResult.Operation echo from ever disagreeing.
+// The operations a mover can run. OpBackup is the sole DATA operation (it reads a PVC); the
+// others are MAINTENANCE operations against the repository alone. Splitting them as named
+// constants (rather than free strings at call sites) keeps the --operation value and the
+// MoverResult.Operation echo from ever disagreeing.
+//
+// OpSnapshots is the one operation whose PAYLOAD is its stdout, not its MoverResult: discovery
+// reads the `restic snapshots --json` array back off the pod log (the maintenance stdout wiring
+// tees stdout to the pod log), because a snapshot inventory is far larger than the 4096-byte
+// termination message. Its MoverResult still reports OK/failure like any maintenance op.
 const (
 	// OpBackup snapshots one PVC into the repository; the only shape that mounts data.
 	OpBackup Operation = "backup"
@@ -75,6 +80,12 @@ const (
 	OpPrune Operation = "prune"
 	// OpCheck verifies repository structural integrity.
 	OpCheck Operation = "check"
+	// OpSnapshots lists the repository's snapshots (`restic snapshots --json`); discovery reads
+	// the JSON off the pod log. Maintenance shape (no PVC).
+	OpSnapshots Operation = "snapshots"
+	// OpUnlock removes stale repository locks (`restic unlock`) so an OOM-killed mover's lock
+	// cannot wedge the next run. Maintenance shape (no PVC).
+	OpUnlock Operation = "unlock"
 )
 
 // Filesystem layout inside the mover container. These paths are a two-sided contract: the

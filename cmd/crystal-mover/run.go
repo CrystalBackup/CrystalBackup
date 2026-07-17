@@ -43,7 +43,8 @@ const (
 // compile-time prompt to decide how the shim should treat it, rather than a silent default.
 func knownOperation(op string) bool {
 	switch mover.Operation(op) {
-	case mover.OpBackup, mover.OpInit, mover.OpForget, mover.OpPrune, mover.OpCheck:
+	case mover.OpBackup, mover.OpInit, mover.OpForget, mover.OpPrune, mover.OpCheck,
+		mover.OpSnapshots, mover.OpUnlock:
 		return true
 	default:
 		return false

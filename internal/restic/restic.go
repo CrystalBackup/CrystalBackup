@@ -293,3 +293,32 @@ func ForgetArgs(r v1alpha1.RetentionSpec) []string {
 	keep("yearly", r.KeepYearly)
 	return args
 }
+
+// SnapshotsArgs is the complete restic argv (subcommand first) discovery inventories the
+// repository with: `snapshots --json --tag crystalbackup`. The --tag filter scopes the listing
+// to CrystalBackup's own snapshots (never a foreign tool's), and --json makes the output the
+// machine-readable array ParseSnapshots decodes. Unlike ForgetArgs (retention flags a caller
+// prepends "forget" to), this is a whole command with no dynamic parts.
+func SnapshotsArgs() []string {
+	return []string{"snapshots", "--json", "--tag", TagBase}
+}
+
+// ForgetCommand is the complete restic argv for the per-PVC retention forget: the "forget"
+// subcommand followed by ForgetArgs(r). It is a convenience so callers do not re-prepend the
+// subcommand (and cannot forget to). It returns ok=false when r requests NO keep (ForgetArgs
+// degenerates to the bare prefix): a keep-less forget would drop every snapshot, so the caller
+// must skip running it — never forget an empty policy.
+func ForgetCommand(r v1alpha1.RetentionSpec) (argv []string, ok bool) {
+	flags := ForgetArgs(r)
+	if len(flags) <= 4 { // only the --tag/--group-by prefix ⇒ no keep policy set.
+		return nil, false
+	}
+	return append([]string{"forget"}, flags...), true
+}
+
+// UnlockArgs is the complete restic argv that clears stale repository locks: `unlock`. restic
+// removes only locks past its staleness window by default, so this is safe to run
+// opportunistically after a mover crash without disturbing a genuinely in-progress operation.
+func UnlockArgs() []string {
+	return []string{"unlock"}
+}
