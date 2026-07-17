@@ -14,6 +14,25 @@ rules:
 - apiGroups:
   - ""
   resources:
+  - namespaces
+  - pods
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - persistentvolumeclaims
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resources:
   - secrets
   verbs:
   - create
@@ -49,6 +68,7 @@ rules:
   - crystalbackup.io
   resources:
   - backuprepositories/finalizers
+  - backups/finalizers
   - clusterbackuplocations/finalizers
   verbs:
   - update
@@ -56,6 +76,7 @@ rules:
   - crystalbackup.io
   resources:
   - backuprepositories/status
+  - backups/status
   - clusterbackuplocations/status
   verbs:
   - get
@@ -64,10 +85,48 @@ rules:
 - apiGroups:
   - crystalbackup.io
   resources:
+  - backups
   - clusterbackuplocations
   verbs:
   - get
   - list
   - patch
   - update
+  - watch
+- apiGroups:
+  - crystalbackup.io
+  resources:
+  - clusterbackups
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - snapshot.storage.k8s.io
+  resources:
+  - volumesnapshotclasses
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - snapshot.storage.k8s.io
+  resources:
+  - volumesnapshotcontents
+  - volumesnapshots
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - storage.k8s.io
+  resources:
+  - storageclasses
+  verbs:
+  - get
+  - list
   - watch

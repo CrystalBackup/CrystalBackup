@@ -69,6 +69,42 @@ const (
 	// ClusterBackupSchedule's namespaces.matchLabels (spec/02-api.md example:
 	// `crystalbackup.io/protect: "true"`). The operator reads it; it never sets it.
 	LabelProtect = Domain + "/protect"
+
+	// LabelPVC records the source PersistentVolumeClaim a per-PVC exposure (its dynamic
+	// VolumeSnapshot, the static VS/VSC re-bind pair, and the temp clone PVC) and its mover
+	// Job belong to. Together with LabelClusterBackup and LabelNamespace it is the selector
+	// the orphan reaper (M1 task #22) and the crucible leak-check
+	// (test/crucible/tests/m1_reliability_test.go) use to find and tear down the objects a
+	// Backup leaves behind, so it is stamped on EVERY exposure object and mover Job.
+	LabelPVC = Domain + "/pvc"
+)
+
+// Standard Kubernetes "managed-by" label stamped on the operator-owned objects a backup
+// creates (the per-PVC exposure objects and the mover Jobs), so the orphan reaper can select
+// every CrystalBackup-managed workload object with one label. It intentionally reuses the
+// recommended app.kubernetes.io/managed-by key already stamped on the wrapped-DEK Secrets
+// (internal/keys) and the repository-init Jobs (the BackupRepository controller), and is
+// deliberately NOT app.kubernetes.io/name=crystal-backup — that is the operator pod's own
+// label, which the crucible's operator-restart test selects on; a mover pod carrying it would
+// be swept up by that test.
+const (
+	// LabelManagedBy is the app.kubernetes.io/managed-by key.
+	LabelManagedBy = "app.kubernetes.io/managed-by"
+	// ManagedByValue is the LabelManagedBy value shared by every operator-managed object.
+	ManagedByValue = "crystal-backup"
+)
+
+// Annotations the controllers honour on the objects they read.
+const (
+	// AnnotationProjected marks a Backup as a read-only materialized view PROJECTED from the
+	// repository by discovery (M1 task #21), not a unit of execution. The Backup controller
+	// treats a Backup carrying this annotation (=AnnotationProjectedValue) as inert: it never
+	// snapshots or moves data for it, because a projection merely mirrors snapshots that
+	// already exist. It is the forward-compat guard that keeps the execution controller and
+	// the discovery projector from fighting over the same Backup kind.
+	AnnotationProjected = Domain + "/projected"
+	// AnnotationProjectedValue is the truthy value discovery sets AnnotationProjected to.
+	AnnotationProjectedValue = "true"
 )
 
 // Origin label values (see LabelOrigin).
@@ -91,6 +127,12 @@ const (
 
 	// FinalizerRepository guards a BackupRepository delete.
 	FinalizerRepository = Domain + "/repository"
+
+	// FinalizerBackup guards a Backup delete so the Backup controller can, before the object
+	// is removed, tear down any live per-PVC exposure and mover Job it created (the "effective
+	// cancel / no leak on delete" guarantee). It is distinct from FinalizerRepository: a Backup
+	// is a namespaced unit of execution, not the cluster-scoped repository.
+	FinalizerBackup = Domain + "/backup"
 )
 
 // RunTimestampLayout is the Go reference-time layout for the timestamp segment of a

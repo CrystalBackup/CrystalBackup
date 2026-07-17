@@ -149,6 +149,21 @@ var _ = BeforeSuite(func() {
 		mgr.GetEventRecorderFor("backuprepository"),
 	).SetupWithManager(mgr)).To(Succeed())
 
+	// The Backup reconciler under test. Its exposer seam is a STUB (stubExposerRegistry, defined
+	// in backup_controller_test.go) so the suite needs neither the external snapshot CRDs nor a
+	// CSI driver: the stub creates a real temp clone PVC in the operator namespace (so the mover
+	// Job has something to mount) and reports Ready immediately. envtest has no kubelet, so specs
+	// SIMULATE each mover Job's outcome exactly as the BackupRepository specs do.
+	Expect(NewBackupReconciler(
+		mgr.GetClient(),
+		mgr.GetScheme(),
+		secrets.NewByNameReader(mgr.GetAPIReader()),
+		&stubExposerRegistry{client: mgr.GetClient(), operatorNamespace: suiteOperatorNamespace},
+		suiteOperatorNamespace,
+		suiteMoverImage,
+		mgr.GetEventRecorderFor("backup"),
+	).SetupWithManager(mgr)).To(Succeed())
+
 	go func() {
 		defer GinkgoRecover()
 		Expect(mgr.Start(ctx)).To(Succeed())

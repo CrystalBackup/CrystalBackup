@@ -281,36 +281,51 @@ func m1HasCrystalLabel(labels map[string]string) bool {
 func m1AssertNoResidualSnapshotObjects(namespaces ...string) {
 	GinkgoHelper()
 
-	nsSet := make(map[string]bool, len(namespaces))
-	for _, ns := range namespaces {
-		nsSet[ns] = true
+	// Exposure objects live in the tenant namespaces (the dynamic origin VolumeSnapshot) AND —
+	// after ADR 0003's static VS/VSC re-bind — in the operator namespace (the static VolumeSnapshot
+	// and the temp clone PVC the mover mounts). Check BOTH. Every exposure object carries a
+	// crystalbackup.io/* label (internal/controller exposureLabels), which is the leak selector the
+	// orphan reaper also uses.
+	checkNS := append(append([]string{}, namespaces...), operatorNS)
+	checkSet := make(map[string]bool, len(checkNS))
+	for _, ns := range checkNS {
+		checkSet[ns] = true
 	}
 
 	Eventually(func(g Gomega) {
-		// (1) No VolumeSnapshots left in any of the tenant namespaces.
-		for _, ns := range namespaces {
+		// (1) No CrystalBackup-labelled VolumeSnapshots left in any checked namespace: neither the
+		//     dynamic origin VS (tenant ns) nor the static re-bound VS (operator ns).
+		for _, ns := range checkNS {
 			vs := &unstructured.UnstructuredList{}
 			vs.SetGroupVersionKind(schema.GroupVersionKind{
 				Group: "snapshot.storage.k8s.io", Version: "v1", Kind: "VolumeSnapshotList",
 			})
 			g.Expect(k8s.List(ctx, vs, client.InNamespace(ns))).To(Succeed())
-			g.Expect(vs.Items).To(BeEmpty(), "residual VolumeSnapshot(s) left in namespace %s", ns)
+			for i := range vs.Items {
+				g.Expect(m1HasCrystalLabel(vs.Items[i].GetLabels())).To(BeFalse(),
+					"residual VolumeSnapshot %s/%s (labels %v)", ns, vs.Items[i].GetName(), vs.Items[i].GetLabels())
+			}
 		}
 
-		// (2) No VolumeSnapshotContents (cluster-scoped) still pointing back at them.
+		// (2) No CrystalBackup VolumeSnapshotContents (cluster-scoped) left: neither our static VSC
+		//     (which carries our labels and references the OPERATOR namespace, so a namespace filter
+		//     alone would miss it) nor a dynamic origin VSC still pointing back at a checked namespace.
 		vsc := &unstructured.UnstructuredList{}
 		vsc.SetGroupVersionKind(schema.GroupVersionKind{
 			Group: "snapshot.storage.k8s.io", Version: "v1", Kind: "VolumeSnapshotContentList",
 		})
 		g.Expect(k8s.List(ctx, vsc)).To(Succeed())
 		for i := range vsc.Items {
+			labelled := m1HasCrystalLabel(vsc.Items[i].GetLabels())
 			refNS, _, _ := unstructured.NestedString(vsc.Items[i].Object, "spec", "volumeSnapshotRef", "namespace")
-			g.Expect(nsSet[refNS]).To(BeFalse(),
-				"residual VolumeSnapshotContent %s still references namespace %s", vsc.Items[i].GetName(), refNS)
+			g.Expect(labelled || checkSet[refNS]).To(BeFalse(),
+				"residual VolumeSnapshotContent %s (labels %v, refNS %s)",
+				vsc.Items[i].GetName(), vsc.Items[i].GetLabels(), refNS)
 		}
 
-		// (3) No temporary clone PVCs (a crystalbackup.io/* label, but not a seed PVC).
-		for _, ns := range namespaces {
+		// (3) No temporary clone PVCs (a crystalbackup.io/* label, but not a seed PVC) in any checked
+		//     namespace — including the operator namespace, where the mover-mounted clone lives.
+		for _, ns := range checkNS {
 			var pvcs corev1.PersistentVolumeClaimList
 			g.Expect(k8s.List(ctx, &pvcs, client.InNamespace(ns))).To(Succeed())
 			for i := range pvcs.Items {

@@ -36,14 +36,21 @@ func TestConstants(t *testing.T) {
 		{"LabelNamespace", LabelNamespace, "crystalbackup.io/namespace"},
 		{"LabelTenant", LabelTenant, "crystalbackup.io/tenant"},
 		{"LabelProtect", LabelProtect, "crystalbackup.io/protect"},
+		{"LabelPVC", LabelPVC, "crystalbackup.io/pvc"},
+
+		{"LabelManagedBy", LabelManagedBy, "app.kubernetes.io/managed-by"},
+		{"ManagedByValue", ManagedByValue, "crystal-backup"},
 
 		{"OriginCluster", OriginCluster, "cluster"},
 		{"OriginNamespace", OriginNamespace, "namespace"},
 
 		{"AnnotationPreBackupPrefix", AnnotationPreBackupPrefix, "crystalbackup.io/pre-backup-"},
+		{"AnnotationProjected", AnnotationProjected, "crystalbackup.io/projected"},
+		{"AnnotationProjectedValue", AnnotationProjectedValue, "true"},
 
 		{"FinalizerLocation", FinalizerLocation, "crystalbackup.io/location"},
 		{"FinalizerRepository", FinalizerRepository, "crystalbackup.io/repository"},
+		{"FinalizerBackup", FinalizerBackup, "crystalbackup.io/backup"},
 
 		{"RunTimestampLayout", RunTimestampLayout, "20060102-150405"},
 	}

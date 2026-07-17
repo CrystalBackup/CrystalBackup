@@ -41,6 +41,7 @@ import (
 	"github.com/CrystalBackup/CrystalBackup/internal/apiconst"
 	"github.com/CrystalBackup/CrystalBackup/internal/client/secrets"
 	"github.com/CrystalBackup/CrystalBackup/internal/controller"
+	"github.com/CrystalBackup/CrystalBackup/internal/exposer"
 	"github.com/CrystalBackup/CrystalBackup/internal/repo/queue"
 	// +kubebuilder:scaffold:imports
 )
@@ -243,6 +244,22 @@ func main() {
 		mgr.GetEventRecorderFor("backuprepository"),
 	).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Unable to create controller", "controller", "BackupRepository")
+		os.Exit(1)
+	}
+	if err := controller.NewBackupReconciler(
+		mgr.GetClient(),
+		mgr.GetScheme(),
+		// Same uncached Secret reader (the cluster KEK + DR S3 credentials); never GetClient().
+		secrets.NewByNameReader(mgr.GetAPIReader()),
+		// The production exposer registry, over the cached client (it reads StorageClasses and
+		// VolumeSnapshotClasses, and creates the exposure objects), scoped to the operator
+		// namespace where the static re-bind pair and temp clone PVCs land.
+		exposer.NewRegistry(mgr.GetClient(), operatorNamespace),
+		operatorNamespace,
+		moverImage,
+		mgr.GetEventRecorderFor("backup"),
+	).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Unable to create controller", "controller", "Backup")
 		os.Exit(1)
 	}
 	// +kubebuilder:scaffold:builder
