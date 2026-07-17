@@ -93,9 +93,13 @@ const (
 // from them. They are pinned here so the producer and the consumer can never disagree on
 // where the password lives or where the cache goes.
 const (
-	// MoverBinaryPath is the shim entrypoint, baked into the CrystalBackup image. It is
-	// the container command; args carry --operation and the restic argv.
-	MoverBinaryPath = "/usr/local/bin/crystal-mover"
+	// MoverBinaryPath is the shim entrypoint, baked into the CrystalBackup image. It is the
+	// container command BuildJob pins (args carry --operation and the restic argv), so it MUST
+	// equal where the image actually installs the binary: build/melange/mover.yaml copies
+	// crystal-mover to /usr/bin/crystal-mover and build/apko/mover.yaml's entrypoint is the same
+	// path (alongside restic at /usr/bin/restic). A mismatch here fails every mover Job with
+	// "no such file", so this constant and those two build files are one contract.
+	MoverBinaryPath = "/usr/bin/crystal-mover"
 
 	// SecretMountPath is where the per-Job Secret (restic password + AWS creds) is mounted
 	// READ-ONLY. Each Secret data key becomes a file of the same name under this directory.

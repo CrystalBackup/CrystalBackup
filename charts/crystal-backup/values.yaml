@@ -46,6 +46,23 @@ image:
   # -- Image pull policy.
   pullPolicy: IfNotPresent
 
+# The mover image carries the crystal-mover shim + the pinned restic engine
+# (build/apko/mover.yaml, build/melange/{mover,restic}.yaml). The operator passes it to EVERY
+# mover Job (repository init, per-PVC backup, discovery snapshots, retention forget, stale-lock
+# unlock) via --mover-image, so it is REQUIRED for real backups; envtest tolerates it unset only
+# because it never runs a Job. Same supply chain as the operator image (apko/Wolfi/glibc, adr/0012).
+mover:
+  image:
+    # -- Mover image repository on GHCR.
+    repository: ghcr.io/crystalbackup/mover
+    # -- Mover image digest — the immutable pin (mover Jobs reference the image BY DIGEST, never a
+    # floating tag). PLACEHOLDER for scaffolding; the release pipeline substitutes the real index
+    # digest at publish time.
+    digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    # -- Fallback tag, used ONLY when `mover.image.digest` is empty (e.g. local dev). Defaults to
+    # .Chart.AppVersion when left blank.
+    tag: ""
+
 # -- Pull secrets for private registries. GHCR images are public — none needed.
 imagePullSecrets: []
 

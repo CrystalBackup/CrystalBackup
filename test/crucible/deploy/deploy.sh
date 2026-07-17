@@ -28,6 +28,11 @@ CEPH_HEALTH_TIMEOUT="${CEPH_HEALTH_TIMEOUT:-1800}" # seconds
 # the deployment then stays Unavailable — the m0 tests know and tolerate that).
 OPERATOR_IMAGE_DIGEST="${OPERATOR_IMAGE_DIGEST:-}"
 OPERATOR_IMAGE_TAG="${OPERATOR_IMAGE_TAG:-}"
+# Mover image override — the image every mover Job runs (crystal-mover + restic). REQUIRED for the
+# M1 data path (repository init, backup, discovery snapshots, retention forget, unlock): a run that
+# leaves this empty falls back to the chart's placeholder and every mover Job ImagePullBackOffs.
+MOVER_IMAGE_DIGEST="${MOVER_IMAGE_DIGEST:-}"
+MOVER_IMAGE_TAG="${MOVER_IMAGE_TAG:-}"
 
 export KUBECONFIG="${KUBECONFIG:-${CRUCIBLE_DIR}/artifacts/kubeconfig}"
 
@@ -124,7 +129,9 @@ helm upgrade --install crystal-backup "${REPO_ROOT}/charts/crystal-backup" \
   --namespace crystal-backup-system \
   --set namespace.create=false \
   --set image.digest="${OPERATOR_IMAGE_DIGEST}" \
-  --set image.tag="${OPERATOR_IMAGE_TAG}"
+  --set image.tag="${OPERATOR_IMAGE_TAG}" \
+  --set mover.image.digest="${MOVER_IMAGE_DIGEST}" \
+  --set mover.image.tag="${MOVER_IMAGE_TAG}"
 
 echo
 echo "Deployed. Storage classes:"

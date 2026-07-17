@@ -47,9 +47,22 @@ spec:
             - --health-probe-bind-address=:{{ .Values.health.port }}
             - --metrics-bind-address=:{{ .Values.metrics.port }}
             - --leader-elect
+            # The image every mover Job runs (crystal-mover + restic). Required for real backups;
+            # digest-pinned via the moverImage helper. The operator reads no default for this — a
+            # cluster that never sets it can init/inspect CRs but cannot move data.
+            - --mover-image={{ include "crystal-backup.moverImage" . }}
             {{- with .Values.extraArgs }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
+          env:
+            # The operator's own namespace, surfaced via the downward API. --operator-namespace
+            # defaults to $POD_NAMESPACE (see cmd/main.go): the one namespace holding the cluster
+            # KEK, the wrapped DEKs, the DR S3 credentials, every per-Job creds Secret and all
+            # mover Jobs (tenancy invariants I3/I5).
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
           ports:
             - name: health
               containerPort: {{ .Values.health.port }}

@@ -83,3 +83,18 @@ back to a tag (default: appVersion) only when no digest is configured.
 {{- printf "%s:%s" $repo (.Values.image.tag | default .Chart.AppVersion) -}}
 {{- end -}}
 {{- end -}}
+
+{{/*
+The fully-qualified mover image reference the operator passes to every mover Job via
+--mover-image. Digest-pinned when mover.image.digest is set (production references the mover BY
+DIGEST), else repository:tag with the tag defaulting to the chart appVersion. Mirrors
+crystal-backup.image so the operator and mover images share one resolution rule.
+*/}}
+{{- define "crystal-backup.moverImage" -}}
+{{- $repo := .Values.mover.image.repository -}}
+{{- if .Values.mover.image.digest -}}
+{{- printf "%s@%s" $repo .Values.mover.image.digest -}}
+{{- else -}}
+{{- printf "%s:%s" $repo (.Values.mover.image.tag | default .Chart.AppVersion) -}}
+{{- end -}}
+{{- end -}}
