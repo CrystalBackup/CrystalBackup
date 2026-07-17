@@ -8,6 +8,12 @@
 #   helm install crystal-backup ./charts/crystal-backup -n crystal-backup-system --create-namespace
 #
 # (the chart also creates the namespace itself by default; see `namespace.create`).
+#
+# This chart NEVER generates or creates any Secret — not the cluster KEK, not a DEK, not
+# credentials. The cluster KEK is the admin's root of trust: generate it out-of-band (e.g.
+# `age-keygen`), escrow it OUTSIDE the cluster, and provision it as the `cluster-kek` Secret
+# yourself before creating a ClusterBackupLocation. A key generated inside the cluster would be
+# lost with the cluster, making every backup unrecoverable (spec/03-security-and-tenancy.md).
 
 # -- Override the generated resource base name (default "crystal-backup"). The
 # cluster-scoped RBAC object names derive from this base (crystal-backup-operator,

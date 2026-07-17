@@ -170,6 +170,34 @@ var _ = Describe("ClusterBackupLocationReconciler", func() {
 		}, 2*time.Second, 200*time.Millisecond).Should(Succeed())
 	})
 
+	It("never generates a cluster KEK itself: an absent KEK degrades the location and creates no Secret", func() {
+		const name = "cbl-nokek"
+		const kekName = "kek-absent" // deliberately NEVER created — the admin must provide it
+		createS3CredsSecret("s3-nokek")
+		createTestLocation(newTestLocation(name, kekName, "s3-nokek", false))
+
+		By("the location reports EncryptionValid=False/KEKMissing and is not Ready")
+		Eventually(func(g Gomega) {
+			var got cbv1.ClusterBackupLocation
+			g.Expect(k8sClient.Get(ctx, client.ObjectKey{Name: name}, &got)).To(Succeed())
+			c := apimeta.FindStatusCondition(got.Status.Conditions, ConditionEncryptionValid)
+			g.Expect(c).NotTo(BeNil())
+			g.Expect(c.Status).To(Equal(metav1.ConditionFalse))
+			g.Expect(c.Reason).To(Equal("KEKMissing"))
+			g.Expect(apimeta.IsStatusConditionTrue(got.Status.Conditions, ConditionReady)).To(BeFalse())
+		}, eventuallyTimeout, eventuallyPoll).Should(Succeed())
+
+		// The load-bearing guard: the operator must NEVER mint the referenced KEK Secret. The cluster
+		// KEK is the admin's root of trust — a silently generated key would vanish with the cluster and
+		// leave every backup unrecoverable (spec/03). It stays absent; the location just waits.
+		By("the operator never creates the referenced KEK Secret itself")
+		Consistently(func(g Gomega) {
+			var sec corev1.Secret
+			err := k8sClient.Get(ctx, client.ObjectKey{Namespace: suiteOperatorNamespace, Name: kekName}, &sec)
+			g.Expect(apierrors.IsNotFound(err)).To(BeTrue(), "operator must not generate a cluster KEK Secret")
+		}, 2*time.Second, 200*time.Millisecond).Should(Succeed())
+	})
+
 	It("flags MultipleDefaults for two default locations and clears it for a lone default", func() {
 		const nameA = "cbl-default-a"
 		const nameB = "cbl-default-b"
