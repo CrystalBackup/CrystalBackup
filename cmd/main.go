@@ -25,6 +25,7 @@ import (
 	// to ensure that exec-entrypoint and run can make use of them.
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -32,6 +33,7 @@ import (
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/utils/clock"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
@@ -188,6 +190,22 @@ func main() {
 
 	mgr, err := ctrl.NewManager(restConfig, ctrl.Options{
 		Scheme: scheme,
+		// The mover / repository-init / maintenance Jobs the operator creates all live in ITS
+		// OWN namespace (invariant I5, spec/03 §5): every Job Get/List/Create/Delete in the
+		// controllers is scoped to operatorNamespace, and the Helm chart grants batch/jobs
+		// through a namespaced Role, NOT the ClusterRole. Scope the Job informer to that one
+		// namespace so the manager cache asks only for a namespaced Job list/watch (which the
+		// Role allows) instead of the cluster-wide list/watch the default cache would demand —
+		// that exact mismatch CrashLoops the operator against the least-privilege chart RBAC.
+		// Every other watched kind keeps the default cluster-wide cache; their ClusterRole
+		// grants already cover it.
+		Cache: cache.Options{
+			ByObject: map[client.Object]cache.ByObject{
+				&batchv1.Job{}: {
+					Namespaces: map[string]cache.Config{operatorNamespace: {}},
+				},
+			},
+		},
 		// The operator must never build a cluster-wide Secret cache/informer (tenancy
 		// invariant I3): it holds Secrets GET-only, no list/watch. Bypassing the cache for
 		// Secrets makes every manager-client Get(Secret) a direct API read, so the

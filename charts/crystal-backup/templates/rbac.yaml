@@ -75,6 +75,13 @@ rules:
   - apiGroups: [""]
     resources: ["persistentvolumes"]
     verbs: ["get", "list", "watch"]
+  # StorageClasses: read-only. The exposer resolves a PVC's CSI provisioner from its
+  # StorageClass (adr/0003) to pick the snapshot strategy and match a VolumeSnapshotClass.
+  # StorageClass is cluster-scoped, so the manager's informer for it is unavoidably
+  # cluster-wide — hence a ClusterRole grant, not a namespaced one.
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get", "list", "watch"]
   # Namespaces: read + create (ClusterRestore targets).
   - apiGroups: [""]
     resources: ["namespaces"]

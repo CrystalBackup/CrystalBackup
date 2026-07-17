@@ -195,9 +195,14 @@ per-namespace user roles (02-api RBAC section):
 - 8 verbs on `volumesnapshots` and `volumesnapshotcontents`; read on
   `volumesnapshotclasses` (`snapshot.storage.k8s.io`).
 - `persistentvolumeclaims`: 8 verbs (temp PVCs; restored PVCs in user namespaces);
-  `persistentvolumes`: read. `namespaces`: read + `create` (ClusterRestore targets).
+  `persistentvolumes`: read; `storageclasses` (`storage.k8s.io`): read — the exposer
+  resolves a PVC's CSI provisioner from its StorageClass (adr/0003). `namespaces`: read +
+  `create` (ClusterRestore targets).
 - `batch/jobs`: 8 verbs **via a namespaced Role in `crystal-backup-system` only** — the
-  operator cannot create workloads anywhere else.
+  operator cannot create workloads anywhere else. The manager's Job informer is
+  namespace-scoped to `crystal-backup-system` to match: the default cluster-wide Job cache
+  would otherwise demand a cluster-wide `jobs` `list`/`watch` this Role deliberately
+  withholds, CrashLooping the operator (cache sync fails) against its own least-privilege RBAC.
 - `pods`: read; `pods/exec`: `create` (hooks, R16). Controller invariant: a hook only ever
   execs into pods **in the same namespace as the `BackupSchedule` that declares it** —
   users can only make the platform run commands they can already run themselves (the
