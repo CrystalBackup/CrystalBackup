@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"testing"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2" //nolint:revive,staticcheck
 	. "github.com/onsi/gomega"    //nolint:revive,staticcheck
@@ -30,6 +31,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
+	clocktesting "k8s.io/utils/clock/testing"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
@@ -72,6 +74,10 @@ var (
 	// Stop()ped in AfterSuite so its worker goroutines are joined — a leaked worker would keep
 	// the suite process alive and mask a shutdown bug.
 	repoQueue *queue.Manager
+	// scheduleClock is the fake clock the ClusterBackupSchedule reconciler reads "now" from, so the
+	// schedule specs drive cron activations deterministically. A BeforeEach in the schedule Describe
+	// resets it to real-time-ish before each spec (it is shared process-wide).
+	scheduleClock *clocktesting.FakeClock
 )
 
 // suiteMoverImage is the placeholder mover image the envtest BackupRepository reconciler builds
@@ -172,6 +178,17 @@ var _ = BeforeSuite(func() {
 		mgr.GetScheme(),
 		suiteOperatorNamespace,
 		mgr.GetEventRecorderFor("clusterbackup"),
+	).SetupWithManager(mgr)).To(Succeed())
+
+	// The ClusterBackupSchedule reconciler, reading "now" from a fake clock the schedule specs
+	// advance to drive cron activations deterministically (envtest requeues run on real time, so
+	// the specs poke the schedule to re-reconcile after moving the clock).
+	scheduleClock = clocktesting.NewFakeClock(time.Now())
+	Expect(NewClusterBackupScheduleReconciler(
+		mgr.GetClient(),
+		mgr.GetScheme(),
+		scheduleClock,
+		mgr.GetEventRecorderFor("clusterbackupschedule"),
 	).SetupWithManager(mgr)).To(Succeed())
 
 	go func() {

@@ -29,6 +29,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/utils/clock"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
@@ -270,6 +271,16 @@ func main() {
 		mgr.GetEventRecorderFor("clusterbackup"),
 	).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Unable to create controller", "controller", "ClusterBackup")
+		os.Exit(1)
+	}
+
+	if err := controller.NewClusterBackupScheduleReconciler(
+		mgr.GetClient(),
+		mgr.GetScheme(),
+		clock.RealClock{},
+		mgr.GetEventRecorderFor("clusterbackupschedule"),
+	).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Unable to create controller", "controller", "ClusterBackupSchedule")
 		os.Exit(1)
 	}
 	// +kubebuilder:scaffold:builder
