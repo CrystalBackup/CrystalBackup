@@ -301,6 +301,7 @@ type ResourceSelectorItem struct {
 }
 
 // VolumeSelectorItem selects PVCs (and optionally files within them) to restore.
+// When several items match the same PVC, the FIRST matching item wins (02-api.md).
 type VolumeSelectorItem struct {
 	// names of PVCs (whole-PVC restore).
 	// +optional
@@ -311,18 +312,24 @@ type VolumeSelectorItem struct {
 	// exclude is a list of file globs to skip.
 	// +optional
 	Exclude []string `json:"exclude,omitempty"`
-	// targetPath overrides the restore root within the PVC.
+	// targetPath overrides the restore root within the PVC (empty or "/" ⇒ the PVC root).
+	// It is resolved inside the PVC and must not contain ".." segments.
 	// +optional
+	// +kubebuilder:validation:XValidation:rule="!self.split('/').exists(p, p == '..')",message="targetPath must not contain '..' segments"
 	TargetPath string `json:"targetPath,omitempty"`
 }
 
 // RestoreSource identifies a Backup in the same namespace (self-service Restore).
+// Exactly one of backup and time must be set (CEL); origin only refines time.
+// +kubebuilder:validation:XValidation:rule="has(self.backup) != has(self.time)",message="exactly one of source.backup and source.time must be set"
+// +kubebuilder:validation:XValidation:rule="!has(self.origin) || has(self.time)",message="source.origin is only valid together with source.time"
 type RestoreSource struct {
 	// backup names a Backup in this namespace.
 	// +optional
 	Backup string `json:"backup,omitempty"`
 	// time selects "latest" or an RFC3339 instant instead of a named backup.
 	// +optional
+	// +kubebuilder:validation:XValidation:rule="self == 'latest' || self.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}')",message="time must be \"latest\" or an RFC3339 timestamp"
 	Time string `json:"time,omitempty"`
 	// origin disambiguates when using time.
 	// +optional
@@ -331,6 +338,8 @@ type RestoreSource struct {
 }
 
 // ClusterRestoreSource identifies a repository coordinate for an admin restore.
+// Exactly one of backup and time must be set (CEL).
+// +kubebuilder:validation:XValidation:rule="has(self.backup) != has(self.time)",message="exactly one of source.backup and source.time must be set"
 type ClusterRestoreSource struct {
 	// locationRef is the source ClusterBackupLocation.
 	// +required
@@ -344,6 +353,7 @@ type ClusterRestoreSource struct {
 	Backup string `json:"backup,omitempty"`
 	// time selects "latest" or an RFC3339 instant.
 	// +optional
+	// +kubebuilder:validation:XValidation:rule="self == 'latest' || self.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}')",message="time must be \"latest\" or an RFC3339 timestamp"
 	Time string `json:"time,omitempty"`
 }
 

@@ -146,13 +146,16 @@ Rules:
   location degraded with `EncryptionValid=False`/`KEKMissing`; it is never silently created). A key
   born inside the cluster would die with it, taking every backup with it, so the KEK is the one
   secret whose custody the platform must own out-of-band (platform DR, R22).
-- **Wrapped-DEK availability for bare-cluster DR**: the wrapped DEK (`crystal-dek-<location>`) today
-  lives only in `crystal-backup-system`, so a *total* cluster loss would strand it even with the KEK
-  safe in escrow — the KEK alone cannot open the repository without the wrapped DEK to unwrap. Full
-  "restore with no surviving cluster" therefore also escrows the wrapped DEK **in the bucket**
-  (useless without the KEK): DR then = pull the wrapped DEK from S3 + the escrowed KEK → unwrap →
-  open restic. Wiring that bucket escrow is DR-bootstrap work (M2); until then the wrapped DEK Secret
-  is part of what an operator must back up out-of-band.
+- **Wrapped-DEK availability for bare-cluster DR** (implemented in M2): the wrapped DEK
+  (`crystal-dek-<location>`) lives in `crystal-backup-system`, and a *total* cluster loss would
+  strand it even with the KEK safe in escrow — the KEK alone cannot open the repository without
+  the wrapped DEK to unwrap. The operator therefore **escrows the wrapped DEK in the bucket**
+  (useless without the KEK) at `<prefix>/<clusterID>.crystal-meta/wrapped-dek.age` — a sibling
+  of the repository prefix, invisible to restic and outside the movers' repo-scoped credential
+  prefix (I4) — rewritten on every DEK ensure/re-wrap. Bare-cluster DR = escrowed KEK + this
+  object: creating a `ClusterBackupLocation` whose DEK Secret is missing recovers it from the
+  escrow object, then discovery inventories the repo
+  ([02-api.md § Repository layout](02-api.md#repository-layout--snapshot-identity)).
 - **KEK rotation** = decrypt-and-rewrap the `crystal-dek-<location>` Secret under the new
   KEK version (`kek.version` field). No data movement, no restic involvement; the `Wrapper`
   seam ([adr/0004](adr/0004-encryption-key-management.md)) lets a KMS-backed KEK replace age

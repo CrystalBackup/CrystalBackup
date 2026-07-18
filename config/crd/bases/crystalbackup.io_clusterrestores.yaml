@@ -162,10 +162,16 @@ spec:
                   time:
                     description: time selects "latest" or an RFC3339 instant.
                     type: string
+                    x-kubernetes-validations:
+                    - message: time must be "latest" or an RFC3339 timestamp
+                      rule: self == 'latest' || self.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}')
                 required:
                 - locationRef
                 - namespace
                 type: object
+                x-kubernetes-validations:
+                - message: exactly one of source.backup and source.time must be set
+                  rule: has(self.backup) != has(self.time)
               target:
                 description: target is where the restore lands.
                 properties:
@@ -189,8 +195,9 @@ spec:
               volumes:
                 description: volumes selects PVCs (and optionally files) to restore.
                 items:
-                  description: VolumeSelectorItem selects PVCs (and optionally files
-                    within them) to restore.
+                  description: |-
+                    VolumeSelectorItem selects PVCs (and optionally files within them) to restore.
+                    When several items match the same PVC, the FIRST matching item wins (02-api.md).
                   properties:
                     exclude:
                       description: exclude is a list of file globs to skip.
@@ -209,9 +216,13 @@ spec:
                         type: string
                       type: array
                     targetPath:
-                      description: targetPath overrides the restore root within the
-                        PVC.
+                      description: |-
+                        targetPath overrides the restore root within the PVC (empty or "/" ⇒ the PVC root).
+                        It is resolved inside the PVC and must not contain ".." segments.
                       type: string
+                      x-kubernetes-validations:
+                      - message: targetPath must not contain '..' segments
+                        rule: '!self.split(''/'').exists(p, p == ''..'')'
                   type: object
                 type: array
             required:
