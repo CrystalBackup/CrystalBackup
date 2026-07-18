@@ -57,14 +57,7 @@ var _ = Describe("Crystal Backup admission (M2)", Ordered, func() {
 	}
 
 	BeforeAll(func() {
-		// Ginkgo randomizes top-level container order, so this container must be
-		// self-sufficient: install the CRDs and deploy the operator itself (both idempotent —
-		// a no-op when the M0 container already ran them, and vice versa).
-		By("installing CRDs and deploying the controller-manager (idempotent)")
-		_, err := utils.Run(exec.Command("make", "install"))
-		Expect(err).NotTo(HaveOccurred(), "Failed to install CRDs")
-		_, err = utils.Run(exec.Command("make", "deploy", fmt.Sprintf("IMG=%s", managerImage)))
-		Expect(err).NotTo(HaveOccurred(), "Failed to deploy the controller-manager")
+		deployOperatorFresh()
 
 		// The chart renders rule 7's paramRef ConfigMap into the chart's canonical namespace
 		// (crystal-backup-system) — this suite deploys via kustomize into a prefixed one, so
