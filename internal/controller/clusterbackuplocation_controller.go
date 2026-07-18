@@ -187,6 +187,10 @@ type ClusterBackupLocationReconciler struct {
 	Secrets *secrets.ByNameReader
 	// Prober is the reachability seam: httpS3Prober in production, a stub in envtest.
 	Prober S3Prober
+	// Escrow builds the bucket-side wrapped-DEK escrow store (adr/0016 / 03-security §4):
+	// internal/escrow.New in production, a stub in tests. Nil disables the escrow (and its
+	// DEKEscrowed condition) entirely — the envtest default.
+	Escrow EscrowFactory
 	// OperatorNamespace is where the cluster KEK Secret (and every other cluster-plane
 	// platform Secret) lives — apiconst.DefaultOperatorNamespace by default, overridable via
 	// main.go's --operator-namespace flag.
@@ -266,6 +270,12 @@ func (r *ClusterBackupLocationReconciler) Reconcile(ctx context.Context, req ctr
 		}
 		return ctrl.Result{RequeueAfter: shortRequeueInterval}, nil
 	}
+
+	// The wrapped-DEK bucket escrow runs BEFORE the repository is ensured: on a bare-cluster
+	// DR bootstrap it recovers the wrapped DEK from the bucket first, so the repository
+	// init's EnsureDEK can never mint a fresh DEK over a recoverable one (adr/0016,
+	// 03-security §4). Advisory: failures land on the DEKEscrowed condition, never block.
+	r.reconcileDEKEscrow(ctx, &loc)
 
 	if err := r.ensureRepository(ctx, &loc); err != nil {
 		log.Error(err, "ensure BackupRepository")

@@ -46,6 +46,7 @@ import (
 	"github.com/CrystalBackup/CrystalBackup/internal/apiconst"
 	"github.com/CrystalBackup/CrystalBackup/internal/client/secrets"
 	"github.com/CrystalBackup/CrystalBackup/internal/controller"
+	"github.com/CrystalBackup/CrystalBackup/internal/escrow"
 	"github.com/CrystalBackup/CrystalBackup/internal/exposer"
 	"github.com/CrystalBackup/CrystalBackup/internal/metrics"
 	"github.com/CrystalBackup/CrystalBackup/internal/repo/queue"
@@ -254,8 +255,13 @@ func main() {
 		Scheme: mgr.GetScheme(),
 		// The uncached, GET-by-name reader — never mgr.GetClient() — per
 		// internal/client/secrets' package doc (tenancy invariant I3).
-		Secrets:           secrets.NewByNameReader(mgr.GetAPIReader()),
-		Prober:            controller.NewHTTPS3Prober(),
+		Secrets: secrets.NewByNameReader(mgr.GetAPIReader()),
+		Prober:  controller.NewHTTPS3Prober(),
+		// The wrapped-DEK bucket escrow (adr/0016, 03-security §4): mirrors the age
+		// ciphertext next to the repository and recovers it on bare-cluster DR bootstrap.
+		Escrow: func(s3 crystalbackupiov1alpha1.S3Spec, accessKey, secretKey string) (controller.EscrowStore, error) {
+			return escrow.New(s3, accessKey, secretKey)
+		},
 		OperatorNamespace: operatorNamespace,
 		Recorder:          mgr.GetEventRecorder("clusterbackuplocation"),
 	}).SetupWithManager(mgr); err != nil {
