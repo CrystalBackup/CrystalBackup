@@ -1,9 +1,20 @@
 apiVersion: crystalbackup.io/v1alpha1
 kind: Restore
 metadata:
-  labels:
-    app.kubernetes.io/name: bs-k8s-backup
-    app.kubernetes.io/managed-by: kustomize
-  name: restore-sample
+  name: recover-uploads
+  namespace: c-team-x
 spec:
-  # TODO(user): Add fields here
+  # The source is a Backup IN THIS NAMESPACE (structural confinement, R14): use its name,
+  # or time: latest / an RFC3339 instant (+ optional origin: cluster|namespace).
+  source:
+    backup: dr-daily-20260711-020000
+  # Overwrite keeps files the backup does not know; Recreate reconciles to an exact match.
+  mode: Overwrite
+  # Selection (omit both resources and volumes for the whole namespace). A single folder of
+  # a single PVC (R7):
+  volumes:
+    - names: ["uploads"]
+      include: ["images/2026/**"]
+  # Every Recreate/Overwrite requires the typed confirmation == this namespace (R23).
+  # Leave it empty to park the restore in AwaitingConfirmation and fill it in later.
+  confirmation: c-team-x

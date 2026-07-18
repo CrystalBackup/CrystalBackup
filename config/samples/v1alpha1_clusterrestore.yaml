@@ -1,9 +1,21 @@
 apiVersion: crystalbackup.io/v1alpha1
 kind: ClusterRestore
 metadata:
-  labels:
-    app.kubernetes.io/name: bs-k8s-backup
-    app.kubernetes.io/managed-by: kustomize
-  name: clusterrestore-sample
+  name: recover-team-x
 spec:
-  # TODO(user): Add fields here
+  # A REPO COORDINATE — works even when the source namespace (and every CR) is gone (R26):
+  # the location, the origin namespace, and a run name (or time: latest / RFC3339).
+  source:
+    locationRef:
+      name: dr-primary
+    namespace: c-team-x
+    backup: dr-daily-20260711-020000
+  target:
+    namespace: c-team-x-restored
+    createNamespace: true
+    # Rewrites the recreated PVCs' storage class (source class from the pvcclass tag).
+    storageClassMapping:
+      fast-rbd: standard
+  mode: Recreate
+  # Typed confirmation == the TARGET namespace (R23).
+  confirmation: c-team-x-restored

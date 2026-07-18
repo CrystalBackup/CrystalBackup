@@ -1,0 +1,76 @@
+# Changelog
+
+All notable changes to Crystal Backup. Versioning follows
+[adr/0014](spec/adr/0014-versioning-and-release.md): milestone `Mn` → minor `0.n.z` on
+major 0; `1.0.0` is a deliberate post-M9 API-stability decision.
+
+## 0.2.0 — M2 “Restore” (2026-07-18)
+
+The restore milestone (R2 cornerstone, R6, R7, R14, R23): everything a backup wrote in M1
+now comes back — self-service, mediated, byte-verified — including into namespaces that no
+longer exist.
+
+### Added
+
+- **`Restore` controller** (namespaced, self-service): consumes a `Backup` in its own
+  namespace (name or `time: latest`/RFC3339 + origin), `Recreate`/`Overwrite` modes ×
+  NetworkPolicy-style `volumes[]` selection with file-level `include`/`exclude` (partial
+  restore, R7), and the R23 `AwaitingConfirmation` flow re-checked at execution.
+- **Operator-mediated cluster-DR restore** (R2/R14 cornerstone): a cluster-origin source is
+  resolved exclusively through a repository listing filtered server-side by
+  `namespace=<the CR's namespace>` — snapshot IDs from the projection are never trusted,
+  and a coordinate outside the namespace fails closed (`SnapshotNotFound`).
+- **`ClusterRestore` controller** (admin DR): restores a **repo coordinate** (location +
+  origin namespace + run/time) with `target.createNamespace` and `storageClassMapping`;
+  works with zero surviving in-cluster objects (R26).
+- **Restore target exposure** ([adr/0016](spec/adr/0016-restore-execution-and-target-exposure.md)):
+  movers stay in `crystal-backup-system` (the repository key never enters a user
+  namespace); an absent target PVC is provisioned and **transplanted** (WFFC-safe PV
+  re-bind, provenance annotation `crystalbackup.io/restored-from`), a bound one is written
+  through a Retain-only **twin PV** with a same-node pin for singly-attached RWO volumes.
+- **Restore mover**: `OpRestore` mounts the target read-write, runs
+  `restic restore --overwrite always [--delete]` with `--sparse` and full xattr/ACL fidelity
+  caps (CHOWN, DAC_OVERRIDE, FOWNER, MKNOD, SETFCAP — PSA-baseline legal), and reports a
+  summary-verified `restoredBytes`.
+- **PVC-meta snapshot tags** (`pvcsize`, `pvcclass`, `pvcmodes`) on every data snapshot, so
+  `ClusterRestore` recreates PVCs at their original size/class/modes from the repository
+  alone (documented fallback for pre-0.2 snapshots).
+- **Admission, VAP-first** ([adr/0010](spec/adr/0010-admission-vap-first.md)): the chart now
+  ships `ValidatingAdmissionPolicy` objects for R23 confirmation (Restore, ClusterRestore,
+  ClusterErasure — empty parks, wrong is denied), user isolation (operator SA exempt),
+  Immutable-forbids-prune, denied namespaces (ConfigMap `paramRef`), namespace-selector
+  shape and external-sync distinctness; plus the one dynamic webhook — single-default
+  `ClusterBackupLocation` — fail-open with a chart-generated certificate.
+- **Wrapped-DEK bucket escrow** (bare-cluster DR bootstrap, 03-security §4): the age
+  ciphertext is mirrored to `<prefix>/<clusterID>.crystal-meta/wrapped-dek.age` and
+  recovered automatically when a location is re-created on a fresh cluster with the KEK.
+- **Restore metrics** (R19): `crystalbackup_restore_*` / `crystalbackup_clusterrestore_*`
+  (last success, restored bytes, failures), state-derived and namespace-labelled.
+- **Docs**: [docs/RESTORE.md](docs/RESTORE.md) (user guide + bare-cluster DR runbook);
+  `Restore`/`ClusterRestore` samples.
+
+### Changed
+
+- The orphan reaper resolves restore-owned residue (staging claims, twin/transplant PVs,
+  restore movers) and can never touch a delivered volume (handover strips the labels).
+- The stale-lock unlock machinery is shared: a hard-killed **restore** mover triggers the
+  same quiescence-gated `unlock --remove-all` a backup mover does (adr/0015).
+- Operator RBAC: PersistentVolume write + VolumeAttachment read (the adr/0016 machinery).
+- `source.backup`/`source.time` are mutually exclusive (CEL); `targetPath` rejects `..`.
+
+## 0.1.0 — M1 “Core engine & cluster DR” (2026-07-17)
+
+The restic-backed backup engine and the cluster-DR plane: `ClusterBackupLocation` /
+`BackupRepository` (lazy init through the per-repo exclusive queue), the
+`ClusterBackupSchedule → ClusterBackup → Backup → movers` cascade with restic-tag tenancy
+(adr/0009), envelope encryption (age KEK → per-location DEK, adr/0004), CSI-generic
+snapshot exposure (adr/0003), discovery projection (repository as source of truth, R26),
+retention, the orphan reaper, mover-concurrency limits, metrics v1, and the backup⇄unlock
+reliability mutex (adr/0015). Field-validated by the crucible on a live RKE2 + rook-ceph +
+longhorn + local-path platform (25/25 specs).
+
+## 0.0.0 — M0 “Project scaffolding”
+
+Kubebuilder layout, the twelve `crystalbackup.io/v1alpha1` CRDs, CI (lint/test/e2e,
+apko/Wolfi multi-arch images with SBOM + SLSA provenance), envtest + kind harnesses, Helm
+chart skeleton.

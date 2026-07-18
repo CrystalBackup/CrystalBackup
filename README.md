@@ -188,6 +188,7 @@ Start with the specification index: **[spec/README.md](spec/README.md)**.
 
 | Doc | Content |
 |---|---|
+| [docs/RESTORE.md](docs/RESTORE.md) | Restore guide: self-service, cluster DR, bare-cluster runbook |
 | [spec/00-requirements.md](spec/00-requirements.md) | Requirements R1–R28, personas, scope, priorities |
 | [spec/01-architecture.md](spec/01-architecture.md) | Components, two-plane model, cascade, flows, concurrency |
 | [spec/02-api.md](spec/02-api.md) | CRD naming & field contract, validation, RBAC |
@@ -198,7 +199,7 @@ Start with the specification index: **[spec/README.md](spec/README.md)**.
 | [spec/07-ui.md](spec/07-ui.md) | UI strategy |
 | [spec/08-testing-and-dod.md](spec/08-testing-and-dod.md) | Test strategy, fidelity suite, Definition of Done |
 | [spec/90-roadmap.md](spec/90-roadmap.md) | Milestones M0–M9, task breakdown |
-| [spec/adr/](spec/adr/) | 14 Architecture Decision Records (0001–0014) |
+| [spec/adr/](spec/adr/) | 16 Architecture Decision Records (0001–0016) |
 | [test/crucible/](test/crucible/README.md) | Real-conditions e2e on Hetzner Cloud (bring your own project) |
 
 ## License
