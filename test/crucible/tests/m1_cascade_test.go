@@ -391,6 +391,12 @@ type m1CascadeNode struct {
 
 // m1CascadeLsNodes runs `restic ls --json <snapshot>` through the crucible's restic oracle and
 // decodes the NDJSON node stream (the leading snapshot summary line has no path and is dropped).
+//
+// restic's `ls --json` node object omits the symlink TARGET — verified against restic 0.17.3 and
+// 0.18.0, the versions the oracle runs (m1_restic_test.go), whose node JSON carries type/inode/path
+// but no linktarget field — so every symlink's LinkTarget is filled in from a second `restic ls -l`
+// (long/human) pass, the only restic-native source for the target. The JSON pass stays authoritative
+// for type/inode/path; the -l coupling is scoped to symlink targets alone.
 func m1CascadeLsNodes(locationName, snapshotID string) []m1CascadeNode {
 	GinkgoHelper()
 	out := m1ResticExec(locationName, "ls", "--json", snapshotID)
@@ -408,7 +414,37 @@ func m1CascadeLsNodes(locationName, snapshotID string) []m1CascadeNode {
 			nodes = append(nodes, n)
 		}
 	}
+	targets := m1CascadeSymlinkTargets(locationName, snapshotID)
+	for i := range nodes {
+		if nodes[i].Type == "symlink" {
+			nodes[i].LinkTarget = targets[nodes[i].Path]
+		}
+	}
 	return nodes
+}
+
+// m1CascadeSymlinkTargets returns a path→target map for the snapshot's symlinks, parsed from
+// `restic ls -l` (the long/human format prints each symlink as `<columns...> <path> -> <target>`).
+// restic's machine-readable `ls --json` does not expose the symlink target at all, so the long
+// format is the only restic-native way to read it back. Only symlink rows carry ` -> ` and a target
+// never contains that token, so a single split per line is unambiguous; the path is the last column
+// before the arrow (the crucible's symlink names are space-free).
+func m1CascadeSymlinkTargets(locationName, snapshotID string) map[string]string {
+	GinkgoHelper()
+	out := m1ResticExec(locationName, "ls", "-l", snapshotID)
+	targets := map[string]string{}
+	for _, line := range strings.Split(out, "\n") {
+		idx := strings.Index(line, " -> ")
+		if idx < 0 {
+			continue
+		}
+		fields := strings.Fields(line[:idx])
+		if len(fields) == 0 {
+			continue
+		}
+		targets[fields[len(fields)-1]] = strings.TrimSpace(line[idx+len(" -> "):])
+	}
+	return targets
 }
 
 // m1CascadeNodeByPath returns the node at an exact restic path.
