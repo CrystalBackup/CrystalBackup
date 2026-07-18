@@ -191,7 +191,7 @@ type backupRunContext struct {
 // +kubebuilder:rbac:groups=snapshot.storage.k8s.io,resources=volumesnapshots;volumesnapshotcontents,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=snapshot.storage.k8s.io,resources=volumesnapshotclasses,verbs=get;list;watch
 // +kubebuilder:rbac:groups=storage.k8s.io,resources=storageclasses,verbs=get;list;watch
-// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
+// +kubebuilder:rbac:groups="";events.k8s.io,resources=events,verbs=create;patch
 
 // Reconcile drives one Backup towards a terminal per-namespace result. After deletion-handling
 // and finalizer-ensuring it short-circuits two inert cases (a discovery projection, an

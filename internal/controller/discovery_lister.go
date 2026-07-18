@@ -291,13 +291,21 @@ func (l *JobSnapshotLister) waitForJob(ctx context.Context, jobName string) erro
 
 	for {
 		var job batchv1.Job
-		if err := l.Get(ctx, key, &job); err != nil {
+		err := l.Get(ctx, key, &job)
+		switch {
+		case apierrors.IsNotFound(err):
+			// The Job was just created (ensureSnapshotsJob) but the cached informer may not have it
+			// yet, or a predecessor from the previous List is still terminating. A transient NotFound
+			// is "not ready", not a failure: keep polling until the Job appears or the List deadline
+			// (discoveryJobDeadline) elapses, so an inventory — and thus a whole discovery pass — is
+			// never failed by a cache lag. This is why List blocks synchronously right after creating
+			// the Job (unlike the Backup controller, which re-GETs the mover Job in a later reconcile
+			// once the cache has caught up).
+		case err != nil:
 			return fmt.Errorf("get discovery job %s/%s: %w", l.OperatorNamespace, jobName, err)
-		}
-		if job.Status.Succeeded >= 1 || jobConditionTrue(&job, batchv1.JobComplete) {
+		case job.Status.Succeeded >= 1 || jobConditionTrue(&job, batchv1.JobComplete):
 			return nil
-		}
-		if jobConditionTrue(&job, batchv1.JobFailed) || job.Status.Failed > discoveryJobBackoffLimit {
+		case jobConditionTrue(&job, batchv1.JobFailed) || job.Status.Failed > discoveryJobBackoffLimit:
 			return fmt.Errorf("discovery job %s/%s failed (failed pods=%d, backoffLimit=%d)",
 				l.OperatorNamespace, jobName, job.Status.Failed, discoveryJobBackoffLimit)
 		}
@@ -349,9 +357,15 @@ func (l *JobSnapshotLister) readPodLog(ctx context.Context, jobName string) ([]b
 // job-scoped creds Secret. Failures are logged, never returned: the Job's TTL and the orphan reaper
 // are the backstop, and a leftover inventory resource is harmless (it is re-adopted next List).
 func (l *JobSnapshotLister) cleanup(ctx context.Context, name string) {
-	fg := metav1.DeletePropagationForeground
+	// Background (not Foreground) propagation: discovery re-creates a Job of the SAME name every
+	// inventory pass, so the object name must be freed IMMEDIATELY — a Foreground delete leaves the
+	// Job in Terminating until its pods are gone (slow under storage load), and the next pass's Create
+	// then races that terminating predecessor (AlreadyExists, no fresh Job, then a NotFound as it
+	// finally vanishes). Background frees the name at once; the k8s GC reclaims the completed pods
+	// asynchronously. The one-shot maintenance ops keep Foreground because their names are unique.
+	bg := metav1.DeletePropagationBackground
 	job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: l.OperatorNamespace}}
-	if err := l.Delete(ctx, job, &client.DeleteOptions{PropagationPolicy: &fg}); err != nil && !apierrors.IsNotFound(err) {
+	if err := l.Delete(ctx, job, &client.DeleteOptions{PropagationPolicy: &bg}); err != nil && !apierrors.IsNotFound(err) {
 		logf.FromContext(ctx).Error(err, "best-effort delete of discovery job failed", "job", name)
 	}
 	sec := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: l.OperatorNamespace}}

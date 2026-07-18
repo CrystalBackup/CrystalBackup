@@ -186,7 +186,7 @@ func NewBackupRepositoryReconciler(
 // +kubebuilder:rbac:groups=crystalbackup.io,resources=clusterbackuplocations,verbs=get;list;watch
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;create;update;patch;delete
-// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
+// +kubebuilder:rbac:groups="";events.k8s.io,resources=events,verbs=create;patch
 
 // Reconcile drives one BackupRepository towards an initialized shared repository. After
 // deletion-handling, finalizer-ensuring and resolving the owning ClusterBackupLocation, it
