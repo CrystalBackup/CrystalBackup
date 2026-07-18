@@ -43,6 +43,18 @@ type Snapshot struct {
 	Paths []string `json:"paths"`
 	// Tags are the restic tags; the crystalbackup marker plus the identity tags.
 	Tags []string `json:"tags"`
+	// Summary is restic's per-snapshot statistics block (emitted since restic 0.17; the
+	// mover pins ≥0.19.1). Optional and best-effort: an older repository's snapshots may
+	// lack it, so consumers (the restore capacity fallback) treat a nil Summary as
+	// "size unknown".
+	Summary *SnapshotSummary `json:"summary,omitempty"`
+}
+
+// SnapshotSummary is the subset of a snapshot's statistics the operator consumes.
+type SnapshotSummary struct {
+	// TotalBytesProcessed is the logical size of everything the snapshot backed up — the
+	// sizing input of the restore capacity fallback (adr/0016) when PVC-meta tags are absent.
+	TotalBytesProcessed int64 `json:"total_bytes_processed"`
 }
 
 // ParseSnapshots decodes the JSON array printed by `restic snapshots --json` into Snapshots.

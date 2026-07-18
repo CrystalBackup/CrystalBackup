@@ -42,8 +42,10 @@ type ClusterRestoreSpec struct {
 	// +optional
 	Resources []ResourceSelectorItem `json:"resources,omitempty"`
 
-	// volumes selects PVCs (and optionally files) to restore.
+	// volumes selects PVCs (and optionally files) to restore. Bounded so the per-item CEL
+	// cost stays within the apiserver's per-CRD budget.
 	// +optional
+	// +kubebuilder:validation:MaxItems=128
 	Volumes []VolumeSelectorItem `json:"volumes,omitempty"`
 
 	// clusterResources selects cluster-scoped resources to restore (omitted ⇒ none; adr/0011).

@@ -193,7 +193,9 @@ spec:
                 - namespace
                 type: object
               volumes:
-                description: volumes selects PVCs (and optionally files) to restore.
+                description: |-
+                  volumes selects PVCs (and optionally files) to restore. Bounded so the per-item CEL
+                  cost stays within the apiserver's per-CRD budget.
                 items:
                   description: |-
                     VolumeSelectorItem selects PVCs (and optionally files within them) to restore.
@@ -218,12 +220,15 @@ spec:
                     targetPath:
                       description: |-
                         targetPath overrides the restore root within the PVC (empty or "/" ⇒ the PVC root).
-                        It is resolved inside the PVC and must not contain ".." segments.
+                        It is resolved inside the PVC and must not contain ".." segments. Bounded so the CEL
+                        rule's cost stays within the apiserver's per-CRD budget.
+                      maxLength: 256
                       type: string
                       x-kubernetes-validations:
                       - message: targetPath must not contain '..' segments
                         rule: '!self.split(''/'').exists(p, p == ''..'')'
                   type: object
+                maxItems: 128
                 type: array
             required:
             - source

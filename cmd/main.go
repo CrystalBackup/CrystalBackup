@@ -49,6 +49,7 @@ import (
 	"github.com/CrystalBackup/CrystalBackup/internal/exposer"
 	"github.com/CrystalBackup/CrystalBackup/internal/metrics"
 	"github.com/CrystalBackup/CrystalBackup/internal/repo/queue"
+	"github.com/CrystalBackup/CrystalBackup/internal/rexposer"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -323,20 +324,58 @@ func main() {
 		setupLog.Error(err, "Unable to build the clientset for the discovery pod-log reader")
 		os.Exit(1)
 	}
+	// One production lister serves discovery's full inventory AND the restore controllers'
+	// mediated, tag-filtered resolutions (adr/0016 §3) — same Job mechanics, distinct Job names.
+	snapshotLister := controller.NewJobSnapshotLister(
+		mgr.GetClient(),
+		clientset,
+		secrets.NewByNameReader(mgr.GetAPIReader()),
+		mgr.GetScheme(),
+		operatorNamespace,
+		moverImage,
+	)
 	if err := controller.NewDiscoveryReconciler(
 		mgr.GetClient(),
 		mgr.GetScheme(),
-		controller.NewJobSnapshotLister(
-			mgr.GetClient(),
-			clientset,
-			secrets.NewByNameReader(mgr.GetAPIReader()),
-			mgr.GetScheme(),
-			operatorNamespace,
-			moverImage,
-		),
+		snapshotLister,
 		mgr.GetEventRecorder("discovery"),
 	).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Unable to create controller", "controller", "Discovery")
+		os.Exit(1)
+	}
+
+	// The restore pair (M2, adr/0016): the namespaced self-service Restore and the admin
+	// ClusterRestore share the target exposer (pvc-transplant / pv-twin) and the mediated
+	// lister; each holds its own engine over the same primitives, including the shared
+	// exclusive queue (a crashed restore mover enqueues the same stale-lock unlock a backup
+	// mover does).
+	targetExposer := rexposer.NewTargetExposer(mgr.GetClient(), operatorNamespace)
+	if err := controller.NewRestoreReconciler(
+		mgr.GetClient(),
+		mgr.GetScheme(),
+		secrets.NewByNameReader(mgr.GetAPIReader()),
+		targetExposer,
+		snapshotLister,
+		operatorNamespace,
+		moverImage,
+		mgr.GetEventRecorder("restore"),
+		repoQueue,
+	).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Unable to create controller", "controller", "Restore")
+		os.Exit(1)
+	}
+	if err := controller.NewClusterRestoreReconciler(
+		mgr.GetClient(),
+		mgr.GetScheme(),
+		secrets.NewByNameReader(mgr.GetAPIReader()),
+		targetExposer,
+		snapshotLister,
+		operatorNamespace,
+		moverImage,
+		mgr.GetEventRecorder("clusterrestore"),
+		repoQueue,
+	).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Unable to create controller", "controller", "ClusterRestore")
 		os.Exit(1)
 	}
 

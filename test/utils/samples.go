@@ -67,7 +67,7 @@ func SampleObjects(namespace string) []client.Object {
 		&cbv1.ClusterRestore{
 			ObjectMeta: metav1.ObjectMeta{Name: "recover-x"},
 			Spec: cbv1.ClusterRestoreSpec{
-				Source:       cbv1.ClusterRestoreSource{LocationRef: cbv1.LocalObjectReference{Name: drPrimary}, Namespace: cTeamX},
+				Source:       cbv1.ClusterRestoreSource{LocationRef: cbv1.LocalObjectReference{Name: drPrimary}, Namespace: cTeamX, Backup: "dr-run-1"},
 				Target:       cbv1.ClusterRestoreTarget{Namespace: "c-team-x-restored", CreateNamespace: true},
 				Confirmation: "c-team-x-restored",
 			},

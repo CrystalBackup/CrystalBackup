@@ -313,8 +313,10 @@ type VolumeSelectorItem struct {
 	// +optional
 	Exclude []string `json:"exclude,omitempty"`
 	// targetPath overrides the restore root within the PVC (empty or "/" ⇒ the PVC root).
-	// It is resolved inside the PVC and must not contain ".." segments.
+	// It is resolved inside the PVC and must not contain ".." segments. Bounded so the CEL
+	// rule's cost stays within the apiserver's per-CRD budget.
 	// +optional
+	// +kubebuilder:validation:MaxLength=256
 	// +kubebuilder:validation:XValidation:rule="!self.split('/').exists(p, p == '..')",message="targetPath must not contain '..' segments"
 	TargetPath string `json:"targetPath,omitempty"`
 }
@@ -327,8 +329,10 @@ type RestoreSource struct {
 	// backup names a Backup in this namespace.
 	// +optional
 	Backup string `json:"backup,omitempty"`
-	// time selects "latest" or an RFC3339 instant instead of a named backup.
+	// time selects "latest" or an RFC3339 instant instead of a named backup. Bounded so the
+	// CEL rule's cost stays within the apiserver's per-CRD budget.
 	// +optional
+	// +kubebuilder:validation:MaxLength=64
 	// +kubebuilder:validation:XValidation:rule="self == 'latest' || self.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}')",message="time must be \"latest\" or an RFC3339 timestamp"
 	Time string `json:"time,omitempty"`
 	// origin disambiguates when using time.
