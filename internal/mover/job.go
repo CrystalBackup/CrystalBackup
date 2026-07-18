@@ -42,6 +42,17 @@ const (
 // the way SecretMountPath / CacheDir are.
 const tmpDir = "/tmp"
 
+// Capability names the security contexts below add/drop; named once (they recur across the
+// per-operation sets).
+const (
+	capAll         corev1.Capability = "ALL"
+	capChown       corev1.Capability = "CHOWN"
+	capDACOverride corev1.Capability = "DAC_OVERRIDE"
+	capFowner      corev1.Capability = "FOWNER"
+	capMknod       corev1.Capability = "MKNOD"
+	capSetfcap     corev1.Capability = "SETFCAP"
+)
+
 // operationFlag is the CLI flag the crystal-mover shim reads to select its operation
 // (`--operation <op>`); BuildJob passes it as the first arg, before restic's "--" separator.
 const operationFlag = "--operation"
@@ -149,7 +160,7 @@ func BuildJob(req JobRequest) *batchv1.Job {
 			AllowPrivilegeEscalation: ptrTo(false),
 			ReadOnlyRootFilesystem:   ptrTo(true),
 			Capabilities: &corev1.Capabilities{
-				Drop: []corev1.Capability{"ALL"},
+				Drop: []corev1.Capability{capAll},
 				Add:  moverCapabilities(req.Operation),
 			},
 			SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
@@ -206,9 +217,9 @@ func BuildJob(req JobRequest) *batchv1.Job {
 // documented as NOT restored. The list order is pinned for byte-reproducible Job specs.
 func moverCapabilities(op Operation) []corev1.Capability {
 	if op == OpRestore {
-		return []corev1.Capability{"CHOWN", "DAC_OVERRIDE", "FOWNER", "MKNOD", "SETFCAP"}
+		return []corev1.Capability{capChown, capDACOverride, capFowner, capMknod, capSetfcap}
 	}
-	return []corev1.Capability{"DAC_OVERRIDE"}
+	return []corev1.Capability{capDACOverride}
 }
 
 // spreadConstraints returns the soft topology-spread constraint selecting pods by labels, or nil

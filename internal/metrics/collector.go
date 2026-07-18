@@ -62,15 +62,16 @@ var buildInfoDesc = prometheus.NewDesc(
 // repeated names are defined once): the originating schedule, the location, and the cluster
 // identity (resolved from a location's clusterID).
 const (
-	scheduleLabel = "schedule"
-	locationLabel = "location"
-	clusterLabel  = "cluster"
+	namespaceLabel = "namespace"
+	scheduleLabel  = "schedule"
+	locationLabel  = "location"
+	clusterLabel   = "cluster"
 )
 
 // backupLabels / clusterBackupLabels are the label sets of the two metric families,
 // in the fixed order the metric values are appended below.
 var (
-	backupLabels        = []string{"namespace", "tenant", scheduleLabel, "origin", locationLabel, clusterLabel}
+	backupLabels        = []string{namespaceLabel, "tenant", scheduleLabel, "origin", locationLabel, clusterLabel}
 	clusterBackupLabels = []string{scheduleLabel, locationLabel, clusterLabel}
 
 	backupLastSuccessDesc = prometheus.NewDesc(
@@ -130,6 +131,11 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- clusterBackupLastSuccessDesc
 	ch <- clusterBackupNamespacesMatchedDesc
 	ch <- clusterBackupNamespacesFailedDesc
+	ch <- restoreLastSuccessDesc
+	ch <- restoreLastBytesDesc
+	ch <- restoreFailuresDesc
+	ch <- clusterRestoreLastSuccessDesc
+	ch <- clusterRestoreFailuresDesc
 }
 
 // Collect implements prometheus.Collector. It reads the live objects once and emits
@@ -144,12 +150,36 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 	clusterByLocation := c.locationClusterIDs(ctx)
 
 	var backups cbv1.BackupList
-	if err := c.reader.List(ctx, &backups); err == nil {
+	backupsListed := c.reader.List(ctx, &backups) == nil
+	if backupsListed {
 		collectBackups(ch, backups.Items, clusterByLocation)
 	}
 	var runs cbv1.ClusterBackupList
 	if err := c.reader.List(ctx, &runs); err == nil {
 		collectClusterBackups(ch, runs.Items, clusterByLocation)
+	}
+
+	// The restore families (M2). A namespaced Restore's cluster label resolves through its
+	// source Backup's location — joined against the Backups already listed above.
+	backupCluster := func(namespace, backupName string) string {
+		if !backupsListed {
+			return ""
+		}
+		for i := range backups.Items {
+			b := &backups.Items[i]
+			if b.Namespace == namespace && b.Name == backupName {
+				return clusterByLocation[b.Spec.LocationRef.Name]
+			}
+		}
+		return ""
+	}
+	var restores cbv1.RestoreList
+	if err := c.reader.List(ctx, &restores); err == nil {
+		collectRestores(ch, restores.Items, backupCluster)
+	}
+	var clusterRestores cbv1.ClusterRestoreList
+	if err := c.reader.List(ctx, &clusterRestores); err == nil {
+		collectClusterRestores(ch, clusterRestores.Items, clusterByLocation)
 	}
 }
 

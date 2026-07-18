@@ -19,7 +19,9 @@ package controller
 import (
 	"context"
 	"fmt"
+	"maps"
 	"path"
+	"slices"
 	"strings"
 	"sync"
 
@@ -407,19 +409,21 @@ func (e *restoreEngine) maintenanceDeps() repoMaintenanceDeps {
 }
 
 // restoreTargetPath resolves a VolumeSelectorItem.targetPath into the restic --target under
-// the fixed staging mount. Empty (or "/") means the PVC root. The CRD's CEL already rejects
-// ".." segments; this re-checks after cleaning (defense in depth — a path that escapes the
-// mount must never reach restic) and confines the result under restoreTargetMountPath.
+// the fixed staging mount. Empty (or "/") means the PVC root. Any ".." SEGMENT is rejected
+// outright — the same rule the CRD's CEL enforces at admission, re-checked here as defense
+// in depth. The check runs on the RAW segments, before path.Clean: Clean would silently
+// neutralize a leading ".." against the root ("../x" → "/x"), and a traversal attempt must
+// fail loudly, never be quietly rewritten into something else.
 func restoreTargetPath(targetPath string) (string, error) {
 	if targetPath == "" || targetPath == "/" {
 		return restoreTargetMountPath, nil
 	}
+	if slices.Contains(strings.Split(targetPath, "/"), "..") {
+		return "", fmt.Errorf("targetPath %q contains a '..' segment", targetPath)
+	}
 	cleaned := path.Clean("/" + targetPath)
 	if cleaned == "/" {
 		return restoreTargetMountPath, nil
-	}
-	if strings.Contains(cleaned, "..") {
-		return "", fmt.Errorf("targetPath %q escapes the volume root", targetPath)
 	}
 	return restoreTargetMountPath + cleaned, nil
 }
@@ -450,15 +454,7 @@ func planVolumes(volumes []cbv1.VolumeSelectorItem, sourcePVCs []string, hasSele
 // volumeItemMatches reports whether one selection item selects a PVC: an empty names list
 // matches every PVC; otherwise the name must be listed.
 func volumeItemMatches(item *cbv1.VolumeSelectorItem, pvc string) bool {
-	if len(item.Names) == 0 {
-		return true
-	}
-	for _, n := range item.Names {
-		if n == pvc {
-			return true
-		}
-	}
-	return false
+	return len(item.Names) == 0 || slices.Contains(item.Names, pvc)
 }
 
 // deleteJobAndSecret best-effort deletes a Job (Background propagation — see
@@ -479,8 +475,6 @@ func deleteJobAndSecret(ctx context.Context, c client.Client, namespace, name st
 // copyStringMap returns an independent copy of in (nil-safe).
 func copyStringMap(in map[string]string) map[string]string {
 	out := make(map[string]string, len(in))
-	for k, v := range in {
-		out[k] = v
-	}
+	maps.Copy(out, in)
 	return out
 }

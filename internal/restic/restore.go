@@ -17,7 +17,7 @@ limitations under the License.
 package restic
 
 import (
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -47,11 +47,20 @@ const (
 // compact abbreviations stored in the pvcmodes= tag. Taking the mode as a plain string
 // (corev1.PersistentVolumeAccessMode is a string type) keeps this package free of any k8s
 // dependency beyond the API types it already uses.
+// The Kubernetes PersistentVolumeAccessMode string values (spelled locally — this package
+// deliberately imports no k8s API package beyond the CRD types it already uses).
+const (
+	accessModeRWO  = "ReadWriteOnce"
+	accessModeROX  = "ReadOnlyMany"
+	accessModeRWX  = "ReadWriteMany"
+	accessModeRWOP = "ReadWriteOncePod"
+)
+
 var accessModeAbbrevs = map[string]string{
-	"ReadWriteOnce":    "RWO",
-	"ReadOnlyMany":     "ROX",
-	"ReadWriteMany":    "RWX",
-	"ReadWriteOncePod": "RWOP",
+	accessModeRWO:  "RWO",
+	accessModeROX:  "ROX",
+	accessModeRWX:  "RWX",
+	accessModeRWOP: "RWOP",
 }
 
 // accessModeNames is the exact inverse of accessModeAbbrevs, derived once so encode and
@@ -85,7 +94,7 @@ func PVCMetaTags(capacityBytes int64, storageClass string, accessModes []string)
 		}
 	}
 	if len(abbrevs) > 0 {
-		sort.Strings(abbrevs)
+		slices.Sort(abbrevs)
 		tags = append(tags, Tag(TagKeyPVCModes, strings.Join(abbrevs, pvcModesJoiner)))
 	}
 	return tags
@@ -120,7 +129,7 @@ func ParsePVCMeta(tags []string) PVCMeta {
 		meta.StorageClass = v
 	}
 	if v, ok := TagValue(tags, TagKeyPVCModes); ok {
-		for _, a := range strings.Split(v, pvcModesJoiner) {
+		for a := range strings.SplitSeq(v, pvcModesJoiner) {
 			if name, known := accessModeNames[a]; known {
 				meta.AccessModes = append(meta.AccessModes, name)
 			}
@@ -194,5 +203,5 @@ func RestoreArgs(snapshotID, snapshotPath, targetPath string, deleteExtras bool,
 // derived (namespace, run names) and can never contain a comma, so the joining is safe;
 // with no extra tags this degenerates to exactly SnapshotsArgs.
 func SnapshotsFilterArgs(filterTags ...string) []string {
-	return []string{"snapshots", "--json", flagTag, strings.Join(append([]string{TagBase}, filterTags...), ",")}
+	return []string{snapshotsCmd, flagJSON, flagTag, strings.Join(append([]string{TagBase}, filterTags...), ",")}
 }

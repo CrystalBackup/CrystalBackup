@@ -69,7 +69,8 @@ func main() {
 	// controller would have to guess about.
 	fs := flag.NewFlagSet("crystal-mover", flag.ContinueOnError)
 	operation := fs.String("operation", "",
-		"the mover operation to run: one of backup, restore, init, forget, prune, check, snapshots, unlock (mover.Op* values)")
+		"the mover operation to run: one of backup, restore, init, forget, prune, check, snapshots, "+
+			"unlock (mover.Op* values)")
 	terminationLog := fs.String("termination-log", mover.TerminationMessagePath,
 		"path the MoverResult JSON is written to; defaults to the kubelet's termination message file, "+
 			"overridable so tests can point it at a temp file")

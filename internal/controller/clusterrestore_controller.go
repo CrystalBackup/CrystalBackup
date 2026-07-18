@@ -19,7 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
-	"sort"
+	"slices"
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
@@ -299,7 +299,7 @@ func (r *ClusterRestoreReconciler) buildPlans(ctx context.Context, cr *cbv1.Clus
 	for pvc := range byPVC {
 		sourcePVCs = append(sourcePVCs, pvc)
 	}
-	sort.Strings(sourcePVCs)
+	slices.Sort(sourcePVCs)
 	selected := planVolumes(cr.Spec.Volumes, sourcePVCs, cr.Spec.Volumes != nil)
 
 	var plans []restoreVolumePlan

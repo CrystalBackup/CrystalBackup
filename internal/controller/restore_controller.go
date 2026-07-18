@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
@@ -398,10 +399,10 @@ func (r *RestoreReconciler) resolveSource(ctx context.Context, restore *cbv1.Res
 		if !backupSucceeded(b.Status.Phase) || b.Status.BackupTime == nil {
 			continue
 		}
-		if cutoff != nil && b.Status.BackupTime.Time.After(*cutoff) {
+		if cutoff != nil && b.Status.BackupTime.After(*cutoff) {
 			continue
 		}
-		if best == nil || b.Status.BackupTime.Time.After(best.Status.BackupTime.Time) {
+		if best == nil || b.Status.BackupTime.After(best.Status.BackupTime.Time) {
 			best = b
 		}
 	}
@@ -560,10 +561,7 @@ func sourceVolumeSize(source *cbv1.Backup, pvc string) int64 {
 func fallbackRestoreCapacity(dataSizeBytes int64) resource.Quantity {
 	const gib = int64(1) << 30
 	padded := dataSizeBytes + dataSizeBytes/5
-	gibs := (padded + gib - 1) / gib
-	if gibs < 1 {
-		gibs = 1
-	}
+	gibs := max((padded+gib-1)/gib, 1)
 	return *resource.NewQuantity(gibs*gib, resource.BinarySI)
 }
 
@@ -632,11 +630,12 @@ func joinFailures(failures []string) string {
 	if len(failures) == 0 {
 		return "no volumes restored"
 	}
-	out := failures[0]
+	var out strings.Builder
+	out.WriteString(failures[0])
 	for _, f := range failures[1:] {
-		out += "; " + f
+		out.WriteString("; " + f)
 	}
-	return out
+	return out.String()
 }
 
 // meta_HasConditionTrue reports whether the condition of the given type is present & True.

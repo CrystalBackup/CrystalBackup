@@ -19,6 +19,7 @@ package rexposer
 import (
 	"context"
 	"fmt"
+	"maps"
 
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
@@ -245,9 +246,7 @@ func (e *TargetExposer) Ready(ctx context.Context, ex *TargetExposure) (bool, er
 // entries without guarding).
 func copyLabels(in map[string]string) map[string]string {
 	out := make(map[string]string, len(in))
-	for k, v := range in {
-		out[k] = v
-	}
+	maps.Copy(out, in)
 	return out
 }
 

@@ -19,6 +19,7 @@ package rexposer
 import (
 	"context"
 	"fmt"
+	"maps"
 
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
@@ -102,9 +103,7 @@ func (e *TargetExposer) retainAndReleaseStaging(ctx context.Context, ex *TargetE
 		if pv.Labels == nil {
 			pv.Labels = map[string]string{}
 		}
-		for k, v := range ex.Labels {
-			pv.Labels[k] = v
-		}
+		maps.Copy(pv.Labels, ex.Labels)
 		pv.Labels[apiconst.LabelPVRole] = apiconst.PVRoleTransplant
 		pv.Spec.PersistentVolumeReclaimPolicy = corev1.PersistentVolumeReclaimRetain
 		if err := e.Patch(ctx, &pv, client.MergeFrom(base)); err != nil {

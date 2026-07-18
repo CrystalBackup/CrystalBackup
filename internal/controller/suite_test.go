@@ -42,6 +42,7 @@ import (
 	cbv1 "github.com/CrystalBackup/CrystalBackup/api/v1alpha1"
 	"github.com/CrystalBackup/CrystalBackup/internal/client/secrets"
 	"github.com/CrystalBackup/CrystalBackup/internal/repo/queue"
+	"github.com/CrystalBackup/CrystalBackup/internal/rexposer"
 )
 
 // suiteOperatorNamespace stands in for apiconst.DefaultOperatorNamespace ("crystal-backup-system")
@@ -81,6 +82,11 @@ var (
 	// discoveryLister is the stub inventory the DiscoveryReconciler reads; the discovery specs feed
 	// it canned snapshots (mutex-guarded, since the manager reconciles on another goroutine).
 	discoveryLister *stubSnapshotLister
+	// restoreLister is the stub MEDIATED lister both restore reconcilers resolve through. It
+	// applies the filter tags itself (AND semantics, like restic) so a spec can prove the
+	// controller only ever sees what the server-side filter returns, and it records every
+	// call's filter tags so the derivation is assertable.
+	restoreLister *stubFilteredLister
 )
 
 // suiteMoverImage is the placeholder mover image the envtest BackupRepository reconciler builds
@@ -207,6 +213,35 @@ var _ = BeforeSuite(func() {
 		mgr.GetScheme(),
 		discoveryLister,
 		mgr.GetEventRecorder("discovery"),
+	).SetupWithManager(mgr)).To(Succeed())
+
+	// The restore pair (M2). Both share the REAL target exposer — rexposer only touches core
+	// types (PVC/PV/StorageClass/VolumeAttachment), which envtest serves natively; the specs
+	// play the missing kube controllers (binder, PV lifecycle) by patching status, exactly as
+	// the rexposer unit tests do against the fake client. The mediated lister is the stub.
+	restoreLister = &stubFilteredLister{}
+	restoreTargets := rexposer.NewTargetExposer(mgr.GetClient(), suiteOperatorNamespace)
+	Expect(NewRestoreReconciler(
+		mgr.GetClient(),
+		mgr.GetScheme(),
+		secrets.NewByNameReader(mgr.GetAPIReader()),
+		restoreTargets,
+		restoreLister,
+		suiteOperatorNamespace,
+		suiteMoverImage,
+		mgr.GetEventRecorder("restore"),
+		repoQueue,
+	).SetupWithManager(mgr)).To(Succeed())
+	Expect(NewClusterRestoreReconciler(
+		mgr.GetClient(),
+		mgr.GetScheme(),
+		secrets.NewByNameReader(mgr.GetAPIReader()),
+		restoreTargets,
+		restoreLister,
+		suiteOperatorNamespace,
+		suiteMoverImage,
+		mgr.GetEventRecorder("clusterrestore"),
+		repoQueue,
 	).SetupWithManager(mgr)).To(Succeed())
 
 	go func() {

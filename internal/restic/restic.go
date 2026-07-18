@@ -101,8 +101,10 @@ const flagGroupBy = "--group-by"
 // PVC's chain in isolation; forgetCmd is restic's retention subcommand.
 const (
 	flagTag          = "--tag"
+	flagJSON         = "--json"
 	groupByHostPaths = "host,paths"
 	forgetCmd        = "forget"
+	snapshotsCmd     = "snapshots"
 )
 
 // Tag renders one restic tag as "key=value". Centralising the "="-joined format means the
@@ -317,7 +319,7 @@ func ForgetArgs(r v1alpha1.RetentionSpec) []string {
 // machine-readable array ParseSnapshots decodes. Unlike ForgetArgs (retention flags a caller
 // prepends "forget" to), this is a whole command with no dynamic parts.
 func SnapshotsArgs() []string {
-	return []string{"snapshots", "--json", flagTag, TagBase}
+	return []string{snapshotsCmd, flagJSON, flagTag, TagBase}
 }
 
 // ForgetCommand is the complete restic argv for the per-PVC retention forget: the "forget"
