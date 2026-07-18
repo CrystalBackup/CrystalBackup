@@ -169,7 +169,7 @@ var _ = Describe("ClusterBackupScheduleReconciler", func() {
 		createSchedule(newSchedule(name, "* * * * *", loc))
 		created := getScheduleNow(name)
 
-		tick := created.CreationTimestamp.Time.UTC().Truncate(time.Minute).Add(time.Minute)
+		tick := created.CreationTimestamp.UTC().Truncate(time.Minute).Add(time.Minute)
 		scheduleClock.SetTime(tick.Add(30 * time.Second))
 		pokeSchedule(name)
 
@@ -198,7 +198,7 @@ var _ = Describe("ClusterBackupScheduleReconciler", func() {
 		createSchedule(newSchedule(name, "* * * * *", "cbs-loc-catchup"))
 		created := getScheduleNow(name)
 
-		base := created.CreationTimestamp.Time.UTC().Truncate(time.Minute)
+		base := created.CreationTimestamp.UTC().Truncate(time.Minute)
 		scheduleClock.SetTime(base.Add(5*time.Minute + 30*time.Second))
 		pokeSchedule(name)
 
@@ -221,7 +221,7 @@ var _ = Describe("ClusterBackupScheduleReconciler", func() {
 		createSchedule(s)
 		created := getScheduleNow(name)
 
-		scheduleClock.SetTime(created.CreationTimestamp.Time.UTC().Add(5 * time.Minute))
+		scheduleClock.SetTime(created.CreationTimestamp.UTC().Add(5 * time.Minute))
 		pokeSchedule(name)
 
 		By("no run is stamped and the schedule reports Paused")
@@ -238,7 +238,7 @@ var _ = Describe("ClusterBackupScheduleReconciler", func() {
 		// Location absent ⇒ the stamped run blocks on LocationNotFound and stays non-terminal (active).
 		createSchedule(newSchedule(name, "* * * * *", "cbs-loc-forbid-absent"))
 		created := getScheduleNow(name)
-		base := created.CreationTimestamp.Time.UTC().Truncate(time.Minute)
+		base := created.CreationTimestamp.UTC().Truncate(time.Minute)
 
 		By("firing the first run")
 		scheduleClock.SetTime(base.Add(time.Minute + 30*time.Second))
@@ -261,7 +261,7 @@ var _ = Describe("ClusterBackupScheduleReconciler", func() {
 		s.Spec.SuccessfulRunsHistoryLimit = 1
 		createSchedule(s)
 		created := getScheduleNow(name)
-		base := created.CreationTimestamp.Time.UTC()
+		base := created.CreationTimestamp.UTC()
 
 		// Three Completed run records, created oldest→newest (GC orders by creation time).
 		oldest := createTerminalScheduleRun(name, base.Add(-72*time.Hour))

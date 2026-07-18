@@ -17,6 +17,8 @@ limitations under the License.
 package mover
 
 import (
+	"maps"
+
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -39,6 +41,10 @@ const (
 // writable mount. Unexported because it is not part of the operator↔mover path contract
 // the way SecretMountPath / CacheDir are.
 const tmpDir = "/tmp"
+
+// operationFlag is the CLI flag the crystal-mover shim reads to select its operation
+// (`--operation <op>`); BuildJob passes it as the first arg, before restic's "--" separator.
+const operationFlag = "--operation"
 
 // Fixed environment variable names restic reads. The AWS credential names are intentionally
 // absent here: they equal SecretKeyAWSAccessKeyID / SecretKeyAWSSecretAccessKey, so moverEnv
@@ -119,7 +125,7 @@ func BuildJob(req JobRequest) *batchv1.Job {
 		Command: []string{MoverBinaryPath},
 		// Everything after "--" is restic's own argv, forwarded verbatim by the shim. The
 		// prefix literal has len == cap, so append allocates fresh and never aliases ResticArgs.
-		Args:         append([]string{"--operation", string(req.Operation), "--"}, req.ResticArgs...),
+		Args:         append([]string{operationFlag, string(req.Operation), "--"}, req.ResticArgs...),
 		Env:          moverEnv(req),
 		VolumeMounts: mounts,
 		Resources:    req.Resources,
@@ -285,8 +291,6 @@ func copyLabels(in map[string]string) map[string]string {
 		return nil
 	}
 	out := make(map[string]string, len(in))
-	for k, v := range in {
-		out[k] = v
-	}
+	maps.Copy(out, in)
 	return out
 }

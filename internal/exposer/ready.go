@@ -198,7 +198,7 @@ func buildStaticVolumeSnapshotContent(ex *Exposure, driver, snapshotHandle strin
 	_ = unstructured.SetNestedField(vsc.Object, driver, "spec", "driver")
 	_ = unstructured.SetNestedField(vsc.Object, snapshotHandle, "spec", "source", "snapshotHandle")
 	_ = unstructured.SetNestedField(vsc.Object, volumeSnapshotGVK().GroupVersion().String(), "spec", "volumeSnapshotRef", "apiVersion")
-	_ = unstructured.SetNestedField(vsc.Object, "VolumeSnapshot", "spec", "volumeSnapshotRef", "kind")
+	_ = unstructured.SetNestedField(vsc.Object, dataSourceKindVolumeSnapshot, "spec", "volumeSnapshotRef", "kind")
 	_ = unstructured.SetNestedField(vsc.Object, ex.StaticVSName, "spec", "volumeSnapshotRef", "name")
 	_ = unstructured.SetNestedField(vsc.Object, ex.OperatorNamespace, "spec", "volumeSnapshotRef", "namespace")
 

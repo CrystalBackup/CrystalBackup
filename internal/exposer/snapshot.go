@@ -67,7 +67,7 @@ const (
 // VolumeSnapshot and (cluster-scoped) VolumeSnapshotContent objects this package creates, reads,
 // patches and deletes.
 func volumeSnapshotGVK() schema.GroupVersionKind {
-	return schema.GroupVersionKind{Group: volumeSnapshotGroup, Version: volumeSnapshotVersion, Kind: "VolumeSnapshot"}
+	return schema.GroupVersionKind{Group: volumeSnapshotGroup, Version: volumeSnapshotVersion, Kind: dataSourceKindVolumeSnapshot}
 }
 
 func volumeSnapshotContentGVK() schema.GroupVersionKind {

@@ -31,7 +31,7 @@ import (
 	"fmt"
 	"path"
 	"regexp"
-	"sort"
+	"slices"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -84,7 +84,7 @@ func Match(namespaces []corev1.Namespace, sel cbv1.NamespaceSelector) ([]string,
 		}
 		out = append(out, ns.Name)
 	}
-	sort.Strings(out)
+	slices.Sort(out)
 	return out, nil
 }
 

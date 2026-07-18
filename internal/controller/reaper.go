@@ -167,7 +167,7 @@ func (r *OrphanReaper) orphaned(ctx context.Context, obj client.Object, cutoff t
 	if pvc == "" || run == "" || ns == "" {
 		return false, nil // not a per-PVC exposure object (e.g. a repository-init Job).
 	}
-	if obj.GetCreationTimestamp().Time.After(cutoff) {
+	if obj.GetCreationTimestamp().After(cutoff) {
 		return false, nil // too young — a live reconcile may still be settling its status.
 	}
 

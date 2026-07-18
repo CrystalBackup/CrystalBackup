@@ -27,7 +27,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -108,9 +108,9 @@ func initResourceName(repoName string) string {
 // operator-restart test. The mover carries its own name instead.
 func initJobLabels() map[string]string {
 	return map[string]string{
-		"app.kubernetes.io/name":       "crystal-mover",
-		"app.kubernetes.io/managed-by": "crystal-backup",
-		"app.kubernetes.io/component":  "repo-init",
+		labelAppName:      moverAppName,
+		labelAppManagedBy: moverManagedBy,
+		labelAppComponent: "repo-init",
 	}
 }
 
@@ -145,7 +145,7 @@ type BackupRepositoryReconciler struct {
 	// + restic). Required for real backups; empty is tolerated only because envtest never runs
 	// the Job.
 	MoverImage string
-	Recorder   record.EventRecorder
+	Recorder   events.EventRecorder
 
 	// mu guards inflight. inflight tracks the in-flight init Handle per repoKey so the
 	// reconciler is restart-safe (empty map after restart -> re-enqueue -> re-adopt) and never
@@ -166,7 +166,7 @@ func NewBackupRepositoryReconciler(
 	secretsReader *secrets.ByNameReader,
 	q *queue.Manager,
 	operatorNamespace, moverImage string,
-	recorder record.EventRecorder,
+	recorder events.EventRecorder,
 ) *BackupRepositoryReconciler {
 	return &BackupRepositoryReconciler{
 		Client:            c,
@@ -281,7 +281,7 @@ func (r *BackupRepositoryReconciler) finalize(ctx context.Context, br *cbv1.Back
 	delete(r.inflight, br.Name)
 	r.mu.Unlock()
 
-	r.Recorder.Event(br, corev1.EventTypeNormal, "Finalizing",
+	r.Recorder.Eventf(br, nil, corev1.EventTypeNormal, "Finalizing", "Finalize",
 		"removing finalizer; no S3 data is erased and the platform DEK Secret is retained (adr/0009) — "+
 			"decommissioning the repository is an explicit action, not a delete side effect")
 
@@ -428,7 +428,7 @@ func (r *BackupRepositoryReconciler) driveInit(ctx context.Context, br *cbv1.Bac
 		if err := r.Status().Update(ctx, br); err != nil {
 			return ctrl.Result{}, fmt.Errorf("update status for BackupRepository %s: %w", br.Name, err)
 		}
-		r.Recorder.Event(br, corev1.EventTypeNormal, "Initialized",
+		r.Recorder.Eventf(br, nil, corev1.EventTypeNormal, "Initialized", "InitializeRepository",
 			"shared restic repository initialized at "+br.Status.RepositoryURL)
 		// Best-effort cleanup of the one-shot init resources now that init succeeded.
 		r.deleteInitJob(ctx, br.Name, metav1.DeletePropagationBackground)

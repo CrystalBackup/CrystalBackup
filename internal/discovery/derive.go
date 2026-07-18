@@ -23,7 +23,8 @@ limitations under the License.
 package discovery
 
 import (
-	"sort"
+	"cmp"
+	"slices"
 
 	cbv1 "github.com/CrystalBackup/CrystalBackup/api/v1alpha1"
 	"github.com/CrystalBackup/CrystalBackup/internal/restic"
@@ -54,7 +55,7 @@ func VolumesFromSnapshots(snaps []restic.Snapshot) []cbv1.VolumeStatus {
 			Phase:      status.VolumePhaseCompleted,
 		})
 	}
-	sort.Slice(vols, func(i, j int) bool { return vols[i].Pvc < vols[j].Pvc })
+	slices.SortFunc(vols, func(a, b cbv1.VolumeStatus) int { return cmp.Compare(a.Pvc, b.Pvc) })
 	return vols
 }
 

@@ -19,6 +19,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 
 	"github.com/CrystalBackup/CrystalBackup/internal/mover"
@@ -37,6 +38,10 @@ const (
 	// grow the buffer without limit.
 	maxStderrTailBytes = 4096
 )
+
+// jsonFlag is restic's global --json flag. ensureBackupJSON ensures it on a backup so the shim
+// can parse the machine-readable summary off stdout; named once here rather than repeated.
+const jsonFlag = "--json"
 
 // knownOperation reports whether op is one of the five mover operations. It is written as an
 // exhaustive switch over the mover.Op* constants (not a map) so adding a sixth operation is a
@@ -65,12 +70,10 @@ func ensureBackupJSON(operation string, resticArgv []string) []string {
 	if operation != string(mover.OpBackup) {
 		return resticArgv
 	}
-	for _, a := range resticArgv {
-		if a == "--json" {
-			return resticArgv
-		}
+	if slices.Contains(resticArgv, jsonFlag) {
+		return resticArgv
 	}
-	return append(resticArgv[:len(resticArgv):len(resticArgv)], "--json")
+	return append(resticArgv[:len(resticArgv):len(resticArgv)], jsonFlag)
 }
 
 // buildResult is the shim's decision logic, isolated from the exec so it is unit-testable
@@ -174,8 +177,8 @@ func clampError(err error) string {
 // into a failure MoverResult to make the controller's status specific.
 func lastLine(b []byte) string {
 	lines := strings.Split(string(b), "\n")
-	for i := len(lines) - 1; i >= 0; i-- {
-		if s := strings.TrimSpace(lines[i]); s != "" {
+	for _, line := range slices.Backward(lines) {
+		if s := strings.TrimSpace(line); s != "" {
 			return s
 		}
 	}

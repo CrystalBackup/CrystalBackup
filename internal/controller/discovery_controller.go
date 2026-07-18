@@ -24,9 +24,10 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -78,11 +79,11 @@ type DiscoveryReconciler struct {
 	client.Client
 	Scheme   *runtime.Scheme
 	Lister   SnapshotLister
-	Recorder record.EventRecorder
+	Recorder events.EventRecorder
 }
 
 // NewDiscoveryReconciler builds the reconciler. Callers wire the production or stub lister here.
-func NewDiscoveryReconciler(c client.Client, scheme *runtime.Scheme, lister SnapshotLister, recorder record.EventRecorder) *DiscoveryReconciler {
+func NewDiscoveryReconciler(c client.Client, scheme *runtime.Scheme, lister SnapshotLister, recorder events.EventRecorder) *DiscoveryReconciler {
 	return &DiscoveryReconciler{Client: c, Scheme: scheme, Lister: lister, Recorder: recorder}
 }
 
@@ -125,7 +126,7 @@ func (r *DiscoveryReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	snaps, err := r.Lister.List(ctx, &repo)
 	if err != nil {
 		log.Error(err, "discovery: inventory failed; will retry", "repository", repo.Name)
-		r.Recorder.Eventf(&repo, corev1.EventTypeWarning, "InventoryFailed",
+		r.Recorder.Eventf(&repo, nil, corev1.EventTypeWarning, "InventoryFailed", "InventoryRepository",
 			"repository inventory failed: %v", err)
 		return ctrl.Result{RequeueAfter: discoveryRetryInterval}, nil
 	}
@@ -207,10 +208,14 @@ func (r *DiscoveryReconciler) projectGroup(ctx context.Context, repo *cbv1.Backu
 			},
 		},
 		Spec: cbv1.BackupSpec{
-			LocationRef: cbv1.LocationReference{Kind: "ClusterBackupLocation", Name: repo.Name},
+			LocationRef: cbv1.LocationReference{Kind: kindClusterBackupLocation, Name: repo.Name},
 		},
 	}
-	if err := r.Patch(ctx, proj, client.Apply,
+	u, err := runtime.DefaultUnstructuredConverter.ToUnstructured(proj)
+	if err != nil {
+		return fmt.Errorf("convert projected Backup %s/%s to unstructured: %w", key.Namespace, key.Run, err)
+	}
+	if err := r.Apply(ctx, client.ApplyConfigurationFromUnstructured(&unstructured.Unstructured{Object: u}),
 		client.FieldOwner(discoveryFieldManager), client.ForceOwnership); err != nil {
 		return fmt.Errorf("project Backup %s/%s: %w", key.Namespace, key.Run, err)
 	}
@@ -225,7 +230,11 @@ func (r *DiscoveryReconciler) projectGroup(ctx context.Context, repo *cbv1.Backu
 			Volumes: discovery.VolumesFromSnapshots(snaps),
 		},
 	}
-	if err := r.Status().Patch(ctx, statusObj, client.Apply,
+	su, err := runtime.DefaultUnstructuredConverter.ToUnstructured(statusObj)
+	if err != nil {
+		return fmt.Errorf("convert projected Backup status %s/%s to unstructured: %w", key.Namespace, key.Run, err)
+	}
+	if err := r.Status().Apply(ctx, client.ApplyConfigurationFromUnstructured(&unstructured.Unstructured{Object: su}),
 		client.FieldOwner(discoveryFieldManager), client.ForceOwnership); err != nil {
 		return fmt.Errorf("project Backup status %s/%s: %w", key.Namespace, key.Run, err)
 	}
@@ -254,7 +263,7 @@ func (r *DiscoveryReconciler) gcProjections(ctx context.Context, repoKeys map[re
 		if err := r.Delete(ctx, b); err != nil && !apierrors.IsNotFound(err) {
 			return fmt.Errorf("delete stale projection %s/%s: %w", b.Namespace, b.Name, err)
 		}
-		r.Recorder.Eventf(b, corev1.EventTypeNormal, "ProjectionRemoved",
+		r.Recorder.Eventf(b, nil, corev1.EventTypeNormal, "ProjectionRemoved", "RemoveProjection",
 			"removed projected Backup %s/%s: its repository snapshots are gone", b.Namespace, b.Name)
 	}
 	return nil

@@ -26,7 +26,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -66,7 +66,7 @@ type ClusterBackupReconciler struct {
 	// ClusterBackup controller does not touch them directly, but carries the value for parity with
 	// the sibling controllers and for future cluster-manifests capture (M3).
 	OperatorNamespace string
-	Recorder          record.EventRecorder
+	Recorder          events.EventRecorder
 }
 
 // NewClusterBackupReconciler builds a ClusterBackupReconciler. Callers (main.go, the envtest
@@ -76,7 +76,7 @@ func NewClusterBackupReconciler(
 	c client.Client,
 	scheme *runtime.Scheme,
 	operatorNamespace string,
-	recorder record.EventRecorder,
+	recorder events.EventRecorder,
 ) *ClusterBackupReconciler {
 	return &ClusterBackupReconciler{
 		Client:            c,
@@ -172,7 +172,7 @@ func (r *ClusterBackupReconciler) ensureChildBackup(ctx context.Context, cb *cbv
 		Spec: cbv1.BackupSpec{
 			ScheduleRef: cb.Spec.ScheduleRef,
 			LocationRef: cbv1.LocationReference{
-				Kind: "ClusterBackupLocation",
+				Kind: kindClusterBackupLocation,
 				Name: cb.Spec.LocationRef.Name,
 			},
 		},
@@ -183,7 +183,7 @@ func (r *ClusterBackupReconciler) ensureChildBackup(ctx context.Context, cb *cbv
 		}
 		return fmt.Errorf("create child Backup %s/%s: %w", ns, cb.Name, err)
 	}
-	r.Recorder.Eventf(cb, corev1.EventTypeNormal, "FannedOut",
+	r.Recorder.Eventf(cb, nil, corev1.EventTypeNormal, "FannedOut", "FanOut",
 		"created child Backup in namespace %q", ns)
 	return nil
 }
@@ -273,7 +273,7 @@ func (r *ClusterBackupReconciler) aggregateAndWrite(
 		// (vacuously Completed) rather than hot-loop in Pending, but surface it so a misaimed
 		// selector is diagnosable. The terminal guard then freezes it after this single event.
 		phase = status.ClusterBackupPhaseCompleted
-		r.Recorder.Event(cb, corev1.EventTypeWarning, "NoNamespacesMatched",
+		r.Recorder.Eventf(cb, nil, corev1.EventTypeWarning, "NoNamespacesMatched", "SelectNamespaces",
 			"namespace selector matched no namespaces; nothing to back up")
 	}
 	st.Phase = string(phase)

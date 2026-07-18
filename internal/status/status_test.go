@@ -33,7 +33,7 @@ import (
 func TestPhaseConstantsPinned(t *testing.T) {
 	// Compile-time proof that VolumePhase is a true alias for the API type: an
 	// api-typed variable accepts our const without conversion.
-	var _ v1alpha1.VolumePhase = VolumePhaseCompleted
+	var _ v1alpha1.VolumePhase = VolumePhaseCompleted //nolint:staticcheck // explicit type is the assertion: proves VolumePhase aliases the API type
 
 	cases := []struct {
 		got  string
@@ -246,7 +246,7 @@ func TestSetConditionStatusChangeBumpsTransitionTime(t *testing.T) {
 	if c.Status != metav1.ConditionFalse {
 		t.Fatalf("Status = %q, want False", c.Status)
 	}
-	if !c.LastTransitionTime.Time.After(past.Time) {
+	if !c.LastTransitionTime.After(past.Time) {
 		t.Errorf("LastTransitionTime not bumped on status change: got %v, seeded %v", c.LastTransitionTime, past)
 	}
 	if c.ObservedGeneration != 2 {

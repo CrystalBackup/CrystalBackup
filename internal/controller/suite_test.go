@@ -142,7 +142,7 @@ var _ = BeforeSuite(func() {
 		// exercise the Reachable=False path deterministically.
 		Prober:            stubS3Prober{},
 		OperatorNamespace: suiteOperatorNamespace,
-		Recorder:          mgr.GetEventRecorderFor("clusterbackuplocation"),
+		Recorder:          mgr.GetEventRecorder("clusterbackuplocation"),
 	}).SetupWithManager(mgr)).To(Succeed())
 
 	// The per-repository exclusive queue, bound to the suite ctx (cancel() also stops it) and
@@ -155,7 +155,7 @@ var _ = BeforeSuite(func() {
 		repoQueue,
 		suiteOperatorNamespace,
 		suiteMoverImage,
-		mgr.GetEventRecorderFor("backuprepository"),
+		mgr.GetEventRecorder("backuprepository"),
 	).SetupWithManager(mgr)).To(Succeed())
 
 	// The Backup reconciler under test. Its exposer seam is a STUB (stubExposerRegistry, defined
@@ -170,7 +170,7 @@ var _ = BeforeSuite(func() {
 		&stubExposerRegistry{client: mgr.GetClient(), operatorNamespace: suiteOperatorNamespace},
 		suiteOperatorNamespace,
 		suiteMoverImage,
-		mgr.GetEventRecorderFor("backup"),
+		mgr.GetEventRecorder("backup"),
 		// The same shared exclusive queue as the BackupRepository controller. In envtest no backup
 		// sets a retention policy and no mover is simulated as hard-killed, so the forget/unlock
 		// triggers stay inert here; the real ops are crucible-validated.
@@ -184,7 +184,7 @@ var _ = BeforeSuite(func() {
 		mgr.GetClient(),
 		mgr.GetScheme(),
 		suiteOperatorNamespace,
-		mgr.GetEventRecorderFor("clusterbackup"),
+		mgr.GetEventRecorder("clusterbackup"),
 	).SetupWithManager(mgr)).To(Succeed())
 
 	// The ClusterBackupSchedule reconciler, reading "now" from a fake clock the schedule specs
@@ -195,7 +195,7 @@ var _ = BeforeSuite(func() {
 		mgr.GetClient(),
 		mgr.GetScheme(),
 		scheduleClock,
-		mgr.GetEventRecorderFor("clusterbackupschedule"),
+		mgr.GetEventRecorder("clusterbackupschedule"),
 	).SetupWithManager(mgr)).To(Succeed())
 
 	// The discovery reconciler, reading the repository inventory from a stub lister the specs feed
@@ -206,7 +206,7 @@ var _ = BeforeSuite(func() {
 		mgr.GetClient(),
 		mgr.GetScheme(),
 		discoveryLister,
-		mgr.GetEventRecorderFor("discovery"),
+		mgr.GetEventRecorder("discovery"),
 	).SetupWithManager(mgr)).To(Succeed())
 
 	go func() {

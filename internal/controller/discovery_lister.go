@@ -76,9 +76,9 @@ func discoveryResourceName(repoName string) string {
 // reaper sweeps by, so a leaked inventory Job is reclaimed like any other stray mover resource.
 func discoveryJobLabels() map[string]string {
 	return map[string]string{
-		"app.kubernetes.io/name":       "crystal-mover",
-		"app.kubernetes.io/managed-by": "crystal-backup",
-		"app.kubernetes.io/component":  "discovery",
+		labelAppName:      moverAppName,
+		labelAppManagedBy: moverManagedBy,
+		labelAppComponent: "discovery",
 	}
 }
 

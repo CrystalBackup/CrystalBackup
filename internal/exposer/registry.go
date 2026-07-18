@@ -20,7 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sort"
+	"slices"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -147,6 +147,6 @@ func (r *Registry) findVolumeSnapshotClass(ctx context.Context, provisioner stri
 	if len(candidates) == 0 {
 		return "", nil
 	}
-	sort.Strings(candidates)
+	slices.Sort(candidates)
 	return candidates[0], nil
 }

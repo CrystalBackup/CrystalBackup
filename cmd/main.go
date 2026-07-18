@@ -255,7 +255,7 @@ func main() {
 		Secrets:           secrets.NewByNameReader(mgr.GetAPIReader()),
 		Prober:            controller.NewHTTPS3Prober(),
 		OperatorNamespace: operatorNamespace,
-		Recorder:          mgr.GetEventRecorderFor("clusterbackuplocation"),
+		Recorder:          mgr.GetEventRecorder("clusterbackuplocation"),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Unable to create controller", "controller", "ClusterBackupLocation")
 		os.Exit(1)
@@ -268,7 +268,7 @@ func main() {
 		repoQueue,
 		operatorNamespace,
 		moverImage,
-		mgr.GetEventRecorderFor("backuprepository"),
+		mgr.GetEventRecorder("backuprepository"),
 	).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Unable to create controller", "controller", "BackupRepository")
 		os.Exit(1)
@@ -284,7 +284,7 @@ func main() {
 		exposer.NewRegistry(mgr.GetClient(), operatorNamespace),
 		operatorNamespace,
 		moverImage,
-		mgr.GetEventRecorderFor("backup"),
+		mgr.GetEventRecorder("backup"),
 		// The SAME per-repository exclusive queue the BackupRepository controller uses: the Backup
 		// controller enqueues retention-forget and stale-lock-unlock on it, serialised per repository
 		// against init and each other.
@@ -298,7 +298,7 @@ func main() {
 		mgr.GetClient(),
 		mgr.GetScheme(),
 		operatorNamespace,
-		mgr.GetEventRecorderFor("clusterbackup"),
+		mgr.GetEventRecorder("clusterbackup"),
 	).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Unable to create controller", "controller", "ClusterBackup")
 		os.Exit(1)
@@ -308,7 +308,7 @@ func main() {
 		mgr.GetClient(),
 		mgr.GetScheme(),
 		clock.RealClock{},
-		mgr.GetEventRecorderFor("clusterbackupschedule"),
+		mgr.GetEventRecorder("clusterbackupschedule"),
 	).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Unable to create controller", "controller", "ClusterBackupSchedule")
 		os.Exit(1)
@@ -334,7 +334,7 @@ func main() {
 			operatorNamespace,
 			moverImage,
 		),
-		mgr.GetEventRecorderFor("discovery"),
+		mgr.GetEventRecorder("discovery"),
 	).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Unable to create controller", "controller", "Discovery")
 		os.Exit(1)

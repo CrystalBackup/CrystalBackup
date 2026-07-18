@@ -19,7 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
@@ -28,7 +28,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	"k8s.io/utils/clock"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -74,7 +74,7 @@ type ClusterBackupScheduleReconciler struct {
 	Scheme *runtime.Scheme
 	// Clock is the only source of "now": clock.RealClock in production, a fake clock in tests.
 	Clock    clock.PassiveClock
-	Recorder record.EventRecorder
+	Recorder events.EventRecorder
 }
 
 // NewClusterBackupScheduleReconciler builds the reconciler. Callers go through this constructor to
@@ -83,7 +83,7 @@ func NewClusterBackupScheduleReconciler(
 	c client.Client,
 	scheme *runtime.Scheme,
 	cl clock.PassiveClock,
-	recorder record.EventRecorder,
+	recorder events.EventRecorder,
 ) *ClusterBackupScheduleReconciler {
 	return &ClusterBackupScheduleReconciler{Client: c, Scheme: scheme, Clock: cl, Recorder: recorder}
 }
@@ -143,7 +143,7 @@ func (r *ClusterBackupScheduleReconciler) Reconcile(ctx context.Context, req ctr
 	stampedName := ""
 	if tick, due := cronSched.DueTick(r.baselineTick(&sched, runs), effectiveNow, deadline); due {
 		if active := activeRun(runs); active != nil {
-			r.Recorder.Eventf(&sched, corev1.EventTypeWarning, "ConcurrencySkip",
+			r.Recorder.Eventf(&sched, nil, corev1.EventTypeWarning, "ConcurrencySkip", "SkipRun",
 				"skipping run for tick %s: previous run %q still active (concurrencyPolicy %s)",
 				tick.UTC().Format(time.RFC3339), active.Name, concurrencyPolicyOf(&sched))
 		} else {
@@ -220,7 +220,7 @@ func (r *ClusterBackupScheduleReconciler) stampRun(ctx context.Context, sched *c
 		}
 		return "", fmt.Errorf("create run %s: %w", name, err)
 	}
-	r.Recorder.Eventf(sched, corev1.EventTypeNormal, "RunStamped",
+	r.Recorder.Eventf(sched, nil, corev1.EventTypeNormal, "RunStamped", "StampRun",
 		"created ClusterBackup run %q for tick %s", name, tick.UTC().Format(time.RFC3339))
 	return name, nil
 }
@@ -254,16 +254,29 @@ func (r *ClusterBackupScheduleReconciler) trimHistory(ctx context.Context, sched
 		return
 	}
 	log := logf.FromContext(ctx)
-	sort.Slice(group, func(i, j int) bool {
-		ti, oki := parseRunTick(sched.Name, group[i].Name)
-		tj, okj := parseRunTick(sched.Name, group[j].Name)
-		if oki && okj && !ti.Equal(tj) {
-			return ti.After(tj) // newer activation first
+	slices.SortFunc(group, func(a, b cbv1.ClusterBackup) int {
+		ta, oka := parseRunTick(sched.Name, a.Name)
+		tb, okb := parseRunTick(sched.Name, b.Name)
+		if oka && okb && !ta.Equal(tb) {
+			if ta.After(tb) {
+				return -1 // newer activation first
+			}
+			return 1
 		}
-		if !group[i].CreationTimestamp.Time.Equal(group[j].CreationTimestamp.Time) {
-			return group[i].CreationTimestamp.After(group[j].CreationTimestamp.Time)
+		if !a.CreationTimestamp.Time.Equal(b.CreationTimestamp.Time) {
+			if a.CreationTimestamp.After(b.CreationTimestamp.Time) {
+				return -1
+			}
+			return 1
 		}
-		return group[i].Name > group[j].Name
+		switch {
+		case a.Name > b.Name:
+			return -1
+		case a.Name < b.Name:
+			return 1
+		default:
+			return 0
+		}
 	})
 	for i := keep; i < len(group); i++ {
 		old := group[i]
@@ -271,7 +284,7 @@ func (r *ClusterBackupScheduleReconciler) trimHistory(ctx context.Context, sched
 			log.Error(err, "run-history GC: delete old run record failed", "run", old.Name)
 			continue
 		}
-		r.Recorder.Eventf(sched, corev1.EventTypeNormal, "RunHistoryGC",
+		r.Recorder.Eventf(sched, nil, corev1.EventTypeNormal, "RunHistoryGC", "PruneRunHistory",
 			"deleted old run record %q (history limit %d); its child backups are unaffected", old.Name, keep)
 	}
 }

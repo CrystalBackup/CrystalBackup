@@ -88,6 +88,23 @@ const (
 	KindClusterManifests = "cluster-manifests"
 )
 
+// clusterManifestsPath is the fixed restic backup path of the cluster-scoped-objects snapshot
+// (ClusterManifestsIdentity); unlike /data/<ns>/<pvc> and /manifests/<ns> it belongs to no
+// namespace.
+const clusterManifestsPath = "/cluster-manifests"
+
+// flagGroupBy is restic's --group-by flag. Retention groups snapshots by "host,paths" so each
+// PVC's chain is thinned in isolation (see ForgetArgs).
+const flagGroupBy = "--group-by"
+
+// flagTag is restic's --tag filter flag; groupByHostPaths is the --group-by value that thins each
+// PVC's chain in isolation; forgetCmd is restic's retention subcommand.
+const (
+	flagTag          = "--tag"
+	groupByHostPaths = "host,paths"
+	forgetCmd        = "forget"
+)
+
 // Tag renders one restic tag as "key=value". Centralising the "="-joined format means the
 // identity builders below and every reader (TagValue, discovery, restore, erasure) share a
 // single definition of a tag's shape, so encode and decode can never drift apart.
@@ -203,7 +220,7 @@ func ClusterManifestsIdentity(clusterID, schedule, run string) Identity {
 	}
 	return Identity{
 		Host: clusterID,
-		Path: "/cluster-manifests",
+		Path: clusterManifestsPath,
 		Tags: scheduleRunTags(tags, schedule, run),
 	}
 }
@@ -279,7 +296,7 @@ func RepoURL(endpoint, bucket, prefix, clusterID string) string {
 // for a Standard-mode schedule, so this degenerate all-zero case never reaches a real run;
 // it is returned (rather than panicking) so callers can detect it as len(args) == 4.
 func ForgetArgs(r v1alpha1.RetentionSpec) []string {
-	args := []string{"--tag", TagBase, "--group-by", "host,paths"}
+	args := []string{flagTag, TagBase, flagGroupBy, groupByHostPaths}
 	keep := func(bucket string, n int32) {
 		if n > 0 {
 			args = append(args, "--keep-"+bucket, strconv.FormatInt(int64(n), 10))
@@ -300,7 +317,7 @@ func ForgetArgs(r v1alpha1.RetentionSpec) []string {
 // machine-readable array ParseSnapshots decodes. Unlike ForgetArgs (retention flags a caller
 // prepends "forget" to), this is a whole command with no dynamic parts.
 func SnapshotsArgs() []string {
-	return []string{"snapshots", "--json", "--tag", TagBase}
+	return []string{"snapshots", "--json", flagTag, TagBase}
 }
 
 // ForgetCommand is the complete restic argv for the per-PVC retention forget: the "forget"
@@ -313,7 +330,7 @@ func ForgetCommand(r v1alpha1.RetentionSpec) (argv []string, ok bool) {
 	if len(flags) <= 4 { // only the --tag/--group-by prefix ⇒ no keep policy set.
 		return nil, false
 	}
-	return append([]string{"forget"}, flags...), true
+	return append([]string{forgetCmd}, flags...), true
 }
 
 // UnlockArgs is the complete restic argv that clears a hard-killed mover's repository lock:

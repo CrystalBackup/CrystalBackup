@@ -22,7 +22,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"path"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
@@ -32,7 +32,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -118,7 +118,7 @@ type BackupReconciler struct {
 	// MoverImage is the image the mover Jobs run. Required for real backups; empty is tolerated
 	// only because envtest simulates the Job outcome and never runs it.
 	MoverImage string
-	Recorder   record.EventRecorder
+	Recorder   events.EventRecorder
 	// Queue is the per-repository exclusive work queue, SHARED with the BackupRepository controller
 	// (main.go constructs one and passes it to both). The Backup controller enqueues the two
 	// repository maintenance ops it triggers — retention forget after a successful backup, and a
@@ -136,7 +136,7 @@ func NewBackupReconciler(
 	secretsReader *secrets.ByNameReader,
 	exposers ExposerRegistry,
 	operatorNamespace, moverImage string,
-	recorder record.EventRecorder,
+	recorder events.EventRecorder,
 	q *queue.Manager,
 ) *BackupReconciler {
 	return &BackupReconciler{
@@ -401,7 +401,7 @@ func (r *BackupReconciler) finalize(ctx context.Context, backup *cbv1.Backup) (c
 		r.deleteMoverJobAndSecret(ctx, moverNamePrefix(backup.Name, vol.Pvc))
 	}
 
-	r.Recorder.Event(backup, corev1.EventTypeNormal, "Finalizing",
+	r.Recorder.Eventf(backup, nil, corev1.EventTypeNormal, "Finalizing", "Finalize",
 		"tearing down live exposures and mover Jobs; no repository data is erased (adr/0009)")
 
 	controllerutil.RemoveFinalizer(backup, apiconst.FinalizerBackup)
@@ -487,7 +487,7 @@ func (r *BackupReconciler) ensureVolumes(ctx context.Context, backup *cbv1.Backu
 			matched = append(matched, pvcs.Items[i].Name)
 		}
 	}
-	sort.Strings(matched)
+	slices.Sort(matched)
 
 	tracked := make(map[string]bool, len(backup.Status.Volumes))
 	for i := range backup.Status.Volumes {
@@ -513,7 +513,7 @@ func (r *BackupReconciler) ensureVolumes(ctx context.Context, backup *cbv1.Backu
 func (r *BackupReconciler) advanceVolume(ctx context.Context, backup *cbv1.Backup, vol *cbv1.VolumeStatus, rc *backupRunContext) (string, error) {
 	switch vol.Phase {
 	case status.VolumePhasePending, "":
-		return "", r.advancePending(ctx, backup, vol, rc)
+		return "", r.advancePending(ctx, backup, vol)
 	case status.VolumePhaseSnapshotting:
 		return "", r.advanceSnapshotting(ctx, backup, vol, rc)
 	case status.VolumePhaseUploading:
@@ -528,7 +528,7 @@ func (r *BackupReconciler) advanceVolume(ctx context.Context, backup *cbv1.Backu
 // CSISnapshotUnsupported — a Skipped volume makes the Backup PartiallyCompleted, never Failed
 // (status.RollUpVolumePhases encodes this). SnapshottingHooks (M4) are skipped in M1: Pending
 // goes straight to Snapshotting.
-func (r *BackupReconciler) advancePending(ctx context.Context, backup *cbv1.Backup, vol *cbv1.VolumeStatus, rc *backupRunContext) error {
+func (r *BackupReconciler) advancePending(ctx context.Context, backup *cbv1.Backup, vol *cbv1.VolumeStatus) error {
 	var pvc corev1.PersistentVolumeClaim
 	if err := r.Get(ctx, client.ObjectKey{Namespace: backup.Namespace, Name: vol.Pvc}, &pvc); err != nil {
 		if apierrors.IsNotFound(err) {
@@ -544,7 +544,7 @@ func (r *BackupReconciler) advancePending(ctx context.Context, backup *cbv1.Back
 		if errors.Is(err, exposer.ErrUnsupported) {
 			vol.Phase = status.VolumePhaseSkipped
 			vol.Reason = backupReasonSkippedUnsupported
-			r.Recorder.Eventf(backup, corev1.EventTypeNormal, "VolumeSkipped",
+			r.Recorder.Eventf(backup, nil, corev1.EventTypeNormal, "VolumeSkipped", "SkipVolume",
 				"PVC %s is on storage without CSI snapshot support; skipped", vol.Pvc)
 			return nil
 		}
@@ -736,7 +736,7 @@ func (r *BackupReconciler) advanceUploading(ctx context.Context, backup *cbv1.Ba
 	default:
 		vol.Phase = status.VolumePhaseFailed
 		vol.Reason = moverFailureReason(result, rerr)
-		r.Recorder.Eventf(backup, corev1.EventTypeWarning, "VolumeFailed",
+		r.Recorder.Eventf(backup, nil, corev1.EventTypeWarning, "VolumeFailed", "BackupVolume",
 			"backup of PVC %s failed: %s", vol.Pvc, vol.Reason)
 		// A BLANK or unparseable termination message (rerr != nil) is the load-bearing signal that
 		// the mover was hard-killed (OOMKilled / SIGKILL) before it could report — so it may have

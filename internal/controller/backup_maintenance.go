@@ -79,6 +79,20 @@ func maintenanceResourceName(backupName, op string) string {
 	return backupName + "-" + op
 }
 
+// Recommended Kubernetes label keys stamped on the operator's mover-family workloads (the
+// repo-init, maintenance and discovery Jobs and their pods). Centralised so the three label
+// builders share one definition rather than repeating the string keys. The name value is always
+// crystal-mover, never crystal-backup (the operator pod's own app.kubernetes.io/name, which the
+// crucible's operator-restart tests select on).
+const (
+	labelAppName      = "app.kubernetes.io/name"
+	labelAppManagedBy = "app.kubernetes.io/managed-by"
+	labelAppComponent = "app.kubernetes.io/component"
+
+	moverAppName   = "crystal-mover"
+	moverManagedBy = "crystal-backup"
+)
+
 // maintenanceJobLabels stamps a maintenance Job (and its pod template) and its creds Secret. Like
 // initJobLabels it avoids app.kubernetes.io/name=crystal-backup (the operator pod's label). It
 // carries the managed-by label but NO per-PVC label, which matters twice: the mover-concurrency
@@ -87,9 +101,9 @@ func maintenanceResourceName(backupName, op string) string {
 // out from under itself. Cleanup of these is runRepoMaintenance's own responsibility.
 func maintenanceJobLabels() map[string]string {
 	return map[string]string{
-		"app.kubernetes.io/name":       "crystal-mover",
-		"app.kubernetes.io/managed-by": "crystal-backup",
-		"app.kubernetes.io/component":  "maintenance",
+		labelAppName:      moverAppName,
+		labelAppManagedBy: moverManagedBy,
+		labelAppComponent: "maintenance",
 	}
 }
 
@@ -111,7 +125,7 @@ func (r *BackupReconciler) maybeEnqueueRetentionForget(ctx context.Context, back
 	}
 	name := maintenanceResourceName(backup.Name, "forget")
 	r.enqueueRepoMaintenance(ctx, rc, queue.OpForget, name, mover.OpForget, argv)
-	r.Recorder.Eventf(backup, corev1.EventTypeNormal, "RetentionEnqueued",
+	r.Recorder.Eventf(backup, nil, corev1.EventTypeNormal, "RetentionEnqueued", "EnqueueRetention",
 		"retention forget enqueued on repository %s", rc.repoName)
 }
 
@@ -123,7 +137,7 @@ func (r *BackupReconciler) maybeEnqueueRetentionForget(ctx context.Context, back
 func (r *BackupReconciler) enqueueStaleLockUnlock(ctx context.Context, backup *cbv1.Backup, rc *backupRunContext) {
 	name := maintenanceResourceName(backup.Name, "unlock")
 	r.enqueueRepoMaintenance(ctx, rc, queue.OpUnlock, name, mover.OpUnlock, restic.UnlockArgs())
-	r.Recorder.Eventf(backup, corev1.EventTypeWarning, "StaleLockUnlockEnqueued",
+	r.Recorder.Eventf(backup, nil, corev1.EventTypeWarning, "StaleLockUnlockEnqueued", "EnqueueUnlock",
 		"a mover was hard-killed; stale-lock unlock enqueued on repository %s", rc.repoName)
 }
 

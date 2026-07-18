@@ -51,7 +51,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -86,6 +86,10 @@ const (
 	// location with an ignored retention is still Ready.
 	ConditionRetentionIgnored = "RetentionIgnored"
 )
+
+// locationPhaseDegraded is the Status.Phase a ClusterBackupLocation records when a fail-fast
+// check (encryption or reachability) fails, or when the readiness rollup is otherwise not met.
+const locationPhaseDegraded = "Degraded"
 
 const (
 	// kekIdentityDataKey is the data key inside the Secret named by
@@ -187,7 +191,7 @@ type ClusterBackupLocationReconciler struct {
 	// platform Secret) lives — apiconst.DefaultOperatorNamespace by default, overridable via
 	// main.go's --operator-namespace flag.
 	OperatorNamespace string
-	Recorder          record.EventRecorder
+	Recorder          events.EventRecorder
 }
 
 // +kubebuilder:rbac:groups=crystalbackup.io,resources=clusterbackuplocations,verbs=get;list;watch;update;patch
@@ -246,7 +250,7 @@ func (r *ClusterBackupLocationReconciler) Reconcile(ctx context.Context, req ctr
 	if encryptionValid := r.validateEncryption(ctx, &loc); !encryptionValid {
 		status.SetCondition(&loc.Status.Conditions, ConditionReady, metav1.ConditionFalse, "EncryptionInvalid",
 			"cluster encryption is not valid; see condition EncryptionValid", loc.Generation)
-		loc.Status.Phase = "Degraded"
+		loc.Status.Phase = locationPhaseDegraded
 		if err := r.Status().Update(ctx, &loc); err != nil {
 			return ctrl.Result{}, fmt.Errorf("update status for ClusterBackupLocation %s: %w", loc.Name, err)
 		}
@@ -256,7 +260,7 @@ func (r *ClusterBackupLocationReconciler) Reconcile(ctx context.Context, req ctr
 	if reachable := r.checkReachability(ctx, &loc); !reachable {
 		status.SetCondition(&loc.Status.Conditions, ConditionReady, metav1.ConditionFalse, "Unreachable",
 			"object storage endpoint is not reachable; see condition Reachable", loc.Generation)
-		loc.Status.Phase = "Degraded"
+		loc.Status.Phase = locationPhaseDegraded
 		if err := r.Status().Update(ctx, &loc); err != nil {
 			return ctrl.Result{}, fmt.Errorf("update status for ClusterBackupLocation %s: %w", loc.Name, err)
 		}
@@ -288,7 +292,7 @@ func (r *ClusterBackupLocationReconciler) Reconcile(ctx context.Context, req ctr
 	default:
 		status.SetCondition(&loc.Status.Conditions, ConditionReady, metav1.ConditionFalse, "NotReady",
 			"location is not ready", loc.Generation)
-		loc.Status.Phase = "Degraded"
+		loc.Status.Phase = locationPhaseDegraded
 	}
 
 	if err := r.Status().Update(ctx, &loc); err != nil {
@@ -309,7 +313,7 @@ func (r *ClusterBackupLocationReconciler) finalize(ctx context.Context, loc *cbv
 		return ctrl.Result{}, nil
 	}
 
-	r.Recorder.Event(loc, corev1.EventTypeNormal, "Finalizing",
+	r.Recorder.Eventf(loc, nil, corev1.EventTypeNormal, "Finalizing", "Finalize",
 		"removing finalizer; no S3 data is erased (adr/0009) and the owned BackupRepository, "+
 			"if any, is left for garbage collection via its ownerReference")
 
@@ -368,7 +372,7 @@ func (r *ClusterBackupLocationReconciler) reconcileRetentionAdvisory(loc *cbv1.C
 			"ImmutableLocation",
 			"spec.retention keep* is ignored on an Immutable location (object-lock governs expiry)", loc.Generation)
 		if !wasIgnored {
-			r.Recorder.Event(loc, corev1.EventTypeWarning, "RetentionIgnored",
+			r.Recorder.Eventf(loc, nil, corev1.EventTypeWarning, "RetentionIgnored", "IgnoreRetention",
 				"spec.retention is set but the location is Immutable; keep* is ignored until object-lock expiry")
 		}
 		return

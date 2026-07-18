@@ -58,11 +58,20 @@ var buildInfoDesc = prometheus.NewDesc(
 	"A constant 1, labelled with the operator build version; always present.",
 	[]string{"version"}, nil)
 
+// Prometheus label names shared by the two metric families' label sets below (extracted so the
+// repeated names are defined once): the originating schedule, the location, and the cluster
+// identity (resolved from a location's clusterID).
+const (
+	scheduleLabel = "schedule"
+	locationLabel = "location"
+	clusterLabel  = "cluster"
+)
+
 // backupLabels / clusterBackupLabels are the label sets of the two metric families,
 // in the fixed order the metric values are appended below.
 var (
-	backupLabels        = []string{"namespace", "tenant", "schedule", "origin", "location", "cluster"}
-	clusterBackupLabels = []string{"schedule", "location", "cluster"}
+	backupLabels        = []string{"namespace", "tenant", scheduleLabel, "origin", locationLabel, clusterLabel}
+	clusterBackupLabels = []string{scheduleLabel, locationLabel, clusterLabel}
 
 	backupLastSuccessDesc = prometheus.NewDesc(
 		"crystalbackup_backup_last_success_timestamp_seconds",
