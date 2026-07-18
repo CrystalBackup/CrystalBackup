@@ -32,6 +32,7 @@ import (
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -113,7 +114,7 @@ func (r *ClusterRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		}
 		return ctrl.Result{Requeue: true}, nil
 	}
-	if isTerminalRestorePhase(cr.Status.Phase) {
+	if status.IsTerminalRestorePhase(cr.Status.Phase) {
 		return ctrl.Result{}, nil
 	}
 
@@ -122,7 +123,7 @@ func (r *ClusterRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	if cr.Spec.Confirmation != cr.Spec.Target.Namespace {
 		return r.awaitConfirmation(ctx, &cr)
 	}
-	if !meta_HasConditionTrue(cr.Status.Conditions, ConditionConfirmed) {
+	if !status.IsConditionTrue(cr.Status.Conditions, ConditionConfirmed) {
 		status.SetCondition(&cr.Status.Conditions, ConditionConfirmed, metav1.ConditionTrue,
 			"ConfirmationAccepted", "spec.confirmation matches the target namespace", cr.Generation)
 		r.Recorder.Eventf(&cr, nil, corev1.EventTypeNormal, "ConfirmationAccepted", "Confirm",
@@ -140,55 +141,40 @@ func (r *ClusterRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return res, err
 	}
 
-	// (4) Drive the volumes; (5) single status write; (6) teardown after terminal.
-	settled, completed, failedCount := 0, 0, 0
-	var restoredBytes int64
-	var failures []string
-	for i := range plans {
-		outcome, err := r.Engine.adviseVolume(ctx, rc, &plans[i])
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		if !outcome.settled {
-			continue
-		}
-		settled++
-		if outcome.failed {
-			failedCount++
-			failures = append(failures, plans[i].pvc+": "+outcome.reason)
-			continue
-		}
-		completed++
-		restoredBytes += outcome.restoredBytes
+	// (4) Drive the volumes; (5) single status write; (6) teardown after terminal. The
+	// shared engine loop budgets errors per volume, so one flaky volume never stalls the rest.
+	drive := r.Engine.driveVolumes(ctx, rc, plans)
+	if drive.err != nil {
+		return ctrl.Result{}, drive.err
 	}
 
-	if settled < len(plans) {
+	if drive.settled < len(plans) {
 		cr.Status.Phase = string(status.RestorePhaseRunning)
 		status.SetCondition(&cr.Status.Conditions, ConditionReady, metav1.ConditionFalse, "InProgress",
-			fmt.Sprintf("restoring: %d/%d volumes settled", settled, len(plans)), cr.Generation)
+			fmt.Sprintf("restoring: %d/%d volumes settled", drive.settled, len(plans)), cr.Generation)
 		if err := r.Status().Update(ctx, &cr); err != nil {
 			return ctrl.Result{}, fmt.Errorf("update status for ClusterRestore %s: %w", cr.Name, err)
 		}
 		return ctrl.Result{RequeueAfter: restorePollInterval}, nil
 	}
 
-	phase := status.RollUpRestoreOutcomes(completed, failedCount)
+	phase := status.RollUpRestoreOutcomes(drive.completed, drive.failedCount)
 	cr.Status.Phase = string(phase)
-	cr.Status.RestoredVolumes = int32(completed)
-	cr.Status.RestoredBytes = restoredBytes
-	setRestoreTerminalCondition(&cr.Status.Conditions, phase, failures, cr.Generation)
+	cr.Status.RestoredVolumes = int32(drive.completed)
+	cr.Status.RestoredBytes = drive.restoredBytes
+	setRestoreTerminalCondition(&cr.Status.Conditions, phase, drive.failures, cr.Generation)
 	if err := r.Status().Update(ctx, &cr); err != nil {
 		return ctrl.Result{}, fmt.Errorf("update status for ClusterRestore %s: %w", cr.Name, err)
 	}
 
 	r.Engine.teardownAll(ctx, rc, plans)
-	r.Engine.forgetResolution(cr.UID)
+	r.Engine.forgetResolution(cr.UID, rc.ownerID)
 	if phase == status.RestorePhaseCompleted {
 		r.Recorder.Eventf(&cr, nil, corev1.EventTypeNormal, "RestoreCompleted", "Restore",
-			"restored %d volume(s), %d bytes into namespace %s", completed, restoredBytes, cr.Spec.Target.Namespace)
+			"restored %d volume(s), %d bytes into namespace %s", drive.completed, drive.restoredBytes, cr.Spec.Target.Namespace)
 	} else {
 		r.Recorder.Eventf(&cr, nil, corev1.EventTypeWarning, "RestoreFailed", "Restore",
-			"restore ended %s: %s", string(phase), clampMessage(joinFailures(failures)))
+			"restore ended %s: %s", string(phase), clampMessage(joinFailures(drive.failures)))
 	}
 	return ctrl.Result{}, nil
 }
@@ -241,17 +227,20 @@ func (r *ClusterRestoreReconciler) prepare(ctx context.Context, cr *cbv1.Cluster
 			fmt.Sprintf("BackupRepository %q is not initialized", loc.Name))
 		return nil, nil, res, gerr
 	}
-	dek, reason, message, ok := ensurePlatformDEKFor(ctx, r.Client, r.Engine.Secrets, r.OperatorNamespace, &loc)
+	dek, reason, message, ok := resolvePlatformDEKCommon(ctx, r.Client, r.Engine.Secrets, r.OperatorNamespace, &loc)
 	if !ok {
 		res, gerr := r.gate(ctx, cr, reason, message)
 		return nil, nil, res, gerr
 	}
 
 	// One filtered listing for the whole source namespace, cached per (owner, coordinate).
+	// The coordinate is the SPEC string, not the resolved run, so a "latest" resolution is
+	// pinned for the restore's lifetime by the cache itself (cleared on terminal): a newer
+	// run uploading mid-restore can never flip the remaining volumes onto a different run.
 	coordinate := cr.Spec.Source.Namespace + "/" + cr.Spec.Source.Backup + "/" + cr.Spec.Source.Time
 	byPVC, cached := r.Engine.cachedResolution(cr.UID, coordinate)
 	if !cached {
-		snaps, err := r.Lister.ListFiltered(ctx, &repo, restoreResolveJobName(cr.Name),
+		snaps, err := r.Lister.ListFiltered(ctx, &repo, restoreResolveJobName(clusterRestoreOwnerID(cr.Name)),
 			restic.Tag(restic.TagKeyNamespace, cr.Spec.Source.Namespace))
 		if err != nil {
 			res, gerr := r.gate(ctx, cr, "SnapshotResolutionFailed",
@@ -260,26 +249,33 @@ func (r *ClusterRestoreReconciler) prepare(ctx context.Context, cr *cbv1.Cluster
 		}
 		run, runSnaps, found := selectRun(snaps, cr.Spec.Source.Backup, cr.Spec.Source.Time)
 		if !found {
-			res, gerr := r.gate(ctx, cr, "RunNotFound",
-				fmt.Sprintf("no run matching spec.source in the repository for namespace %q", cr.Spec.Source.Namespace))
+			// Slow cadence on purpose: each retry re-runs a whole listing Job against S3, and
+			// the usual causes (the run has not uploaded yet; a typo'd coordinate) either
+			// resolve within minutes or need a spec edit (which requeues immediately anyway).
+			res, gerr := r.gateAt(ctx, cr, "RunNotFound",
+				fmt.Sprintf("no run matching spec.source in the repository for namespace %q", cr.Spec.Source.Namespace),
+				periodicRequeueInterval)
+			return nil, nil, res, gerr
+		}
+		byPVC = dataSnapshotsByPVC(runSnaps)
+		if len(byPVC) == 0 {
+			// Gate WITHOUT caching, on the slow cadence: the run's data snapshots may still
+			// be uploading, and a cached empty map would replay this dead end until restart.
+			res, gerr := r.gateAt(ctx, cr, "RunNotFound",
+				fmt.Sprintf("run %q holds no data snapshots for namespace %q", run, cr.Spec.Source.Namespace),
+				periodicRequeueInterval)
 			return nil, nil, res, gerr
 		}
 		r.Recorder.Eventf(cr, nil, corev1.EventTypeNormal, "RunResolved", "ResolveRun",
 			"restoring run %q of namespace %s", run, cr.Spec.Source.Namespace)
-		byPVC = dataSnapshotsByPVC(runSnaps)
 		r.Engine.storeResolution(cr.UID, coordinate, byPVC)
-	}
-
-	if len(byPVC) == 0 {
-		res, gerr := r.gate(ctx, cr, "RunNotFound",
-			fmt.Sprintf("the resolved run holds no data snapshots for namespace %q", cr.Spec.Source.Namespace))
-		return nil, nil, res, gerr
 	}
 
 	run := runOf(byPVC)
 	rc := &restoreExecContext{
 		ownerName:       cr.Name,
 		ownerLabelKey:   apiconst.LabelClusterRestore,
+		ownerID:         clusterRestoreOwnerID(cr.Name),
 		targetNamespace: cr.Spec.Target.Namespace,
 		deleteExtras:    cr.Spec.Mode == cbv1.RestoreModeRecreate,
 		restoredFromRun: run,
@@ -376,14 +372,19 @@ func (r *ClusterRestoreReconciler) awaitConfirmation(ctx context.Context, cr *cb
 	return ctrl.Result{RequeueAfter: shortRequeueInterval}, nil
 }
 
-// gate records a non-terminal blocker and requeues on the fixable-fault cadence.
+// gate records a non-terminal blocker and requeues on the fixable-fault cadence; gateAt is
+// the same with a caller-chosen cadence (a blocker whose retry is expensive backs off).
 func (r *ClusterRestoreReconciler) gate(ctx context.Context, cr *cbv1.ClusterRestore, reason, message string) (ctrl.Result, error) {
+	return r.gateAt(ctx, cr, reason, message, shortRequeueInterval)
+}
+
+func (r *ClusterRestoreReconciler) gateAt(ctx context.Context, cr *cbv1.ClusterRestore, reason, message string, after time.Duration) (ctrl.Result, error) {
 	cr.Status.Phase = string(status.RestorePhasePending)
 	status.SetCondition(&cr.Status.Conditions, ConditionReady, metav1.ConditionFalse, reason, message, cr.Generation)
 	if err := r.Status().Update(ctx, cr); err != nil {
 		return ctrl.Result{}, fmt.Errorf("update status for ClusterRestore %s: %w", cr.Name, err)
 	}
-	return ctrl.Result{RequeueAfter: shortRequeueInterval}, nil
+	return ctrl.Result{RequeueAfter: after}, nil
 }
 
 // finalize tears down the restore's operator-side residue before dropping the finalizer.
@@ -391,12 +392,13 @@ func (r *ClusterRestoreReconciler) finalize(ctx context.Context, cr *cbv1.Cluste
 	if !controllerutil.ContainsFinalizer(cr, apiconst.FinalizerClusterRestore) {
 		return ctrl.Result{}, nil
 	}
-	r.Engine.forgetResolution(cr.UID)
 	rc := &restoreExecContext{
 		ownerName:       cr.Name,
 		ownerLabelKey:   apiconst.LabelClusterRestore,
+		ownerID:         clusterRestoreOwnerID(cr.Name),
 		targetNamespace: cr.Spec.Target.Namespace,
 	}
+	r.Engine.forgetResolution(cr.UID, rc.ownerID)
 	teardownRestoreResidue(ctx, r.Engine, rc)
 	r.Recorder.Eventf(cr, nil, corev1.EventTypeNormal, "Finalizing", "Finalize",
 		"tearing down restore movers and target exposures; no repository data is erased")
@@ -415,6 +417,9 @@ func (r *ClusterRestoreReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&cbv1.ClusterRestore{}).
 		Watches(&batchv1.Job{}, handler.EnqueueRequestsFromMapFunc(r.mapJobToClusterRestore)).
+		// Same rationale as the Restore controller: resolutions block, workers keep DR
+		// drills over many namespaces from serializing behind one listing.
+		WithOptions(controller.Options{MaxConcurrentReconciles: 4}).
 		Named("clusterrestore").
 		Complete(r)
 }
@@ -456,9 +461,9 @@ func selectRun(snaps []restic.Snapshot, namedRun, timeSpec string) (string, []re
 	}
 
 	var cutoff *time.Time
-	if timeSpec != "" && timeSpec != "latest" {
-		parsed, err := time.Parse(time.RFC3339, timeSpec)
-		if err != nil {
+	if timeSpec != "" && timeSpec != sourceTimeLatest {
+		parsed, ok := parseRestoreTime(timeSpec)
+		if !ok {
 			return "", nil, false
 		}
 		cutoff = &parsed

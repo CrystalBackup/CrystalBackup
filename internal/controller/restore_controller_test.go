@@ -269,7 +269,7 @@ var _ = Describe("Restore controller", func() {
 		}, initTimeout, initPoll).Should(Succeed())
 
 		By("exposing the bound target via a twin PV and pre-bound staging claim")
-		prefix := restoreNamePrefix("recover-data", "data")
+		prefix := restoreNamePrefix(restoreOwnerID(nsName, "recover-data"), "data")
 		stagingName := rexposer.StagingPVCName(prefix)
 		Eventually(func(g Gomega) {
 			var twin corev1.PersistentVolume
@@ -365,7 +365,7 @@ var _ = Describe("Restore controller", func() {
 		}, initTimeout, initPoll).Should(Succeed())
 
 		// No mover Job may exist for this restore — nothing was restorable.
-		prefix := restoreNamePrefix("recover-neg", "data")
+		prefix := restoreNamePrefix(restoreOwnerID(nsName, "recover-neg"), "data")
 		err := k8sClient.Get(ctx, client.ObjectKey{Namespace: suiteOperatorNamespace, Name: restoreJobName(prefix)}, &batchv1.Job{})
 		Expect(apierrors.IsNotFound(err)).To(BeTrue())
 	})
@@ -415,7 +415,7 @@ var _ = Describe("ClusterRestore controller", func() {
 		}, initTimeout, initPoll).Should(Succeed())
 
 		By("provisioning the transplant staging claim from the PVC-meta tags, class mapped")
-		prefix := restoreNamePrefix("recover-gone", "data")
+		prefix := restoreNamePrefix(clusterRestoreOwnerID("recover-gone"), "data")
 		stagingName := rexposer.StagingPVCName(prefix)
 		Eventually(func(g Gomega) {
 			var staging corev1.PersistentVolumeClaim

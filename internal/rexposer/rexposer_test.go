@@ -257,8 +257,18 @@ func TestExposeTwinSameNodePin(t *testing.T) {
 		}
 	}
 
+	node := func(name string, ready corev1.ConditionStatus) *corev1.Node {
+		return &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+			Status: corev1.NodeStatus{Conditions: []corev1.NodeCondition{
+				{Type: corev1.NodeReady, Status: ready},
+			}},
+		}
+	}
+
 	pvc, pv := boundTargetFixture()
-	c := newClient(t, pvc, pv, va("va-1", "worker-3", pv.Name, true), va("va-2", "worker-9", "other-pv", true))
+	c := newClient(t, pvc, pv, node("worker-3", corev1.ConditionTrue),
+		va("va-1", "worker-3", pv.Name, true), va("va-2", "worker-9", "other-pv", true))
 	ex, err := NewTargetExposer(c, opNS).Expose(context.Background(), testRequest())
 	if err != nil {
 		t.Fatalf("Expose: %v", err)
@@ -268,7 +278,8 @@ func TestExposeTwinSameNodePin(t *testing.T) {
 	}
 
 	pvc2, pv2 := boundTargetFixture()
-	c = newClient(t, pvc2, pv2, va("va-1", "worker-3", pv2.Name, true), va("va-2", "worker-4", pv2.Name, true))
+	c = newClient(t, pvc2, pv2, node("worker-3", corev1.ConditionTrue), node("worker-4", corev1.ConditionTrue),
+		va("va-1", "worker-3", pv2.Name, true), va("va-2", "worker-4", pv2.Name, true))
 	ex, err = NewTargetExposer(c, opNS).Expose(context.Background(), testRequest())
 	if err != nil {
 		t.Fatalf("Expose: %v", err)
@@ -276,19 +287,54 @@ func TestExposeTwinSameNodePin(t *testing.T) {
 	if ex.NodeName != "" {
 		t.Errorf("NodeName = %q, want empty (multi-attach ⇒ no pin)", ex.NodeName)
 	}
+
+	// A stale attachment onto a NotReady node must not pin (the mover would wedge Pending);
+	// same for a node object that no longer exists.
+	pvc3, pv3 := boundTargetFixture()
+	c = newClient(t, pvc3, pv3, node("worker-3", corev1.ConditionFalse), va("va-1", "worker-3", pv3.Name, true))
+	ex, err = NewTargetExposer(c, opNS).Expose(context.Background(), testRequest())
+	if err != nil {
+		t.Fatalf("Expose: %v", err)
+	}
+	if ex.NodeName != "" {
+		t.Errorf("NodeName = %q, want empty (NotReady node ⇒ no pin)", ex.NodeName)
+	}
+
+	pvc4, pv4 := boundTargetFixture()
+	c = newClient(t, pvc4, pv4, va("va-1", "worker-gone", pv4.Name, true))
+	ex, err = NewTargetExposer(c, opNS).Expose(context.Background(), testRequest())
+	if err != nil {
+		t.Fatalf("Expose: %v", err)
+	}
+	if ex.NodeName != "" {
+		t.Errorf("NodeName = %q, want empty (deleted node ⇒ no pin)", ex.NodeName)
+	}
 }
 
-// TestExposeRefusesUnboundAndBlockTargets: an existing-but-unbound claim is the caller's
-// destructive decision (ErrTargetUnbound), and a Block-mode target is unsupported.
-func TestExposeRefusesUnboundAndBlockTargets(t *testing.T) {
+// TestExposeAdoptsUnboundAndRefusesBlockTargets: an existing-but-unbound claim (the
+// pre-create-to-override workflow) takes the TRANSPLANT path — the user's object is never
+// deleted, Finalize later adopts it — and a Block-mode target is unsupported.
+func TestExposeAdoptsUnboundAndRefusesBlockTargets(t *testing.T) {
 	pending := &corev1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{Name: "uploads", Namespace: tenantNS},
 		Spec:       corev1.PersistentVolumeClaimSpec{AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}},
 		Status:     corev1.PersistentVolumeClaimStatus{Phase: corev1.ClaimPending},
 	}
-	_, err := NewTargetExposer(newClient(t, pending), opNS).Expose(context.Background(), testRequest())
-	if !errors.Is(err, ErrTargetUnbound) {
-		t.Errorf("Expose(pending target) error = %v, want ErrTargetUnbound", err)
+	c := newClient(t, pending)
+	ex, err := NewTargetExposer(c, opNS).Expose(context.Background(), testRequest())
+	if err != nil {
+		t.Fatalf("Expose(pending target): %v", err)
+	}
+	if ex.Kind != KindTransplant {
+		t.Errorf("Expose(pending target) kind = %q, want %q", ex.Kind, KindTransplant)
+	}
+	var staging corev1.PersistentVolumeClaim
+	if err := c.Get(context.Background(), client.ObjectKey{Namespace: opNS, Name: ex.StagingPVCName}, &staging); err != nil {
+		t.Errorf("staging PVC for pending target not created: %v", err)
+	}
+	var kept corev1.PersistentVolumeClaim
+	if err := c.Get(context.Background(), client.ObjectKey{Namespace: tenantNS, Name: "uploads"}, &kept); err != nil {
+		t.Errorf("the user's pending claim must be preserved, got: %v", err)
 	}
 
 	block := corev1.PersistentVolumeBlock

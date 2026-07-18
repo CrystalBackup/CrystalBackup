@@ -32,6 +32,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -102,6 +103,7 @@ func NewRestoreReconciler(
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;delete
 // +kubebuilder:rbac:groups="",resources=persistentvolumes,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=storage.k8s.io,resources=storageclasses;volumeattachments,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
 
 // Reconcile drives one Restore to a terminal outcome: resolve the source Backup, hold at
 // AwaitingConfirmation until spec.confirmation equals the target namespace (R23, re-checked
@@ -130,11 +132,19 @@ func (r *RestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	// Terminal restores are done for good; a stray watch event must not re-execute them.
-	if isTerminalRestorePhase(restore.Status.Phase) {
+	if status.IsTerminalRestorePhase(restore.Status.Phase) {
 		return ctrl.Result{}, nil
 	}
 
-	// (1) Resolve the source Backup IN THIS NAMESPACE (by name, or by time/origin).
+	// (1) R23 confirmation FIRST, re-checked at execution (defense in depth beyond the VAP):
+	// every Recreate/Overwrite requires spec.confirmation == the target namespace — this
+	// namespace. Checked before source resolution so the human-actionable ask surfaces
+	// immediately, even while the source Backup is still being projected.
+	if restore.Spec.Confirmation != restore.Namespace {
+		return r.awaitConfirmation(ctx, &restore)
+	}
+
+	// (2) Resolve the source Backup IN THIS NAMESPACE (by name, or by time/origin).
 	source, ok, err := r.resolveSource(ctx, &restore)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -143,13 +153,7 @@ func (r *RestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return r.gate(ctx, &restore, "SourceBackupNotFound",
 			"no Backup in this namespace matches spec.source (it may not be projected yet)")
 	}
-
-	// (2) R23 confirmation, re-checked at execution (defense in depth beyond the VAP): every
-	// Recreate/Overwrite requires spec.confirmation == the target namespace — this namespace.
-	if restore.Spec.Confirmation != restore.Namespace {
-		return r.awaitConfirmation(ctx, &restore)
-	}
-	if !meta_HasConditionTrue(restore.Status.Conditions, ConditionConfirmed) {
+	if !status.IsConditionTrue(restore.Status.Conditions, ConditionConfirmed) {
 		status.SetCondition(&restore.Status.Conditions, ConditionConfirmed, metav1.ConditionTrue,
 			"ConfirmationAccepted", "spec.confirmation matches the target namespace", restore.Generation)
 		r.Recorder.Eventf(&restore, nil, corev1.EventTypeNormal, "ConfirmationAccepted", "Confirm",
@@ -162,44 +166,29 @@ func (r *RestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return res, err
 	}
 
-	// (4) Drive every planned volume one step; collect outcomes.
-	settled, completed, failedCount := 0, 0, 0
-	var restoredBytes int64
-	var failures []string
-	for i := range plans {
-		outcome, err := r.Engine.adviseVolume(ctx, rc, &plans[i])
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		if !outcome.settled {
-			continue
-		}
-		settled++
-		if outcome.failed {
-			failedCount++
-			failures = append(failures, plans[i].pvc+": "+outcome.reason)
-			continue
-		}
-		completed++
-		restoredBytes += outcome.restoredBytes
+	// (4) Drive every planned volume one step; collect outcomes (shared engine loop with a
+	// per-volume error budget — a transient error on one volume never stalls its siblings).
+	drive := r.Engine.driveVolumes(ctx, rc, plans)
+	if drive.err != nil {
+		return ctrl.Result{}, drive.err
 	}
 
 	// (5) Single status write; terminal only when EVERY volume settled.
-	if settled < len(plans) {
+	if drive.settled < len(plans) {
 		restore.Status.Phase = string(status.RestorePhaseRunning)
 		status.SetCondition(&restore.Status.Conditions, ConditionReady, metav1.ConditionFalse, "InProgress",
-			fmt.Sprintf("restoring: %d/%d volumes settled", settled, len(plans)), restore.Generation)
+			fmt.Sprintf("restoring: %d/%d volumes settled", drive.settled, len(plans)), restore.Generation)
 		if err := r.Status().Update(ctx, &restore); err != nil {
 			return ctrl.Result{}, fmt.Errorf("update status for Restore %s/%s: %w", restore.Namespace, restore.Name, err)
 		}
 		return ctrl.Result{RequeueAfter: restorePollInterval}, nil
 	}
 
-	phase := status.RollUpRestoreOutcomes(completed, failedCount)
+	phase := status.RollUpRestoreOutcomes(drive.completed, drive.failedCount)
 	restore.Status.Phase = string(phase)
-	restore.Status.RestoredVolumes = int32(completed)
-	restore.Status.RestoredBytes = restoredBytes
-	setRestoreTerminalCondition(&restore.Status.Conditions, phase, failures, restore.Generation)
+	restore.Status.RestoredVolumes = int32(drive.completed)
+	restore.Status.RestoredBytes = drive.restoredBytes
+	setRestoreTerminalCondition(&restore.Status.Conditions, phase, drive.failures, restore.Generation)
 	if err := r.Status().Update(ctx, &restore); err != nil {
 		// Status not persisted: return WITHOUT tearing down, so the Jobs (the durable
 		// per-volume state) survive and the next pass re-derives the same terminal result.
@@ -208,13 +197,13 @@ func (r *RestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	// (6) The terminal result is durable: reclaim the operator-side residue.
 	r.Engine.teardownAll(ctx, rc, plans)
-	r.Engine.forgetResolution(restore.UID)
+	r.Engine.forgetResolution(restore.UID, rc.ownerID)
 	if phase == status.RestorePhaseCompleted {
 		r.Recorder.Eventf(&restore, nil, corev1.EventTypeNormal, "RestoreCompleted", "Restore",
-			"restored %d volume(s), %d bytes", completed, restoredBytes)
+			"restored %d volume(s), %d bytes", drive.completed, drive.restoredBytes)
 	} else {
 		r.Recorder.Eventf(&restore, nil, corev1.EventTypeWarning, "RestoreFailed", "Restore",
-			"restore ended %s: %s", string(phase), clampMessage(joinFailures(failures)))
+			"restore ended %s: %s", string(phase), clampMessage(joinFailures(drive.failures)))
 	}
 	return ctrl.Result{}, nil
 }
@@ -250,7 +239,7 @@ func (r *RestoreReconciler) prepare(ctx context.Context, restore *cbv1.Restore, 
 		return nil, nil, res, gerr
 	}
 
-	dek, reason, message, ok := ensurePlatformDEKFor(ctx, r.Client, r.Engine.Secrets, r.OperatorNamespace, &loc)
+	dek, reason, message, ok := resolvePlatformDEKCommon(ctx, r.Client, r.Engine.Secrets, r.OperatorNamespace, &loc)
 	if !ok {
 		res, gerr := r.gate(ctx, restore, reason, message)
 		return nil, nil, res, gerr
@@ -259,6 +248,7 @@ func (r *RestoreReconciler) prepare(ctx context.Context, restore *cbv1.Restore, 
 	rc := &restoreExecContext{
 		ownerName:       restore.Name,
 		ownerLabelKey:   apiconst.LabelRestore,
+		ownerID:         restoreOwnerID(restore.Namespace, restore.Name),
 		targetNamespace: restore.Namespace,
 		deleteExtras:    restore.Spec.Mode == cbv1.RestoreModeRecreate,
 		restoredFromRun: source.Name,
@@ -276,7 +266,7 @@ func (r *RestoreReconciler) prepare(ctx context.Context, restore *cbv1.Restore, 
 	// anyway (adr/0010 "controllers re-derive at execution").
 	byPVC, cached := r.Engine.cachedResolution(restore.UID, source.Name)
 	if !cached {
-		snaps, err := r.Lister.ListFiltered(ctx, &repo, restoreResolveJobName(restore.Name),
+		snaps, err := r.Lister.ListFiltered(ctx, &repo, restoreResolveJobName(restoreOwnerID(restore.Namespace, restore.Name)),
 			restic.Tag(restic.TagKeyNamespace, restore.Namespace),
 			restic.Tag(restic.TagKeyRun, source.Name))
 		if err != nil {
@@ -285,16 +275,20 @@ func (r *RestoreReconciler) prepare(ctx context.Context, restore *cbv1.Restore, 
 			return nil, nil, res, gerr
 		}
 		byPVC = dataSnapshotsByPVC(snaps)
-		r.Engine.storeResolution(restore.UID, source.Name, byPVC)
 	}
 
 	plans, missing := r.buildPlans(ctx, restore, source, byPVC)
 	if len(missing) > 0 {
 		// A selected PVC with no snapshot under the mediated filter cannot be restored —
-		// fail CLOSED (never fall back to an unmediated identifier).
+		// fail CLOSED (never fall back to an unmediated identifier), and WITHOUT caching
+		// this listing: the run may still be uploading its last volumes, so the next pass
+		// must re-list rather than replay an incomplete map until restart.
 		res, gerr := r.gate(ctx, restore, "SnapshotNotFound",
 			fmt.Sprintf("no snapshot under the namespace filter for PVC(s): %s", clampMessage(joinFailures(missing))))
 		return nil, nil, res, gerr
+	}
+	if !cached {
+		r.Engine.storeResolution(restore.UID, source.Name, byPVC)
 	}
 	if plans == nil {
 		// An empty selection is a VALID, immediately-terminal outcome (02-api: a present-but-
@@ -383,10 +377,24 @@ func (r *RestoreReconciler) resolveSource(ctx context.Context, restore *cbv1.Res
 		return &b, true, nil
 	}
 
+	// A time-resolved source is PINNED for the restore's lifetime (cleared on terminal): a
+	// newer Backup completing mid-restore must never flip the remaining volumes onto a
+	// different run — every volume of one restore comes from ONE point in time.
+	if pinned, ok := r.Engine.pinnedSourceFor(restore.UID); ok {
+		var b cbv1.Backup
+		if err := r.Get(ctx, client.ObjectKey{Namespace: restore.Namespace, Name: pinned}, &b); err != nil {
+			if apierrors.IsNotFound(err) {
+				return nil, false, nil // pinned source vanished mid-restore: gate, never re-pick.
+			}
+			return nil, false, fmt.Errorf("get pinned source Backup %s/%s: %w", restore.Namespace, pinned, err)
+		}
+		return &b, true, nil
+	}
+
 	var cutoff *time.Time
-	if t := restore.Spec.Source.Time; t != "" && t != "latest" {
-		parsed, err := time.Parse(time.RFC3339, t)
-		if err != nil {
+	if t := restore.Spec.Source.Time; t != "" && t != sourceTimeLatest {
+		parsed, ok := parseRestoreTime(t)
+		if !ok {
 			return nil, false, nil // CRD CEL bounds the shape; an unparseable instant resolves nothing.
 		}
 		cutoff = &parsed
@@ -412,7 +420,27 @@ func (r *RestoreReconciler) resolveSource(ctx context.Context, restore *cbv1.Res
 			best = b
 		}
 	}
-	return best, best != nil, nil
+	if best == nil {
+		return nil, false, nil
+	}
+	r.Engine.pinSource(restore.UID, best.Name)
+	return best, true, nil
+}
+
+// sourceTimeLatest is the sentinel spec.source.time value selecting the newest run.
+const sourceTimeLatest = "latest"
+
+// parseRestoreTime parses a spec.source.time instant: RFC3339 first, else the same layout
+// without a zone offset, read as UTC ("2026-07-01T12:00:00" — matching the CRD's CEL shape,
+// which admits both). Returns ok=false for anything else.
+func parseRestoreTime(value string) (time.Time, bool) {
+	if t, err := time.Parse(time.RFC3339, value); err == nil {
+		return t, true
+	}
+	if t, err := time.Parse("2006-01-02T15:04:05", value); err == nil {
+		return t, true
+	}
+	return time.Time{}, false
 }
 
 // awaitConfirmation parks the Restore in AwaitingConfirmation (R23): the user edits
@@ -453,13 +481,13 @@ func (r *RestoreReconciler) finalize(ctx context.Context, restore *cbv1.Restore)
 	if !controllerutil.ContainsFinalizer(restore, apiconst.FinalizerRestore) {
 		return ctrl.Result{}, nil
 	}
-	r.Engine.forgetResolution(restore.UID)
-
 	rc := &restoreExecContext{
 		ownerName:       restore.Name,
 		ownerLabelKey:   apiconst.LabelRestore,
+		ownerID:         restoreOwnerID(restore.Namespace, restore.Name),
 		targetNamespace: restore.Namespace,
 	}
+	r.Engine.forgetResolution(restore.UID, rc.ownerID)
 	teardownRestoreResidue(ctx, r.Engine, rc)
 
 	r.Recorder.Eventf(restore, nil, corev1.EventTypeNormal, "Finalizing", "Finalize",
@@ -481,6 +509,9 @@ func (r *RestoreReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&cbv1.Restore{}).
 		Watches(&batchv1.Job{}, handler.EnqueueRequestsFromMapFunc(r.mapJobToRestore)).
+		// A mediated resolution BLOCKS its reconcile on a listing Job (bounded by the lister
+		// deadline); a few workers keep other restores' 5s progress passes moving meanwhile.
+		WithOptions(controller.Options{MaxConcurrentReconciles: 4}).
 		Named("restore").
 		Complete(r)
 }
@@ -512,9 +543,12 @@ const ConditionConfirmed = "Confirmed"
 
 // restoreResolveJobName names the mediated-resolution listing Job for one restore —
 // distinct from every discovery inventory name ("<repo>-discovery") and deterministic per
-// owner so a restarted resolution re-adopts.
-func restoreResolveJobName(ownerName string) string {
-	return sanitizeDNSName(ownerName, restoreNamePrefixMax) + "-resolve"
+// owner so a restarted resolution re-adopts. ownerID (restoreOwnerID/clusterRestoreOwnerID)
+// is the cluster-unique identity: a bare CR name would collide across namespaces and kinds
+// in the one operator namespace, letting one owner's resolution Job — and its DIFFERENTLY
+// FILTERED listing — be read by another (a cross-tenant mix-up the mediation must exclude).
+func restoreResolveJobName(ownerID string) string {
+	return sanitizeDNSName(ownerID, restoreNamePrefixMax) + "-resolve"
 }
 
 // restorableVolumes lists the PVCs a source Backup can restore: volumes that completed
@@ -577,9 +611,16 @@ func fallbackRestoreCapacity(dataSizeBytes int64) resource.Quantity {
 // label (kind-agnostic double cleanup); a labeled transplant PV with no delivered claim is
 // reclaimed.
 func teardownRestoreResidue(ctx context.Context, e *restoreEngine, rc *restoreExecContext) {
+	// The mediated-resolution Job + Secret are name-addressed (the lister's objects carry
+	// repository labels, not this owner's, so the label sweep below cannot find them).
+	deleteJobAndSecret(ctx, e.Client, e.OperatorNamespace, restoreResolveJobName(rc.ownerID))
+	// LabelNamespace scopes the sweep: the owner-name label value is only unique per
+	// namespace for the Restore kind, and a bare {managed-by, restore=<name>} selector would
+	// match a SAME-NAMED sibling's live objects in another namespace.
 	sel := client.MatchingLabels{
 		apiconst.LabelManagedBy: apiconst.ManagedByValue,
 		rc.ownerLabelKey:        rc.ownerName,
+		apiconst.LabelNamespace: rc.targetNamespace,
 	}
 	var jobs batchv1.JobList
 	if err := e.List(ctx, &jobs, client.InNamespace(e.OperatorNamespace), sel); err == nil {
@@ -618,16 +659,6 @@ func setRestoreTerminalCondition(conds *[]metav1.Condition, phase status.Restore
 	default:
 		status.SetCondition(conds, ConditionReady, metav1.ConditionFalse, string(phase),
 			clampMessage(joinFailures(failures)), generation)
-	}
-}
-
-// isTerminalRestorePhase reports whether a Restore/ClusterRestore phase is terminal.
-func isTerminalRestorePhase(phase string) bool {
-	switch status.RestorePhase(phase) {
-	case status.RestorePhaseCompleted, status.RestorePhasePartiallyFailed, status.RestorePhaseFailed:
-		return true
-	default:
-		return false
 	}
 }
 

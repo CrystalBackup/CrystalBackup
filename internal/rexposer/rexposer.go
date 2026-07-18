@@ -46,10 +46,11 @@ limitations under the License.
 //     volume to exactly one node, the exposure records that node so the caller pins the
 //     mover there (an RWO volume must not be asked to attach twice).
 //
-// An EXISTING but UNBOUND target PVC is neither: it holds no data and no volume. Expose
-// returns ErrTargetUnbound and the controller — which owns destructive policy — deletes it
-// (behind the R23 confirmation it already holds) and re-drives, landing on pvc-transplant.
-// A volumeMode: Block target is ErrBlockUnsupported (restic restores files, not devices).
+// An EXISTING but UNBOUND target PVC (a WaitForFirstConsumer claim no pod ever used — the
+// documented pre-create-to-override workflow) takes the TRANSPLANT path without deletion:
+// the staging claim provisions from the existing claim's own spec, and Finalize ADOPTS the
+// claim by setting its still-empty volumeName — the user's object survives untouched. A
+// volumeMode: Block target is ErrBlockUnsupported (restic restores files, not devices).
 //
 // # The leak-check invariant
 //
@@ -77,13 +78,6 @@ const (
 	// KindTwin is the twin-PV mechanism (target PVC exists and is bound).
 	KindTwin = "pv-twin"
 )
-
-// ErrTargetUnbound reports an EXISTING target PVC with no bound volume (a
-// WaitForFirstConsumer claim no pod ever used). The caller owns destructive policy: it
-// deletes the empty claim (behind the R23 confirmation it already enforced) and re-drives
-// Expose, which then provisions via pvc-transplant.
-var ErrTargetUnbound = errors.New(
-	"restore target PVC exists but is not bound: delete it and re-expose to provision via transplant")
 
 // ErrBlockUnsupported reports a volumeMode: Block target. restic restores files into a
 // filesystem; a raw block target has none, so the volume is surfaced as failed

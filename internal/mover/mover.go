@@ -156,3 +156,15 @@ const (
 // distinguish "unset" from a zero value; this is the local, dependency-free equivalent of
 // k8s.io/utils/ptr.To, which this package deliberately does not import.
 func ptrTo[T any](v T) *T { return &v }
+
+// NoTTL, as JobRequest.TTLSeconds, leaves the Job's ttlSecondsAfterFinished unset — the Job
+// persists until its owner deletes it (used when the Job itself is the caller's durable state).
+const NoTTL int32 = -1
+
+// ttlSeconds maps JobRequest.TTLSeconds to the Job field: nil for NoTTL, a pointer otherwise.
+func ttlSeconds(v int32) *int32 {
+	if v == NoTTL {
+		return nil
+	}
+	return ptrTo(v)
+}

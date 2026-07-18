@@ -112,6 +112,8 @@ type JobRequest struct {
 	// Labels are stamped on BOTH the Job and its pod template (for discovery/selection).
 	Labels map[string]string
 	// BackoffLimit and TTLSeconds map to the Job's backoffLimit and ttlSecondsAfterFinished.
+	// TTLSeconds == NoTTL leaves ttlSecondsAfterFinished UNSET: the Job persists until its
+	// owner deletes it (used when the Job itself is the caller's durable state).
 	BackoffLimit int32
 	TTLSeconds   int32
 	// GoMemLimit, when non-empty, sets GOMEMLIMIT to cap the mover's Go heap; skipped when
@@ -185,7 +187,7 @@ func BuildJob(req JobRequest) *batchv1.Job {
 		},
 		Spec: batchv1.JobSpec{
 			BackoffLimit:            ptrTo(req.BackoffLimit),
-			TTLSecondsAfterFinished: ptrTo(req.TTLSeconds),
+			TTLSecondsAfterFinished: ttlSeconds(req.TTLSeconds),
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: copyLabels(req.Labels)},
 				Spec: corev1.PodSpec{

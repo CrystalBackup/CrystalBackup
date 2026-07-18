@@ -150,6 +150,30 @@ func (e *TargetExposer) handOver(ctx context.Context, ex *TargetExposure, pv *co
 	case err != nil:
 		return false, fmt.Errorf("get final PVC %s/%s: %w", ex.TargetNamespace, ex.TargetPVCName, err)
 	}
+	switch {
+	case final.Spec.VolumeName == "":
+		// A PRE-EXISTING, never-bound claim (the WaitForFirstConsumer override workflow):
+		// adopt it by setting its still-empty volumeName — the two-sided pre-bind that lets
+		// the binder complete without ever deleting the user's object.
+		base := final.DeepCopy()
+		final.Spec.VolumeName = pv.Name
+		if ann := final.Annotations; ex.RestoredFromRun != "" {
+			if ann == nil {
+				final.Annotations = map[string]string{}
+			}
+			final.Annotations[apiconst.AnnotationRestoredFrom] = ex.RestoredFromRun
+		}
+		if err := e.Patch(ctx, &final, client.MergeFrom(base)); err != nil {
+			return false, fmt.Errorf("bind pre-existing final PVC %s/%s to the transplant volume: %w",
+				ex.TargetNamespace, ex.TargetPVCName, err)
+		}
+		return false, nil // adopted; wait for the bind.
+	case final.Spec.VolumeName != pv.Name:
+		// Bound (or pre-bound) to a DIFFERENT volume since the handover started — never
+		// fight the binder for a claim that found another home; surface it.
+		return false, fmt.Errorf("final PVC %s/%s is bound to volume %q, not the transplant volume %q",
+			ex.TargetNamespace, ex.TargetPVCName, final.Spec.VolumeName, pv.Name)
+	}
 	if final.Status.Phase != corev1.ClaimBound {
 		return false, nil
 	}

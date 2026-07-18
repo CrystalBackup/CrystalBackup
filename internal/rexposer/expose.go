@@ -45,10 +45,10 @@ func NewTargetExposer(c client.Client, operatorNamespace string) *TargetExposer 
 }
 
 // Expose makes ONE restore target mountable, resolving the mechanism from the target PVC's
-// live state: absent ⇒ transplant (provision a staging PVC), bound ⇒ twin (alias the bound
-// PV into the operator namespace), existing-but-unbound ⇒ ErrTargetUnbound (the caller owns
-// that destructive resolution). Idempotent: every Create tolerates AlreadyExists, so a
-// re-reconcile (or a restarted controller) converges on the same objects.
+// live state: absent OR existing-but-unbound ⇒ transplant (provision a staging PVC; an
+// unbound claim is later ADOPTED by Finalize), bound ⇒ twin (alias the bound PV into the
+// operator namespace). Idempotent: every Create tolerates AlreadyExists, so a re-reconcile
+// (or a restarted controller) converges on the same objects.
 func (e *TargetExposer) Expose(ctx context.Context, req TargetRequest) (*TargetExposure, error) {
 	var target corev1.PersistentVolumeClaim
 	err := e.Get(ctx, client.ObjectKey{Namespace: req.TargetNamespace, Name: req.PVCName}, &target)
@@ -66,7 +66,12 @@ func (e *TargetExposer) Expose(ctx context.Context, req TargetRequest) (*TargetE
 		return nil, ErrBlockUnsupported
 	}
 	if target.Status.Phase != corev1.ClaimBound || target.Spec.VolumeName == "" {
-		return nil, ErrTargetUnbound
+		// An EXISTING but UNBOUND claim (typically WaitForFirstConsumer, never consumed):
+		// transplant INTO it. The staging claim provisions with the caller's request — which
+		// the caller derives from this very claim's spec, honoring a pre-created override —
+		// and Finalize binds the user's claim by setting its (still empty) volumeName rather
+		// than creating a new one. Nothing is deleted; the user's object is preserved.
+		return e.exposeTransplant(ctx, req)
 	}
 	return e.exposeTwin(ctx, req, &target)
 }
@@ -187,6 +192,10 @@ func (e *TargetExposer) exposeTwin(ctx context.Context, req TargetRequest, targe
 // attached (mount anywhere) or attached on several nodes (RWX — any node works, no pin).
 // The attach-after-check race is accepted: a second attach of an RWO volume is refused by
 // the CSI stack and surfaces as a mover scheduling/attach timeout, never as corruption.
+// A pin onto a GONE or NotReady node is dropped too: a VolumeAttachment can outlive a
+// crashed/removed node, and pinning there would wedge the mover Pending forever — on an
+// unready node the attachment is stale-or-dying either way, so letting the scheduler place
+// the mover (and the CSI stack arbitrate the attach) beats a guaranteed wedge.
 func (e *TargetExposer) attachedNode(ctx context.Context, pvName string) (string, error) {
 	var attachments storagev1.VolumeAttachmentList
 	if err := e.List(ctx, &attachments); err != nil {
@@ -199,12 +208,30 @@ func (e *TargetExposer) attachedNode(ctx context.Context, pvName string) (string
 			nodes[va.Spec.NodeName] = struct{}{}
 		}
 	}
-	if len(nodes) == 1 {
-		for n := range nodes {
-			return n, nil
+	if len(nodes) != 1 {
+		return "", nil
+	}
+	var name string
+	for n := range nodes {
+		name = n
+	}
+	var node corev1.Node
+	switch err := e.Get(ctx, client.ObjectKey{Name: name}, &node); {
+	case apierrors.IsNotFound(err):
+		return "", nil
+	case err != nil:
+		return "", fmt.Errorf("get attached node %s for PV %s: %w", name, pvName, err)
+	}
+	for i := range node.Status.Conditions {
+		c := &node.Status.Conditions[i]
+		if c.Type == corev1.NodeReady {
+			if c.Status != corev1.ConditionTrue {
+				return "", nil
+			}
+			break
 		}
 	}
-	return "", nil
+	return name, nil
 }
 
 // exposure assembles the TargetExposure for one request — pure, so both mechanisms and any

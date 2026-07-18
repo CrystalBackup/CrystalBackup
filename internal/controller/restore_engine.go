@@ -77,11 +77,21 @@ const (
 // when a Backup and a Restore share a name.
 func restoreJobName(prefix string) string { return prefix + "-restore" }
 
-// restoreNamePrefix is the deterministic per-PVC NamePrefix "<owner>-<pvc>" for restore
-// objects, sanitized exactly like moverNamePrefix but under the restore cap.
-func restoreNamePrefix(ownerName, pvcName string) string {
-	return sanitizeDNSName(ownerName+"-"+pvcName, restoreNamePrefixMax)
+// restoreNamePrefix is the deterministic per-PVC NamePrefix "<ownerID>-<pvc>" for restore
+// objects, sanitized exactly like moverNamePrefix but under the restore cap. ownerID is the
+// UNIQUE owner identity (restoreOwnerID/clusterRestoreOwnerID), never a bare CR name — two
+// namespaced Restores may share a name across namespaces while their objects share the one
+// operator namespace.
+func restoreNamePrefix(ownerID, pvcName string) string {
+	return sanitizeDNSName(ownerID+"-"+pvcName, restoreNamePrefixMax)
 }
+
+// restoreOwnerID / clusterRestoreOwnerID derive the cluster-unique identity every
+// operator-namespace object name is built from. The kind prefix keeps a Restore and a
+// ClusterRestore sharing a bare name apart; the namespace qualifies a Restore's name,
+// which is only unique within its namespace.
+func restoreOwnerID(namespace, name string) string { return "rst-" + namespace + "-" + name }
+func clusterRestoreOwnerID(name string) string     { return "crst-" + name }
 
 // restoreVolumePlan is one PVC's fully-resolved restore work order. Every field is derived
 // server-side by the owning controller (snapshot IDs from the mediated listing or the
@@ -110,6 +120,13 @@ type restoreExecContext struct {
 	// apiconst.LabelRestore for a Restore, apiconst.LabelClusterRestore for a ClusterRestore.
 	ownerName     string
 	ownerLabelKey string
+	// ownerID is the UNIQUE identity every operator-namespace object name derives from. Two
+	// namespaced Restores may share a NAME across namespaces (and a ClusterRestore may share
+	// one with either), while all their staging PVCs, twin PVs and mover Jobs share the ONE
+	// operator namespace — so a bare name would collide and cross-adopt another tenant's
+	// objects. Callers set it to "rst-<namespace>-<name>" for a Restore and "crst-<name>"
+	// for a (cluster-scoped, so cluster-unique) ClusterRestore.
+	ownerID string
 	// targetNamespace is where the restored PVCs live.
 	targetNamespace string
 	// deleteExtras selects the Recreate reconciliation (restic --delete).
@@ -147,7 +164,25 @@ type restoreEngine struct {
 	// re-runs only after a restart or run change. Guarded by mu; forgotten on terminal.
 	mu       sync.Mutex
 	resolved map[types.UID]resolvedSnapshots
+	// pinnedSource pins a time-resolved ("latest"/cutoff) source per owner so a NEWER Backup
+	// completing mid-restore can never flip remaining volumes onto a different run (all
+	// volumes of one restore come from ONE point in time). In-memory: a restart re-pins, a
+	// window accepted and documented. Guarded by mu; forgotten with the resolution.
+	pinnedSource map[types.UID]string
+	// unlockOnce dedupes the stale-lock unlock per (owner, pvc): the restore keeps no
+	// persisted per-volume phase, so without it a hard-killed mover would re-enqueue an
+	// exclusive unlock EVERY 5s pass, flooding the repository lane and holding
+	// QuiescenceRequired forever. In-memory: a restart re-enqueues once more (idempotent op).
+	unlockOnce map[string]struct{}
+	// errCounts is the per-(owner, pvc) budget for TRANSIENT advise errors: a volume whose
+	// expose/finalize keeps erroring eventually settles as failed instead of wedging the
+	// whole restore in Running forever. In-memory; a restart restarts the budget.
+	errCounts map[string]int
 }
+
+// maxVolumeAdviseErrors is how many consecutive reconcile-visible errors one volume may
+// produce before it is settled as failed (~5 minutes at the 5s poll, more under backoff).
+const maxVolumeAdviseErrors = 60
 
 // resolvedSnapshots is one cached mediated resolution: the run it was resolved for and the
 // kind=data snapshots by PVC name.
@@ -168,7 +203,58 @@ func newRestoreEngine(c client.Client, secretsReader *clientsecrets.ByNameReader
 		MoverImage:        moverImage,
 		Queue:             q,
 		resolved:          make(map[types.UID]resolvedSnapshots),
+		pinnedSource:      make(map[types.UID]string),
+		unlockOnce:        make(map[string]struct{}),
+		errCounts:         make(map[string]int),
 	}
+}
+
+// pinSource records (once) and returns the pinned source Backup name for a time-resolved
+// restore; returns the existing pin when present.
+func (e *restoreEngine) pinSource(owner types.UID, name string) string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if pinned, ok := e.pinnedSource[owner]; ok {
+		return pinned
+	}
+	e.pinnedSource[owner] = name
+	return name
+}
+
+// pinnedSourceFor returns the pinned source for owner, if any.
+func (e *restoreEngine) pinnedSourceFor(owner types.UID) (string, bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	name, ok := e.pinnedSource[owner]
+	return name, ok
+}
+
+// shouldEnqueueUnlock returns true exactly once per (ownerID, pvc) — the unlock dedupe.
+func (e *restoreEngine) shouldEnqueueUnlock(key string) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if _, done := e.unlockOnce[key]; done {
+		return false
+	}
+	e.unlockOnce[key] = struct{}{}
+	return true
+}
+
+// noteVolumeError counts a transient advise error for (ownerID, pvc); giveUp turns true
+// once the budget is exhausted, and the caller settles the volume as failed.
+func (e *restoreEngine) noteVolumeError(key string) (giveUp bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.errCounts[key]++
+	return e.errCounts[key] >= maxVolumeAdviseErrors
+}
+
+// clearVolumeError resets a volume's transient-error budget after a clean advise (the
+// budget counts CONSECUTIVE errors, not lifetime ones).
+func (e *restoreEngine) clearVolumeError(key string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	delete(e.errCounts, key)
 }
 
 // cachedResolution returns the cached mediated resolution for owner iff it matches run.
@@ -189,10 +275,22 @@ func (e *restoreEngine) storeResolution(owner types.UID, run string, byPVC map[s
 	e.resolved[owner] = resolvedSnapshots{run: run, byPVC: byPVC}
 }
 
-func (e *restoreEngine) forgetResolution(owner types.UID) {
+func (e *restoreEngine) forgetResolution(owner types.UID, ownerID string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	delete(e.resolved, owner)
+	delete(e.pinnedSource, owner)
+	prefix := ownerID + "/"
+	for k := range e.unlockOnce {
+		if strings.HasPrefix(k, prefix) {
+			delete(e.unlockOnce, k)
+		}
+	}
+	for k := range e.errCounts {
+		if strings.HasPrefix(k, prefix) {
+			delete(e.errCounts, k)
+		}
+	}
 }
 
 // volumeLabels are stamped on every object one volume's restore creates (staging PVC, twin
@@ -213,8 +311,8 @@ func (e *restoreEngine) volumeLabels(rc *restoreExecContext, pvc string) map[str
 // reads the LIVE target state, which the handover itself is mutating — re-resolving
 // mid-handover would misclassify the volume; the kind is therefore pinned on the mover Job
 // at creation, see the exposure-kind label).
-func (e *restoreEngine) exposureFor(rc *restoreExecContext, plan *restoreVolumePlan, kind, node string) *rexposer.TargetExposure {
-	prefix := restoreNamePrefix(rc.ownerName, plan.pvc)
+func (e *restoreEngine) exposureFor(rc *restoreExecContext, plan *restoreVolumePlan, kind string) *rexposer.TargetExposure {
+	prefix := restoreNamePrefix(rc.ownerID, plan.pvc)
 	return &rexposer.TargetExposure{
 		Kind:              kind,
 		TargetNamespace:   rc.targetNamespace,
@@ -222,10 +320,57 @@ func (e *restoreEngine) exposureFor(rc *restoreExecContext, plan *restoreVolumeP
 		OperatorNamespace: e.OperatorNamespace,
 		StagingPVCName:    rexposer.StagingPVCName(prefix),
 		TwinPVName:        rexposer.TwinPVName(prefix),
-		NodeName:          node,
 		Labels:            e.volumeLabels(rc, plan.pvc),
 		RestoredFromRun:   rc.restoredFromRun,
 	}
+}
+
+// volumeDrive aggregates one reconcile pass over all planned volumes.
+type volumeDrive struct {
+	settled, completed, failedCount int
+	restoredBytes                   int64
+	failures                        []string
+	// err is the first TRANSIENT advise error of the pass (budget not yet exhausted),
+	// surfaced after every volume has been driven so one flaky volume never stalls its
+	// siblings' progress.
+	err error
+}
+
+// driveVolumes advances every plan one step and aggregates the outcomes — the shared drive
+// loop of both restore controllers. An advise error settles the volume as failed once its
+// per-volume budget is exhausted; before that it is only remembered (drive.err) for the
+// caller's usual backoff, and the remaining volumes still advance this pass.
+func (e *restoreEngine) driveVolumes(ctx context.Context, rc *restoreExecContext, plans []restoreVolumePlan) volumeDrive {
+	var d volumeDrive
+	for i := range plans {
+		key := rc.ownerID + "/" + plans[i].pvc
+		outcome, err := e.adviseVolume(ctx, rc, &plans[i])
+		if err != nil {
+			if e.noteVolumeError(key) {
+				d.settled++
+				d.failedCount++
+				d.failures = append(d.failures, plans[i].pvc+": gave up after repeated errors, last: "+err.Error())
+				continue
+			}
+			if d.err == nil {
+				d.err = err
+			}
+			continue
+		}
+		e.clearVolumeError(key)
+		if !outcome.settled {
+			continue
+		}
+		d.settled++
+		if outcome.failed {
+			d.failedCount++
+			d.failures = append(d.failures, plans[i].pvc+": "+outcome.reason)
+			continue
+		}
+		d.completed++
+		d.restoredBytes += outcome.restoredBytes
+	}
+	return d
 }
 
 // adviseVolume derives one volume's state from live objects and advances it by at most one
@@ -234,7 +379,7 @@ func (e *restoreEngine) exposureFor(rc *restoreExecContext, plan *restoreVolumeP
 // status writer). Every path is idempotent — a restarted controller re-derives the same
 // step from the same objects.
 func (e *restoreEngine) adviseVolume(ctx context.Context, rc *restoreExecContext, plan *restoreVolumePlan) (volumeOutcome, error) {
-	prefix := restoreNamePrefix(rc.ownerName, plan.pvc)
+	prefix := restoreNamePrefix(rc.ownerID, plan.pvc)
 	jobName := restoreJobName(prefix)
 
 	var job batchv1.Job
@@ -256,7 +401,10 @@ func (e *restoreEngine) adviseVolume(ctx context.Context, rc *restoreExecContext
 	if failed || rerr != nil || !result.OK {
 		// A BLANK/unparseable termination message means the mover was hard-killed and may
 		// have died holding the repository lock — clear it exactly as the backup path does.
-		if rerr != nil {
+		// ONCE per volume: the failure is re-derived every pass (no persisted per-volume
+		// state), and re-enqueuing an exclusive unlock each 5s would flood the repository
+		// lane and hold mover admission shut for its whole tail.
+		if rerr != nil && e.shouldEnqueueUnlock(rc.ownerID+"/"+plan.pvc) {
 			enqueueRepoMaintenance(ctx, e.Queue, e.maintenanceDeps(), rc.repoName, queue.OpUnlock,
 				maintenanceResourceName(prefix, "unlock"), mover.OpUnlock, restic.UnlockArgs(),
 				rc.repoURL, rc.dek, rc.s3CredsSecret)
@@ -266,7 +414,25 @@ func (e *restoreEngine) adviseVolume(ctx context.Context, rc *restoreExecContext
 
 	// The data landed in the staging volume; complete the handover. The mechanism kind was
 	// pinned on the Job at creation — never re-resolved from the (mutating) target state.
-	ex := e.exposureFor(rc, plan, job.Labels[apiconst.LabelExposureKind], "")
+	kind := job.Labels[apiconst.LabelExposureKind]
+	if kind != rexposer.KindTransplant && kind != rexposer.KindTwin {
+		// Pin label lost (a mutated or hand-rebuilt Job). Re-derive from the durable
+		// exposure objects — only the twin mechanism creates the twin PV — rather than
+		// silently no-opping Finalize, which would strand a transplant's restored volume
+		// in the operator namespace while the restore reports success.
+		var twin corev1.PersistentVolume
+		switch gerr := e.Get(ctx, client.ObjectKey{Name: rexposer.TwinPVName(prefix)}, &twin); {
+		case gerr == nil:
+			kind = rexposer.KindTwin
+		case apierrors.IsNotFound(gerr):
+			kind = rexposer.KindTransplant
+		default:
+			return volumeOutcome{}, fmt.Errorf("derive exposure kind for %s/%s: %w", rc.targetNamespace, plan.pvc, gerr)
+		}
+		logf.FromContext(ctx).Info("Exposure-kind label missing on restore mover Job; derived from live objects",
+			"job", jobName, "kind", kind)
+	}
+	ex := e.exposureFor(rc, plan, kind)
 	done, err := e.Targets.Finalize(ctx, ex)
 	if err != nil {
 		return volumeOutcome{}, fmt.Errorf("finalize restore target %s/%s: %w", rc.targetNamespace, plan.pvc, err)
@@ -293,11 +459,6 @@ func (e *restoreEngine) startVolume(ctx context.Context, rc *restoreExecContext,
 		RestoredFromRun: rc.restoredFromRun,
 	})
 	switch {
-	case err == rexposer.ErrTargetUnbound:
-		// An existing-but-unbound claim holds no volume and no data. The operation is
-		// destructive by contract (R23 confirmation was required to get here), so replace it:
-		// delete now, re-drive next pass into the transplant path, which recreates it bound.
-		return volumeOutcome{}, e.deleteUnboundTarget(ctx, rc, plan.pvc)
 	case err == rexposer.ErrBlockUnsupported:
 		return volumeOutcome{settled: true, failed: true, reason: "RestoreBlockUnsupported"}, nil
 	case err != nil:
@@ -327,7 +488,7 @@ func (e *restoreEngine) startVolume(ctx context.Context, rc *restoreExecContext,
 	if err != nil {
 		return volumeOutcome{settled: true, failed: true, reason: "InvalidTargetPath"}, nil
 	}
-	jobLabels := copyStringMap(labels)
+	jobLabels := maps.Clone(labels)
 	// Pin the exposure mechanism on the Job so the success path finalizes with the SAME
 	// mechanism this volume started with, however the target state has changed since.
 	jobLabels[apiconst.LabelExposureKind] = ex.Kind
@@ -346,8 +507,13 @@ func (e *restoreEngine) startVolume(ctx context.Context, rc *restoreExecContext,
 			ReadWrite: true,
 		},
 		BackoffLimit: restoreMoverBackoffLimit,
-		TTLSeconds:   moverJobTTLSeconds,
-		Labels:       jobLabels,
+		// NO TTL: per adr/0016 the mover Jobs ARE the restore's only durable per-volume
+		// state (there is no persisted per-volume phase list), so the TTL controller erasing
+		// a settled volume's Job while a slow sibling still runs would make the next pass
+		// re-derive "never started" and RE-RESTORE a delivered volume. Teardown deletes the
+		// Jobs after the terminal status write; the reaper backstops leaks by owner labels.
+		TTLSeconds: mover.NoTTL,
+		Labels:     jobLabels,
 		// Same-node pin for a singly-attached target volume (twin path); empty otherwise.
 		NodeName: ex.NodeName,
 		// Soft-spread restore movers across nodes with the rest of the mover family.
@@ -361,31 +527,18 @@ func (e *restoreEngine) startVolume(ctx context.Context, rc *restoreExecContext,
 	return volumeOutcome{}, nil
 }
 
-// deleteUnboundTarget removes an existing-but-unbound target claim so the transplant path
-// can recreate it bound (see startVolume). Best-effort semantics are wrong here — a failed
-// delete must surface, or the volume would wedge in the unbound gate forever.
-func (e *restoreEngine) deleteUnboundTarget(ctx context.Context, rc *restoreExecContext, pvcName string) error {
-	claim := &corev1.PersistentVolumeClaim{
-		ObjectMeta: metav1.ObjectMeta{Name: pvcName, Namespace: rc.targetNamespace},
-	}
-	if err := e.Delete(ctx, claim); err != nil && !apierrors.IsNotFound(err) {
-		return fmt.Errorf("delete unbound restore target PVC %s/%s: %w", rc.targetNamespace, pvcName, err)
-	}
-	return nil
-}
-
 // teardownVolume removes one volume's operator-side residue AFTER its terminal outcome is
 // durably recorded: the mover Job + creds Secret, then the exposure objects of BOTH
 // mechanisms — the kind-agnostic double cleanup is safe by construction (each Cleanup
 // tolerates absence, a delivered transplant is never reclaimed, and a twin cleanup deletes
 // only the alias PV object).
 func (e *restoreEngine) teardownVolume(ctx context.Context, rc *restoreExecContext, plan *restoreVolumePlan) {
-	prefix := restoreNamePrefix(rc.ownerName, plan.pvc)
+	prefix := restoreNamePrefix(rc.ownerID, plan.pvc)
 	deleteJobAndSecret(ctx, e.Client, e.OperatorNamespace, restoreJobName(prefix))
 	log := logf.FromContext(ctx)
 	for _, kind := range []string{rexposer.KindTwin, rexposer.KindTransplant} {
-		if err := e.Targets.Cleanup(ctx, e.exposureFor(rc, plan, kind, "")); err != nil {
-			log.Error(err, "best-effort restore exposure cleanup failed; leaving to the orphan reaper",
+		if err := e.Targets.Cleanup(ctx, e.exposureFor(rc, plan, kind)); err != nil {
+			log.Error(err, "Best-effort restore exposure cleanup failed; leaving to the orphan reaper",
 				"owner", rc.ownerName, "pvc", plan.pvc, "kind", kind)
 		}
 	}
@@ -396,6 +549,10 @@ func (e *restoreEngine) teardownAll(ctx context.Context, rc *restoreExecContext,
 	for i := range plans {
 		e.teardownVolume(ctx, rc, &plans[i])
 	}
+	// The mediated-resolution listing Job + Secret self-clean after a successful listing;
+	// this catches one still live (or failed) when the restore settles. Name-addressed —
+	// the lister's objects carry repository labels, not this owner's.
+	deleteJobAndSecret(ctx, e.Client, e.OperatorNamespace, restoreResolveJobName(rc.ownerID))
 }
 
 // maintenanceDeps assembles the shared maintenance/creds dependency bundle from the engine.
@@ -464,17 +621,10 @@ func deleteJobAndSecret(ctx context.Context, c client.Client, namespace, name st
 	background := metav1.DeletePropagationBackground
 	job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace}}
 	if err := c.Delete(ctx, job, &client.DeleteOptions{PropagationPolicy: &background}); err != nil && !apierrors.IsNotFound(err) {
-		log.Error(err, "best-effort delete of mover job failed", "job", name)
+		log.Error(err, "Best-effort delete of mover Job failed", "job", name)
 	}
 	sec := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace}}
 	if err := c.Delete(ctx, sec); err != nil && !apierrors.IsNotFound(err) {
-		log.Error(err, "best-effort delete of mover creds secret failed", "secret", name)
+		log.Error(err, "Best-effort delete of mover creds Secret failed", "secret", name)
 	}
-}
-
-// copyStringMap returns an independent copy of in (nil-safe).
-func copyStringMap(in map[string]string) map[string]string {
-	out := make(map[string]string, len(in))
-	maps.Copy(out, in)
-	return out
 }
