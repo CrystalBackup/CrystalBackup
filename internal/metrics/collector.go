@@ -161,23 +161,22 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 
 	// The unified restore family (M2, 05-observability §2.3). A namespaced Restore's
 	// origin/location/tenant/cluster resolve through its source Backup — joined against the
-	// Backups already listed above, no extra API reads.
-	resolveSource := func(namespace, backupName string) restoreSourceInfo {
-		if !backupsListed {
-			return restoreSourceInfo{}
-		}
+	// Backups already listed above via a one-pass index (never a per-restore linear scan:
+	// the scrape cost must stay O(backups + restores), not their product).
+	sourceByKey := make(map[[2]string]restoreSourceInfo, len(backups.Items))
+	if backupsListed {
 		for i := range backups.Items {
 			b := &backups.Items[i]
-			if b.Namespace == namespace && b.Name == backupName {
-				return restoreSourceInfo{
-					tenant:   b.Labels[apiconst.LabelTenant],
-					origin:   b.Labels[apiconst.LabelOrigin],
-					location: b.Spec.LocationRef.Name,
-					cluster:  clusterByLocation[b.Spec.LocationRef.Name],
-				}
+			sourceByKey[[2]string{b.Namespace, b.Name}] = restoreSourceInfo{
+				tenant:   b.Labels[apiconst.LabelTenant],
+				origin:   b.Labels[apiconst.LabelOrigin],
+				location: b.Spec.LocationRef.Name,
+				cluster:  clusterByLocation[b.Spec.LocationRef.Name],
 			}
 		}
-		return restoreSourceInfo{}
+	}
+	resolveSource := func(namespace, backupName string) restoreSourceInfo {
+		return sourceByKey[[2]string{namespace, backupName}]
 	}
 	var restores cbv1.RestoreList
 	var clusterRestores cbv1.ClusterRestoreList

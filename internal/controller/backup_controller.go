@@ -891,13 +891,28 @@ func readMoverResult(ctx context.Context, c client.Client, operatorNamespace, jo
 		client.MatchingLabels{batchv1.JobNameLabel: jobName}); err != nil {
 		return mover.MoverResult{}, "", fmt.Errorf("list mover pods for job %s: %w", jobName, err)
 	}
+	// With backoffLimit retries a Complete Job can retain BOTH a failed and a succeeded pod,
+	// and list order is arbitrary — prefer the exit-0 attempt's message so a retried-then-
+	// successful run is never misread as its own earlier failure; fall back to any
+	// terminated pod (all attempts failed, or a hard kill left a blank message).
+	var fallback *corev1.Pod
 	for i := range pods.Items {
 		pod := &pods.Items[i]
 		cs := pod.Status.ContainerStatuses
-		if len(cs) > 0 && cs[0].State.Terminated != nil {
+		if len(cs) == 0 || cs[0].State.Terminated == nil {
+			continue
+		}
+		if cs[0].State.Terminated.ExitCode == 0 {
 			result, err := mover.ParseMoverResult(cs[0].State.Terminated.Message)
 			return result, pod.Spec.NodeName, err
 		}
+		if fallback == nil {
+			fallback = pod
+		}
+	}
+	if fallback != nil {
+		result, err := mover.ParseMoverResult(fallback.Status.ContainerStatuses[0].State.Terminated.Message)
+		return result, fallback.Spec.NodeName, err
 	}
 	return mover.MoverResult{}, "", fmt.Errorf("no terminated mover pod found for job %s/%s", operatorNamespace, jobName)
 }
@@ -912,17 +927,7 @@ func readMoverResult(ctx context.Context, c client.Client, operatorNamespace, jo
 // envtest (it runs only apiserver + etcd, no GC controller), leaving the Job wedged in
 // Terminating forever. Background achieves the same teardown in both environments.
 func (r *BackupReconciler) deleteMoverJobAndSecret(ctx context.Context, prefix string) {
-	log := logf.FromContext(ctx)
-	name := prefix + "-mover"
-	background := metav1.DeletePropagationBackground
-	job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: r.OperatorNamespace}}
-	if err := r.Delete(ctx, job, &client.DeleteOptions{PropagationPolicy: &background}); err != nil && !apierrors.IsNotFound(err) {
-		log.Error(err, "best-effort delete of mover job failed", "job", name)
-	}
-	sec := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: r.OperatorNamespace}}
-	if err := r.Delete(ctx, sec); err != nil && !apierrors.IsNotFound(err) {
-		log.Error(err, "best-effort delete of mover creds secret failed", "secret", name)
-	}
+	deleteJobAndSecret(ctx, r.Client, r.OperatorNamespace, prefix+"-mover")
 }
 
 // SetupWithManager registers this reconciler. It watches Backup directly and, via a label-based

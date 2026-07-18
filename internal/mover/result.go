@@ -109,13 +109,15 @@ type ResticBackupSummary struct {
 	DataAdded int64 `json:"data_added"`
 }
 
-// lastSummaryLine scans a restic --json stream and returns the raw bytes of the LAST line
-// whose object has message_type == "summary" (last-wins is defensive; there is normally
-// exactly one). restic emits ONE JSON object per line: a run of "status" progress objects,
-// then a single {"message_type":"summary",...} at the end. Blank lines and non-JSON chatter
-// are skipped gracefully; found is false only when no summary line exists at all. Shared by
-// the backup and restore summary parsers so the stream-scanning rules can never diverge.
-func lastSummaryLine(resticStdout []byte) (line []byte, found bool) {
+// scanSummaryLines walks a restic --json stream line by line and hands each candidate
+// object line to tryDecode; the caller's closure keeps the LAST line it could FULLY decode
+// as its summary type (last-valid-wins is defensive: a summary-typed line that does not
+// decode — injected chatter, a truncation artifact — is skipped, never fatal, exactly like
+// any other noise). restic emits ONE JSON object per line: a run of "status" progress
+// objects, then a single {"message_type":"summary",...} at the end. Returns whether any
+// candidate decoded. Shared by the backup and restore summary parsers so the scanning rules
+// can never diverge.
+func scanSummaryLines(resticStdout []byte, tryDecode func(line []byte) bool) (found bool) {
 	// bufio.Reader.ReadBytes has no line-length cap (unlike bufio.Scanner's default 64KiB),
 	// so an unusually long status line — restic can list many current files — never
 	// truncates the scan and hides a later summary.
@@ -126,31 +128,33 @@ func lastSummaryLine(resticStdout []byte) (line []byte, found bool) {
 		// line together with io.EOF when the stream does not end in a newline, so the summary
 		// object (often the last line, sometimes unterminated) is still seen.
 		if trimmed := bytes.TrimSpace(candidate); len(trimmed) > 0 && trimmed[0] == '{' {
-			// Guard on a leading '{' so restic's non-JSON output (progress text, warnings) is
-			// cheaply skipped, and probe just the discriminator: a line that starts with '{'
-			// but is not valid JSON, or is not a summary object, is skipped rather than
-			// aborting the whole scan.
-			var probe struct {
-				MessageType string `json:"message_type"`
-			}
-			if json.Unmarshal(trimmed, &probe) == nil && probe.MessageType == messageTypeSummary {
-				line, found = trimmed, true
+			// Guard on a leading '{' so restic's non-JSON output is cheaply skipped; the
+			// closure decides whether the line fully decodes as its summary shape.
+			if tryDecode(trimmed) {
+				found = true
 			}
 		}
 		if readErr != nil {
-			return line, found
+			return found
 		}
 	}
 }
 
 // ParseBackupSummary extracts the final summary from a `restic backup --json` stream (see
-// lastSummaryLine for the scanning rules). The total absence of a summary is an error,
+// scanSummaryLines for the scanning rules). The total absence of a summary is an error,
 // because that means the backup never reported success and the caller must not fabricate a
 // snapshot id from a truncated stream.
 func ParseBackupSummary(resticStdout []byte) (ResticBackupSummary, error) {
-	line, found := lastSummaryLine(resticStdout)
 	var summary ResticBackupSummary
-	if !found || json.Unmarshal(line, &summary) != nil {
+	found := scanSummaryLines(resticStdout, func(line []byte) bool {
+		var candidate ResticBackupSummary
+		if json.Unmarshal(line, &candidate) == nil && candidate.MessageType == messageTypeSummary {
+			summary = candidate
+			return true
+		}
+		return false
+	})
+	if !found {
 		return ResticBackupSummary{}, fmt.Errorf(
 			"no restic backup summary (message_type=%q) in %d bytes of --json output",
 			messageTypeSummary, len(resticStdout))
@@ -188,13 +192,20 @@ type ResticRestoreSummary struct {
 }
 
 // ParseRestoreSummary extracts the final summary from a `restic restore --json` stream (see
-// lastSummaryLine for the scanning rules). Like the backup parser, the total absence of a
+// scanSummaryLines for the scanning rules). Like the backup parser, the total absence of a
 // summary is an error: restic always emits one on a clean restore, so a summary-less clean
 // exit means the stream was truncated and the caller must not report an unverified success.
 func ParseRestoreSummary(resticStdout []byte) (ResticRestoreSummary, error) {
-	line, found := lastSummaryLine(resticStdout)
 	var summary ResticRestoreSummary
-	if !found || json.Unmarshal(line, &summary) != nil {
+	found := scanSummaryLines(resticStdout, func(line []byte) bool {
+		var candidate ResticRestoreSummary
+		if json.Unmarshal(line, &candidate) == nil && candidate.MessageType == messageTypeSummary {
+			summary = candidate
+			return true
+		}
+		return false
+	})
+	if !found {
 		return ResticRestoreSummary{}, fmt.Errorf(
 			"no restic restore summary (message_type=%q) in %d bytes of --json output",
 			messageTypeSummary, len(resticStdout))

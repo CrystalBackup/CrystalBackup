@@ -144,14 +144,7 @@ func m2WaitClusterRestoreTerminal(name string, timeout time.Duration) *cbv1.Clus
 	return &cr
 }
 
-func isTerminalM2Phase(phase string) bool {
-	switch status.RestorePhase(phase) {
-	case status.RestorePhaseCompleted, status.RestorePhasePartiallyFailed, status.RestorePhaseFailed:
-		return true
-	default:
-		return false
-	}
-}
+func isTerminalM2Phase(phase string) bool { return status.IsTerminalRestorePhase(phase) }
 
 // m2AssertNoResidualRestoreObjects extends the leak-check invariant to the M2 restore
 // machinery: after a scenario, the operator namespace holds no restore mover Jobs, creds

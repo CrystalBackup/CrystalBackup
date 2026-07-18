@@ -274,11 +274,27 @@ func (r *ClusterBackupLocationReconciler) Reconcile(ctx context.Context, req ctr
 	// The wrapped-DEK bucket escrow runs BEFORE the repository is ensured: on a bare-cluster
 	// DR bootstrap it recovers the wrapped DEK from the bucket first, so the repository
 	// init's EnsureDEK can never mint a fresh DEK over a recoverable one (adr/0016,
-	// 03-security §4). Advisory: failures land on the DEKEscrowed condition, never block.
-	r.reconcileDEKEscrow(ctx, &loc)
+	// 03-security §4). Mostly advisory — but when the DEK Secret is MISSING and the escrow
+	// question is unresolved, provisioning must wait: a mint now could fork the repository
+	// password away from a recoverable escrow copy.
+	if r.reconcileDEKEscrow(ctx, &loc) {
+		status.SetCondition(&loc.Status.Conditions, ConditionReady, metav1.ConditionFalse, "DEKRecoveryPending",
+			"the bucket escrow may hold a recoverable DEK; repository provisioning waits — see condition DEKEscrowed", loc.Generation)
+		loc.Status.Phase = locationPhaseDegraded
+		if err := r.Status().Update(ctx, &loc); err != nil {
+			return ctrl.Result{}, fmt.Errorf("update status for ClusterBackupLocation %s: %w", loc.Name, err)
+		}
+		return ctrl.Result{RequeueAfter: shortRequeueInterval}, nil
+	}
 
 	if err := r.ensureRepository(ctx, &loc); err != nil {
 		log.Error(err, "ensure BackupRepository")
+		// Best-effort persist of everything this pass already recorded (the escrow's
+		// DEKEscrowed condition included) so a persistent repository fault does not discard
+		// the escrow/recovery evidence on every retry.
+		if serr := r.Status().Update(ctx, &loc); serr != nil {
+			log.Error(serr, "Persist status before returning the repository error failed")
+		}
 		return ctrl.Result{}, fmt.Errorf("ensure BackupRepository for ClusterBackupLocation %s: %w", loc.Name, err)
 	}
 

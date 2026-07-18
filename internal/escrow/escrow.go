@@ -42,7 +42,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
 	"strings"
 
 	"github.com/minio/minio-go/v7"
@@ -173,11 +172,13 @@ func (s *Store) Put(ctx context.Context, prefix, clusterID string, wrapped []byt
 	return nil
 }
 
-// isNoSuchKey reports the S3 "object does not exist" family of errors.
+// isNoSuchKey reports the one condition that means "the escrow OBJECT does not exist":
+// minio's NoSuchKey (which its StatObject error mapping also synthesizes for a bodyless
+// HEAD 404 when an object name was given). Anything else — NoSuchBucket from a mistyped
+// bucket, auth failures, gateway oddities — stays an ERROR: Fetch's contract is that
+// found=false asserts positive knowledge of absence, because the recovery path treats it
+// as "a genuinely fresh location" and proceeds to mint.
 func isNoSuchKey(err error) bool {
 	resp := minio.ToErrorResponse(err)
-	if resp.Code == "NoSuchKey" || resp.Code == "NotFound" {
-		return true
-	}
-	return resp.StatusCode == http.StatusNotFound
+	return resp.Code == "NoSuchKey" || resp.Code == "NotFound"
 }

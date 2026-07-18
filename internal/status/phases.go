@@ -101,6 +101,18 @@ const (
 	RestorePhaseFailed               RestorePhase = "Failed"
 )
 
+// IsTerminalRestorePhase reports whether a Restore/ClusterRestore phase string is one of
+// the three terminal phases. Exported so the controllers AND the crucible suite share the
+// one definition — a future phase added here can then never desynchronize a poller.
+func IsTerminalRestorePhase(phase string) bool {
+	switch RestorePhase(phase) {
+	case RestorePhaseCompleted, RestorePhasePartiallyFailed, RestorePhaseFailed:
+		return true
+	default:
+		return false
+	}
+}
+
 // RollUpRestoreOutcomes maps a settled restore's per-volume tallies to its
 // terminal phase. Unlike the backup roll-ups it takes counts, not a phase list:
 // a restore keeps no persisted per-volume phases (the mover Jobs are the ground

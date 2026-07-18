@@ -18,10 +18,12 @@ package controller
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -175,7 +177,7 @@ func (r *OrphanReaper) reapRestorePV(ctx context.Context, pv *corev1.PersistentV
 	log := logf.FromContext(ctx).WithName("orphan-reaper")
 	orphaned, err := r.orphaned(ctx, pv, cutoff)
 	if err != nil {
-		log.Error(err, "orphan reaper: restore PV orphan check failed", "pv", pv.Name)
+		log.Error(err, "Orphan reaper: restore PV orphan check failed", "pv", pv.Name)
 		return
 	}
 	if !orphaned {
@@ -184,21 +186,44 @@ func (r *OrphanReaper) reapRestorePV(ctx context.Context, pv *corev1.PersistentV
 	switch pv.Labels[apiconst.LabelPVRole] {
 	case apiconst.PVRoleTwin:
 		if err := r.Delete(ctx, pv); err != nil && !apierrors.IsNotFound(err) {
-			log.Error(err, "orphan reaper: twin PV delete failed", "pv", pv.Name)
+			log.Error(err, "Orphan reaper: twin PV delete failed", "pv", pv.Name)
 			return
 		}
-		log.Info("orphan reaper: reaped leftover twin PV", "pv", pv.Name)
+		log.Info("Orphan reaper: reaped leftover twin PV", "pv", pv.Name)
 	case apiconst.PVRoleTransplant:
+		// Defensive delivered-check (mirror of rexposer.Cleanup's): a final claim BOUND to
+		// this PV outside the operator namespace means the handover in fact succeeded and
+		// only the label-strip/policy-restore tail was missed (a crash between two writes).
+		// Finish that tail — NEVER reclaim delivered user data.
+		if ref := pv.Spec.ClaimRef; ref != nil && ref.Namespace != r.OperatorNamespace {
+			var final corev1.PersistentVolumeClaim
+			if err := r.Get(ctx, client.ObjectKey{Namespace: ref.Namespace, Name: ref.Name}, &final); err == nil &&
+				final.Spec.VolumeName == pv.Name {
+				base := pv.DeepCopy()
+				pv.Spec.PersistentVolumeReclaimPolicy = r.classReclaimPolicy(ctx, pv.Spec.StorageClassName)
+				for k := range pv.Labels {
+					if strings.HasPrefix(k, apiconst.Domain+"/") {
+						delete(pv.Labels, k)
+					}
+				}
+				if err := r.Patch(ctx, pv, client.MergeFrom(base)); err != nil {
+					log.Error(err, "Orphan reaper: delivered-transplant handover tail failed", "pv", pv.Name)
+					return
+				}
+				log.Info("Orphan reaper: finished a delivered transplant's handover tail", "pv", pv.Name)
+				return
+			}
+		}
 		if pv.Spec.PersistentVolumeReclaimPolicy == corev1.PersistentVolumeReclaimDelete {
 			return // already handed back; the PV controller owns it from here.
 		}
 		base := pv.DeepCopy()
 		pv.Spec.PersistentVolumeReclaimPolicy = corev1.PersistentVolumeReclaimDelete
 		if err := r.Patch(ctx, pv, client.MergeFrom(base)); err != nil {
-			log.Error(err, "orphan reaper: transplant PV reclaim patch failed", "pv", pv.Name)
+			log.Error(err, "Orphan reaper: transplant PV reclaim patch failed", "pv", pv.Name)
 			return
 		}
-		log.Info("orphan reaper: reclaimed unfinished transplant PV", "pv", pv.Name)
+		log.Info("Orphan reaper: reclaimed unfinished transplant PV", "pv", pv.Name)
 	}
 }
 
@@ -265,7 +290,7 @@ func (r *OrphanReaper) restoreOrphaned(ctx context.Context, namespace, name stri
 	if !restore.DeletionTimestamp.IsZero() {
 		return false, nil
 	}
-	return isTerminalRestorePhase(restore.Status.Phase), nil
+	return status.IsTerminalRestorePhase(restore.Status.Phase), nil
 }
 
 // clusterRestoreOrphaned is restoreOrphaned's cluster-scoped sibling.
@@ -280,7 +305,21 @@ func (r *OrphanReaper) clusterRestoreOrphaned(ctx context.Context, name string) 
 	if !cr.DeletionTimestamp.IsZero() {
 		return false, nil
 	}
-	return isTerminalRestorePhase(cr.Status.Phase), nil
+	return status.IsTerminalRestorePhase(cr.Status.Phase), nil
+}
+
+// classReclaimPolicy resolves the reclaim policy a delivered volume should end with: its
+// StorageClass's policy, Delete when the class is unset/gone (mirrors
+// rexposer.storageClassReclaimPolicy for the reaper's handover-tail path).
+func (r *OrphanReaper) classReclaimPolicy(ctx context.Context, scName string) corev1.PersistentVolumeReclaimPolicy {
+	if scName == "" {
+		return corev1.PersistentVolumeReclaimDelete
+	}
+	var sc storagev1.StorageClass
+	if err := r.Get(ctx, client.ObjectKey{Name: scName}, &sc); err != nil || sc.ReclaimPolicy == nil {
+		return corev1.PersistentVolumeReclaimDelete
+	}
+	return *sc.ReclaimPolicy
 }
 
 // volumePhaseTerminal reports whether a per-PVC volume phase is terminal, so its exposure objects
