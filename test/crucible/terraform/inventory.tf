@@ -8,15 +8,21 @@ resource "local_file" "ansible_inventory" {
   file_permission = "0600"
 
   content = templatefile("${path.module}/templates/hosts.ini.tftpl", {
+    # private_mac lets the `common` role bring the private NIC up by MAC when
+    # cloud-init raced the network attach and never wrote a netplan entry for it
+    # (one(...) asserts the single inline network block — fails loudly if that
+    # ever changes). Hetzner's DHCP hands the reserved IP to this MAC.
     masters = [for i, s in hcloud_server.master : {
-      name       = s.name
-      public_ip  = s.ipv4_address
-      private_ip = local.master_ips[i]
+      name        = s.name
+      public_ip   = s.ipv4_address
+      private_ip  = local.master_ips[i]
+      private_mac = one(s.network).mac_address
     }]
     workers = [for i, s in hcloud_server.worker : {
-      name       = s.name
-      public_ip  = s.ipv4_address
-      private_ip = local.worker_ips[i]
+      name        = s.name
+      public_ip   = s.ipv4_address
+      private_ip  = local.worker_ips[i]
+      private_mac = one(s.network).mac_address
     }]
     rke2_token   = random_password.rke2_token.result
     rke2_channel = var.rke2_channel
