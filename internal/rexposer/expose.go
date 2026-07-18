@@ -50,13 +50,35 @@ func NewTargetExposer(c client.Client, operatorNamespace string) *TargetExposer 
 // operator namespace). Idempotent: every Create tolerates AlreadyExists, so a re-reconcile
 // (or a restarted controller) converges on the same objects.
 func (e *TargetExposer) Expose(ctx context.Context, req TargetRequest) (*TargetExposure, error) {
+	// The mechanism is STICKY once a staging claim exists: its shape — not the live target
+	// state — decides. Between passes the target can appear (a StatefulSet recreating its
+	// claim, a user racing the restore) or vanish, and re-resolving would build the OTHER
+	// mechanism's objects around a staging claim already bound to this one's volume — the
+	// mover would then restore into a volume nobody hands over, and a Completed restore
+	// would deliver nothing. A twin staging is pre-bound to the twin PV BY NAME, so the
+	// shape reads straight off spec.volumeName; the twin's node pin rides an annotation
+	// (the original bound PV, the only object VolumeAttachments name, may be gone by now).
+	stagingName := StagingPVCName(req.NamePrefix)
+	var staging corev1.PersistentVolumeClaim
+	err := e.Get(ctx, client.ObjectKey{Namespace: e.OperatorNamespace, Name: stagingName}, &staging)
+	switch {
+	case err == nil:
+		if staging.Spec.VolumeName == TwinPVName(req.NamePrefix) {
+			return e.exposure(KindTwin, req, TwinPVName(req.NamePrefix),
+				staging.Annotations[apiconst.AnnotationExposureNode]), nil
+		}
+		return e.exposure(KindTransplant, req, "", ""), nil
+	case !apierrors.IsNotFound(err):
+		return nil, fmt.Errorf("get staging PVC %s/%s: %w", e.OperatorNamespace, stagingName, err)
+	}
+
 	var target corev1.PersistentVolumeClaim
-	err := e.Get(ctx, client.ObjectKey{Namespace: req.TargetNamespace, Name: req.PVCName}, &target)
+	err = e.Get(ctx, client.ObjectKey{Namespace: req.TargetNamespace, Name: req.PVCName}, &target)
 	switch {
 	case apierrors.IsNotFound(err):
-		// The staging PVC may already exist from a prior pass whose target PVC creation is
-		// itself the missing piece (transplant handover deletes staging BEFORE creating the
-		// final PVC — see Finalize). Either way the transplant path owns this shape.
+		// No staging yet and no target: the transplant path owns this shape (it also covers
+		// the mid-handover window — Finalize deletes staging before creating the final PVC —
+		// but that window is never re-exposed: the mover Job still exists then).
 		return e.exposeTransplant(ctx, req)
 	case err != nil:
 		return nil, fmt.Errorf("get restore target PVC %s/%s: %w", req.TargetNamespace, req.PVCName, err)
@@ -159,6 +181,14 @@ func (e *TargetExposer) exposeTwin(ctx context.Context, req TargetRequest, targe
 		return nil, fmt.Errorf("create twin PV %s: %w", twinName, err)
 	}
 
+	// Resolve the node pin BEFORE the staging claim exists: the claim's creation is the
+	// commit point after which Expose resumes from the staging shape alone and never
+	// re-reads the bound PV or its VolumeAttachments.
+	node, err := e.attachedNode(ctx, boundPV.Name)
+	if err != nil {
+		return nil, err
+	}
+
 	staging := &corev1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      stagingName,
@@ -177,13 +207,11 @@ func (e *TargetExposer) exposeTwin(ctx context.Context, req TargetRequest, targe
 			VolumeName:       twinName,
 		},
 	}
+	if node != "" {
+		staging.Annotations = map[string]string{apiconst.AnnotationExposureNode: node}
+	}
 	if err := e.Create(ctx, staging); err != nil && !apierrors.IsAlreadyExists(err) {
 		return nil, fmt.Errorf("create staging PVC %s/%s: %w", e.OperatorNamespace, stagingName, err)
-	}
-
-	node, err := e.attachedNode(ctx, boundPV.Name)
-	if err != nil {
-		return nil, err
 	}
 	return e.exposure(KindTwin, req, twinName, node), nil
 }

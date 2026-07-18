@@ -346,6 +346,102 @@ func TestExposeAdoptsUnboundAndRefusesBlockTargets(t *testing.T) {
 	}
 }
 
+// TestExposeMechanismIsSticky: once a staging claim exists, its SHAPE decides the
+// mechanism — the live target state is not re-read. A transplant staging survives the
+// target PVC appearing and binding mid-restore (a StatefulSet recreating its claim); a
+// twin staging survives the target vanishing, and its node pin resumes from the
+// annotation instead of the (possibly gone) bound PV's VolumeAttachments.
+func TestExposeMechanismIsSticky(t *testing.T) {
+	ctx := context.Background()
+
+	// Transplant staging already exists (dynamically bound to its own volume), and the
+	// target has since appeared and bound: the resolution must STAY pvc-transplant and no
+	// twin PV may be created around the transplant-shaped claim.
+	staging := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "recover-1-uploads-target", Namespace: opNS, Labels: testLabels()},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			VolumeName:  "pvc-dynamic-1234",
+		},
+		Status: corev1.PersistentVolumeClaimStatus{Phase: corev1.ClaimBound},
+	}
+	target, targetPV := boundTargetFixture()
+	c := newClient(t, staging, target, targetPV)
+	ex, err := NewTargetExposer(c, opNS).Expose(ctx, testRequest())
+	if err != nil {
+		t.Fatalf("Expose(existing transplant staging): %v", err)
+	}
+	if ex.Kind != KindTransplant {
+		t.Errorf("kind = %q, want %q (staging shape must win over the now-bound target)", ex.Kind, KindTransplant)
+	}
+	var twin corev1.PersistentVolume
+	if gerr := c.Get(ctx, client.ObjectKey{Name: TwinPVName("recover-1-uploads")}, &twin); gerr == nil {
+		t.Error("a twin PV was created around a transplant-shaped staging claim")
+	}
+
+	// Twin staging already exists (pre-bound to the twin PV by name, node pin annotated),
+	// and the target has since been DELETED: the resolution must stay pv-twin and the pin
+	// must resume from the annotation.
+	twinStaging := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "recover-1-uploads-target", Namespace: opNS, Labels: testLabels(),
+			Annotations: map[string]string{apiconst.AnnotationExposureNode: "worker-7"},
+		},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			VolumeName:  TwinPVName("recover-1-uploads"),
+		},
+		Status: corev1.PersistentVolumeClaimStatus{Phase: corev1.ClaimBound},
+	}
+	c = newClient(t, twinStaging)
+	ex, err = NewTargetExposer(c, opNS).Expose(ctx, testRequest())
+	if err != nil {
+		t.Fatalf("Expose(existing twin staging, target gone): %v", err)
+	}
+	if ex.Kind != KindTwin {
+		t.Errorf("kind = %q, want %q (staging shape must win over the vanished target)", ex.Kind, KindTwin)
+	}
+	if ex.TwinPVName != TwinPVName("recover-1-uploads") {
+		t.Errorf("TwinPVName = %q, want %q", ex.TwinPVName, TwinPVName("recover-1-uploads"))
+	}
+	if ex.NodeName != "worker-7" {
+		t.Errorf("NodeName = %q, want worker-7 (resumed from the staging annotation)", ex.NodeName)
+	}
+}
+
+// TestExposeTwinStampsNodeAnnotation: the twin path records its node pin on the staging
+// claim at creation, so a restarted controller resumes the same pin without re-reading
+// VolumeAttachments (see TestExposeMechanismIsSticky's resume half).
+func TestExposeTwinStampsNodeAnnotation(t *testing.T) {
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "worker-3"},
+		Status: corev1.NodeStatus{Conditions: []corev1.NodeCondition{
+			{Type: corev1.NodeReady, Status: corev1.ConditionTrue},
+		}},
+	}
+	pvc, pv := boundTargetFixture()
+	va := &storagev1.VolumeAttachment{
+		ObjectMeta: metav1.ObjectMeta{Name: "va-1"},
+		Spec: storagev1.VolumeAttachmentSpec{
+			Attacher: "csi", NodeName: "worker-3",
+			Source: storagev1.VolumeAttachmentSource{PersistentVolumeName: &pv.Name},
+		},
+		Status: storagev1.VolumeAttachmentStatus{Attached: true},
+	}
+	c := newClient(t, pvc, pv, node, va)
+	ex, err := NewTargetExposer(c, opNS).Expose(context.Background(), testRequest())
+	if err != nil {
+		t.Fatalf("Expose: %v", err)
+	}
+	var staging corev1.PersistentVolumeClaim
+	if err := c.Get(context.Background(), client.ObjectKey{Namespace: opNS, Name: ex.StagingPVCName}, &staging); err != nil {
+		t.Fatalf("get staging: %v", err)
+	}
+	if got := staging.Annotations[apiconst.AnnotationExposureNode]; got != "worker-3" {
+		t.Errorf("staging %s annotation = %q, want worker-3", apiconst.AnnotationExposureNode, got)
+	}
+}
+
 // TestFinalizeTransplantHandover walks the whole multi-pass handover, playing the PV
 // controller between passes: label+Retain+staging-delete → (Released) → re-point + final
 // claim created pre-bound with provenance and NO operator labels → (Bound) → class policy

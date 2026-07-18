@@ -21,6 +21,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"slices"
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
@@ -292,8 +293,26 @@ func (l *JobSnapshotLister) ensureSnapshotsJob(ctx context.Context, repo *cbv1.B
 	if err := controllerutil.SetControllerReference(repo, job, l.Scheme); err != nil {
 		return fmt.Errorf("set controller reference on discovery job %s: %w", name, err)
 	}
-	if err := l.Create(ctx, job); err != nil && !apierrors.IsAlreadyExists(err) {
-		return fmt.Errorf("create discovery job %s/%s: %w", l.OperatorNamespace, name, err)
+	if err := l.Create(ctx, job); err != nil {
+		if !apierrors.IsAlreadyExists(err) {
+			return fmt.Errorf("create discovery job %s/%s: %w", l.OperatorNamespace, name, err)
+		}
+		// Re-adoption guard: the Job NAME is deterministic per purpose, but its restic argv
+		// was baked at creation — a leftover Job can carry a DIFFERENT filter than this
+		// call's (a restarted controller re-pinning "latest" onto a newer run), and adopting
+		// it would parse the OLD filter's output as the new filter's result: a restore
+		// executing one run while status and provenance attest another. Identical argv ⇒
+		// adopt (the normal restart path); anything else is superseded and retried.
+		var existing batchv1.Job
+		if gerr := l.Get(ctx, client.ObjectKey{Namespace: l.OperatorNamespace, Name: name}, &existing); gerr != nil {
+			return fmt.Errorf("inspect existing discovery job %s/%s: %w", l.OperatorNamespace, name, gerr)
+		}
+		if len(existing.Spec.Template.Spec.Containers) == 0 ||
+			!slices.Equal(existing.Spec.Template.Spec.Containers[0].Args, job.Spec.Template.Spec.Containers[0].Args) {
+			l.cleanup(ctx, name)
+			return fmt.Errorf("discovery job %s/%s carried stale arguments and was superseded; retrying",
+				l.OperatorNamespace, name)
+		}
 	}
 	return nil
 }

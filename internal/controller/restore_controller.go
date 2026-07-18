@@ -280,9 +280,11 @@ func (r *RestoreReconciler) prepare(ctx context.Context, restore *cbv1.Restore, 
 	plans, missing := r.buildPlans(ctx, restore, source, byPVC)
 	if len(missing) > 0 {
 		// A selected PVC with no snapshot under the mediated filter cannot be restored —
-		// fail CLOSED (never fall back to an unmediated identifier), and WITHOUT caching
-		// this listing: the run may still be uploading its last volumes, so the next pass
-		// must re-list rather than replay an incomplete map until restart.
+		// fail CLOSED (never fall back to an unmediated identifier), and DROP any cached
+		// listing: the run may still be uploading its last volumes (the source Backup's
+		// restorable set can grow mid-run), so the next pass must re-list rather than
+		// replay an incomplete map until restart. The source pin survives.
+		r.Engine.forgetListing(restore.UID)
 		res, gerr := r.gate(ctx, restore, "SnapshotNotFound",
 			fmt.Sprintf("no snapshot under the namespace filter for PVC(s): %s", clampMessage(joinFailures(missing))))
 		return nil, nil, res, gerr
@@ -673,19 +675,4 @@ func joinFailures(failures []string) string {
 		out.WriteString("; " + f)
 	}
 	return out.String()
-}
-
-// meta_HasConditionTrue reports whether the condition of the given type is present & True.
-func meta_HasConditionTrue(conds []metav1.Condition, condType string) bool {
-	c := status.FindCondition(conds, condType)
-	return c != nil && c.Status == metav1.ConditionTrue
-}
-
-// ensurePlatformDEKFor is the shared DEK resolution both restore controllers use (the
-// read-mostly twin of the Backup controller's ensureDEK, package-scoped so ClusterRestore
-// reuses it without a reconciler receiver).
-func ensurePlatformDEKFor(ctx context.Context, c client.Client, secretsReader *secrets.ByNameReader,
-	operatorNamespace string, loc *cbv1.ClusterBackupLocation,
-) (dek, reason, message string, ok bool) {
-	return resolvePlatformDEKCommon(ctx, c, secretsReader, operatorNamespace, loc)
 }

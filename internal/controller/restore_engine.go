@@ -37,6 +37,7 @@ import (
 	cbv1 "github.com/CrystalBackup/CrystalBackup/api/v1alpha1"
 	"github.com/CrystalBackup/CrystalBackup/internal/apiconst"
 	clientsecrets "github.com/CrystalBackup/CrystalBackup/internal/client/secrets"
+	"github.com/CrystalBackup/CrystalBackup/internal/concurrency"
 	"github.com/CrystalBackup/CrystalBackup/internal/mover"
 	"github.com/CrystalBackup/CrystalBackup/internal/repo/queue"
 	"github.com/CrystalBackup/CrystalBackup/internal/restic"
@@ -135,6 +136,10 @@ type restoreExecContext struct {
 	restoredFromRun string
 	// Repository access, resolved by the owning controller.
 	repoName, repoURL, dek, s3CredsSecret string
+	// startBudget is set by driveVolumes each pass to (restoreOwnerMoverCap - running
+	// movers of this owner); startVolume consumes one unit per mover Job it creates and
+	// holds further volumes back at zero. Per-reconcile state — never shared or persisted.
+	startBudget int
 }
 
 // volumeOutcome is the DERIVED state of one planned volume this pass.
@@ -183,6 +188,14 @@ type restoreEngine struct {
 // maxVolumeAdviseErrors is how many consecutive reconcile-visible errors one volume may
 // produce before it is settled as failed (~5 minutes at the 5s poll, more under backoff).
 const maxVolumeAdviseErrors = 60
+
+// restoreOwnerMoverCap bounds how many of ONE owner's restore movers run at once: a
+// many-volume ClusterRestore must not stampede node attach limits and the S3 endpoint with
+// every volume simultaneously, and — because restore movers count in the shared mover
+// census (listMoverJobs) — an unbounded restore would hold a capped backup cascade's
+// admission gate shut for its whole duration. Per OWNER, not cluster-wide: the global
+// cross-kind semaphore stays deferred (see the backup controller's task #22 note).
+const restoreOwnerMoverCap = 4
 
 // resolvedSnapshots is one cached mediated resolution: the run it was resolved for and the
 // kind=data snapshots by PVC name.
@@ -275,6 +288,16 @@ func (e *restoreEngine) storeResolution(owner types.UID, run string, byPVC map[s
 	e.resolved[owner] = resolvedSnapshots{run: run, byPVC: byPVC}
 }
 
+// forgetListing drops ONLY the cached snapshot listing — the source pin and the per-volume
+// bookkeeping survive. Used when the cached map proves INCOMPLETE (a selected PVC has no
+// snapshot in it): the run may still be uploading, so the next pass must re-list instead of
+// replaying the stale map until an operator restart.
+func (e *restoreEngine) forgetListing(owner types.UID) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	delete(e.resolved, owner)
+}
+
 func (e *restoreEngine) forgetResolution(owner types.UID, ownerID string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -336,12 +359,38 @@ type volumeDrive struct {
 	err error
 }
 
+// ownerRunningMovers counts this owner's live, still-running mover Jobs — the supply side
+// of the restoreOwnerMoverCap admission in startVolume.
+func (e *restoreEngine) ownerRunningMovers(ctx context.Context, rc *restoreExecContext) (int, error) {
+	var jobs batchv1.JobList
+	if err := e.List(ctx, &jobs, client.InNamespace(e.OperatorNamespace), client.MatchingLabels{
+		apiconst.LabelManagedBy: apiconst.ManagedByValue,
+		rc.ownerLabelKey:        rc.ownerName,
+		apiconst.LabelNamespace: rc.targetNamespace,
+	}); err != nil {
+		return 0, fmt.Errorf("list restore mover Jobs for the concurrency gate: %w", err)
+	}
+	live := jobs.Items[:0]
+	for _, j := range jobs.Items {
+		if j.Labels[apiconst.LabelPVC] != "" && j.DeletionTimestamp == nil {
+			live = append(live, j)
+		}
+	}
+	return concurrency.RunningMoverJobs(live), nil
+}
+
 // driveVolumes advances every plan one step and aggregates the outcomes — the shared drive
 // loop of both restore controllers. An advise error settles the volume as failed once its
 // per-volume budget is exhausted; before that it is only remembered (drive.err) for the
 // caller's usual backoff, and the remaining volumes still advance this pass.
 func (e *restoreEngine) driveVolumes(ctx context.Context, rc *restoreExecContext, plans []restoreVolumePlan) volumeDrive {
 	var d volumeDrive
+	running, err := e.ownerRunningMovers(ctx, rc)
+	if err != nil {
+		d.err = err
+		return d
+	}
+	rc.startBudget = restoreOwnerMoverCap - running
 	for i := range plans {
 		key := rc.ownerID + "/" + plans[i].pvc
 		outcome, err := e.adviseVolume(ctx, rc, &plans[i])
@@ -480,6 +529,13 @@ func (e *restoreEngine) startVolume(ctx context.Context, rc *restoreExecContext,
 		return volumeOutcome{}, nil
 	}
 
+	// Per-owner concurrency admission (restoreOwnerMoverCap): hold this volume in its
+	// pre-mover state — the exposure above is idempotent and cheap — until a sibling's
+	// mover finishes. The pass budget was primed by driveVolumes from the live Job census.
+	if rc.startBudget <= 0 {
+		return volumeOutcome{}, nil
+	}
+
 	if err := ensureMoverCredsSecret(ctx, e.maintenanceDeps(), jobName, rc.dek, rc.s3CredsSecret, labels); err != nil {
 		return volumeOutcome{}, err
 	}
@@ -524,6 +580,7 @@ func (e *restoreEngine) startVolume(ctx context.Context, rc *restoreExecContext,
 	if err := e.Create(ctx, job); err != nil && !apierrors.IsAlreadyExists(err) {
 		return volumeOutcome{}, fmt.Errorf("create restore mover Job %s/%s: %w", e.OperatorNamespace, jobName, err)
 	}
+	rc.startBudget--
 	return volumeOutcome{}, nil
 }
 

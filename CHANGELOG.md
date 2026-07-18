@@ -65,6 +65,14 @@ longer exist.
 - Admission rule 8 counts **non-empty** positive selector forms (an empty `matchNames: []`
   no longer masks — or trips over — a real form), denies an absent selector with the
   rule-8 message instead of a CEL evaluation error, and exempts the operator SA.
+- The exposure mechanism is **sticky per volume**: once a staging claim exists, its shape —
+  never the live target state — decides transplant vs twin, so a target PVC appearing (a
+  StatefulSet recreating its claim) or vanishing mid-restore can no longer misroute the
+  handover. A restore runs at most **4 concurrent movers per owner** (slots free as movers
+  finish; the cross-kind global semaphore remains a roadmap item), and a mediated-resolution
+  listing Job is only re-adopted when its baked restic argv matches the current filter —
+  a leftover listing from before a controller restart can never masquerade as a different
+  run's resolution.
 
 ## 0.1.0 — M1 “Core engine & cluster DR” (2026-07-17)
 

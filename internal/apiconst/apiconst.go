@@ -145,6 +145,11 @@ const (
 	// operator's managed-by/reaper labels: a restored PVC is the USER'S object and must never
 	// be selectable by the reaper or the leak-check.
 	AnnotationRestoredFrom = Domain + "/restored-from"
+	// AnnotationExposureNode is stamped on a pv-twin STAGING claim at creation with the node
+	// the target volume was singly attached on: the exposure's node pin must survive a
+	// controller restart without re-resolving live state (the original bound PV — the only
+	// object VolumeAttachments reference — may be unreachable by then).
+	AnnotationExposureNode = Domain + "/exposure-node"
 )
 
 // Origin label values (see LabelOrigin).

@@ -66,6 +66,11 @@ an explicitly empty list restores none.
   to one node is handled — the mover is pinned to that node.
 - `volumeMode: Block` PVCs are not restorable (restic restores files); the volume fails
   with reason `RestoreBlockUnsupported`.
+- A many-volume restore is paced: at most **4 mover Jobs per restore** run at once (slots
+  free as volumes finish), so a large `ClusterRestore` cannot stampede node attach limits
+  or the S3 endpoint.
+- `spec.source` and `spec.mode` are immutable once created (`target.namespace` too, on a
+  `ClusterRestore`): one restore is one point in time. To change them, delete and recreate.
 - Terminal state: `Completed`, `PartiallyFailed` or `Failed`, with `restoredVolumes` /
   `restoredBytes` counters and per-volume detail in Events.
 

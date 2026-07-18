@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -368,6 +369,121 @@ var _ = Describe("Restore controller", func() {
 		prefix := restoreNamePrefix(restoreOwnerID(nsName, "recover-neg"), "data")
 		err := k8sClient.Get(ctx, client.ObjectKey{Namespace: suiteOperatorNamespace, Name: restoreJobName(prefix)}, &batchv1.Job{})
 		Expect(apierrors.IsNotFound(err)).To(BeTrue())
+	})
+
+	It("caps one owner's concurrent restore movers and frees slots as movers finish", func() {
+		const (
+			nsName   = "restore-cap"
+			location = "restore-cap-loc"
+			run      = "dr-cap-20260719-010000"
+		)
+		seedInitializedRepo(location, "restore-cap-kek", "restore-cap-s3")
+		createTenantNamespace(nsName)
+
+		// Six twin targets (bound PVC + PV each): twin volumes settle the moment their
+		// mover succeeds — no transplant handover to play — so the spec isolates the
+		// admission cap. envtest has no job controller, so the Complete CONDITION (what
+		// the census counts, concurrency.jobTerminal) is stamped here after the shared
+		// simulate helper sets Succeeded.
+		pvcs := []string{"vol-a", "vol-b", "vol-c", "vol-d", "vol-e", "vol-f"}
+		snaps := make([]restic.Snapshot, 0, len(pvcs))
+		volumes := make([]cbv1.VolumeStatus, 0, len(pvcs))
+		for i, pvc := range pvcs {
+			id := strings.Repeat(fmt.Sprintf("%02d", i+1), 32)
+			createBoundTargetPVC(nsName, pvc, "pv-cap-"+pvc)
+			snaps = append(snaps, dataSnapshot(id, nsName, pvc, run))
+			volumes = append(volumes, cbv1.VolumeStatus{Pvc: pvc, Phase: status.VolumePhaseCompleted, SnapshotID: id})
+		}
+		restoreLister.seed(snaps)
+		createProjectedBackup(nsName, run, location, volumes)
+
+		restoreObj := &cbv1.Restore{
+			ObjectMeta: metav1.ObjectMeta{Namespace: nsName, Name: "recover-cap"},
+			Spec: cbv1.RestoreSpec{
+				Source:       cbv1.RestoreSource{Backup: run},
+				Mode:         cbv1.RestoreModeOverwrite,
+				Confirmation: nsName,
+			},
+		}
+		Expect(k8sClient.Create(ctx, restoreObj)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(context.Background(), restoreObj) })
+
+		ownerID := restoreOwnerID(nsName, "recover-cap")
+		jobNameFor := func(pvc string) string { return restoreJobName(restoreNamePrefix(ownerID, pvc)) }
+		presentJobs := func() []string {
+			names := make([]string, 0, len(pvcs))
+			for _, pvc := range pvcs {
+				if k8sClient.Get(ctx, client.ObjectKey{Namespace: suiteOperatorNamespace, Name: jobNameFor(pvc)},
+					&batchv1.Job{}) == nil {
+					names = append(names, jobNameFor(pvc))
+				}
+			}
+			return names
+		}
+		markJobComplete := func(jobName string) {
+			GinkgoHelper()
+			Eventually(func(g Gomega) {
+				var job batchv1.Job
+				g.Expect(k8sClient.Get(ctx, client.ObjectKey{Namespace: suiteOperatorNamespace, Name: jobName}, &job)).To(Succeed())
+				for _, c := range job.Status.Conditions {
+					if c.Type == batchv1.JobComplete && c.Status == corev1.ConditionTrue {
+						return // a prior attempt landed
+					}
+				}
+				// The apiserver validates the whole terminal shape: Complete requires
+				// SuccessCriteriaMet, a startTime and a completionTime.
+				now := metav1.Now()
+				if job.Status.StartTime == nil {
+					job.Status.StartTime = &now
+				}
+				job.Status.CompletionTime = &now
+				job.Status.Conditions = append(job.Status.Conditions,
+					batchv1.JobCondition{Type: batchv1.JobSuccessCriteriaMet, Status: corev1.ConditionTrue},
+					batchv1.JobCondition{Type: batchv1.JobComplete, Status: corev1.ConditionTrue})
+				g.Expect(k8sClient.Status().Update(ctx, &job)).To(Succeed())
+			}, initTimeout, initPoll).Should(Succeed())
+		}
+
+		By("binding every staging claim (exposure is not capped, only the movers are)")
+		for _, pvc := range pvcs {
+			bindStagingPVC(rexposer.StagingPVCName(restoreNamePrefix(ownerID, pvc)))
+		}
+
+		By("holding the extra volumes back at restoreOwnerMoverCap running movers")
+		Eventually(func(g Gomega) {
+			g.Expect(presentJobs()).To(HaveLen(restoreOwnerMoverCap))
+		}, initTimeout, initPoll).Should(Succeed())
+		Consistently(func(g Gomega) {
+			g.Expect(len(presentJobs())).To(BeNumerically("<=", restoreOwnerMoverCap))
+		}, 3*time.Second, 500*time.Millisecond).Should(Succeed())
+
+		By("starting a held volume as each slot frees, until every volume completes")
+		succeeded := map[string]bool{}
+		for range pvcs {
+			var next string
+			Eventually(func(g Gomega) {
+				next = ""
+				for _, name := range presentJobs() {
+					if !succeeded[name] {
+						next = name
+						break
+					}
+				}
+				g.Expect(next).NotTo(BeEmpty(), "a fresh mover Job should have started")
+			}, initTimeout, initPoll).Should(Succeed())
+			simulateMoverSucceeded(next, "node-cap", mover.MoverResult{
+				OK: true, Operation: string(mover.OpRestore), RestoredBytes: 100,
+			})
+			markJobComplete(next)
+			succeeded[next] = true
+		}
+
+		Eventually(func(g Gomega) {
+			var r cbv1.Restore
+			g.Expect(k8sClient.Get(ctx, client.ObjectKey{Namespace: nsName, Name: "recover-cap"}, &r)).To(Succeed())
+			g.Expect(r.Status.Phase).To(Equal(string(status.RestorePhaseCompleted)))
+			g.Expect(r.Status.RestoredVolumes).To(Equal(int32(len(pvcs))))
+		}, initTimeout, initPoll).Should(Succeed())
 	})
 })
 
