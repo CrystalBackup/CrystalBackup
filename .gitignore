@@ -31,4 +31,7 @@ charts/crystal-backup/crds/*.yaml
 *.swo
 *~
 
+# macOS
+.DS_Store
+
 .secrets/
