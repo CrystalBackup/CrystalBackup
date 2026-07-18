@@ -36,6 +36,61 @@
     state: directory
     mode: "0755"
 
+# The Hetzner private NIC can attach AFTER cloud-init's network stage: the
+# interface then exists but stays DOWN with no address and no netplan entry, so
+# nothing ever DHCPs it (seen on one worker during crucible M1 run #2,
+# 2026-07-18 — cloud-init had configured eth0 only). When the private IP is
+# absent, drop in a netplan file that matches the NIC by its MAC (handed down
+# from terraform / hcloud) and DHCP-configures it, then apply and wait for the
+# reserved IP to land. This mirrors the manual fix that unblocked that run.
+# Guarded on the IP being missing, so healthy nodes — where cloud-init already
+# wrote the config — are never touched (no conflicting netplan rule for the
+# same device).
+- name: Check whether the private IP is already up (before any repair)
+  ansible.builtin.shell:
+    cmd: "ip -o -4 addr show | awk -v ip='{{ private_ip }}' '$4 ~ \"^\" ip \"/\" {print $2; exit}'"
+  register: crucible_priv_iface_precheck
+  changed_when: false
+
+- name: Bring up the private NIC when cloud-init missed it
+  when:
+    - private_mac is defined
+    - private_mac | length > 0
+    - crucible_priv_iface_precheck.stdout | trim | length == 0
+  block:
+    - name: Write a netplan drop-in matching the private NIC by MAC
+      ansible.builtin.copy:
+        dest: /etc/netplan/99-crucible-private.yaml
+        mode: "0600" # keep netplan from warning about world-readable config
+        content: |
+          # Managed by crucible ansible (roles/common). Brings up the Hetzner
+          # private NIC by MAC when it attached after cloud-init's network stage.
+          # Match-by-MAC (no set-name): the NIC keeps its kernel name and the
+          # detection below finds it by the address DHCP assigns.
+          network:
+            version: 2
+            ethernets:
+              crucible-private:
+                match:
+                  macaddress: "{{ private_mac | lower }}"
+                dhcp4: true
+
+    - name: Apply the netplan configuration
+      # Regenerates networkd from all files and reloads; eth0's config is
+      # unchanged so the public link (our SSH path) is not bounced.
+      ansible.builtin.command:
+        cmd: netplan apply
+      changed_when: true
+
+    - name: Wait for the reserved private IP to appear on the NIC
+      ansible.builtin.shell:
+        cmd: "ip -o -4 addr show | awk -v ip='{{ private_ip }}' '$4 ~ \"^\" ip \"/\" {print $2; exit}'"
+      register: crucible_priv_iface_wait
+      changed_when: false
+      retries: 24
+      delay: 5
+      until: crucible_priv_iface_wait.stdout | trim | length > 0
+
 # flannel must ride the PRIVATE network, not the public one. By default RKE2's
 # canal picks the default-route interface (public eth0): its VXLAN then (a) uses
 # public IPs on 8472/udp, which the cloud firewall drops between nodes, and
@@ -55,4 +110,8 @@
 - name: Ensure the private interface was found
   ansible.builtin.assert:
     that: private_iface | length > 0
-    fail_msg: "Could not find the interface holding private_ip={{ private_ip }} (ip -o -4 addr show)"
+    fail_msg: >-
+      Could not find the interface holding private_ip={{ private_ip }}
+      (private_mac={{ private_mac | default('undefined') }}). The private NIC
+      never came up — even after the netplan-by-MAC repair, if it ran. Check
+      `ip -o addr` and `netplan status` on this node.
