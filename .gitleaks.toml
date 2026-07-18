@@ -19,3 +19,9 @@ regexTarget = "line"
 regexes = [
   '''sha256:0{64}''',
 ]
+
+[[allowlists]]
+description = "Key-handling unit tests use FABRICATED / invalid age keys as fixtures (e.g. \"not-an-age-secret-key\", \"AGE-SECRET-KEY-1-garbage\") to prove the parser rejects them — never real secrets. Real keys live in the git-ignored .secrets/."
+paths = [
+  '''internal/keys/keys_test\.go''',
+]
