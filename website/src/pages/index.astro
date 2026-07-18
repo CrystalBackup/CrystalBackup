@@ -62,16 +62,16 @@ const compareRows = [
 ];
 
 const milestones = [
-  ['M0', 'Scaffolding — CRDs, CI (0-CVE images), test harness', true],
-  ['M1', 'Core engine & cluster disaster recovery', false, `${base}/reports/crucible-m1.html`],
-  ['M2', 'Restore — self-service & admin', false],
-  ['M3', 'Manifests & cluster-scoped DR', false],
-  ['M4', 'Consistency hooks, verification & maintenance', false],
-  ['M5', 'Namespace plane, external sync & right-to-erasure', false],
-  ['M6', 'Observability hardening & production beta', false],
-  ['M7', 'CLI & browse UI', false],
-  ['M8', 'Immutable locations', false],
-  ['M9', 'Coexistence hardening & DR drills', false],
+  ['M0', 'Scaffolding — CRDs, CI (0-CVE images), test harness', 'done'],
+  ['M1', 'Core engine & cluster disaster recovery', 'done', `${base}/reports/crucible-m1.html`],
+  ['M2', 'Restore — self-service & admin', 'here'],
+  ['M3', 'Manifests & cluster-scoped DR', ''],
+  ['M4', 'Consistency hooks, verification & maintenance', ''],
+  ['M5', 'Namespace plane, external sync & right-to-erasure', ''],
+  ['M6', 'Observability hardening & production beta', ''],
+  ['M7', 'CLI & browse UI', ''],
+  ['M8', 'Immutable locations', ''],
+  ['M9', 'Coexistence hardening & DR drills', ''],
 ];
 
 const markLabel = { yes: 'Yes', partial: 'Partial', no: 'No' };
@@ -121,7 +121,7 @@ const description =
       <section class="hero">
         <div class="hero-copy">
           <span class="pill">
-            <span class="dot"></span> Open-design phase · milestone M0
+            <span class="dot"></span> Building M2 · M1 shipped (v0.1.0)
           </span>
           <h1>
             Every namespace gets <span class="grad">its own backups.</span>
@@ -249,7 +249,7 @@ const description =
         <p class="eyebrow">How it compares</p>
         <h2>Where Crystal Backup aims</h2>
         <p class="section-lead">
-          Design-stage <strong>targets</strong> vs the <strong>current</strong> capabilities of
+          Early-stage <strong>targets</strong> vs the <strong>current</strong> capabilities of
           established tools, to our knowledge — different projects, different goals, not a benchmark.
         </p>
 
@@ -297,16 +297,18 @@ const description =
         <p class="eyebrow">Roadmap</p>
         <h2>Releasable, core-first, in the open</h2>
         <p class="section-lead">
-          Each milestone ships something usable. Today we’re at <strong>M0 — not started</strong>:
-          the design is what’s public.
+          Each milestone ships something usable. <strong>M0 and M1 have shipped</strong> — CRDs, CI
+          and the core engine and cluster disaster recovery are live (v0.1.0); we’re now building
+          <strong>M2 — Restore</strong>.
         </p>
         <ol class="timeline">
           {
-            milestones.map(([id, label, here, report]) => (
-              <li class={here ? 'here' : ''}>
+            milestones.map(([id, label, state, report]) => (
+              <li class={state}>
                 <span class="ms-id">{id}</span>
                 <span class="ms-label">{label}</span>
-                {here && <span class="ms-here">you are here</span>}
+                {state === 'here' && <span class="ms-here">you are here</span>}
+                {state === 'done' && !report && <span class="ms-done">done</span>}
                 {report && (
                   <a class="ms-report" href={report} target="_blank" rel="noopener">Crucible report</a>
                 )}
@@ -327,7 +329,7 @@ const description =
             <h2>You can read every decision.</h2>
             <p class="section-lead">
               Crystal Backup is as much an experiment in <strong>AI-assisted engineering</strong> as
-              it is a backup tool. Specs, decision records and the code to come are produced with AI
+              it is a backup tool. Specs, decision records and code are produced with AI
               assistants under human review — every requirement and trade-off is written down and
               public. You get to watch the reasoning, not just the result.
             </p>
@@ -335,8 +337,9 @@ const description =
           <aside class="note">
             <h3>You’re early — and that’s the point</h3>
             <p>
-              This is the open-design phase; code starts at M0. It isn’t production-ready yet, so
-              try it in a sandbox, keep your existing backups, and use it at your own risk. It’s
+              M0 and M1 have shipped (v0.1.0) — real, tested code — but it’s still early: most
+              milestones are ahead and it isn’t production-ready yet, so try it in a sandbox, keep
+              your existing backups, and use it at your own risk. It’s
               provided <strong>as-is under Apache-2.0</strong>, without warranty. If the direction
               speaks to you, <a href={links.gh} target="_blank" rel="noopener">star or watch the
               repo</a> and follow along.
@@ -348,7 +351,7 @@ const description =
       <!-- ───────────────────────── cta ───────────────────────── -->
       <section class="cta">
         <h2>Follow the build</h2>
-        <p>The specifications and 13 decision records are public. Code is next.</p>
+        <p>The specifications, 15 decision records and the M1 core engine (v0.1.0) are public. Restore is next.</p>
         <div class="hero-cta">
           <a class="btn btn-primary" href={links.gh} target="_blank" rel="noopener">
             <span class="star">★</span> Star / watch on GitHub
