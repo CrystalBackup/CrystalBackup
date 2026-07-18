@@ -1,0 +1,26 @@
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: validating-webhook-configuration
+webhooks:
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: system
+      path: /validate-crystalbackup-io-v1alpha1-clusterbackuplocation
+  failurePolicy: Ignore
+  name: vclusterbackuplocation-v1alpha1.kb.io
+  rules:
+  - apiGroups:
+    - crystalbackup.io
+    apiVersions:
+    - v1alpha1
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - clusterbackuplocations
+  sideEffects: None

@@ -70,6 +70,11 @@ spec:
             - name: https
               containerPort: {{ .Values.metrics.port }}
               protocol: TCP
+            {{- if .Values.admission.webhook.enabled }}
+            - name: webhook
+              containerPort: 9443
+              protocol: TCP
+            {{- end }}
           livenessProbe:
             httpGet:
               path: /healthz
@@ -94,9 +99,21 @@ spec:
             # readOnlyRootFilesystem: true ⇒ give the manager a writable scratch dir.
             - name: tmp
               mountPath: /tmp
+            {{- if .Values.admission.webhook.enabled }}
+            # The chart-generated webhook serving certificate (webhook.yaml). The path is
+            # controller-runtime's default CertDir, so no --webhook-cert-path flag is needed.
+            - name: webhook-certs
+              mountPath: /tmp/k8s-webhook-server/serving-certs
+              readOnly: true
+            {{- end }}
       volumes:
         - name: tmp
           emptyDir: {}
+        {{- if .Values.admission.webhook.enabled }}
+        - name: webhook-certs
+          secret:
+            secretName: {{ include "crystal-backup.fullname" . }}-webhook-certs
+        {{- end }}
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       {{- with .Values.nodeSelector }}
       nodeSelector:

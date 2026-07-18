@@ -1,0 +1,348 @@
+{{- /*
+Static blocking admission (adr/0010, spec/02-api.md §Validation): every rule that is a pure
+per-object CEL check ships as a ValidatingAdmissionPolicy + Binding, versioned with the
+CRDs, so safety holds even when the operator is down and can never wedge unrelated writes.
+
+Rule inventory (numbers per spec/02-api.md; stable, other specs cite them):
+  1  R23 destructive confirmation (conservative superset) — Restore, ClusterRestore,
+     ClusterErasure. EMPTY confirmation is admitted (the controller parks the CR in
+     AwaitingConfirmation); a non-empty value must equal the target.
+  2  User isolation — a Backup naming a ClusterBackupLocation is denied for everyone but
+     the operator ServiceAccount (its cluster-origin fan-out children legitimately do).
+     BackupSchedule/BackupExternalSync references are LocalObjectReference (name-only), so
+     their same-namespace confinement is STRUCTURAL — no policy object needed.
+  3  Retention-vs-Immutable is a controller-side ADVISORY (RetentionIgnored condition), not
+     admission — see adr/0010.
+  4  Single-default ClusterBackupLocation is the DYNAMIC webhook (webhook.yaml), not a VAP.
+  5  Secret refs are LocalObjectReference (name-only) — structural, no policy object.
+  6  Immutable mode forbids maintenance.pruneSchedule — ClusterBackupLocation.
+  7  Denied namespaces — tenant-facing kinds, parameterized by the ConfigMap below
+     (paramRef), so operators tune the list without editing policy.
+  8  namespaces selector shape — exactly one positive form — ClusterBackupSchedule,
+     ClusterBackup.
+  9  External sync source != destination — BackupExternalSync, ClusterBackupExternalSync.
+
+The operator ServiceAccount exemption is expressed as a policy matchCondition (the
+matchConditions field lives on the policy in the VAP API; adr/0010 describes the effect as
+"the binding excludes the operator SA").
+*/ -}}
+{{- if .Values.admission.vap.enabled }}
+{{- $operatorSA := printf "system:serviceaccount:%s:%s" (include "crystal-backup.namespace" .) (include "crystal-backup.serviceAccountName" .) }}
+---
+# Rule 1 — R23 confirmation on Restore: non-empty confirmation must equal the CR's own
+# namespace (the only possible target of a self-service restore).
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: crystalbackup-restore-confirmation
+  labels:
+    {{- include "crystal-backup.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["crystalbackup.io"]
+        apiVersions: ["v1alpha1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["restores"]
+  validations:
+    - expression: >-
+        !has(object.spec.confirmation) || object.spec.confirmation == '' ||
+        object.spec.confirmation == object.metadata.namespace
+      message: >-
+        spec.confirmation must equal the Restore's own namespace (R23); leave it empty to
+        park the restore in AwaitingConfirmation
+      reason: Invalid
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: crystalbackup-restore-confirmation
+  labels:
+    {{- include "crystal-backup.labels" . | nindent 4 }}
+spec:
+  policyName: crystalbackup-restore-confirmation
+  validationActions: ["Deny"]
+---
+# Rule 1 — R23 confirmation on ClusterRestore: non-empty confirmation must equal the
+# target namespace.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: crystalbackup-clusterrestore-confirmation
+  labels:
+    {{- include "crystal-backup.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["crystalbackup.io"]
+        apiVersions: ["v1alpha1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["clusterrestores"]
+  validations:
+    - expression: >-
+        !has(object.spec.confirmation) || object.spec.confirmation == '' ||
+        object.spec.confirmation == object.spec.target.namespace
+      message: >-
+        spec.confirmation must equal spec.target.namespace (R23); leave it empty to park
+        the restore in AwaitingConfirmation
+      reason: Invalid
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: crystalbackup-clusterrestore-confirmation
+  labels:
+    {{- include "crystal-backup.labels" . | nindent 4 }}
+spec:
+  policyName: crystalbackup-clusterrestore-confirmation
+  validationActions: ["Deny"]
+---
+# Rule 1 — R23 confirmation on ClusterErasure: non-empty confirmation must equal the
+# target identity — the tenant when set, else "<namespace>/<pvc>" for a PVC-scoped
+# erasure, else the namespace.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: crystalbackup-clustererasure-confirmation
+  labels:
+    {{- include "crystal-backup.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["crystalbackup.io"]
+        apiVersions: ["v1alpha1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["clustererasures"]
+  validations:
+    - expression: >-
+        !has(object.spec.confirmation) || object.spec.confirmation == '' ||
+        object.spec.confirmation == (
+          (has(object.spec.target.tenant) && object.spec.target.tenant != '') ?
+            object.spec.target.tenant :
+          ((has(object.spec.target.pvc) && object.spec.target.pvc != '') ?
+            object.spec.target.namespace + '/' + object.spec.target.pvc :
+            object.spec.target.namespace))
+      message: >-
+        spec.confirmation must equal the erasure target identity (the tenant, the
+        namespace, or "<namespace>/<pvc>") (R23)
+      reason: Invalid
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: crystalbackup-clustererasure-confirmation
+  labels:
+    {{- include "crystal-backup.labels" . | nindent 4 }}
+spec:
+  policyName: crystalbackup-clustererasure-confirmation
+  validationActions: ["Deny"]
+---
+# Rule 2 — user isolation: a Backup must reference a namespaced BackupLocation, never a
+# ClusterBackupLocation. The operator ServiceAccount is exempt: its cluster-origin fan-out
+# Backups legitimately carry the cluster location (their read-only-ness to users is RBAC,
+# invariant I7, not admission).
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: crystalbackup-backup-user-isolation
+  labels:
+    {{- include "crystal-backup.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConditions:
+    - name: exclude-operator-serviceaccount
+      expression: request.userInfo.username != {{ $operatorSA | quote }}
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["crystalbackup.io"]
+        apiVersions: ["v1alpha1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["backups"]
+  validations:
+    - expression: >-
+        !has(object.spec.locationRef.kind) ||
+        object.spec.locationRef.kind != 'ClusterBackupLocation'
+      message: >-
+        a user-created Backup must reference a namespaced BackupLocation, never a
+        ClusterBackupLocation (R2 user isolation)
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: crystalbackup-backup-user-isolation
+  labels:
+    {{- include "crystal-backup.labels" . | nindent 4 }}
+spec:
+  policyName: crystalbackup-backup-user-isolation
+  validationActions: ["Deny"]
+---
+# Rule 6 — an Immutable location cannot schedule a prune (object-lock forbids it; retention
+# there is repository rotation, adr/0005).
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: crystalbackup-immutable-forbids-prune
+  labels:
+    {{- include "crystal-backup.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["crystalbackup.io"]
+        apiVersions: ["v1alpha1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["clusterbackuplocations"]
+  validations:
+    - expression: >-
+        object.spec.mode != 'Immutable' || !has(object.spec.maintenance) ||
+        !has(object.spec.maintenance.pruneSchedule) ||
+        object.spec.maintenance.pruneSchedule == ''
+      message: an Immutable location cannot set maintenance.pruneSchedule (object-lock forbids prune)
+      reason: Invalid
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: crystalbackup-immutable-forbids-prune
+  labels:
+    {{- include "crystal-backup.labels" . | nindent 4 }}
+spec:
+  policyName: crystalbackup-immutable-forbids-prune
+  validationActions: ["Deny"]
+---
+# Rule 7 — denied namespaces: tenant-facing CRs are rejected in the deny-listed namespaces
+# (default kube-*, the operator namespace). Parameterized by the ConfigMap below (paramRef)
+# so operators tune the list without touching policy. The operator SA is exempt (its
+# fan-out Backups follow the ClusterBackupSchedule's own namespace selection).
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: crystalbackup-denied-namespaces
+  labels:
+    {{- include "crystal-backup.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  paramKind:
+    apiVersion: v1
+    kind: ConfigMap
+  matchConditions:
+    - name: exclude-operator-serviceaccount
+      expression: request.userInfo.username != {{ $operatorSA | quote }}
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["crystalbackup.io"]
+        apiVersions: ["v1alpha1"]
+        operations: ["CREATE"]
+        resources: ["backupschedules", "backuplocations", "restores", "backupexternalsyncs", "backups"]
+  validations:
+    - expression: >-
+        !('deniedNamespaces' in params.data) ||
+        !params.data['deniedNamespaces'].split(',').exists(d,
+          d.endsWith('*')
+            ? object.metadata.namespace.startsWith(d.substring(0, d.size() - 1))
+            : object.metadata.namespace == d)
+      messageExpression: >-
+        'namespace ' + object.metadata.namespace + ' is denied for CrystalBackup tenant resources (rule 7)'
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: crystalbackup-denied-namespaces
+  labels:
+    {{- include "crystal-backup.labels" . | nindent 4 }}
+spec:
+  policyName: crystalbackup-denied-namespaces
+  paramRef:
+    name: {{ include "crystal-backup.fullname" . }}-denied-namespaces
+    namespace: {{ include "crystal-backup.namespace" . }}
+    parameterNotFoundAction: Allow
+  validationActions: ["Deny"]
+---
+# Rule 7's parameter: the deny-list, one comma-separated string ("*"-suffix = prefix glob).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "crystal-backup.fullname" . }}-denied-namespaces
+  namespace: {{ include "crystal-backup.namespace" . }}
+  labels:
+    {{- include "crystal-backup.labels" . | nindent 4 }}
+data:
+  deniedNamespaces: {{ join "," .Values.admission.deniedNamespaces | quote }}
+---
+# Rule 8 — namespace selection must set EXACTLY ONE positive form (matchNames, matchLabels,
+# matchExpressions, or regexp); exclude is the only optional extra.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: crystalbackup-namespace-selector-shape
+  labels:
+    {{- include "crystal-backup.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["crystalbackup.io"]
+        apiVersions: ["v1alpha1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["clusterbackups", "clusterbackupschedules"]
+  validations:
+    - expression: >-
+        [has(variables.ns.matchNames), has(variables.ns.matchLabels),
+         has(variables.ns.matchExpressions),
+         has(variables.ns.regexp) && variables.ns.regexp != ''].filter(b, b).size() == 1
+      message: >-
+        spec.namespaces must set exactly one positive selector form (matchNames,
+        matchLabels, matchExpressions or regexp), plus an optional exclude (rule 8)
+      reason: Invalid
+  variables:
+    - name: ns
+      expression: >-
+        has(object.spec.template) ? object.spec.template.spec.namespaces : object.spec.namespaces
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: crystalbackup-namespace-selector-shape
+  labels:
+    {{- include "crystal-backup.labels" . | nindent 4 }}
+spec:
+  policyName: crystalbackup-namespace-selector-shape
+  validationActions: ["Deny"]
+---
+# Rule 9 — an external sync must copy between two DIFFERENT locations (a self-referential
+# Mirror would forget+prune its own source).
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: crystalbackup-externalsync-distinct-locations
+  labels:
+    {{- include "crystal-backup.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["crystalbackup.io"]
+        apiVersions: ["v1alpha1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["backupexternalsyncs", "clusterbackupexternalsyncs"]
+  validations:
+    - expression: >-
+        object.spec.sourceLocationRef.name != object.spec.destinationLocationRef.name
+      message: an external sync's source and destination locations must differ (rule 9)
+      reason: Invalid
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: crystalbackup-externalsync-distinct-locations
+  labels:
+    {{- include "crystal-backup.labels" . | nindent 4 }}
+spec:
+  policyName: crystalbackup-externalsync-distinct-locations
+  validationActions: ["Deny"]
+{{- end }}

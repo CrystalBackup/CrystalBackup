@@ -1,0 +1,74 @@
+{{- /*
+The ONE dynamic admission webhook (adr/0010, rule 4): single-default
+ClusterBackupLocation uniqueness — inherently cross-object, so it cannot be a
+ValidatingAdmissionPolicy. Deliberately fail-open (failurePolicy: Ignore) and scoped to
+this single CRD: an operator outage must never wedge API writes; the controller's
+MultipleDefaults reconcile condition backstops anything that slips through.
+
+Serving certs are CHART-GENERATED (genCA/genSignedCert) and pinned for the release via
+lookup-less regeneration on upgrade: a helm upgrade re-issues the pair and rolls the
+Deployment (the Secret is mounted), which is acceptable for a non-safety, fail-open
+webhook and keeps the chart free of a cert-manager dependency.
+*/ -}}
+{{- if .Values.admission.webhook.enabled }}
+{{- $serviceName := printf "%s-webhook" (include "crystal-backup.fullname" .) }}
+{{- $ns := include "crystal-backup.namespace" . }}
+{{- $altNames := list (printf "%s.%s.svc" $serviceName $ns) (printf "%s.%s.svc.cluster.local" $serviceName $ns) }}
+{{- $ca := genCA "crystal-backup-webhook-ca" 3650 }}
+{{- $cert := genSignedCert $serviceName nil $altNames 3650 $ca }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ include "crystal-backup.fullname" . }}-webhook-certs
+  namespace: {{ $ns }}
+  labels:
+    {{- include "crystal-backup.labels" . | nindent 4 }}
+type: kubernetes.io/tls
+data:
+  tls.crt: {{ $cert.Cert | b64enc }}
+  tls.key: {{ $cert.Key | b64enc }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $serviceName }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "crystal-backup.labels" . | nindent 4 }}
+spec:
+  ports:
+    - name: webhook
+      port: 443
+      targetPort: webhook
+      protocol: TCP
+  selector:
+    {{- include "crystal-backup.selectorLabels" . | nindent 4 }}
+    control-plane: controller-manager
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: {{ include "crystal-backup.fullname" . }}
+  labels:
+    {{- include "crystal-backup.labels" . | nindent 4 }}
+webhooks:
+  - name: vclusterbackuplocation-v1alpha1.kb.io
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+    # Ignore, per adr/0010: this is uniqueness hygiene with a reconcile-condition backstop,
+    # never a safety boundary — an unreachable operator must not block writes.
+    failurePolicy: Ignore
+    timeoutSeconds: 5
+    clientConfig:
+      caBundle: {{ $ca.Cert | b64enc }}
+      service:
+        name: {{ $serviceName }}
+        namespace: {{ $ns }}
+        path: /validate-crystalbackup-io-v1alpha1-clusterbackuplocation
+        port: 443
+    rules:
+      - apiGroups: ["crystalbackup.io"]
+        apiVersions: ["v1alpha1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["clusterbackuplocations"]
+{{- end }}

@@ -50,6 +50,7 @@ import (
 	"github.com/CrystalBackup/CrystalBackup/internal/metrics"
 	"github.com/CrystalBackup/CrystalBackup/internal/repo/queue"
 	"github.com/CrystalBackup/CrystalBackup/internal/rexposer"
+	webhookv1alpha1 "github.com/CrystalBackup/CrystalBackup/internal/webhook/v1alpha1"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -395,6 +396,13 @@ func main() {
 	if err := ctrlmetrics.Registry.Register(metrics.NewCollector(mgr.GetClient())); err != nil {
 		setupLog.Error(err, "Unable to register the crystalbackup metrics collector")
 		os.Exit(1)
+	}
+	// nolint:goconst
+	if os.Getenv("ENABLE_WEBHOOKS") != "false" {
+		if err := webhookv1alpha1.SetupClusterBackupLocationWebhookWithManager(mgr); err != nil {
+			setupLog.Error(err, "Failed to create webhook", "webhook", "ClusterBackupLocation")
+			os.Exit(1)
+		}
 	}
 	// +kubebuilder:scaffold:builder
 
