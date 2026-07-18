@@ -25,10 +25,12 @@ limitations under the License.
 // One image, two shapes. A mover is the crystal-mover binary (MoverBinaryPath) run from
 // the CrystalBackup image as `crystal-mover --operation <op> -- <restic argv>`. A
 // MAINTENANCE job (OpInit/OpForget/OpPrune/OpCheck/OpSnapshots/OpUnlock) mounts only the
-// repository credentials and scratch; a DATA job (OpBackup) additionally mounts the source PVC
-// read-only at the very path restic will store the snapshot under, so the snapshot's
-// on-disk path equals its restic identity (see internal/restic). BuildJob assembles both
-// from one JobRequest, differing only by whether JobRequest.PVC is set.
+// repository credentials and scratch; a DATA job additionally mounts a PVC — OpBackup
+// mounts the source read-only at the very path restic will store the snapshot under (so
+// the snapshot's on-disk path equals its restic identity, see internal/restic), OpRestore
+// mounts the target read-write at a neutral path restic restores into
+// (PVCMount.ReadWrite). BuildJob assembles all shapes from one JobRequest, differing only
+// by whether JobRequest.PVC is set and how.
 //
 // Secrets never touch argv. restic learns its repository, password and S3 credentials
 // entirely from the environment and a mounted Secret: RESTIC_REPOSITORY, a
@@ -70,8 +72,13 @@ type Operation string
 // tees stdout to the pod log), because a snapshot inventory is far larger than the 4096-byte
 // termination message. Its MoverResult still reports OK/failure like any maintenance op.
 const (
-	// OpBackup snapshots one PVC into the repository; the only shape that mounts data.
+	// OpBackup snapshots one PVC into the repository; mounts the source PVC read-only.
 	OpBackup Operation = "backup"
+	// OpRestore writes one snapshot subtree back into a PVC (`restic restore`); the only
+	// shape that mounts data READ-WRITE (PVCMount.ReadWrite). Against the repository it is
+	// a reader like OpBackup (non-exclusive lock), so it is never enqueued on the per-repo
+	// exclusive queue but counts in the mover-quiescence census (adr/0015, adr/0016).
+	OpRestore Operation = "restore"
 	// OpInit creates the restic repository if it does not yet exist (idempotent).
 	OpInit Operation = "init"
 	// OpForget applies a retention policy, dropping snapshots outside the keep window.

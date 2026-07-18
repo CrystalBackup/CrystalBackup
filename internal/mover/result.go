@@ -48,6 +48,9 @@ type MoverResult struct {
 	// AddedBytes is the incremental bytes this backup actually wrote to the repository
 	// (restic data_added) — near zero for an unchanged PVC, the real storage cost.
 	AddedBytes int64 `json:"addedBytes,omitempty"`
+	// RestoredBytes is the bytes a successful restore actually wrote into the target PVC
+	// (restic restore's bytes_restored); zero for every other operation.
+	RestoredBytes int64 `json:"restoredBytes,omitempty"`
 	// Error is a human-readable failure reason, set only when OK is false. It is advisory
 	// (for status/events); control flow keys off OK, not off this string.
 	Error string `json:"error,omitempty"`
@@ -106,42 +109,48 @@ type ResticBackupSummary struct {
 	DataAdded int64 `json:"data_added"`
 }
 
-// ParseBackupSummary extracts the final summary from a `restic backup --json` stream.
-// restic emits ONE JSON object per line: a run of "status" progress objects, then a
-// single {"message_type":"summary",...} at the end. This scans every line and returns the
-// LAST object whose message_type == "summary" (last-wins is defensive; there is normally
-// exactly one). Blank lines and non-JSON chatter are skipped gracefully — only the total
-// absence of a summary is an error, because that means the backup never reported success
-// and the caller must not fabricate a snapshot id from a truncated stream.
-func ParseBackupSummary(resticStdout []byte) (ResticBackupSummary, error) {
-	var (
-		summary ResticBackupSummary
-		found   bool
-	)
+// lastSummaryLine scans a restic --json stream and returns the raw bytes of the LAST line
+// whose object has message_type == "summary" (last-wins is defensive; there is normally
+// exactly one). restic emits ONE JSON object per line: a run of "status" progress objects,
+// then a single {"message_type":"summary",...} at the end. Blank lines and non-JSON chatter
+// are skipped gracefully; found is false only when no summary line exists at all. Shared by
+// the backup and restore summary parsers so the stream-scanning rules can never diverge.
+func lastSummaryLine(resticStdout []byte) (line []byte, found bool) {
 	// bufio.Reader.ReadBytes has no line-length cap (unlike bufio.Scanner's default 64KiB),
 	// so an unusually long status line — restic can list many current files — never
 	// truncates the scan and hides a later summary.
 	r := bufio.NewReader(bytes.NewReader(resticStdout))
 	for {
-		line, readErr := r.ReadBytes('\n')
+		candidate, readErr := r.ReadBytes('\n')
 		// Process the bytes read so far BEFORE acting on readErr: ReadBytes returns the final
 		// line together with io.EOF when the stream does not end in a newline, so the summary
 		// object (often the last line, sometimes unterminated) is still seen.
-		if trimmed := bytes.TrimSpace(line); len(trimmed) > 0 && trimmed[0] == '{' {
+		if trimmed := bytes.TrimSpace(candidate); len(trimmed) > 0 && trimmed[0] == '{' {
 			// Guard on a leading '{' so restic's non-JSON output (progress text, warnings) is
-			// cheaply skipped, and decode into a candidate: a line that starts with '{' but is
-			// not a valid summary object is skipped too (Unmarshal error or wrong message_type)
-			// rather than aborting the whole scan.
-			var candidate ResticBackupSummary
-			if json.Unmarshal(trimmed, &candidate) == nil && candidate.MessageType == messageTypeSummary {
-				summary, found = candidate, true
+			// cheaply skipped, and probe just the discriminator: a line that starts with '{'
+			// but is not valid JSON, or is not a summary object, is skipped rather than
+			// aborting the whole scan.
+			var probe struct {
+				MessageType string `json:"message_type"`
+			}
+			if json.Unmarshal(trimmed, &probe) == nil && probe.MessageType == messageTypeSummary {
+				line, found = trimmed, true
 			}
 		}
 		if readErr != nil {
-			break
+			return line, found
 		}
 	}
-	if !found {
+}
+
+// ParseBackupSummary extracts the final summary from a `restic backup --json` stream (see
+// lastSummaryLine for the scanning rules). The total absence of a summary is an error,
+// because that means the backup never reported success and the caller must not fabricate a
+// snapshot id from a truncated stream.
+func ParseBackupSummary(resticStdout []byte) (ResticBackupSummary, error) {
+	line, found := lastSummaryLine(resticStdout)
+	var summary ResticBackupSummary
+	if !found || json.Unmarshal(line, &summary) != nil {
 		return ResticBackupSummary{}, fmt.Errorf(
 			"no restic backup summary (message_type=%q) in %d bytes of --json output",
 			messageTypeSummary, len(resticStdout))
@@ -153,7 +162,7 @@ func ParseBackupSummary(resticStdout []byte) (ResticBackupSummary, error) {
 // reports for a backup. It fixes the field translation in one place so producer and
 // tests agree: total_bytes_processed -> SizeBytes (apparent size),
 // data_added -> AddedBytes (incremental cost), and Operation is always "backup" (only a
-// backup produces a summary).
+// backup produces this summary shape).
 func SummaryToResult(s ResticBackupSummary) MoverResult {
 	return MoverResult{
 		OK:         true,
@@ -161,5 +170,46 @@ func SummaryToResult(s ResticBackupSummary) MoverResult {
 		SnapshotID: s.SnapshotID,
 		SizeBytes:  s.TotalBytesProcessed,
 		AddedBytes: s.DataAdded,
+	}
+}
+
+// ResticRestoreSummary is the subset of restic's `restore --json` summary object the mover
+// cares about (restic ≥ 0.17 emits it; the mover pins ≥ 0.19.1). Unlisted fields
+// (files_skipped, seconds_elapsed, ...) are ignored by the JSON decoder.
+type ResticRestoreSummary struct {
+	// MessageType is "summary" on the object this parser wants.
+	MessageType string `json:"message_type"`
+	// TotalBytes is the logical size of the selected restore set.
+	TotalBytes int64 `json:"total_bytes"`
+	// BytesRestored is what was actually written to the target -> MoverResult.RestoredBytes.
+	BytesRestored int64 `json:"bytes_restored"`
+	// FilesRestored counts the files written; logged, not carried into CR status.
+	FilesRestored int64 `json:"files_restored"`
+}
+
+// ParseRestoreSummary extracts the final summary from a `restic restore --json` stream (see
+// lastSummaryLine for the scanning rules). Like the backup parser, the total absence of a
+// summary is an error: restic always emits one on a clean restore, so a summary-less clean
+// exit means the stream was truncated and the caller must not report an unverified success.
+func ParseRestoreSummary(resticStdout []byte) (ResticRestoreSummary, error) {
+	line, found := lastSummaryLine(resticStdout)
+	var summary ResticRestoreSummary
+	if !found || json.Unmarshal(line, &summary) != nil {
+		return ResticRestoreSummary{}, fmt.Errorf(
+			"no restic restore summary (message_type=%q) in %d bytes of --json output",
+			messageTypeSummary, len(resticStdout))
+	}
+	return summary, nil
+}
+
+// RestoreSummaryToResult maps a parsed restore summary to the successful MoverResult the
+// shim reports for a restore: bytes_restored -> RestoredBytes, total_bytes -> SizeBytes
+// (the selected set's apparent size), no snapshot id (a restore creates none).
+func RestoreSummaryToResult(s ResticRestoreSummary) MoverResult {
+	return MoverResult{
+		OK:            true,
+		Operation:     string(OpRestore),
+		SizeBytes:     s.TotalBytes,
+		RestoredBytes: s.BytesRestored,
 	}
 }

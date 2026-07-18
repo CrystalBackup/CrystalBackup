@@ -215,24 +215,26 @@ func TestWriteResultRoundTrip(t *testing.T) {
 	}
 }
 
-// TestEnsureBackupJSON pins the three behaviours the shim relies on: add --json for a backup that
-// lacks it, never duplicate it, and never add it for a non-backup op. It also asserts the helper
-// does not mutate the caller's backing array in place.
-func TestEnsureBackupJSON(t *testing.T) {
-	// adds --json when a backup lacks it
-	if got := ensureBackupJSON(string(mover.OpBackup), []string{"backup", "/data/ns/pvc"}); countArg(got, "--json") != 1 {
-		t.Errorf("ensureBackupJSON(backup without --json) = %v, want exactly one --json", got)
+// TestEnsureSummaryJSON pins the three behaviours the shim relies on: add --json for the
+// summary-parsed operations (backup, restore) when they lack it, never duplicate it, and
+// never add it for any other op. It also asserts the helper does not mutate the caller's
+// backing array in place.
+func TestEnsureSummaryJSON(t *testing.T) {
+	// adds --json when a summary-parsed operation lacks it
+	for _, op := range []mover.Operation{mover.OpBackup, mover.OpRestore} {
+		if got := ensureSummaryJSON(string(op), []string{string(op), "/data/ns/pvc"}); countArg(got, "--json") != 1 {
+			t.Errorf("ensureSummaryJSON(%s without --json) = %v, want exactly one --json", op, got)
+		}
+		// leaves one that already has --json unchanged (no duplicate)
+		if got := ensureSummaryJSON(string(op), []string{string(op), "/data/ns/pvc", "--json"}); countArg(got, "--json") != 1 {
+			t.Errorf("ensureSummaryJSON(%s with --json) = %v, want it kept exactly once", op, got)
+		}
 	}
 
-	// leaves a backup that already has --json unchanged (no duplicate)
-	if got := ensureBackupJSON(string(mover.OpBackup), []string{"backup", "/data/ns/pvc", "--json"}); countArg(got, "--json") != 1 {
-		t.Errorf("ensureBackupJSON(backup with --json) = %v, want it kept exactly once", got)
-	}
-
-	// does not add --json for any non-backup operation
-	for _, op := range []mover.Operation{mover.OpInit, mover.OpForget, mover.OpPrune, mover.OpCheck} {
-		if got := ensureBackupJSON(string(op), []string{string(op)}); countArg(got, "--json") != 0 {
-			t.Errorf("ensureBackupJSON(%s) = %v, want no --json added", op, got)
+	// does not add --json for any non-summary operation
+	for _, op := range []mover.Operation{mover.OpInit, mover.OpForget, mover.OpPrune, mover.OpCheck, mover.OpUnlock} {
+		if got := ensureSummaryJSON(string(op), []string{string(op)}); countArg(got, "--json") != 0 {
+			t.Errorf("ensureSummaryJSON(%s) = %v, want no --json added", op, got)
 		}
 	}
 
@@ -240,9 +242,9 @@ func TestEnsureBackupJSON(t *testing.T) {
 	// would write --json into index 2, then confirm the backing array is untouched.
 	orig := make([]string, 2, 4)
 	copy(orig, []string{"backup", "/data"})
-	_ = ensureBackupJSON(string(mover.OpBackup), orig)
+	_ = ensureSummaryJSON(string(mover.OpBackup), orig)
 	if full := orig[:cap(orig)]; full[2] == "--json" {
-		t.Errorf("ensureBackupJSON mutated the caller's backing array: %v", full)
+		t.Errorf("ensureSummaryJSON mutated the caller's backing array: %v", full)
 	}
 }
 
@@ -273,12 +275,12 @@ func TestTailWriterKeepsLastLine(t *testing.T) {
 // every mover.Op* value is accepted, and anything else (a typo, an empty flag) is rejected so a
 // mistyped "backup" can never be silently treated as a maintenance success.
 func TestKnownOperation(t *testing.T) {
-	for _, op := range []mover.Operation{mover.OpBackup, mover.OpInit, mover.OpForget, mover.OpPrune, mover.OpCheck} {
+	for _, op := range []mover.Operation{mover.OpBackup, mover.OpRestore, mover.OpInit, mover.OpForget, mover.OpPrune, mover.OpCheck} {
 		if !knownOperation(string(op)) {
 			t.Errorf("knownOperation(%q) = false, want true", op)
 		}
 	}
-	for _, bad := range []string{"", "backupp", "BACKUP", "restore", "--json"} {
+	for _, bad := range []string{"", "backupp", "BACKUP", "RESTORE", "restoree", "--json"} {
 		if knownOperation(bad) {
 			t.Errorf("knownOperation(%q) = true, want false", bad)
 		}
