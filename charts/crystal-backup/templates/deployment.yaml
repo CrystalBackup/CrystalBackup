@@ -63,6 +63,12 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            {{- if not .Values.admission.webhook.enabled }}
+            # No webhook Service/cert is rendered: the manager must not register its webhook
+            # server (it would fail readiness waiting for a serving cert that never comes).
+            - name: ENABLE_WEBHOOKS
+              value: "false"
+            {{- end }}
           ports:
             - name: health
               containerPort: {{ .Values.health.port }}

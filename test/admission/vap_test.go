@@ -317,12 +317,42 @@ func TestChartValidatingAdmissionPolicies(t *testing.T) {
 				},
 			}
 		}
+		// The typed client omits empty list fields, so the present-but-EMPTY shapes (the
+		// non-emptiness half of rule 8, matching internal/nsselector's len>0 counting) are
+		// built raw: `matchNames: []` must count as "not set".
+		raw := func(namespaces map[string]any) *unstructured.Unstructured {
+			u := &unstructured.Unstructured{}
+			u.SetAPIVersion("crystalbackup.io/v1alpha1")
+			u.SetKind("ClusterBackup")
+			u.SetName(fmt.Sprintf("cbr-%d", time.Now().UnixNano()))
+			spec := map[string]any{"locationRef": map[string]any{"name": "dr"}}
+			if namespaces != nil {
+				spec["namespaces"] = namespaces
+			}
+			_ = unstructured.SetNestedMap(u.Object, spec, "spec")
+			return u
+		}
 		eventuallyDenied(t, admin, func() client.Object { return build(cbv1.NamespaceSelector{}) }, "positive")
 		eventuallyDenied(t, admin, func() client.Object {
 			return build(cbv1.NamespaceSelector{Regexp: "^c-.*$", MatchNames: []string{"c-a"}})
 		}, "positive")
 		mustAdmit(t, admin, build(cbv1.NamespaceSelector{Regexp: "^c-.*$", Exclude: []string{"kube-*"}}),
 			"one positive form plus exclude")
+		// Non-emptiness counting: an empty list is NOT a set form — alone it is denied,
+		// alongside a real form it must not trip the exactly-one rule.
+		eventuallyDenied(t, admin, func() client.Object {
+			return raw(map[string]any{"matchNames": []any{}})
+		}, "positive")
+		mustAdmit(t, admin, raw(map[string]any{
+			"matchNames": []any{}, "matchLabels": map[string]any{"team": "a"},
+		}), "an empty matchNames beside one real form")
+		// An entirely absent spec.namespaces is a clean rule-8 denial (message, not a CEL
+		// evaluation error).
+		eventuallyDenied(t, admin, func() client.Object { return raw(nil) }, "positive")
+		// The operator's own ServiceAccount is exempt (matchConditions): the engine
+		// re-validates at execution, and a pre-policy schedule's stamped-out ClusterBackups
+		// must not wedge after an upgrade tightens the rule.
+		mustAdmit(t, saClient, build(cbv1.NamespaceSelector{}), "operator SA bypasses rule 8")
 	})
 
 	t.Run("rule 9: external sync must copy between distinct locations", func(t *testing.T) {

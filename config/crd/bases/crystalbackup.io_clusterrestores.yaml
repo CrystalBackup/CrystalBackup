@@ -143,12 +143,14 @@ spec:
                 properties:
                   backup:
                     description: backup names a run; alternatively use time.
+                    maxLength: 253
                     type: string
                   locationRef:
                     description: locationRef is the source ClusterBackupLocation.
                     properties:
                       name:
                         description: name of the referent.
+                        maxLength: 253
                         minLength: 1
                         type: string
                     required:
@@ -157,10 +159,12 @@ spec:
                   namespace:
                     description: namespace is the origin namespace (repository tag
                       filter).
+                    maxLength: 63
                     minLength: 1
                     type: string
                   time:
                     description: time selects "latest" or an RFC3339 instant.
+                    maxLength: 64
                     type: string
                     x-kubernetes-validations:
                     - message: time must be "latest" or an RFC3339 timestamp
@@ -181,6 +185,7 @@ spec:
                     type: boolean
                   namespace:
                     description: namespace to restore into.
+                    maxLength: 63
                     minLength: 1
                     type: string
                   storageClassMapping:
@@ -234,6 +239,13 @@ spec:
             - source
             - target
             type: object
+            x-kubernetes-validations:
+            - message: spec.source is immutable
+              rule: self.source == oldSelf.source
+            - message: spec.mode is immutable
+              rule: self.mode == oldSelf.mode
+            - message: spec.target.namespace is immutable
+              rule: self.target.__namespace__ == oldSelf.target.__namespace__
           status:
             description: status defines the observed state of ClusterRestore
             properties:

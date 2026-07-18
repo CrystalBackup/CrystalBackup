@@ -124,6 +124,7 @@ spec:
                 properties:
                   backup:
                     description: backup names a Backup in this namespace.
+                    maxLength: 253
                     type: string
                   origin:
                     description: origin disambiguates when using time.
@@ -187,6 +188,11 @@ spec:
             required:
             - source
             type: object
+            x-kubernetes-validations:
+            - message: spec.source is immutable
+              rule: self.source == oldSelf.source
+            - message: spec.mode is immutable
+              rule: self.mode == oldSelf.mode
           status:
             description: status defines the observed state of Restore
             properties:

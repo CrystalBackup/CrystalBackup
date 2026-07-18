@@ -24,6 +24,17 @@ import (
 // ClusterRestoreSpec restores any namespace from a repository coordinate. It works
 // even when the source namespace no longer exists and can create the target.
 // Uses the shared restore selection model (mode + resources/volumes lists).
+//
+// The execution identity — source, mode and the target namespace — is IMMUTABLE after
+// creation (CEL): the controller re-derives them every pass, and a mid-run edit would mix
+// two repository coordinates (or drift the owner labels off the objects already created
+// under the old target namespace). confirmation and the selection lists stay mutable, as
+// do createNamespace/storageClassMapping (they only shape volumes not yet started).
+// (`namespace` is a CEL reserved word: schema-typed CRD rules must select it as
+// `__namespace__`, unlike the chart's dynamically-typed VAP expressions.)
+// +kubebuilder:validation:XValidation:rule="self.source == oldSelf.source",message="spec.source is immutable"
+// +kubebuilder:validation:XValidation:rule="self.mode == oldSelf.mode",message="spec.mode is immutable"
+// +kubebuilder:validation:XValidation:rule="self.target.__namespace__ == oldSelf.target.__namespace__",message="spec.target.namespace is immutable"
 type ClusterRestoreSpec struct {
 	// source is the repository coordinate to restore from.
 	// +required

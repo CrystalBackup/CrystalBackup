@@ -25,6 +25,14 @@ import (
 // (no locationRef, no target-namespace field — structural confinement, R14). If the
 // Backup is origin=cluster, the operator mediates against the shared DR repo with the
 // non-forgeable namespace= tag filter. Uses the shared restore selection model.
+//
+// The execution identity — source and mode — is IMMUTABLE after creation (CEL): the
+// controller re-derives both every pass, so an edit mid-run would mix two points in time
+// (or two destructive modes) inside one restore. confirmation stays mutable (R23 is
+// confirmed by editing it) and so do the selection lists (an edit applies to volumes not
+// yet started; residue of a deselected volume is reaped once the restore is terminal).
+// +kubebuilder:validation:XValidation:rule="self.source == oldSelf.source",message="spec.source is immutable"
+// +kubebuilder:validation:XValidation:rule="self.mode == oldSelf.mode",message="spec.mode is immutable"
 type RestoreSpec struct {
 	// source is a Backup in this namespace (or latest).
 	// +required

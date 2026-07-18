@@ -93,6 +93,11 @@ rules:
   - apiGroups: ["storage.k8s.io"]
     resources: ["volumeattachments"]
     verbs: ["get", "list", "watch"]
+  # Nodes: read-only — the pin above is dropped when that node is gone or NotReady (a stale
+  # attachment must not wedge the mover Pending on an unschedulable node).
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
   # Namespaces: read + create (ClusterRestore targets).
   - apiGroups: [""]
     resources: ["namespaces"]

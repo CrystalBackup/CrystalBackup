@@ -236,6 +236,9 @@ spec:
     include: ["apiextensions.k8s.io/CustomResourceDefinition", "storage.k8s.io/StorageClass/*"]
     exclude: []                                # admin-only; apply order CRDs→cluster-scoped→namespaced
   confirmation: "c-team-x-restored"            # required iff the op modifies existing objects
+  # source, mode and target.namespace are IMMUTABLE after creation (CEL): a mid-run edit
+  # would mix two repository coordinates (or drift the labels of already-created objects).
+  # confirmation and the selection lists stay mutable.
 status:
   phase: Completed                             # Pending|AwaitingConfirmation|Running|Completed|PartiallyFailed|Failed
   restoredResources: 148
@@ -417,6 +420,9 @@ spec:
     - names: ["uploads"]
       include: ["images/2026/**"]      # a single folder of a single PVC
   confirmation: "c-team-x"             # required iff the op modifies existing objects
+  # source and mode are IMMUTABLE after creation (CEL); confirmation and the selection
+  # lists stay mutable. `time` accepts "latest" or an RFC3339 instant (a zone-less
+  # `YYYY-MM-DDThh:mm:ss` is read as UTC); a time-resolved source is pinned once resolved.
 status:
   phase: Completed                     # Pending|AwaitingConfirmation|Running|Completed|PartiallyFailed|Failed
   restoredResources: 0
@@ -619,7 +625,7 @@ blocking check (single-default uniqueness), is scoped to this project's CRDs, an
 | 5 | `credentialsSecretRef`/`repositoryPasswordSecretRef` on a `BackupLocation` are same-namespace (name-only). | **VAP** (Deny) |
 | 6 | `Immutable` mode forbids `maintenance.pruneSchedule`. | **VAP** (Deny) |
 | 7 | **Denied namespaces** — tenant-facing CRs rejected in a configurable deny-list (default `kube-*`, `crystal-backup-system`, and any incumbent backup tool's namespace). The list is a **ConfigMap** bound to the policy via `paramRef`. | **VAP** (Deny, parameterized) |
-| 8 | `namespaces` selector must set exactly one positive form + optional `exclude`. | **VAP** (Deny) |
+| 8 | `namespaces` selector must set exactly one **non-empty** positive form + optional `exclude` (an empty list/map counts as unset, mirroring the engine; the operator SA is exempt — the engine re-validates at execution). | **VAP** (Deny) |
 | 9 | **External sync target** — `spec.sourceLocationRef.name != spec.destinationLocationRef.name` on `BackupExternalSync` **and** `ClusterBackupExternalSync` (a self-referential `Mirror` sync would `forget`/`prune` its own source). Static field inequality. | **VAP** (Deny) |
 
 Defaulting (e.g. `clusterID` from the default `ClusterBackupLocation`, the generated repository

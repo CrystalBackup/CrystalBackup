@@ -29,6 +29,7 @@ type LocalObjectReference struct {
 	// name of the referent.
 	// +required
 	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
 	Name string `json:"name"`
 }
 
@@ -328,6 +329,7 @@ type VolumeSelectorItem struct {
 type RestoreSource struct {
 	// backup names a Backup in this namespace.
 	// +optional
+	// +kubebuilder:validation:MaxLength=253
 	Backup string `json:"backup,omitempty"`
 	// time selects "latest" or an RFC3339 instant instead of a named backup. Bounded so the
 	// CEL rule's cost stays within the apiserver's per-CRD budget.
@@ -351,12 +353,15 @@ type ClusterRestoreSource struct {
 	// namespace is the origin namespace (repository tag filter).
 	// +required
 	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
 	Namespace string `json:"namespace"`
 	// backup names a run; alternatively use time.
 	// +optional
+	// +kubebuilder:validation:MaxLength=253
 	Backup string `json:"backup,omitempty"`
 	// time selects "latest" or an RFC3339 instant.
 	// +optional
+	// +kubebuilder:validation:MaxLength=64
 	// +kubebuilder:validation:XValidation:rule="self == 'latest' || self.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}')",message="time must be \"latest\" or an RFC3339 timestamp"
 	Time string `json:"time,omitempty"`
 }
@@ -366,6 +371,7 @@ type ClusterRestoreTarget struct {
 	// namespace to restore into.
 	// +required
 	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
 	Namespace string `json:"namespace"`
 	// createNamespace creates the target namespace if absent (non-destructive).
 	// +optional

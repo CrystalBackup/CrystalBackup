@@ -45,9 +45,9 @@ import (
 //
 // Rule 8 (spec/02-api.md): exactly one positive form must be set, and `exclude`
 // is applied last. In production a ValidatingAdmissionPolicy (adr/0010) enforces
-// the "exactly one" shape in the API server; that policy is M2 and is bypassable
-// (its failurePolicy is Ignore, and a direct write while the operator is down
-// skips it entirely), so Match re-checks the shape defensively and returns an
+// the "exactly one" shape in the API server; that policy exempts the operator's
+// own ServiceAccount and is absent on clusters that install without the chart's
+// admission layer, so Match re-checks the shape defensively and returns an
 // error rather than guessing when zero or more than one positive form is set. A
 // malformed selector must fail loudly — silently backing up the wrong (or every)
 // namespace is the one outcome a DR fan-out cannot have. The caller surfaces the

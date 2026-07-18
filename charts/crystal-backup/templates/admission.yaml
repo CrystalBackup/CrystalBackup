@@ -284,6 +284,13 @@ metadata:
     {{- include "crystal-backup.labels" . | nindent 4 }}
 spec:
   failurePolicy: Fail
+  matchConditions:
+    # The engine re-validates the shape at execution (internal/nsselector refuses a
+    # malformed selector and the fan-out gates), so exempting the operator's own writes can
+    # never widen a selection — and it keeps a pre-policy ClusterBackupSchedule from
+    # wedging the ClusterBackups it stamps out after an upgrade tightens this rule.
+    - name: exclude-operator-serviceaccount
+      expression: request.userInfo.username != {{ $operatorSA | quote }}
   matchConstraints:
     resourceRules:
       - apiGroups: ["crystalbackup.io"]
@@ -291,18 +298,28 @@ spec:
         operations: ["CREATE", "UPDATE"]
         resources: ["clusterbackups", "clusterbackupschedules"]
   validations:
+    # Counts NON-EMPTINESS (size > 0), not mere key presence, mirroring the engine's rule-8
+    # check (len > 0 in internal/nsselector): `matchNames: []` must count as "not set". An
+    # entirely absent spec.namespaces is denied HERE with this message — the optional-safe
+    # derefs make it a clean verdict, never a CEL evaluation error.
     - expression: >-
-        [has(variables.ns.matchNames), has(variables.ns.matchLabels),
-         has(variables.ns.matchExpressions),
-         has(variables.ns.regexp) && variables.ns.regexp != ''].filter(b, b).size() == 1
+        variables.ns.hasValue() &&
+        [variables.ns.value().?matchNames.orValue([]).size() > 0,
+         variables.ns.value().?matchLabels.orValue({}).size() > 0,
+         variables.ns.value().?matchExpressions.orValue([]).size() > 0,
+         variables.ns.value().?regexp.orValue('') != ''].filter(b, b).size() == 1
       message: >-
-        spec.namespaces must set exactly one positive selector form (matchNames,
+        spec.namespaces must set exactly one non-empty positive selector form (matchNames,
         matchLabels, matchExpressions or regexp), plus an optional exclude (rule 8)
       reason: Invalid
   variables:
+    # The selector lives at spec.template.spec.namespaces on a ClusterBackupSchedule and at
+    # spec.namespaces on a ClusterBackup; the two locations are disjoint across the matched
+    # kinds, so first-present picks the right one. optional() end to end: a half-built
+    # object (template with no spec) resolves to none instead of an evaluation error.
     - name: ns
       expression: >-
-        has(object.spec.template) ? object.spec.template.spec.namespaces : object.spec.namespaces
+        object.spec.?template.?spec.?namespaces.or(object.spec.?namespaces)
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding

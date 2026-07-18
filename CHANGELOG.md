@@ -55,8 +55,16 @@ longer exist.
   restore movers) and can never touch a delivered volume (handover strips the labels).
 - The stale-lock unlock machinery is shared: a hard-killed **restore** mover triggers the
   same quiescence-gated `unlock --remove-all` a backup mover does (adr/0015).
-- Operator RBAC: PersistentVolume write + VolumeAttachment read (the adr/0016 machinery).
-- `source.backup`/`source.time` are mutually exclusive (CEL); `targetPath` rejects `..`.
+- Operator RBAC: PersistentVolume write + VolumeAttachment/Node read (the adr/0016
+  machinery; the twin's same-node pin is dropped when the node is gone or NotReady).
+- `source.backup`/`source.time` are mutually exclusive (CEL); `targetPath` rejects `..`;
+  `source`, `mode` (and `ClusterRestore`'s `target.namespace`) are immutable after
+  creation — a mid-run edit cannot mix two points in time in one restore. A time-resolved
+  (`latest`/cutoff) source is pinned for the restore's lifetime; a zone-less
+  `YYYY-MM-DDThh:mm:ss` is read as UTC.
+- Admission rule 8 counts **non-empty** positive selector forms (an empty `matchNames: []`
+  no longer masks — or trips over — a real form), denies an absent selector with the
+  rule-8 message instead of a CEL evaluation error, and exempts the operator SA.
 
 ## 0.1.0 — M1 “Core engine & cluster DR” (2026-07-17)
 
