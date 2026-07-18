@@ -64,7 +64,7 @@ The decision powers the requirements as follows:
 | R13 | Repo v2: zstd + CDC dedup + AES-256/Poly1305, all client-side before S3. |
 | R17 | `restic check --read-data-subset` as the integrity-check primitive. |
 | R21 | `restic forget --tag` (`tenant=` / `namespace=` / `namespace=+pvc=`) then `prune` → **physical** right-to-erasure from the shared repo; a single-master-key repo cannot carry per-tenant keys, so crypto-shredding is dropped ([adr/0009](0009-shared-cluster-repo-tag-tenancy.md), [adr/0004](0004-encryption-key-management.md)). |
-| R24 | `restic forget --keep-last/--keep-hourly/…/--keep-within` maps 1:1 to `BackupSchedule.spec.retention`. |
+| R24 | `restic forget --keep-last/--keep-hourly/…/--keep-within` maps 1:1 to `[Cluster]BackupLocation.spec.retention` (retention lives on the location — one shared repo, one policy — not the schedule; [adr/0009](0009-shared-cluster-repo-tag-tenancy.md)). |
 
 ## Consequences
 

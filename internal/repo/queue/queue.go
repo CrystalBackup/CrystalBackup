@@ -41,7 +41,8 @@ limitations under the License.
 // restic's own lock object on the S3 repository remains the cross-process
 // backstop for the (leader-election-forbidden, but defensively assumed)
 // split-brain window; this queue is the intra-process guarantee that a single
-// leader never races itself. See adr/0010 and the M1 plan.
+// leader never races itself. See adr/0015 (this model as a decision, incl. the
+// readers/writers contract every future mutating op must honour) and the M1 plan.
 //
 // # Concurrency model
 //
