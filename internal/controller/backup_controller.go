@@ -592,6 +592,27 @@ func (r *BackupReconciler) advanceSnapshotting(ctx context.Context, backup *cbv1
 	moverName := prefix + "-mover"
 	labels := exposureLabels(backup, vol.Pvc)
 
+	resticArgs := resticBackupArgs(identity)
+	// PVC-meta tags (adr/0016 §4, best-effort): record the source claim's requested
+	// capacity/class/modes on the snapshot so ClusterRestore can recreate the PVC from the
+	// repository alone. Informational and additive — a claim that vanished between exposure
+	// and now simply yields a snapshot without them (the documented fallback covers it).
+	var srcPVC corev1.PersistentVolumeClaim
+	if err := r.Get(ctx, client.ObjectKey{Namespace: backup.Namespace, Name: vol.Pvc}, &srcPVC); err == nil {
+		storageClass := ""
+		if srcPVC.Spec.StorageClassName != nil {
+			storageClass = *srcPVC.Spec.StorageClassName
+		}
+		modes := make([]string, 0, len(srcPVC.Spec.AccessModes))
+		for _, m := range srcPVC.Spec.AccessModes {
+			modes = append(modes, string(m))
+		}
+		capacity := srcPVC.Spec.Resources.Requests[corev1.ResourceStorage]
+		for _, tag := range restic.PVCMetaTags(capacity.Value(), storageClass, modes) {
+			resticArgs = append(resticArgs, "--tag", tag)
+		}
+	}
+
 	// Cluster-wide mover concurrency gate. If this volume's mover Job does not exist yet and the
 	// cascade is already at maxConcurrentMovers, hold the volume in Snapshotting (its exposure stays
 	// ready) and requeue for a free slot. An already-existing Job means we are re-adopting after a
@@ -611,7 +632,7 @@ func (r *BackupReconciler) advanceSnapshotting(ctx context.Context, backup *cbv1
 		Namespace:    r.OperatorNamespace,
 		Image:        r.MoverImage,
 		Operation:    mover.OpBackup,
-		ResticArgs:   resticBackupArgs(identity),
+		ResticArgs:   resticArgs,
 		RepoURL:      rc.repoURL,
 		SecretName:   moverName,
 		PVC:          &mover.PVCMount{ClaimName: exposure.ExposedPVCName, MountPath: identity.Path},
