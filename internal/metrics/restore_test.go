@@ -28,13 +28,14 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	cbv1 "github.com/CrystalBackup/CrystalBackup/api/v1alpha1"
+	"github.com/CrystalBackup/CrystalBackup/internal/apiconst"
 	"github.com/CrystalBackup/CrystalBackup/internal/status"
 )
 
-// TestRestoreSeries proves the restore families are state-derived: a Completed Restore
-// yields last-success + restored-bytes with the cluster label joined through its source
-// Backup's location, failed restores tally into the failures gauge, and a ClusterRestore
-// series carries its target namespace + location + cluster.
+// TestRestoreSeries proves the UNIFIED restore family (05-observability §2.3): a Completed
+// namespaced Restore resolves tenant/origin/location/cluster through its source Backup, a
+// failed sibling tallies into the same series' failures gauge, and a ClusterRestore is
+// recorded under its SOURCE namespace with origin=cluster — one family for both kinds.
 func TestRestoreSeries(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := clientgoscheme.AddToScheme(scheme); err != nil {
@@ -61,8 +62,14 @@ func TestRestoreSeries(t *testing.T) {
 		},
 	}
 	sourceBackup := &cbv1.Backup{
-		ObjectMeta: metav1.ObjectMeta{Namespace: "tenant-a", Name: "run-1"},
-		Spec:       cbv1.BackupSpec{LocationRef: cbv1.LocationReference{Kind: "ClusterBackupLocation", Name: "dr-primary"}},
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "tenant-a", Name: "run-1",
+			Labels: map[string]string{
+				apiconst.LabelTenant: "team-a",
+				apiconst.LabelOrigin: apiconst.OriginCluster,
+			},
+		},
+		Spec: cbv1.BackupSpec{LocationRef: cbv1.LocationReference{Kind: "ClusterBackupLocation", Name: "dr-primary"}},
 	}
 	completed := &cbv1.Restore{
 		ObjectMeta: metav1.ObjectMeta{Namespace: "tenant-a", Name: "recover-1"},
@@ -82,35 +89,32 @@ func TestRestoreSeries(t *testing.T) {
 			Source: cbv1.ClusterRestoreSource{LocationRef: cbv1.LocalObjectReference{Name: "dr-primary"}, Namespace: "gone", Backup: "run-1"},
 			Target: cbv1.ClusterRestoreTarget{Namespace: "restored"},
 		},
-		Status: cbv1.ClusterRestoreStatus{Phase: string(status.RestorePhaseCompleted), Conditions: readyCond},
+		Status: cbv1.ClusterRestoreStatus{
+			Phase: string(status.RestorePhaseCompleted), RestoredBytes: 4096, Conditions: readyCond,
+		},
 	}
 
 	c := fake.NewClientBuilder().WithScheme(scheme).
 		WithObjects(loc, sourceBackup, completed, failed, clusterRestore).Build()
 
 	want := `
-# HELP crystalbackup_restore_last_success_timestamp_seconds Unix time the last Completed Restore in this namespace reached its terminal phase.
+# HELP crystalbackup_restore_last_success_timestamp_seconds Unix time of the last Completed Restore/ClusterRestore for this series.
 # TYPE crystalbackup_restore_last_success_timestamp_seconds gauge
-crystalbackup_restore_last_success_timestamp_seconds{cluster="prod-eu-1",namespace="tenant-a"} 1.7e+09
-# HELP crystalbackup_restore_last_restored_bytes Bytes the last Completed Restore in this namespace wrote (status.restoredBytes).
+crystalbackup_restore_last_success_timestamp_seconds{cluster="prod-eu-1",location="dr-primary",namespace="tenant-a",origin="cluster",tenant="team-a"} 1.7e+09
+crystalbackup_restore_last_success_timestamp_seconds{cluster="prod-eu-1",location="dr-primary",namespace="gone",origin="cluster",tenant="gone"} 1.7e+09
+# HELP crystalbackup_restore_last_restored_bytes status.restoredBytes of the last Completed Restore/ClusterRestore for this series.
 # TYPE crystalbackup_restore_last_restored_bytes gauge
-crystalbackup_restore_last_restored_bytes{cluster="prod-eu-1",namespace="tenant-a"} 2048
-# HELP crystalbackup_restore_failures Number of Restores currently in a failed terminal phase (Failed or PartiallyFailed) for this series.
+crystalbackup_restore_last_restored_bytes{cluster="prod-eu-1",location="dr-primary",namespace="tenant-a",origin="cluster",tenant="team-a"} 2048
+crystalbackup_restore_last_restored_bytes{cluster="prod-eu-1",location="dr-primary",namespace="gone",origin="cluster",tenant="gone"} 4096
+# HELP crystalbackup_restore_failures Number of Restores/ClusterRestores currently in a failed terminal phase (Failed or PartiallyFailed) for this series.
 # TYPE crystalbackup_restore_failures gauge
-crystalbackup_restore_failures{cluster="prod-eu-1",namespace="tenant-a"} 1
-# HELP crystalbackup_clusterrestore_last_success_timestamp_seconds Unix time the last Completed ClusterRestore into this target namespace reached its terminal phase.
-# TYPE crystalbackup_clusterrestore_last_success_timestamp_seconds gauge
-crystalbackup_clusterrestore_last_success_timestamp_seconds{cluster="prod-eu-1",location="dr-primary",namespace="restored"} 1.7e+09
-# HELP crystalbackup_clusterrestore_failures Number of ClusterRestores currently in a failed terminal phase for this series.
-# TYPE crystalbackup_clusterrestore_failures gauge
-crystalbackup_clusterrestore_failures{cluster="prod-eu-1",location="dr-primary",namespace="restored"} 0
+crystalbackup_restore_failures{cluster="prod-eu-1",location="dr-primary",namespace="tenant-a",origin="cluster",tenant="team-a"} 1
+crystalbackup_restore_failures{cluster="prod-eu-1",location="dr-primary",namespace="gone",origin="cluster",tenant="gone"} 0
 `
 	if err := testutil.CollectAndCompare(NewCollector(c), strings.NewReader(want),
 		"crystalbackup_restore_last_success_timestamp_seconds",
 		"crystalbackup_restore_last_restored_bytes",
 		"crystalbackup_restore_failures",
-		"crystalbackup_clusterrestore_last_success_timestamp_seconds",
-		"crystalbackup_clusterrestore_failures",
 	); err != nil {
 		t.Fatal(err)
 	}

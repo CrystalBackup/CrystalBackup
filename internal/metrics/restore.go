@@ -21,42 +21,39 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	cbv1 "github.com/CrystalBackup/CrystalBackup/api/v1alpha1"
+	"github.com/CrystalBackup/CrystalBackup/internal/apiconst"
 	"github.com/CrystalBackup/CrystalBackup/internal/status"
 )
 
-// The restore metric families (M2, R19): like every crystalbackup_ series they are
-// STATE-DERIVED — computed from the live Restore/ClusterRestore objects at scrape time, so
-// they survive operator restarts and never need in-process counters. A namespaced
-// Restore's series carries the origin namespace; its cluster label is resolved through the
-// source Backup's location (best-effort — a time-based source that no longer resolves
-// leaves it empty, a gap rather than a lie). A ClusterRestore's namespace label is its
-// TARGET namespace.
+// The restore metric family (M2, R19, spec/05-observability.md §2.3): ONE family covers
+// both restore kinds — a ClusterRestore is recorded under its SOURCE (origin) namespace,
+// exactly like the namespaced Restore it is the admin twin of. Like every crystalbackup_
+// series these are STATE-DERIVED at scrape time (restart-safe, no in-process counters);
+// the M6 catalogue's histogram/counter variants layer on later. A namespaced Restore's
+// origin/location/tenant resolve through its source Backup (best-effort — a source that no
+// longer resolves leaves them empty, a gap rather than a lie).
 var (
-	restoreLabels        = []string{namespaceLabel, clusterLabel}
-	clusterRestoreLabels = []string{namespaceLabel, locationLabel, clusterLabel}
+	restoreLabels = []string{namespaceLabel, tenantLabel, originLabel, locationLabel, clusterLabel}
 
 	restoreLastSuccessDesc = prometheus.NewDesc(
 		"crystalbackup_restore_last_success_timestamp_seconds",
-		"Unix time the last Completed Restore in this namespace reached its terminal phase.",
+		"Unix time of the last Completed Restore/ClusterRestore for this series.",
 		restoreLabels, nil)
 	restoreLastBytesDesc = prometheus.NewDesc(
 		"crystalbackup_restore_last_restored_bytes",
-		"Bytes the last Completed Restore in this namespace wrote (status.restoredBytes).",
+		"status.restoredBytes of the last Completed Restore/ClusterRestore for this series.",
 		restoreLabels, nil)
 	restoreFailuresDesc = prometheus.NewDesc(
 		"crystalbackup_restore_failures",
-		"Number of Restores currently in a failed terminal phase (Failed or PartiallyFailed) for this series.",
+		"Number of Restores/ClusterRestores currently in a failed terminal phase (Failed or PartiallyFailed) for this series.",
 		restoreLabels, nil)
-
-	clusterRestoreLastSuccessDesc = prometheus.NewDesc(
-		"crystalbackup_clusterrestore_last_success_timestamp_seconds",
-		"Unix time the last Completed ClusterRestore into this target namespace reached its terminal phase.",
-		clusterRestoreLabels, nil)
-	clusterRestoreFailuresDesc = prometheus.NewDesc(
-		"crystalbackup_clusterrestore_failures",
-		"Number of ClusterRestores currently in a failed terminal phase for this series.",
-		clusterRestoreLabels, nil)
 )
+
+// restoreSourceInfo is what the collector resolves about a restore's SOURCE: the identity
+// labels of its series.
+type restoreSourceInfo struct {
+	tenant, origin, location, cluster string
+}
 
 // terminalTime reads WHEN a restore reached its terminal phase: the Ready condition's last
 // transition (neither restore status carries a completion timestamp by contract). Zero when
@@ -69,87 +66,82 @@ func terminalTime(conds []metav1.Condition) float64 {
 	return float64(c.LastTransitionTime.Unix())
 }
 
-// restoreSeries accumulates one {namespace, cluster} restore series.
+// restoreSeriesKey / restoreSeries accumulate one series across its restores.
+type restoreSeriesKey struct {
+	namespace, tenant, origin, location, cluster string
+}
+
 type restoreSeries struct {
 	lastSuccessUnix float64
 	lastBytes       float64
 	failures        float64
 }
 
-// collectRestores derives the namespaced-Restore series. backupLocationCluster resolves a
-// (namespace, source backup name) to its cluster label via the projected Backups already
-// listed for the backup families — no extra API reads.
-func collectRestores(ch chan<- prometheus.Metric, restores []cbv1.Restore,
-	backupCluster func(namespace, backupName string) string,
+func (k restoreSeriesKey) values() []string {
+	return []string{k.namespace, k.tenant, k.origin, k.location, k.cluster}
+}
+
+// collectRestores derives the unified restore family from BOTH kinds. resolveSource maps a
+// namespaced Restore's (namespace, source backup name) to its identity labels via the
+// Backups already listed for the backup families — no extra API reads.
+func collectRestores(ch chan<- prometheus.Metric, restores []cbv1.Restore, clusterRestores []cbv1.ClusterRestore,
+	resolveSource func(namespace, backupName string) restoreSourceInfo,
+	clusterByLocation map[string]string,
 ) {
-	series := map[[2]string]*restoreSeries{}
-	for i := range restores {
-		r := &restores[i]
-		cluster := ""
-		if r.Spec.Source.Backup != "" {
-			cluster = backupCluster(r.Namespace, r.Spec.Source.Backup)
-		}
-		key := [2]string{r.Namespace, cluster}
+	series := map[restoreSeriesKey]*restoreSeries{}
+	tally := func(key restoreSeriesKey, phase string, conds []metav1.Condition, restoredBytes int64) {
 		s := series[key]
 		if s == nil {
 			s = &restoreSeries{}
 			series[key] = s
 		}
-		switch status.RestorePhase(r.Status.Phase) {
+		switch status.RestorePhase(phase) {
 		case status.RestorePhaseCompleted:
-			if ts := terminalTime(r.Status.Conditions); ts > s.lastSuccessUnix {
+			if ts := terminalTime(conds); ts > s.lastSuccessUnix {
 				s.lastSuccessUnix = ts
-				s.lastBytes = float64(r.Status.RestoredBytes)
+				s.lastBytes = float64(restoredBytes)
 			}
 		case status.RestorePhaseFailed, status.RestorePhasePartiallyFailed:
 			s.failures++
 		}
 	}
-	for key, s := range series {
-		labels := []string{key[0], key[1]}
-		if s.lastSuccessUnix > 0 {
-			ch <- prometheus.MustNewConstMetric(restoreLastSuccessDesc, prometheus.GaugeValue, s.lastSuccessUnix, labels...)
-			ch <- prometheus.MustNewConstMetric(restoreLastBytesDesc, prometheus.GaugeValue, s.lastBytes, labels...)
-		}
-		ch <- prometheus.MustNewConstMetric(restoreFailuresDesc, prometheus.GaugeValue, s.failures, labels...)
-	}
-}
 
-// collectClusterRestores derives the ClusterRestore series, keyed by (target namespace,
-// location, cluster).
-func collectClusterRestores(ch chan<- prometheus.Metric, restores []cbv1.ClusterRestore, clusterByLocation map[string]string) {
-	type key struct{ namespace, location, cluster string }
-	type series struct {
-		lastSuccessUnix float64
-		failures        float64
-	}
-	acc := map[key]*series{}
 	for i := range restores {
-		cr := &restores[i]
-		k := key{
-			namespace: cr.Spec.Target.Namespace,
+		r := &restores[i]
+		var src restoreSourceInfo
+		if r.Spec.Source.Backup != "" {
+			src = resolveSource(r.Namespace, r.Spec.Source.Backup)
+		}
+		tally(restoreSeriesKey{
+			namespace: r.Namespace,
+			tenant:    src.tenant,
+			origin:    src.origin,
+			location:  src.location,
+			cluster:   src.cluster,
+		}, r.Status.Phase, r.Status.Conditions, r.Status.RestoredBytes)
+	}
+
+	// A ClusterRestore is recorded under its SOURCE namespace (05-observability §2.3): the
+	// admin restored THAT namespace's data, wherever it landed. Its origin is always the
+	// cluster plane, and its tenant defaults to the source namespace (the namespace — and
+	// its tenant label — may no longer exist; the restic tenant tag is not surfaced in the
+	// CR, so the namespace itself is the honest v1 fallback, matching the M1 tenant default).
+	for i := range clusterRestores {
+		cr := &clusterRestores[i]
+		tally(restoreSeriesKey{
+			namespace: cr.Spec.Source.Namespace,
+			tenant:    cr.Spec.Source.Namespace,
+			origin:    apiconst.OriginCluster,
 			location:  cr.Spec.Source.LocationRef.Name,
 			cluster:   clusterByLocation[cr.Spec.Source.LocationRef.Name],
-		}
-		s := acc[k]
-		if s == nil {
-			s = &series{}
-			acc[k] = s
-		}
-		switch status.RestorePhase(cr.Status.Phase) {
-		case status.RestorePhaseCompleted:
-			if ts := terminalTime(cr.Status.Conditions); ts > s.lastSuccessUnix {
-				s.lastSuccessUnix = ts
-			}
-		case status.RestorePhaseFailed, status.RestorePhasePartiallyFailed:
-			s.failures++
-		}
+		}, cr.Status.Phase, cr.Status.Conditions, cr.Status.RestoredBytes)
 	}
-	for k, s := range acc {
-		labels := []string{k.namespace, k.location, k.cluster}
+
+	for key, s := range series {
 		if s.lastSuccessUnix > 0 {
-			ch <- prometheus.MustNewConstMetric(clusterRestoreLastSuccessDesc, prometheus.GaugeValue, s.lastSuccessUnix, labels...)
+			ch <- prometheus.MustNewConstMetric(restoreLastSuccessDesc, prometheus.GaugeValue, s.lastSuccessUnix, key.values()...)
+			ch <- prometheus.MustNewConstMetric(restoreLastBytesDesc, prometheus.GaugeValue, s.lastBytes, key.values()...)
 		}
-		ch <- prometheus.MustNewConstMetric(clusterRestoreFailuresDesc, prometheus.GaugeValue, s.failures, labels...)
+		ch <- prometheus.MustNewConstMetric(restoreFailuresDesc, prometheus.GaugeValue, s.failures, key.values()...)
 	}
 }

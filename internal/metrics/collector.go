@@ -63,6 +63,8 @@ var buildInfoDesc = prometheus.NewDesc(
 // identity (resolved from a location's clusterID).
 const (
 	namespaceLabel = "namespace"
+	tenantLabel    = "tenant"
+	originLabel    = "origin"
 	scheduleLabel  = "schedule"
 	locationLabel  = "location"
 	clusterLabel   = "cluster"
@@ -71,7 +73,7 @@ const (
 // backupLabels / clusterBackupLabels are the label sets of the two metric families,
 // in the fixed order the metric values are appended below.
 var (
-	backupLabels        = []string{namespaceLabel, "tenant", scheduleLabel, "origin", locationLabel, clusterLabel}
+	backupLabels        = []string{namespaceLabel, tenantLabel, scheduleLabel, originLabel, locationLabel, clusterLabel}
 	clusterBackupLabels = []string{scheduleLabel, locationLabel, clusterLabel}
 
 	backupLastSuccessDesc = prometheus.NewDesc(
@@ -134,8 +136,6 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- restoreLastSuccessDesc
 	ch <- restoreLastBytesDesc
 	ch <- restoreFailuresDesc
-	ch <- clusterRestoreLastSuccessDesc
-	ch <- clusterRestoreFailuresDesc
 }
 
 // Collect implements prometheus.Collector. It reads the live objects once and emits
@@ -159,27 +159,32 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 		collectClusterBackups(ch, runs.Items, clusterByLocation)
 	}
 
-	// The restore families (M2). A namespaced Restore's cluster label resolves through its
-	// source Backup's location — joined against the Backups already listed above.
-	backupCluster := func(namespace, backupName string) string {
+	// The unified restore family (M2, 05-observability §2.3). A namespaced Restore's
+	// origin/location/tenant/cluster resolve through its source Backup — joined against the
+	// Backups already listed above, no extra API reads.
+	resolveSource := func(namespace, backupName string) restoreSourceInfo {
 		if !backupsListed {
-			return ""
+			return restoreSourceInfo{}
 		}
 		for i := range backups.Items {
 			b := &backups.Items[i]
 			if b.Namespace == namespace && b.Name == backupName {
-				return clusterByLocation[b.Spec.LocationRef.Name]
+				return restoreSourceInfo{
+					tenant:   b.Labels[apiconst.LabelTenant],
+					origin:   b.Labels[apiconst.LabelOrigin],
+					location: b.Spec.LocationRef.Name,
+					cluster:  clusterByLocation[b.Spec.LocationRef.Name],
+				}
 			}
 		}
-		return ""
+		return restoreSourceInfo{}
 	}
 	var restores cbv1.RestoreList
-	if err := c.reader.List(ctx, &restores); err == nil {
-		collectRestores(ch, restores.Items, backupCluster)
-	}
 	var clusterRestores cbv1.ClusterRestoreList
-	if err := c.reader.List(ctx, &clusterRestores); err == nil {
-		collectClusterRestores(ch, clusterRestores.Items, clusterByLocation)
+	restoresListed := c.reader.List(ctx, &restores) == nil
+	clusterRestoresListed := c.reader.List(ctx, &clusterRestores) == nil
+	if restoresListed || clusterRestoresListed {
+		collectRestores(ch, restores.Items, clusterRestores.Items, resolveSource, clusterByLocation)
 	}
 }
 
