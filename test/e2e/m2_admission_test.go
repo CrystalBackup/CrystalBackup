@@ -57,6 +57,12 @@ var _ = Describe("Crystal Backup admission (M2)", Ordered, func() {
 	}
 
 	BeforeAll(func() {
+		// The chart renders rule 7's paramRef ConfigMap into the chart's canonical namespace
+		// (crystal-backup-system) — this suite deploys via kustomize into a prefixed one, so
+		// the canonical namespace must exist for the apply to land. Idempotent.
+		By("ensuring the chart's canonical namespace exists for the paramRef ConfigMap")
+		_, _ = kubectl("create", "namespace", "crystal-backup-system")
+
 		By("installing the chart-rendered ValidatingAdmissionPolicy set")
 		render := exec.Command("helm", "template", "e2e", filepath.Join("charts", "crystal-backup"),
 			"--show-only", "templates/admission.yaml")

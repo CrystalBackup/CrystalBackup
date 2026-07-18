@@ -119,6 +119,7 @@ spec:
     locationRef:
       name: e2e-clusterbackuplocation
     namespace: tenant-a
+    backup: e2e-run-1
   target:
     namespace: tenant-a-restored
 `,

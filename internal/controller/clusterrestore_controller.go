@@ -288,7 +288,13 @@ func (r *ClusterRestoreReconciler) prepare(ctx context.Context, cr *cbv1.Cluster
 		dek:             dek,
 		s3CredsSecret:   loc.Spec.S3.CredentialsSecretRef.Name,
 	}
-	return rc, r.buildPlans(ctx, cr, byPVC), ctrl.Result{}, nil
+	plans := r.buildPlans(ctx, cr, byPVC)
+	if plans == nil {
+		// Empty selection ⇒ valid, immediately-terminal (see the Restore controller's twin
+		// comment): non-nil so nil keeps meaning "a gate was written".
+		plans = []restoreVolumePlan{}
+	}
+	return rc, plans, ctrl.Result{}, nil
 }
 
 // buildPlans intersects the selection with the resolved snapshots and sizes each plan

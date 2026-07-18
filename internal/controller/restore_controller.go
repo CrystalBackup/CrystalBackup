@@ -296,6 +296,12 @@ func (r *RestoreReconciler) prepare(ctx context.Context, restore *cbv1.Restore, 
 			fmt.Sprintf("no snapshot under the namespace filter for PVC(s): %s", clampMessage(joinFailures(missing))))
 		return nil, nil, res, gerr
 	}
+	if plans == nil {
+		// An empty selection is a VALID, immediately-terminal outcome (02-api: a present-but-
+		// empty list restores nothing) — non-nil so the caller's nil-means-gated check never
+		// mistakes it for a blocker and strands the CR without a terminal status.
+		plans = []restoreVolumePlan{}
+	}
 	return rc, plans, ctrl.Result{}, nil
 }
 
