@@ -63,7 +63,7 @@ const compareRows = [
 
 const milestones = [
   ['M0', 'Scaffolding — CRDs, CI (0-CVE images), test harness', true],
-  ['M1', 'Core engine & cluster disaster recovery', false],
+  ['M1', 'Core engine & cluster disaster recovery', false, `${base}/reports/crucible-m1.html`],
   ['M2', 'Restore — self-service & admin', false],
   ['M3', 'Manifests & cluster-scoped DR', false],
   ['M4', 'Consistency hooks, verification & maintenance', false],
@@ -302,11 +302,14 @@ const description =
         </p>
         <ol class="timeline">
           {
-            milestones.map(([id, label, here]) => (
+            milestones.map(([id, label, here, report]) => (
               <li class={here ? 'here' : ''}>
                 <span class="ms-id">{id}</span>
                 <span class="ms-label">{label}</span>
                 {here && <span class="ms-here">you are here</span>}
+                {report && (
+                  <a class="ms-report" href={report} target="_blank" rel="noopener">Crucible report</a>
+                )}
               </li>
             ))
           }
