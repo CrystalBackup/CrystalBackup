@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Last-resort teardown: delete every crucible resource by LABEL, without
 # terraform state. Use when the tfstate is lost/corrupted — otherwise prefer
-# `make down CONFIRM=yes`.
+# `CONFIRM=yes mise run down`.
 #
 # Requires HCLOUD_TOKEN (source scripts/load-env.sh) and the hcloud CLI.
 # NOTE: the S3 bucket is NOT touched (backup data safety) — delete it manually

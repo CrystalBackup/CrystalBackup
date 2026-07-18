@@ -75,26 +75,39 @@ rules:
   - apiGroups: [""]
     resources: ["persistentvolumes"]
     verbs: ["get", "list", "watch"]
+  # StorageClasses: read-only. The exposer resolves a PVC's CSI provisioner from its
+  # StorageClass (adr/0003) to pick the snapshot strategy and match a VolumeSnapshotClass.
+  # StorageClass is cluster-scoped, so the manager's informer for it is unavoidably
+  # cluster-wide — hence a ClusterRole grant, not a namespaced one.
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get", "list", "watch"]
   # Namespaces: read + create (ClusterRestore targets).
   - apiGroups: [""]
     resources: ["namespaces"]
     verbs: ["create", "get", "list", "watch"]
   # Pods: read; pods/exec: create (pre/post-backup hooks, R16 — in-namespace only, by
-  # controller invariant).
+  # controller invariant); pods/log: get (discovery reads a `restic snapshots` mover Job's
+  # inventory off the completed pod's log — the one subresource the cached client cannot stream).
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "watch"]
   - apiGroups: [""]
     resources: ["pods/exec"]
     verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
   # Secrets: get ONLY — no list/watch. The operator reads Secrets by name via a
   # cache-bypassing client, so no cluster-wide Secret cache ever exists (spec/03 §5).
   # Secret CREATION is confined to the crystal-backup-system Role below.
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["get"]
-  # Events: emit operational events.
-  - apiGroups: [""]
+  # Events: emit operational events. The operator uses controller-runtime's GetEventRecorder (the
+  # new events API), which writes events.k8s.io/v1 Events; the core group is kept for any library
+  # still on the legacy recorder.
+  - apiGroups: ["", "events.k8s.io"]
     resources: ["events"]
     verbs: ["create", "patch"]
 ---
@@ -169,7 +182,7 @@ rules:
   - apiGroups: [""]
     resources: ["configmaps"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-  - apiGroups: [""]
+  - apiGroups: ["", "events.k8s.io"]
     resources: ["events"]
     verbs: ["create", "patch"]
 ---

@@ -118,10 +118,17 @@ jobs:
         if: steps.gate.outputs.proceed == 'true' && matrix.with_restic == 'true'
         run: |
           set -euo pipefail
+          # Build each arch in its OWN melange invocation (not a single `--arch x86_64,aarch64`):
+          # the combined multi-arch build intermittently races on melange's shared test workspace
+          # under `--runner docker`, failing with "unable to populate workspace: open
+          # build/melange/test-dirfs-0: no such file or directory". Per-arch is sequential, mirrors
+          # the wrapper step below, and is artifact-identical (melange sandboxes each arch anyway).
           melange keygen
-          melange build build/melange/restic.yaml \
-            --arch x86_64,aarch64 --runner docker \
-            --signing-key melange.rsa --out-dir ./packages
+          for a in x86_64 aarch64; do
+            melange build build/melange/restic.yaml \
+              --arch "$a" --runner docker \
+              --signing-key melange.rsa --out-dir ./packages
+          done
 
       - name: melange — wrap the pre-built binary into a signed apk (per arch)
         if: steps.gate.outputs.proceed == 'true'
@@ -269,16 +276,32 @@ jobs:
         if: steps.gate.outputs.proceed == 'true'
         run: |
           set -euo pipefail
-          sed -i "0,/^  version:/ s|^  version:.*|  version: \"${VERSION}\"|" "${{ matrix.melange }}"
+          # apk (and thus melange) versions are NOT SemVer: a pre-release like
+          # "0.1.0-alpha.1" is rejected by melange's parser. Map SemVer -> apk for the apk
+          # package version only: drop +build metadata, and rewrite the pre-release
+          # (-alpha.1 -> _alpha1) into apk's suffix form (alpha/beta/pre/rc are valid apk
+          # suffixes). The immutable OCI image tag keeps the full SemVer ${VERSION}; only the
+          # apk package version (SBOM cosmetic) is sanitized here.
+          APK_VERSION="${VERSION%%+*}"
+          APK_VERSION="$(printf '%s' "$APK_VERSION" | sed -E 's/-([A-Za-z]+)\.?([0-9]*)/_\1\2/g; s/[^A-Za-z0-9._]/_/g')"
+          echo "apk package version: ${APK_VERSION} (OCI tag stays ${VERSION})"
+          sed -i "0,/^  version:/ s|^  version:.*|  version: \"${APK_VERSION}\"|" "${{ matrix.melange }}"
 
       - name: melange — build pinned restic apk from source (mover only)
         if: steps.gate.outputs.proceed == 'true' && matrix.with_restic == 'true'
         run: |
           set -euo pipefail
+          # Build each arch in its OWN melange invocation (not a single `--arch x86_64,aarch64`):
+          # the combined multi-arch build intermittently races on melange's shared test workspace
+          # under `--runner docker`, failing with "unable to populate workspace: open
+          # build/melange/test-dirfs-0: no such file or directory". Per-arch is sequential, mirrors
+          # the wrapper step below, and is artifact-identical (melange sandboxes each arch anyway).
           melange keygen
-          melange build build/melange/restic.yaml \
-            --arch x86_64,aarch64 --runner docker \
-            --signing-key melange.rsa --out-dir ./packages
+          for a in x86_64 aarch64; do
+            melange build build/melange/restic.yaml \
+              --arch "$a" --runner docker \
+              --signing-key melange.rsa --out-dir ./packages
+          done
 
       - name: melange — wrap the pre-built binary into a signed apk (per arch)
         if: steps.gate.outputs.proceed == 'true'
@@ -375,3 +398,86 @@ jobs:
           subject-name: ${{ env.IMAGE_NAME }}
           subject-digest: ${{ env.IMAGE_DIGEST }}
           push-to-registry: true
+
+  # ===========================================================================
+  # Release: publish the Helm chart as an OCI artifact and cut the GitHub
+  # Release. Runs only AFTER both images are published (needs: images), so the
+  # chart pins operator + mover by their freshly-pushed multi-arch INDEX digests
+  # (adr/0012 "by digest"; adr/0014 one release train). The chart .tgz is added
+  # as a release asset; GitHub auto-attaches the source archives.
+  # ===========================================================================
+  chart-and-release:
+    name: chart (OCI) + GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: images
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the GitHub Release
+      packages: write # helm push the chart to GHCR (OCI)
+      id-token: write # cosign keyless-sign the chart (Fulcio/Rekor OIDC)
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve release version from tag (adr/0014)
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.17.0
+
+      - uses: sigstore/cosign-installer@v3.10.1
+
+      - name: Log in to GHCR (docker for digest lookup, helm for the OCI push)
+        run: |
+          set -euo pipefail
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login "${REGISTRY}" -u "${{ github.actor }}" --password-stdin
+          echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login "${REGISTRY}" -u "${{ github.actor }}" --password-stdin
+
+      - name: Resolve the published image index digests
+        run: |
+          set -euo pipefail
+          op="$(docker buildx imagetools inspect "${REGISTRY}/${IMAGE_NAMESPACE}/operator:${VERSION}" --format '{{.Manifest.Digest}}')"
+          mv="$(docker buildx imagetools inspect "${REGISTRY}/${IMAGE_NAMESPACE}/mover:${VERSION}" --format '{{.Manifest.Digest}}')"
+          [ -n "$op" ] && [ -n "$mv" ] || { echo "could not resolve operator/mover digests for ${VERSION}" >&2; exit 1; }
+          echo "OPERATOR_DIGEST=${op}" >> "$GITHUB_ENV"
+          echo "MOVER_DIGEST=${mv}" >> "$GITHUB_ENV"
+          echo "pinning operator@${op}  mover@${mv}"
+
+      - name: Stamp the chart (appVersion + immutable image digests) and sync CRDs
+        run: |
+          set -euo pipefail
+          # One release train: the chart appVersion tracks the release (adr/0014); the chart's own
+          # `version` is already SemVer-pinned in Chart.yaml and names the .tgz.
+          VERSION="${VERSION}" yq -i '.appVersion = strenv(VERSION)' charts/crystal-backup/Chart.yaml
+          OPERATOR_DIGEST="${OPERATOR_DIGEST}" yq -i '.image.digest = strenv(OPERATOR_DIGEST)' charts/crystal-backup/values.yaml
+          MOVER_DIGEST="${MOVER_DIGEST}" yq -i '.mover.image.digest = strenv(MOVER_DIGEST)' charts/crystal-backup/values.yaml
+          # Helm installs crds/ on first install; sync the generated CRDs into the chart (the chart
+          # keeps crds/ git-ignored, same as deploy/deploy.sh does for the crucible).
+          mkdir -p charts/crystal-backup/crds
+          cp config/crd/bases/*.yaml charts/crystal-backup/crds/
+
+      - name: Package + publish the chart as an OCI artifact, cosign-signed
+        env:
+          COSIGN_YES: "true"
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          helm lint charts/crystal-backup
+          helm package charts/crystal-backup --destination dist
+          tgz="$(ls dist/crystal-backup-*.tgz)"
+          helm push "${tgz}" "oci://${REGISTRY}/${IMAGE_NAMESPACE}/charts" 2>&1 | tee push.log
+          digest="$(grep -oE 'sha256:[0-9a-f]{64}' push.log | head -n1)"
+          [ -n "$digest" ] || { echo "helm push did not report a digest" >&2; exit 1; }
+          cosign sign --yes "${REGISTRY}/${IMAGE_NAMESPACE}/charts/crystal-backup@${digest}"
+          echo "CHART_TGZ=${tgz}" >> "$GITHUB_ENV"
+
+      - name: Cut the GitHub Release (chart .tgz asset + auto source archives)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" "${CHART_TGZ}" --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" --title "${GITHUB_REF_NAME}" --generate-notes "${CHART_TGZ}"
+          fi

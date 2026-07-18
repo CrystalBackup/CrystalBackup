@@ -259,17 +259,16 @@ var _ = Describe("Crystal Backup operator (M0)", Ordered, func() {
 					"controller-runtime metrics missing from /metrics")
 			}, 2*time.Minute).Should(Succeed())
 
-			By("checking for crystalbackup_-prefixed custom metrics (advisory at M0)")
-			if out, err := getMetricsOutput(operatorNamespace); err == nil {
-				if strings.Contains(out, "crystalbackup_") {
-					_, _ = fmt.Fprintf(GinkgoWriter, "found crystalbackup_ custom metrics on /metrics\n")
-				} else {
-					_, _ = fmt.Fprintf(GinkgoWriter,
-						"NOTE: no crystalbackup_-prefixed series yet — expected at M0 (empty-logic "+
-							"operator exports only controller-runtime metrics); this becomes a hard "+
-							"assertion once metrics v1 lands in M1 (spec/05-observability.md).\n")
-				}
-			}
+			By("asserting the operator's own crystalbackup_ metrics v1 are served (M1 hard gate)")
+			Eventually(func(g Gomega) {
+				out, err := getMetricsOutput(operatorNamespace)
+				g.Expect(err).NotTo(HaveOccurred())
+				// crystalbackup_build_info is emitted on every scrape regardless of CR state, so this
+				// is a data-independent proof that metrics v1 (internal/metrics) is registered and
+				// served (spec/05-observability.md) — the M1 hardening of the M0 advisory check.
+				g.Expect(out).To(ContainSubstring("crystalbackup_build_info"),
+					"crystalbackup_ metrics v1 missing from /metrics")
+			}, 2*time.Minute).Should(Succeed())
 		})
 
 		It("emits structured JSON-lines logs on stdout (M0 observability, advisory)", func() {

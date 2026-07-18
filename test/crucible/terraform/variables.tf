@@ -41,13 +41,16 @@ variable "worker_count" {
 variable "master_type" {
   description = "Server type for masters (mon+mgr land here; 8 GB recommended)."
   type        = string
-  default     = "cx32" # 4 vCPU / 8 GB
+  # cpx32 = 4 vCPU / 8 GB, AMD x86, currently available in fsn1. The newer Intel
+  # cx33/cx43 line is Helsinki-only for now; pick a type your location offers
+  # (`hcloud datacenter describe <dc>` -> server_types.available).
+  default = "cpx32"
 }
 
 variable "worker_type" {
   description = "Server type for workers (osd+mds+rgw+longhorn land here; 16 GB recommended)."
   type        = string
-  default     = "cx42" # 8 vCPU / 16 GB
+  default     = "cpx42" # 8 vCPU / 16 GB, AMD x86
 }
 
 variable "image" {
@@ -73,15 +76,15 @@ variable "ssh_key_name" {
 # ---------------------------------------------------------------------------
 
 variable "network_cidr" {
-  description = "Private network range."
+  description = "Private network range. MUST NOT overlap RKE2's defaults (pods 10.42.0.0/16, services 10.43.0.0/16) or nodes and pods collide."
   type        = string
-  default     = "10.42.0.0/16"
+  default     = "10.10.0.0/16"
 }
 
 variable "subnet_cidr" {
-  description = "Subnet for the nodes (masters get .11+, workers .21+)."
+  description = "Subnet for the nodes (masters get .11+, workers .21+). Inside network_cidr, clear of 10.42/10.43."
   type        = string
-  default     = "10.42.0.0/24"
+  default     = "10.10.0.0/24"
 }
 
 # ---------------------------------------------------------------------------

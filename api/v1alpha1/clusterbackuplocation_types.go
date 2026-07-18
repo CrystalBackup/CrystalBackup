@@ -59,6 +59,18 @@ type ClusterBackupLocationSpec struct {
 	// immutable configures object-lock and window rotation (Immutable mode only).
 	// +optional
 	Immutable *ImmutableSpec `json:"immutable,omitempty"`
+
+	// retention is the snapshot retention policy for this location's shared
+	// repository, applied per PVC (per restic (host,paths) group) by a `restic
+	// forget` after each successful backup. It lives on the location — not on
+	// individual ClusterBackup runs or schedules — because a location backs ONE
+	// shared restic repository (adr/0009) and `restic forget` operates on the whole
+	// repository: a single authoritative policy per location is the only way to keep
+	// several runs from fighting over the same snapshots. Standard mode only; on an
+	// Immutable location it is reported ignored (RetentionIgnored condition) because
+	// object-lock forbids prune/forget until lock expiry.
+	// +optional
+	Retention RetentionSpec `json:"retention,omitempty"`
 }
 
 // ClusterBackupLocationStatus is the observed state of a ClusterBackupLocation.

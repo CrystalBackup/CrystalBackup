@@ -50,11 +50,12 @@ only for the genuinely dynamic ones, minimized and fail-open.**
    **`failurePolicy: Ignore`** and object/namespace selectors scoped strictly to `crystalbackup.io`
    CRDs, so an operator outage never wedges the API server (`Ignore` is safe because a transient
    second default is also caught by the operator's `MultipleDefaults` reconcile condition — not a
-   safety property). The **retention-vs-`Immutable`-mode** advisory (rule 3) needs the referenced
-   *location's* mode — a different object — so it is **not admission at all**: the schedule
-   controller emits a `Warning` Event + a `RetentionIgnored` status condition when a schedule sets
-   `keep*` against an `Immutable` location (retention there is repository rotation). No blocking,
-   no cross-object CEL.
+   safety property). The **retention-vs-`Immutable`-mode** advisory (rule 3) is now a **same-object**
+   check — `spec.retention` lives on the location itself, so its mode is right there — emitted as an
+   advisory rather than a denial: the ClusterBackupLocation controller sets a `Warning` Event + a
+   `RetentionIgnored` status condition when an `Immutable` location carries a `keep*` policy
+   (retention there is repository rotation). No blocking; it could be tightened to same-object CEL
+   later if a hard reject is ever wanted.
 3. **Defaulting / mutation** (e.g. `clusterID` from the default location, the generated
    repository-password Secret) stays in the operator's mutating webhook / reconcile path,
    `failurePolicy: Ignore` — it is convenience, not a safety gate.

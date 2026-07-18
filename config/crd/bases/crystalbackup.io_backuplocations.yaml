@@ -101,6 +101,33 @@ spec:
                 - Standard
                 - Immutable
                 type: string
+              retention:
+                description: |-
+                  retention is the snapshot retention policy for this location's repository,
+                  applied per PVC by a `restic forget` after each successful backup. It lives on
+                  the location (not on BackupSchedules) so a single authoritative policy governs
+                  the repository, mirroring ClusterBackupLocation. Standard mode only (reported
+                  ignored on an Immutable location).
+                properties:
+                  keepDaily:
+                    format: int32
+                    type: integer
+                  keepHourly:
+                    format: int32
+                    type: integer
+                  keepLast:
+                    format: int32
+                    type: integer
+                  keepMonthly:
+                    format: int32
+                    type: integer
+                  keepWeekly:
+                    format: int32
+                    type: integer
+                  keepYearly:
+                    format: int32
+                    type: integer
+                type: object
               s3:
                 description: s3 is the user's object storage.
                 properties:

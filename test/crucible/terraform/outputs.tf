@@ -15,7 +15,7 @@ output "api_endpoint" {
 
 output "s3_bucket" {
   description = "Backup target bucket on Hetzner Object Storage."
-  value       = minio_s3_bucket.backup_target.bucket
+  value       = local.bucket_name
 }
 
 output "s3_endpoint" {

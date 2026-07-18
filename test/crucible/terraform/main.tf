@@ -20,12 +20,30 @@ resource "hcloud_network_subnet" "nodes" {
   ip_range     = var.subnet_cidr
 }
 
-# hcloud firewalls only filter the PUBLIC interface; node-to-node traffic
-# (etcd 2379/2380, supervisor 9345, CNI vxlan, ceph, ...) rides the private
-# network and is unaffected.
+# An attached hcloud firewall filters ALL incoming traffic — including the
+# private network (contrary to a common misconception). So every port RKE2 &
+# co. use node-to-node (supervisor 9345, etcd 2379/2380, kubelet 10250, CNI
+# vxlan 8472/udp, ceph, longhorn, NodePorts, ...) must be allowed explicitly:
+# open the whole private CIDR between nodes, and keep only 22/80/443/6443 public.
 resource "hcloud_firewall" "crucible" {
   name   = "${var.name_prefix}-fw"
   labels = var.labels
+
+  rule {
+    description = "All node-to-node TCP on the private network"
+    direction   = "in"
+    protocol    = "tcp"
+    port        = "any"
+    source_ips  = [var.network_cidr]
+  }
+
+  rule {
+    description = "All node-to-node UDP on the private network (CNI vxlan, ...)"
+    direction   = "in"
+    protocol    = "udp"
+    port        = "any"
+    source_ips  = [var.network_cidr]
+  }
 
   rule {
     description = "SSH (ansible)"

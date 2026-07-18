@@ -2,7 +2,7 @@
 # Crucible — deploy the storage stack + crystal-backup onto the RKE2 cluster.
 #
 #   1. external-snapshotter (CSI snapshot CRDs + controller — RKE2 ships none)
-#   2. rook-ceph operator + CephCluster (mon/mgr on masters, osd/mds/rgw on workers)
+#   2. rook-ceph operator + CephCluster (mon/mgr on masters, osd/mds on workers)
 #      + StorageClasses/VolumeSnapshotClasses + toolbox
 #   3. longhorn (snapshot-capable CSI, disks on workers only)
 #   4. local-path-provisioner (NON-snapshottable class — exercises the skip path)
@@ -28,13 +28,18 @@ CEPH_HEALTH_TIMEOUT="${CEPH_HEALTH_TIMEOUT:-1800}" # seconds
 # the deployment then stays Unavailable — the m0 tests know and tolerate that).
 OPERATOR_IMAGE_DIGEST="${OPERATOR_IMAGE_DIGEST:-}"
 OPERATOR_IMAGE_TAG="${OPERATOR_IMAGE_TAG:-}"
+# Mover image override — the image every mover Job runs (crystal-mover + restic). REQUIRED for the
+# M1 data path (repository init, backup, discovery snapshots, retention forget, unlock): a run that
+# leaves this empty falls back to the chart's placeholder and every mover Job ImagePullBackOffs.
+MOVER_IMAGE_DIGEST="${MOVER_IMAGE_DIGEST:-}"
+MOVER_IMAGE_TAG="${MOVER_IMAGE_TAG:-}"
 
 export KUBECONFIG="${KUBECONFIG:-${CRUCIBLE_DIR}/artifacts/kubeconfig}"
 
 step() { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
 
 if [[ ! -f "${KUBECONFIG}" ]]; then
-  echo "FATAL: kubeconfig not found at ${KUBECONFIG} — run 'make cluster' first." >&2
+  echo "FATAL: kubeconfig not found at ${KUBECONFIG} — run 'mise run cluster' first." >&2
   exit 1
 fi
 
@@ -42,10 +47,21 @@ step "Cluster reachability"
 kubectl get nodes -o wide
 
 # ---------------------------------------------------------------------------
-step "external-snapshotter ${SNAPSHOTTER_REF} (CRDs + controller)"
-kubectl apply -k "https://github.com/kubernetes-csi/external-snapshotter/client/config/crd?ref=${SNAPSHOTTER_REF}"
-kubectl apply -k "https://github.com/kubernetes-csi/external-snapshotter/deploy/kubernetes/snapshot-controller?ref=${SNAPSHOTTER_REF}"
-kubectl -n kube-system rollout status deploy/snapshot-controller --timeout=300s
+# CSI snapshot support: VolumeSnapshot CRDs + a snapshot-controller. Some
+# distros already ship these (RKE2 bundles rke2-snapshot-controller and the
+# CRDs) — re-applying them clashes, so install external-snapshotter only when
+# the cluster has no VolumeSnapshot CRD yet.
+step "CSI snapshot support (VolumeSnapshot CRDs + controller)"
+if kubectl get crd volumesnapshots.snapshot.storage.k8s.io >/dev/null 2>&1; then
+  echo "  VolumeSnapshot CRDs already present — using the cluster's snapshot-controller (external-snapshotter ${SNAPSHOTTER_REF} skipped)"
+  # Ready-check whichever controller the distro provides (RKE2: rke2-snapshot-controller).
+  ctrl="$(kubectl -n kube-system get deploy -o name 2>/dev/null | grep -iE 'snapshot-controller' | head -1)"
+  [[ -n "${ctrl}" ]] && kubectl -n kube-system rollout status "${ctrl}" --timeout=300s || true
+else
+  kubectl apply -k "https://github.com/kubernetes-csi/external-snapshotter/client/config/crd?ref=${SNAPSHOTTER_REF}"
+  kubectl apply -k "https://github.com/kubernetes-csi/external-snapshotter/deploy/kubernetes/snapshot-controller?ref=${SNAPSHOTTER_REF}"
+  kubectl -n kube-system rollout status deploy/snapshot-controller --timeout=300s
+fi
 
 # ---------------------------------------------------------------------------
 step "rook-ceph operator ${ROOK_CHART_VERSION}"
@@ -55,7 +71,7 @@ helm upgrade --install rook-ceph rook-release/rook-ceph \
   --version "${ROOK_CHART_VERSION}" \
   --wait --timeout 10m
 
-step "CephCluster + pools + filesystem + object store + toolbox"
+step "CephCluster + pools + filesystem + toolbox"
 kubectl apply -f "${SCRIPT_DIR}/manifests/ceph-cluster.yaml"
 kubectl apply -f "${SCRIPT_DIR}/manifests/ceph-toolbox.yaml"
 
@@ -95,7 +111,12 @@ kubectl -n local-path-storage rollout status deploy/local-path-provisioner --tim
 
 # ---------------------------------------------------------------------------
 step "crystal-backup (CRDs + operator chart)"
-make -C "${REPO_ROOT}" chart-crds
+# Sync the generated CRDs into the chart's crds/ dir (the chart keeps them
+# git-ignored). Equivalent to the repo's `chart-crds` make target, inlined so the
+# crucible has no build-time dependency on make.
+mkdir -p "${REPO_ROOT}/charts/crystal-backup/crds"
+rm -f "${REPO_ROOT}/charts/crystal-backup/crds"/*.yaml
+cp "${REPO_ROOT}/config/crd/bases"/*.yaml "${REPO_ROOT}/charts/crystal-backup/crds/"
 # Create the namespace ourselves (with the chart's PSA labels) so helm's release
 # secret has a home, then tell the chart not to create it a second time.
 kubectl create namespace crystal-backup-system --dry-run=client -o yaml | kubectl apply -f -
@@ -108,10 +129,12 @@ helm upgrade --install crystal-backup "${REPO_ROOT}/charts/crystal-backup" \
   --namespace crystal-backup-system \
   --set namespace.create=false \
   --set image.digest="${OPERATOR_IMAGE_DIGEST}" \
-  --set image.tag="${OPERATOR_IMAGE_TAG}"
+  --set image.tag="${OPERATOR_IMAGE_TAG}" \
+  --set mover.image.digest="${MOVER_IMAGE_DIGEST}" \
+  --set mover.image.tag="${MOVER_IMAGE_TAG}"
 
 echo
 echo "Deployed. Storage classes:"
 kubectl get storageclass
 echo
-echo "Next: 'make seed' then 'make test'."
+echo "Next: 'mise run seed' then 'mise run test'."

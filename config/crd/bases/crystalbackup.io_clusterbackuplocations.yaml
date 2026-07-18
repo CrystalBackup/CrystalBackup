@@ -148,6 +148,37 @@ spec:
                 - Standard
                 - Immutable
                 type: string
+              retention:
+                description: |-
+                  retention is the snapshot retention policy for this location's shared
+                  repository, applied per PVC (per restic (host,paths) group) by a `restic
+                  forget` after each successful backup. It lives on the location — not on
+                  individual ClusterBackup runs or schedules — because a location backs ONE
+                  shared restic repository (adr/0009) and `restic forget` operates on the whole
+                  repository: a single authoritative policy per location is the only way to keep
+                  several runs from fighting over the same snapshots. Standard mode only; on an
+                  Immutable location it is reported ignored (RetentionIgnored condition) because
+                  object-lock forbids prune/forget until lock expiry.
+                properties:
+                  keepDaily:
+                    format: int32
+                    type: integer
+                  keepHourly:
+                    format: int32
+                    type: integer
+                  keepLast:
+                    format: int32
+                    type: integer
+                  keepMonthly:
+                    format: int32
+                    type: integer
+                  keepWeekly:
+                    format: int32
+                    type: integer
+                  keepYearly:
+                    format: int32
+                    type: integer
+                type: object
               s3:
                 description: s3 is the object storage backing the shared repository.
                 properties:

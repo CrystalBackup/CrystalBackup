@@ -167,7 +167,9 @@ For one `Backup` (R11, R12, R15, R16):
    the §2 layout tags. RWO and RWX PVCs follow the same path. Movers are unprivileged
    (`cephfs-shallow`/`csi-generic`) and spread across nodes (`topologySpreadConstraints`) to
    aggregate bandwidth (R12), under global and per-node concurrency limits.
-6. **Manifests** (R15): a **`crystal-manifest-mover` Job** (ServiceAccount
+6. **Manifests** (R15) — **delivered in M3** ([90-roadmap.md](90-roadmap.md)); through M1–M2 a
+   namespace's only durable per-run artifact is its **data** snapshot(s) from step 5, so discovery
+   (§4) and restore (§6) operate on data snapshots alone until M3: a **`crystal-manifest-mover` Job** (ServiceAccount
    `crystal-manifest-mover`, transiently bound to ClusterRole `crystal-manifest-reader` —
    [03-security-and-tenancy.md](03-security-and-tenancy.md)) dumps the namespace's
    resources, sanitizes them ([04-manifest-backup.md](04-manifest-backup.md)) and uploads
@@ -308,3 +310,35 @@ Mechanism — **`restic copy`, not a byte clone**:
 Because copied snapshots keep their `host`/`paths`/tags, **discovery** projects them at the
 destination like any other snapshot; the secondary is a fully independent, restic-readable
 repository (reversibility, R8) under its own key.
+
+## 12. Job orchestration & restart-safety (movers, discovery, maintenance)
+
+Every unit of restic work runs in a **Kubernetes Job**, not in the operator process, so it survives
+an operator restart and is scheduled/retried by the kube-controller-manager. Because the operator
+may crash and re-reconcile at any point, its Job orchestration follows one restart-safe pattern —
+movers (§5), the discovery inventory Job (§4) and the repository-init Job (§2) all use it, and any
+future restore (M2) or maintenance (M4) Job **must** follow it too:
+
+- **Deterministic Job names.** A Job's name is a pure function of what it does (e.g.
+  `<repo>-discovery`, the mover's `(backup, pvc)` identity), never random. On restart the operator
+  **re-adopts** the still-running Job — `Create` tolerating `AlreadyExists` — instead of orphaning it
+  or launching a duplicate. This is what makes *"operator killed mid-run converges via Job
+  re-adoption"* hold (crucible, M1).
+- **Poll *through* a transient `NotFound`.** A wait-loop that has just created a Job (or is observing
+  one whose same-name predecessor is still terminating) may `Get` a `NotFound` from the cache before
+  the object appears. That is *"not ready"*, **not** a failure: the loop keeps polling until the Job
+  appears or the operation's deadline elapses. Hard-failing on a transient `NotFound` would fail a
+  whole discovery/backup pass on nothing more than cache lag.
+- **`Background` deletion propagation for same-name re-creation.** A Job whose name is re-used every
+  pass (the discovery inventory Job) is deleted with `PropagationPolicy: Background` so the **name is
+  freed immediately**; `Foreground` would hold it `Terminating` until its pods are gone and the next
+  pass's `Create` would race the terminating predecessor. One-shot Jobs with unique names may use
+  `Foreground`.
+- **Self-cleaning backstop.** Jobs set `ttlSecondsAfterFinished` so a finished Job is reclaimed even
+  if the explicit post-run cleanup is missed (e.g. the operator restarts between completion and
+  cleanup).
+
+Reference: `internal/controller/discovery_lister.go` (`waitForJob`, cleanup),
+`internal/controller/backuprepository_controller.go` (init-Job re-adoption),
+`internal/controller/backup_controller.go` (mover re-adoption). This is the Job-level complement to
+the per-repository serialization of [adr/0015](adr/0015-per-repository-exclusive-queue-serialization.md).

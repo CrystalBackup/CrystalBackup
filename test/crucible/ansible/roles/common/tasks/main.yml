@@ -35,3 +35,24 @@
     path: /etc/rancher/rke2
     state: directory
     mode: "0755"
+
+# flannel must ride the PRIVATE network, not the public one. By default RKE2's
+# canal picks the default-route interface (public eth0): its VXLAN then (a) uses
+# public IPs on 8472/udp, which the cloud firewall drops between nodes, and
+# (b) sizes the overlay MTU for the public 1500 NIC — 50 bytes too large for the
+# Hetzner private path (1450), so large packets are silently dropped and Ceph
+# mon quorum never forms. Detect the NIC holding private_ip and pin flannel to it.
+- name: Detect the private network interface (the one holding private_ip)
+  ansible.builtin.shell:
+    cmd: "ip -o -4 addr show | awk -v ip='{{ private_ip }}' '$4 ~ \"^\" ip \"/\" {print $2; exit}'"
+  register: crucible_priv_iface
+  changed_when: false
+
+- name: Record the private interface name for the RKE2 configs
+  ansible.builtin.set_fact:
+    private_iface: "{{ crucible_priv_iface.stdout | trim }}"
+
+- name: Ensure the private interface was found
+  ansible.builtin.assert:
+    that: private_iface | length > 0
+    fail_msg: "Could not find the interface holding private_ip={{ private_ip }} (ip -o -4 addr show)"

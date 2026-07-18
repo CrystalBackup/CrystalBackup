@@ -64,7 +64,7 @@ The decision powers the requirements as follows:
 | R13 | Repo v2: zstd + CDC dedup + AES-256/Poly1305, all client-side before S3. |
 | R17 | `restic check --read-data-subset` as the integrity-check primitive. |
 | R21 | `restic forget --tag` (`tenant=` / `namespace=` / `namespace=+pvc=`) then `prune` → **physical** right-to-erasure from the shared repo; a single-master-key repo cannot carry per-tenant keys, so crypto-shredding is dropped ([adr/0009](0009-shared-cluster-repo-tag-tenancy.md), [adr/0004](0004-encryption-key-management.md)). |
-| R24 | `restic forget --keep-last/--keep-hourly/…/--keep-within` maps 1:1 to `BackupSchedule.spec.retention`. |
+| R24 | `restic forget --keep-last/--keep-hourly/…/--keep-within` maps 1:1 to `[Cluster]BackupLocation.spec.retention` (retention lives on the location — one shared repo, one policy — not the schedule; [adr/0009](0009-shared-cluster-repo-tag-tenancy.md)). |
 
 ## Consequences
 
@@ -116,7 +116,7 @@ The decision powers the requirements as follows:
 | Risk | Mitigation |
 |---|---|
 | Leaked repository key: restic cannot securely revoke a key without re-encrypting — `key remove` deletes the wrapped copy but the master key never rotates (documented restic limitation). | Re-encryption procedure = repo copy into a fresh repository with a new DEK; runbook is an M5 deliverable. Threat model documented in [adr/0004](0004-encryption-key-management.md). |
-| Stale locks after mover crashes block subsequent operations. | Orphan-reaper controller runs age-based `restic unlock` (restic itself ignores locks older than 30 min); per-repo operation queue avoids self-inflicted contention. |
+| Stale locks after mover crashes block subsequent operations. A hard-killed (OOMKilled/SIGKILL) mover's lock is NOT stale to restic — created on a since-gone pod (a different host, so restic cannot probe the PID) and under the 30-min age window — so a bare `unlock` leaves it and it then blocks the next `forget`/`prune`. | On detecting a hard-killed mover (blank termination message) the Backup controller enqueues an `unlock --remove-all` on the per-repo exclusive queue. Force-removal is made safe by a per-repo **backup⇄unlock mutex**: the mover admission holds new backups back while an unlock is pending/in-flight (`queue.QuiescenceRequired`), and the unlock drains the in-flight movers before it runs — so no live backup lock exists when it force-removes. `prune`/`erase` join as writers in M2/M4. An age-based `restic unlock` sweep stays a future backstop for locks orphaned while the operator itself was down. |
 | restic CLI flag/JSON output changes across versions. | Version pinned and vendored in the mover image; shim has contract tests against the pinned binary; upgrades are deliberate, tested PRs. |
 | Mover OOM on pathological file counts. | Configurable mover resources per size class; M6 load test defines defaults. The shared cluster repo's index scales with total cluster data (not per-namespace); sharding, which would re-bound it per tenant, is deferred ([adr/0009](0009-shared-cluster-repo-tag-tenancy.md)). |
 | restic bus factor (~1–2 core maintainers). | The format outlives the implementation: public spec + rustic as second implementation; worst case we maintain a fork of a stable CLI, not a storage format. |

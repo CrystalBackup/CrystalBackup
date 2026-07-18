@@ -25,17 +25,30 @@ import (
 	// to ensure that exec-entrypoint and run can make use of them.
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
+	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/utils/clock"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
 	crystalbackupiov1alpha1 "github.com/CrystalBackup/CrystalBackup/api/v1alpha1"
+	"github.com/CrystalBackup/CrystalBackup/internal/apiconst"
+	"github.com/CrystalBackup/CrystalBackup/internal/client/secrets"
+	"github.com/CrystalBackup/CrystalBackup/internal/controller"
+	"github.com/CrystalBackup/CrystalBackup/internal/exposer"
+	"github.com/CrystalBackup/CrystalBackup/internal/metrics"
+	"github.com/CrystalBackup/CrystalBackup/internal/repo/queue"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -61,6 +74,23 @@ func main() {
 	var secureMetrics bool
 	var enableHTTP2 bool
 	var tlsOpts []func(*tls.Config)
+	var operatorNamespace string
+	var moverImage string
+	// defaultOperatorNamespace resolves the operator's own namespace before flags are parsed:
+	// $POD_NAMESPACE (set via the downward API in the Helm chart / manifest) if present, else
+	// the Helm chart's own default, apiconst.DefaultOperatorNamespace. This is where every
+	// cluster-plane platform Secret (the KEK, DR S3 credentials, wrapped DEKs) lives.
+	defaultOperatorNamespace := os.Getenv("POD_NAMESPACE")
+	if defaultOperatorNamespace == "" {
+		defaultOperatorNamespace = apiconst.DefaultOperatorNamespace
+	}
+	flag.StringVar(&operatorNamespace, "operator-namespace", defaultOperatorNamespace,
+		"Namespace where cluster-plane platform Secrets (the cluster KEK, DR S3 credentials, wrapped DEKs) live. "+
+			"Defaults to $POD_NAMESPACE (downward API) or, if unset, "+apiconst.DefaultOperatorNamespace+".")
+	flag.StringVar(&moverImage, "mover-image", "",
+		"Container image for the mover Jobs (repository init and, later, backup/restore/maintenance). "+
+			"REQUIRED for real backups — the Helm chart and the crucible set it; an empty value is tolerated "+
+			"only because envtest never runs a mover Job.")
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
@@ -153,8 +183,36 @@ func main() {
 		metricsServerOptions.KeyName = metricsCertKey
 	}
 
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
-		Scheme:                 scheme,
+	// The REST config is captured (not passed inline to NewManager) so the discovery lister can build
+	// a client-go clientset from it: reading a pod's log is a subresource STREAM the controller-runtime
+	// client does not support, so that one path needs a raw clientset alongside the manager's client.
+	restConfig := ctrl.GetConfigOrDie()
+
+	mgr, err := ctrl.NewManager(restConfig, ctrl.Options{
+		Scheme: scheme,
+		// The mover / repository-init / maintenance Jobs the operator creates all live in ITS
+		// OWN namespace (invariant I5, spec/03 §5): every Job Get/List/Create/Delete in the
+		// controllers is scoped to operatorNamespace, and the Helm chart grants batch/jobs
+		// through a namespaced Role, NOT the ClusterRole. Scope the Job informer to that one
+		// namespace so the manager cache asks only for a namespaced Job list/watch (which the
+		// Role allows) instead of the cluster-wide list/watch the default cache would demand —
+		// that exact mismatch CrashLoops the operator against the least-privilege chart RBAC.
+		// Every other watched kind keeps the default cluster-wide cache; their ClusterRole
+		// grants already cover it.
+		Cache: cache.Options{
+			ByObject: map[client.Object]cache.ByObject{
+				&batchv1.Job{}: {
+					Namespaces: map[string]cache.Config{operatorNamespace: {}},
+				},
+			},
+		},
+		// The operator must never build a cluster-wide Secret cache/informer (tenancy
+		// invariant I3): it holds Secrets GET-only, no list/watch. Bypassing the cache for
+		// Secrets makes every manager-client Get(Secret) a direct API read, so the
+		// controllers and internal/keys.DEKManager can read Secrets through mgr.GetClient()
+		// without starting a Secret informer (which needs list/watch RBAC and would cache
+		// other namespaces' Secrets).
+		Client:                 client.Options{Cache: &client.CacheOptions{DisableFor: []client.Object{&corev1.Secret{}}}},
 		Metrics:                metricsServerOptions,
 		WebhookServer:          webhookServer,
 		HealthProbeBindAddress: probeAddr,
@@ -177,6 +235,128 @@ func main() {
 		os.Exit(1)
 	}
 
+	// The process shutdown signal, obtained ONCE (SetupSignalHandler must not be called twice)
+	// and shared by the repository queue and the manager: a SIGINT/SIGTERM cancels this context,
+	// which shuts the queue's workers down alongside the manager.
+	signalCtx := ctrl.SetupSignalHandler()
+
+	// One per-repository exclusive work queue for the whole process (adr/0010): it serialises
+	// init/forget/prune/check/erase per repository so a single leader never races itself (the
+	// K8up #1055 init race). Bound to signalCtx so shutdown cancels in-flight ops; Stop is
+	// deferred to join the worker goroutines on a clean exit.
+	repoQueue := queue.NewManager(signalCtx)
+	defer repoQueue.Stop()
+
+	if err := (&controller.ClusterBackupLocationReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+		// The uncached, GET-by-name reader — never mgr.GetClient() — per
+		// internal/client/secrets' package doc (tenancy invariant I3).
+		Secrets:           secrets.NewByNameReader(mgr.GetAPIReader()),
+		Prober:            controller.NewHTTPS3Prober(),
+		OperatorNamespace: operatorNamespace,
+		Recorder:          mgr.GetEventRecorder("clusterbackuplocation"),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Unable to create controller", "controller", "ClusterBackupLocation")
+		os.Exit(1)
+	}
+	if err := controller.NewBackupRepositoryReconciler(
+		mgr.GetClient(),
+		mgr.GetScheme(),
+		// Same uncached Secret reader (the cluster KEK + DR S3 credentials); never GetClient().
+		secrets.NewByNameReader(mgr.GetAPIReader()),
+		repoQueue,
+		operatorNamespace,
+		moverImage,
+		mgr.GetEventRecorder("backuprepository"),
+	).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Unable to create controller", "controller", "BackupRepository")
+		os.Exit(1)
+	}
+	if err := controller.NewBackupReconciler(
+		mgr.GetClient(),
+		mgr.GetScheme(),
+		// Same uncached Secret reader (the cluster KEK + DR S3 credentials); never GetClient().
+		secrets.NewByNameReader(mgr.GetAPIReader()),
+		// The production exposer registry, over the cached client (it reads StorageClasses and
+		// VolumeSnapshotClasses, and creates the exposure objects), scoped to the operator
+		// namespace where the static re-bind pair and temp clone PVCs land.
+		exposer.NewRegistry(mgr.GetClient(), operatorNamespace),
+		operatorNamespace,
+		moverImage,
+		mgr.GetEventRecorder("backup"),
+		// The SAME per-repository exclusive queue the BackupRepository controller uses: the Backup
+		// controller enqueues retention-forget and stale-lock-unlock on it, serialised per repository
+		// against init and each other.
+		repoQueue,
+	).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Unable to create controller", "controller", "Backup")
+		os.Exit(1)
+	}
+
+	if err := controller.NewClusterBackupReconciler(
+		mgr.GetClient(),
+		mgr.GetScheme(),
+		operatorNamespace,
+		mgr.GetEventRecorder("clusterbackup"),
+	).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Unable to create controller", "controller", "ClusterBackup")
+		os.Exit(1)
+	}
+
+	if err := controller.NewClusterBackupScheduleReconciler(
+		mgr.GetClient(),
+		mgr.GetScheme(),
+		clock.RealClock{},
+		mgr.GetEventRecorder("clusterbackupschedule"),
+	).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Unable to create controller", "controller", "ClusterBackupSchedule")
+		os.Exit(1)
+	}
+
+	// The discovery reconciler projects a shared repository's snapshots back into read-only Backup
+	// CRs so a DR repository is restorable with no pre-existing objects. Its production lister runs a
+	// real `restic snapshots` mover Job and reads the inventory off the pod log via the clientset;
+	// the uncached Secret reader (I3) resolves the cluster KEK + DR S3 credentials for that Job.
+	clientset, err := kubernetes.NewForConfig(restConfig)
+	if err != nil {
+		setupLog.Error(err, "Unable to build the clientset for the discovery pod-log reader")
+		os.Exit(1)
+	}
+	if err := controller.NewDiscoveryReconciler(
+		mgr.GetClient(),
+		mgr.GetScheme(),
+		controller.NewJobSnapshotLister(
+			mgr.GetClient(),
+			clientset,
+			secrets.NewByNameReader(mgr.GetAPIReader()),
+			mgr.GetScheme(),
+			operatorNamespace,
+			moverImage,
+		),
+		mgr.GetEventRecorder("discovery"),
+	).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Unable to create controller", "controller", "Discovery")
+		os.Exit(1)
+	}
+
+	// The orphan reaper is a periodic Runnable (not a reconciler): it sweeps the operator namespace
+	// for leftover native per-PVC exposure objects (temp clone PVCs, mover Jobs, creds Secrets) a
+	// crashed teardown left behind, backstopping the leak-check invariant.
+	if err := mgr.Add(&controller.OrphanReaper{
+		Client:            mgr.GetClient(),
+		OperatorNamespace: operatorNamespace,
+	}); err != nil {
+		setupLog.Error(err, "Unable to add the orphan reaper")
+		os.Exit(1)
+	}
+
+	// The crystalbackup_ metric collector derives its series from live Backup/ClusterBackup state on
+	// each scrape (restart-safe), served on the controller-runtime metrics endpoint.
+	if err := ctrlmetrics.Registry.Register(metrics.NewCollector(mgr.GetClient())); err != nil {
+		setupLog.Error(err, "Unable to register the crystalbackup metrics collector")
+		os.Exit(1)
+	}
 	// +kubebuilder:scaffold:builder
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
@@ -189,7 +369,7 @@ func main() {
 	}
 
 	setupLog.Info("Starting manager")
-	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
+	if err := mgr.Start(signalCtx); err != nil {
 		setupLog.Error(err, "Failed to run manager")
 		os.Exit(1)
 	}
