@@ -77,6 +77,32 @@ const (
 	// (test/crucible/tests/m1_reliability_test.go) use to find and tear down the objects a
 	// Backup leaves behind, so it is stamped on EVERY exposure object and mover Job.
 	LabelPVC = Domain + "/pvc"
+
+	// LabelRestore records the owning namespaced Restore on every object a restore creates in
+	// the operator namespace (the staging PVC, the twin PV, the restore mover Job and its creds
+	// Secret). Its value is the Restore name; LabelNamespace carries the Restore's namespace.
+	// It is how the orphan reaper resolves a restore-owned object to its owner instead of
+	// misreading LabelClusterBackup as a Backup run (M2, adr/0016).
+	LabelRestore = Domain + "/restore"
+
+	// LabelClusterRestore is LabelRestore's cluster-plane sibling: the owning ClusterRestore's
+	// name on the objects an admin restore creates. ClusterRestore is cluster-scoped, so the
+	// owner lookup needs no namespace; LabelNamespace on these objects carries the TARGET
+	// namespace for correlation only.
+	LabelClusterRestore = Domain + "/cluster-restore"
+
+	// LabelPVRole marks the PersistentVolume objects a restore creates or adopts, so the
+	// reaper and the leak-check can find them without sweeping every PV in the cluster:
+	// PVRoleTwin on the twin PV aliasing a bound target volume, PVRoleTransplant on a
+	// dynamically-provisioned volume mid-handover (removed when the transplant completes and
+	// the volume becomes the user's — a restored PVC/PV must never look operator-owned).
+	LabelPVRole = Domain + "/pv-role"
+)
+
+// LabelPVRole values (see LabelPVRole).
+const (
+	PVRoleTwin       = "twin"
+	PVRoleTransplant = "transplant"
 )
 
 // Standard Kubernetes "managed-by" label stamped on the operator-owned objects a backup
@@ -105,6 +131,13 @@ const (
 	AnnotationProjected = Domain + "/projected"
 	// AnnotationProjectedValue is the truthy value discovery sets AnnotationProjected to.
 	AnnotationProjectedValue = "true"
+
+	// AnnotationRestoredFrom is stamped on a PVC a restore CREATED (the pvc-transplant
+	// handover, adr/0016) with the originating run name. It is informational provenance for
+	// the user — deliberately an annotation, not a label, and never accompanied by the
+	// operator's managed-by/reaper labels: a restored PVC is the USER'S object and must never
+	// be selectable by the reaper or the leak-check.
+	AnnotationRestoredFrom = Domain + "/restored-from"
 )
 
 // Origin label values (see LabelOrigin).
