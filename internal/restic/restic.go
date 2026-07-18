@@ -316,9 +316,15 @@ func ForgetCommand(r v1alpha1.RetentionSpec) (argv []string, ok bool) {
 	return append([]string{"forget"}, flags...), true
 }
 
-// UnlockArgs is the complete restic argv that clears stale repository locks: `unlock`. restic
-// removes only locks past its staleness window by default, so this is safe to run
-// opportunistically after a mover crash without disturbing a genuinely in-progress operation.
+// UnlockArgs is the complete restic argv that clears a hard-killed mover's repository lock:
+// `unlock --remove-all`. A bare `unlock` removes only STALE locks — owner process provably dead
+// on the same host, or older than restic's 30-min window — but an OOMKilled/SIGKILLed mover's lock
+// is neither: it was created on a since-gone pod (a different host, so restic cannot probe the PID)
+// and is fresh, so a bare `unlock` leaves it and the lock blocks the next `forget`/`prune` until it
+// finally ages out. --remove-all forces its removal. Because that also removes a CONCURRENT backup's
+// live lock, the caller MUST run this only under mover quiescence — the per-repo backup⇄unlock mutex
+// (queue.blocksMovers gate on admission + the maintenance op's own drain-wait) guarantees exactly
+// that, so no live backup lock exists when this runs.
 func UnlockArgs() []string {
-	return []string{"unlock"}
+	return []string{"unlock", "--remove-all"}
 }

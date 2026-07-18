@@ -671,7 +671,10 @@ func TestSnapshotsArgs(t *testing.T) {
 }
 
 func TestUnlockArgs(t *testing.T) {
-	if got, want := UnlockArgs(), []string{"unlock"}; !reflect.DeepEqual(got, want) {
+	// A hard-killed mover's lock is fresh and on a since-gone host, so it is not stale to restic;
+	// only --remove-all clears it. Safety against removing a concurrent backup's live lock is the
+	// caller's mover-quiescence mutex, not this argv.
+	if got, want := UnlockArgs(), []string{"unlock", "--remove-all"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("UnlockArgs() = %v, want %v", got, want)
 	}
 }

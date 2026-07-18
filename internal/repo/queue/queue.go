@@ -101,12 +101,28 @@ const (
 	// OpErase performs scoped erasure (ClusterErasure); it mutates the repository
 	// and so shares the single exclusive lane.
 	OpErase OpKind = "erase"
-	// OpUnlock removes a stale repository lock a hard-killed mover (OOMKilled/SIGKILL)
-	// left behind. It shares the exclusive lane so it never runs mid-init/forget/prune,
-	// and restic's own unlock only removes locks past its staleness window, so it is safe
-	// to run opportunistically after a crash.
+	// OpUnlock force-removes repository locks a hard-killed mover (OOMKilled/SIGKILL) left
+	// behind. It shares the exclusive lane so it never runs mid-init/forget/prune. A fresh
+	// lock from a mover on a since-gone pod is NOT stale to restic (different host, under the
+	// 30-min age window), so plain `unlock` leaves it and a bare `unlock` cannot clear it —
+	// OpUnlock therefore runs `unlock --remove-all` (internal/restic.UnlockArgs). Because that
+	// removes ALL locks, including a concurrent backup's live one, it is gated by mover
+	// quiescence (blocksMovers): the mover admission holds new movers back while an OpUnlock is
+	// pending/in-flight, and the op itself drains the in-flight movers before it runs — the two
+	// halves of the per-repo backup⇄unlock mutex.
 	OpUnlock OpKind = "unlock"
 )
+
+// blocksMovers reports whether an op of this kind requires data-mover QUIESCENCE: no concurrent
+// backup may hold a repository lock while it runs. The queue tracks how many such ops are pending
+// or in-flight per repo (worker.moverBlocking) and exposes it via [Manager.QuiescenceRequired], so
+// the Backup controller's mover admission holds new movers back for the duration. In M1 only
+// OpUnlock qualifies — it force-removes every lock, so a live backup's lock must not exist when it
+// runs. OpPrune and OpErase (repository-rewriting, exclusive by construction) join it in later
+// milestones; init/forget/check do not (forget stays best-effort and simply retries behind a lock).
+func blocksMovers(kind OpKind) bool {
+	return kind == OpUnlock
+}
 
 // ErrStopped is returned by [Manager.Enqueue] once the Manager has been stopped
 // (via [Manager.Stop] or cancellation of the context passed to [NewManager]).
@@ -223,6 +239,22 @@ func (m *Manager) Len(repoKey string) int {
 	return w.len()
 }
 
+// QuiescenceRequired reports whether an operation that requires data-mover quiescence
+// (blocksMovers — an OpUnlock in M1) is pending OR in-flight for repoKey. Unlike [Manager.Len]
+// this IS a control signal: the Backup controller's mover admission calls it to hold new movers
+// back for the repo's backup⇄unlock mutex (the unlock's own drain-wait handles movers already
+// running). It counts from Enqueue until the op resolves, so the gate stays closed for the whole
+// pending+in-flight lifetime and cannot reopen mid-unlock. Returns false for an unknown key.
+func (m *Manager) QuiescenceRequired(repoKey string) bool {
+	m.mu.Lock()
+	w, ok := m.workers[repoKey]
+	m.mu.Unlock()
+	if !ok {
+		return false
+	}
+	return w.moverBlockingActive()
+}
+
 // Stop shuts the Manager down: it stops accepting new work, cancels the base
 // context (so every in-flight operation observes cancellation and every
 // queued-but-unstarted operation is resolved with the cancellation error without
@@ -277,12 +309,14 @@ func (m *Manager) runWorker(w *worker) {
 		select {
 		case <-m.baseCtx.Done():
 			h.resolve(m.baseCtx.Err())
+			w.afterResolve(h)
 			m.drainCancelled(w)
 			return
 		default:
 		}
 
 		m.runOne(h)
+		w.afterResolve(h)
 	}
 }
 
@@ -292,6 +326,7 @@ func (m *Manager) runWorker(w *worker) {
 func (m *Manager) drainCancelled(w *worker) {
 	for _, h := range w.drain() {
 		h.resolve(m.baseCtx.Err())
+		w.afterResolve(h)
 	}
 }
 
@@ -331,6 +366,11 @@ type worker struct {
 	mu     sync.Mutex
 	queue  []*Handle
 	notify chan struct{}
+	// moverBlocking counts the enqueued-or-in-flight ops whose kind blocksMovers (M1: OpUnlock).
+	// Incremented in enqueue, decremented in afterResolve — so it spans the whole lifetime from
+	// Enqueue to resolution, covering both the queued and the running op. Guarded by mu (the same
+	// lock as queue) and read by moverBlockingActive for [Manager.QuiescenceRequired].
+	moverBlocking int
 }
 
 func newWorker(key string) *worker {
@@ -347,11 +387,33 @@ func newWorker(key string) *worker {
 func (w *worker) enqueue(h *Handle) {
 	w.mu.Lock()
 	w.queue = append(w.queue, h)
+	if blocksMovers(h.kind) {
+		w.moverBlocking++
+	}
 	w.mu.Unlock()
 	select {
 	case w.notify <- struct{}{}:
 	default:
 	}
+}
+
+// afterResolve accounts for h having been resolved (run to completion, cancelled at shutdown, or
+// panicked): it drops h's contribution to moverBlocking. It is called exactly once per handle, on
+// every resolution path, so the counter returns to zero once no blocksMovers op remains.
+func (w *worker) afterResolve(h *Handle) {
+	if !blocksMovers(h.kind) {
+		return
+	}
+	w.mu.Lock()
+	w.moverBlocking--
+	w.mu.Unlock()
+}
+
+// moverBlockingActive reports whether any blocksMovers op is currently pending or in-flight.
+func (w *worker) moverBlockingActive() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.moverBlocking > 0
 }
 
 // pop removes and returns the head of the queue, or (nil, false) if empty.

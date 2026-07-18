@@ -40,6 +40,7 @@ func TestOpKindValues(t *testing.T) {
 		{OpPrune, "prune"},
 		{OpCheck, "check"},
 		{OpErase, "erase"},
+		{OpUnlock, "unlock"},
 	}
 	for _, c := range cases {
 		if string(c.got) != c.want {
@@ -470,4 +471,95 @@ func TestLen(t *testing.T) {
 		t.Errorf("Len = %d, want 3 (in-flight op excluded)", got)
 	}
 	close(block)
+}
+
+// TestBlocksMovers pins which OpKinds require mover quiescence (the backup⇄unlock mutex). Only
+// OpUnlock does in M1 — it force-removes every lock; adding OpPrune/OpErase later is a deliberate,
+// test-guarded change.
+func TestBlocksMovers(t *testing.T) {
+	for _, k := range []OpKind{OpInit, OpForget, OpPrune, OpCheck, OpErase} {
+		if blocksMovers(k) {
+			t.Errorf("blocksMovers(%q) = true, want false", k)
+		}
+	}
+	if !blocksMovers(OpUnlock) {
+		t.Errorf("blocksMovers(OpUnlock) = false, want true")
+	}
+}
+
+// TestQuiescenceRequired verifies the mover-admission signal: an OpUnlock counts for its whole
+// pending+in-flight lifetime, a non-blocking op never counts, and the flag clears once the unlock
+// resolves. The decrement happens in the worker goroutine just after resolution, so the post-run
+// assertions poll briefly rather than reading immediately.
+func TestQuiescenceRequired(t *testing.T) {
+	m := NewManager(context.Background())
+	defer m.Stop()
+
+	if m.QuiescenceRequired("unknown") {
+		t.Errorf("QuiescenceRequired(unknown) = true, want false")
+	}
+
+	// (1) In-flight: a blocking OpUnlock occupies the slot; the flag is set while it runs.
+	block := make(chan struct{})
+	entered := make(chan struct{})
+	hUnlock, err := m.Enqueue("k1", OpUnlock, func(ctx context.Context) error {
+		close(entered)
+		<-block
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Enqueue in-flight unlock: %v", err)
+	}
+	<-entered
+	if !m.QuiescenceRequired("k1") {
+		t.Errorf("QuiescenceRequired while an OpUnlock is in-flight = false, want true")
+	}
+	close(block)
+	if err := hUnlock.Wait(); err != nil {
+		t.Fatalf("unlock op: %v", err)
+	}
+	if !eventually(func() bool { return !m.QuiescenceRequired("k1") }) {
+		t.Errorf("QuiescenceRequired stayed true after the in-flight OpUnlock resolved")
+	}
+
+	// (2) Pending: a blocking non-unlock head occupies the slot, an OpUnlock queues behind it; the
+	// flag is set while the unlock is merely PENDING (not yet in-flight), and clears once it drains.
+	block2 := make(chan struct{})
+	entered2 := make(chan struct{})
+	if _, err := m.Enqueue("k2", OpForget, func(ctx context.Context) error {
+		close(entered2)
+		<-block2
+		return nil
+	}); err != nil {
+		t.Fatalf("Enqueue forget head: %v", err)
+	}
+	<-entered2
+	if m.QuiescenceRequired("k2") {
+		t.Errorf("QuiescenceRequired with only a non-blocking OpForget in-flight = true, want false")
+	}
+	if _, err := m.Enqueue("k2", OpUnlock, func(ctx context.Context) error { return nil }); err != nil {
+		t.Fatalf("Enqueue pending unlock: %v", err)
+	}
+	if !m.QuiescenceRequired("k2") {
+		t.Errorf("QuiescenceRequired with an OpUnlock pending behind a live head = false, want true")
+	}
+	close(block2) // release the head; the unlock then runs and resolves
+	if !eventually(func() bool { return !m.QuiescenceRequired("k2") }) {
+		t.Errorf("QuiescenceRequired stayed true after the pending OpUnlock drained")
+	}
+}
+
+// eventually polls cond for up to a couple of seconds, returning true as soon as it holds. It
+// absorbs the small window between a Handle resolving and the worker goroutine running afterResolve.
+func eventually(cond func() bool) bool {
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if cond() {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
 }

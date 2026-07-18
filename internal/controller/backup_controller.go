@@ -586,7 +586,7 @@ func (r *BackupReconciler) advanceSnapshotting(ctx context.Context, backup *cbv1
 	// cascade is already at maxConcurrentMovers, hold the volume in Snapshotting (its exposure stays
 	// ready) and requeue for a free slot. An already-existing Job means we are re-adopting after a
 	// restart, never blocking — so an in-flight mover is never counted out of its own slot.
-	if blocked, err := r.moverSlotBlocked(ctx, moverName, rc.maxConcurrentMovers); err != nil {
+	if blocked, err := r.moverSlotBlocked(ctx, moverName, rc.repoName, rc.maxConcurrentMovers); err != nil {
 		return err
 	} else if blocked {
 		return nil
@@ -623,35 +623,75 @@ func (r *BackupReconciler) advanceSnapshotting(ctx context.Context, backup *cbv1
 	return nil
 }
 
-// moverSlotBlocked implements the cluster-wide mover concurrency gate for one PVC's mover. It never
-// blocks when maxConcurrentMovers is unset, or when this PVC's mover Job already exists (a
-// re-adoption, which must proceed). Otherwise it counts the running mover Jobs — those carrying the
-// managed-by AND per-PVC labels, so repository-init Jobs (managed-by but no PVC) are not miscounted
-// — and blocks if the cascade is at its limit.
-func (r *BackupReconciler) moverSlotBlocked(ctx context.Context, moverName string, limit int32) (bool, error) {
-	if limit <= 0 {
-		return false, nil
-	}
+// moverSlotBlocked is the admission gate for one PVC's mover. It combines the per-repo backup⇄unlock
+// mutex (reader side) with the cluster-wide concurrency cap. Re-adoption of an already-existing Job
+// always proceeds (blocking a live mover would strand it and does nothing for either gate). For a
+// NEW mover it blocks when either (a) an op that force-removes repository locks — a stale-lock
+// unlock; queue.blocksMovers — is pending or in-flight for this repo (so a backup never takes a lock
+// the unlock is about to nuke; the unlock's own drain-wait covers movers already running), or (b)
+// the cascade is already at maxConcurrentMovers. The repository-mutex check runs even when the limit
+// is unset (the default), so it is evaluated before the limit short-circuit.
+func (r *BackupReconciler) moverSlotBlocked(ctx context.Context, moverName, repoName string, limit int32) (bool, error) {
 	err := r.Get(ctx, client.ObjectKey{Namespace: r.OperatorNamespace, Name: moverName}, &batchv1.Job{})
 	if err == nil {
 		return false, nil // our Job already exists — re-adopting, never blocked.
 	}
 	if !apierrors.IsNotFound(err) {
-		return false, fmt.Errorf("get mover Job %s/%s for the concurrency gate: %w", r.OperatorNamespace, moverName, err)
+		return false, fmt.Errorf("get mover Job %s/%s for the mover admission gate: %w", r.OperatorNamespace, moverName, err)
 	}
 
+	// (a) Repository backup⇄unlock mutex (reader side): hold a new mover back while a lock-removing
+	// op is queued/running for this repo. Independent of the concurrency limit (unset by default).
+	if r.Queue != nil && repoName != "" && r.Queue.QuiescenceRequired(repoName) {
+		return true, nil
+	}
+
+	// (b) Cluster-wide concurrency cap. Unset ⇒ unlimited ⇒ the common single-tenant case pays for
+	// nothing beyond the mutex check above.
+	if limit <= 0 {
+		return false, nil
+	}
+	movers, err := r.listMoverJobs(ctx)
+	if err != nil {
+		return false, fmt.Errorf("list mover Jobs for the concurrency gate: %w", err)
+	}
+	return !concurrency.CanStartMover(concurrency.RunningMoverJobs(movers), limit), nil
+}
+
+// listMoverJobs returns the per-PVC data-mover Jobs in the operator namespace — those carrying the
+// managed-by AND a per-PVC label, so repository-init/maintenance Jobs (managed-by, no PVC label) are
+// excluded. Shared by the concurrency gate and the unlock drain-wait.
+func (r *BackupReconciler) listMoverJobs(ctx context.Context) ([]batchv1.Job, error) {
 	var jobs batchv1.JobList
 	if err := r.List(ctx, &jobs, client.InNamespace(r.OperatorNamespace),
 		client.MatchingLabels{apiconst.LabelManagedBy: apiconst.ManagedByValue}); err != nil {
-		return false, fmt.Errorf("list mover Jobs for the concurrency gate: %w", err)
+		return nil, err
 	}
 	movers := jobs.Items[:0]
 	for _, j := range jobs.Items {
-		if j.Labels[apiconst.LabelPVC] != "" { // per-PVC ⇒ a mover, not a repository-init Job
+		if j.Labels[apiconst.LabelPVC] != "" { // per-PVC ⇒ a mover, not a repository-init/maintenance Job
 			movers = append(movers, j)
 		}
 	}
-	return !concurrency.CanStartMover(concurrency.RunningMoverJobs(movers), limit), nil
+	return movers, nil
+}
+
+// activeMoverCount counts the data-mover Jobs still occupying a slot: per-PVC, not terminal, and not
+// being deleted — a torn-down crashed mover (DeletionTimestamp set by teardownVolume) must not hold
+// the unlock drain-wait open. It is the reader census the backup⇄unlock mutex drains before an
+// exclusive lock-removal runs.
+func (r *BackupReconciler) activeMoverCount(ctx context.Context) (int, error) {
+	movers, err := r.listMoverJobs(ctx)
+	if err != nil {
+		return 0, err
+	}
+	live := movers[:0]
+	for _, j := range movers {
+		if j.DeletionTimestamp == nil {
+			live = append(live, j)
+		}
+	}
+	return concurrency.RunningMoverJobs(live), nil
 }
 
 // advanceUploading polls the mover Job and, once it is terminal, RECORDS the result on the

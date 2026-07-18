@@ -65,6 +65,10 @@ const (
 	// uses a context detached from the (possibly already-cancelled) op context so cleanup runs even
 	// when the op hit its deadline or the manager is shutting down.
 	maintenanceCleanupTimeout = 30 * time.Second
+
+	// moverQuiescencePoll is how often the unlock drain-wait re-reads the live data-mover count while
+	// waiting for the repository to go quiet before a lock force-removal.
+	moverQuiescencePoll = 2 * time.Second
 )
 
 // maintenanceResourceName is the deterministic name of BOTH a maintenance Job and its job-scoped
@@ -123,6 +127,39 @@ func (r *BackupReconciler) enqueueStaleLockUnlock(ctx context.Context, backup *c
 		"a mover was hard-killed; stale-lock unlock enqueued on repository %s", rc.repoName)
 }
 
+// maintenanceOpBlocksMovers reports whether a maintenance op force-removes repository locks and so
+// must run under mover quiescence — the writer side of the per-repo backup⇄unlock mutex. It is the
+// mover.Operation counterpart of queue.blocksMovers (which gates admission by queue.OpKind): both
+// name OpUnlock in M1, and both gain OpPrune when the maintenance controller lands (M2/M4).
+func maintenanceOpBlocksMovers(op mover.Operation) bool {
+	return op == mover.OpUnlock
+}
+
+// waitForMoverQuiescence blocks until no data-mover Job is running (or ctx expires), so an
+// `unlock --remove-all` never strips a live backup's lock out from under it. It is the drain-wait
+// half of the per-repo backup⇄unlock mutex; the reader side (moverSlotBlocked) holds NEW movers
+// back while this op is in-flight, so the running movers it waits on monotonically drain. It
+// conservatively waits on ALL data movers — M1 has one shared cluster repository; a per-repository
+// wait arrives with the namespace plane (M5). Bounded by ctx; a timeout is returned to the caller.
+func (r *BackupReconciler) waitForMoverQuiescence(ctx context.Context) error {
+	ticker := time.NewTicker(moverQuiescencePoll)
+	defer ticker.Stop()
+	for {
+		n, err := r.activeMoverCount(ctx)
+		if err != nil {
+			return fmt.Errorf("counting in-flight movers before an exclusive lock removal: %w", err)
+		}
+		if n == 0 {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("timed out waiting for %d in-flight mover(s) to drain: %w", n, ctx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
 // enqueueRepoMaintenance schedules a maintenance mover op on the repository's exclusive queue and
 // returns immediately. It is FIRE-AND-FORGET: the Handle is intentionally dropped because these ops
 // are best-effort and the queue runs the closure to completion whether or not anyone awaits it.
@@ -154,6 +191,18 @@ func (r *BackupReconciler) runRepoMaintenance(opCtx context.Context, name string
 	// LIFO defer order: this runs BEFORE cancel(), so ctx is still live for the delete when the op
 	// finished normally; the detached context inside covers the deadline/shutdown case.
 	defer r.deleteMaintenanceResources(opCtx, name)
+
+	// Drain-wait half of the per-repo backup⇄unlock mutex: an op that force-removes locks
+	// (`unlock --remove-all`) must not run while a backup holds a live lock. The reader side
+	// (moverSlotBlocked → QuiescenceRequired) already holds NEW movers back — this op is in-flight
+	// on the queue by now — so the in-flight movers this waits on only drain. Bounded by ctx
+	// (maintenanceJobDeadline); a timeout returns an error and, being best-effort, the op is
+	// reapplied by the next trigger.
+	if maintenanceOpBlocksMovers(op) {
+		if err := r.waitForMoverQuiescence(ctx); err != nil {
+			return err
+		}
+	}
 
 	labels := maintenanceJobLabels()
 	if err := r.ensureMoverCredsSecret(ctx, name, dek, s3CredsSecret, labels); err != nil {
