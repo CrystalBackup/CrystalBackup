@@ -75,17 +75,14 @@ var _ = Describe("M1 — discovery projects restorable backups", Label("m1"), Or
 		}
 		m1WaitRepositoryInitialized(m1LocationName)
 
-		// A namespace with content but no PVC: the run writes a manifests snapshot
-		// tagged namespace=c-ghost, then we delete the namespace so the repo group
-		// outlives it.
+		// A namespace with a SNAPSHOTTABLE PVC (ceph-block), backed up then deleted so its data
+		// snapshot (tagged namespace=c-ghost) is the repo group that must outlive the namespace.
+		// In M1 the only durable per-namespace artifact is a DATA snapshot — the namespace-manifests
+		// snapshot is M3 — so a PVC-less ghost would leave nothing in the repository and this fixture
+		// would be vacuous. startPVCConsumer writes /data/probe.txt and waits Running (PVC bound with
+		// content) before the run below snapshots the volume.
 		ensureNamespace(m1DiscoveryGhostNS)
-		cm := &corev1.ConfigMap{
-			ObjectMeta: metav1.ObjectMeta{Name: "ghost-keep", Namespace: m1DiscoveryGhostNS},
-			Data:       map[string]string{"note": "crucible discovery ghost — namespace deleted after the run"},
-		}
-		if cerr := k8s.Create(ctx, cm); cerr != nil && !apierrors.IsAlreadyExists(cerr) {
-			Expect(cerr).NotTo(HaveOccurred(), "seed ghost ConfigMap")
-		}
+		startPVCConsumer(m1DiscoveryGhostNS, "ghost-data", "ceph-block")
 
 		// A unique run name keeps each execution hermetic (its snapshots are distinct),
 		// while discovery's set semantics still hold across any accumulated runs.
