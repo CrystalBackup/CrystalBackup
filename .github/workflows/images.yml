@@ -118,10 +118,17 @@ jobs:
         if: steps.gate.outputs.proceed == 'true' && matrix.with_restic == 'true'
         run: |
           set -euo pipefail
+          # Build each arch in its OWN melange invocation (not a single `--arch x86_64,aarch64`):
+          # the combined multi-arch build intermittently races on melange's shared test workspace
+          # under `--runner docker`, failing with "unable to populate workspace: open
+          # build/melange/test-dirfs-0: no such file or directory". Per-arch is sequential, mirrors
+          # the wrapper step below, and is artifact-identical (melange sandboxes each arch anyway).
           melange keygen
-          melange build build/melange/restic.yaml \
-            --arch x86_64,aarch64 --runner docker \
-            --signing-key melange.rsa --out-dir ./packages
+          for a in x86_64 aarch64; do
+            melange build build/melange/restic.yaml \
+              --arch "$a" --runner docker \
+              --signing-key melange.rsa --out-dir ./packages
+          done
 
       - name: melange — wrap the pre-built binary into a signed apk (per arch)
         if: steps.gate.outputs.proceed == 'true'
@@ -284,10 +291,17 @@ jobs:
         if: steps.gate.outputs.proceed == 'true' && matrix.with_restic == 'true'
         run: |
           set -euo pipefail
+          # Build each arch in its OWN melange invocation (not a single `--arch x86_64,aarch64`):
+          # the combined multi-arch build intermittently races on melange's shared test workspace
+          # under `--runner docker`, failing with "unable to populate workspace: open
+          # build/melange/test-dirfs-0: no such file or directory". Per-arch is sequential, mirrors
+          # the wrapper step below, and is artifact-identical (melange sandboxes each arch anyway).
           melange keygen
-          melange build build/melange/restic.yaml \
-            --arch x86_64,aarch64 --runner docker \
-            --signing-key melange.rsa --out-dir ./packages
+          for a in x86_64 aarch64; do
+            melange build build/melange/restic.yaml \
+              --arch "$a" --runner docker \
+              --signing-key melange.rsa --out-dir ./packages
+          done
 
       - name: melange — wrap the pre-built binary into a signed apk (per arch)
         if: steps.gate.outputs.proceed == 'true'
