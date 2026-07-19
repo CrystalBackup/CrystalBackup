@@ -65,6 +65,7 @@ const milestones = [
   ['M0', 'Scaffolding — CRDs, CI (0-CVE images), test harness', 'done'],
   ['M1', 'Core engine & cluster disaster recovery', 'done', `${base}/reports/crucible-m1.html`],
   ['M2', 'Restore — self-service & admin', 'done', `${base}/reports/crucible-m2.html`],
+  ['0.2.1', 'Hardening — full M0–M2 audit & fixes', 'patch', [['Check report', `${base}/reports/audit-m2.1.html`], ['Crucible M2.1', `${base}/reports/crucible-m2.1.html`]]],
   ['M3', 'Manifests & cluster-scoped DR', 'here'],
   ['M4', 'Consistency hooks, verification & maintenance', ''],
   ['M5', 'Namespace plane, external sync & right-to-erasure', ''],
@@ -121,7 +122,7 @@ const description =
       <section class="hero">
         <div class="hero-copy">
           <span class="pill">
-            <span class="dot"></span> Building M3 · M2 shipped (v0.2.0)
+            <span class="dot"></span> Building M3 · M2 shipped (v0.2.1)
           </span>
           <h1>
             Every namespace gets <span class="grad">its own backups.</span>
@@ -299,7 +300,7 @@ const description =
         <p class="section-lead">
           Each milestone ships something usable. <strong>M0, M1 and M2 have shipped</strong> — CRDs,
           CI, the core engine, cluster disaster recovery and self-service &amp; admin restore are
-          live (v0.2.0); we’re now building <strong>M3 — Manifests &amp; cluster-scoped DR</strong>.
+          live (v0.2.1); we’re now building <strong>M3 — Manifests &amp; cluster-scoped DR</strong>.
         </p>
         <ol class="timeline">
           {
@@ -308,9 +309,13 @@ const description =
                 <span class="ms-id">{id}</span>
                 <span class="ms-label">{label}</span>
                 {state === 'here' && <span class="ms-here">you are here</span>}
+                {state === 'patch' && <span class="ms-patch">hardening</span>}
                 {state === 'done' && !report && <span class="ms-done">done</span>}
-                {report && (
-                  <a class="ms-report" href={report} target="_blank" rel="noopener">Crucible report</a>
+                {report && (Array.isArray(report)
+                  ? report.map(([lbl, href]) => (
+                      <a class="ms-report" href={href} target="_blank" rel="noopener">{lbl}</a>
+                    ))
+                  : <a class="ms-report" href={report} target="_blank" rel="noopener">Crucible report</a>
                 )}
               </li>
             ))
@@ -337,7 +342,7 @@ const description =
           <aside class="note">
             <h3>You’re early — and that’s the point</h3>
             <p>
-              M0, M1 and M2 have shipped (v0.2.0) — real, tested code — but it’s still early: most
+              M0, M1 and M2 have shipped (v0.2.1) — real, tested code — but it’s still early: most
               milestones are ahead and it isn’t production-ready yet, so try it in a sandbox, keep
               your existing backups, and use it at your own risk. It’s
               provided <strong>as-is under Apache-2.0</strong>, without warranty. If the direction
@@ -351,7 +356,7 @@ const description =
       <!-- ───────────────────────── cta ───────────────────────── -->
       <section class="cta">
         <h2>Follow the build</h2>
-        <p>The specifications, 16 decision records and self-service &amp; admin restore (v0.2.0) are public. Manifests &amp; cluster-scoped DR are next.</p>
+        <p>The specifications, 16 decision records and self-service &amp; admin restore (v0.2.1) are public. Manifests &amp; cluster-scoped DR are next.</p>
         <div class="hero-cta">
           <a class="btn btn-primary" href={links.gh} target="_blank" rel="noopener">
             <span class="star">★</span> Star / watch on GitHub

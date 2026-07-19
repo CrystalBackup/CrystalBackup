@@ -1,0 +1,490 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Crystal Backup — Crucible M2.1 Hardening Report</title>
+<style>
+  :root {
+    --paper: #f6f8f9;
+    --panel: #ffffff;
+    --ink: #0f1620;
+    --muted: #59636e;
+    --faint: #8b96a1;
+    --line: #e2e7ec;
+    --line-strong: #d0d8de;
+    --steel: #35607a;        /* structural accent: infra / k8s / links */
+    --steel-soft: #eaf1f5;
+    --pass: #0f9d63;         /* the one bold place: success / verdict */
+    --pass-soft: #e6f5ed;
+    --skip: #8a97a3;         /* label-gated, not a failure */
+    --skip-soft: #eef1f4;
+    --amber: #b6791f;
+    --tag-product: #2a5db0;
+    --tag-product-soft: #e9eff9;
+    --tag-test: #5f6b78;
+    --tag-test-soft: #edf0f3;
+    --shadow: 0 1px 2px rgba(15,22,32,.04), 0 8px 24px rgba(15,22,32,.05);
+
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper: #0c1116;
+      --panel: #121a22;
+      --ink: #e8eef3;
+      --muted: #97a3ae;
+      --faint: #6c7883;
+      --line: #212c35;
+      --line-strong: #2c3a45;
+      --steel: #74a7c8;
+      --steel-soft: #16242e;
+      --pass: #37d18b;
+      --pass-soft: #10241b;
+      --skip: #6c7883;
+      --skip-soft: #171f27;
+      --amber: #d6a24e;
+      --tag-product: #7aa5e8;
+      --tag-product-soft: #16202f;
+      --tag-test: #97a3ae;
+      --tag-test-soft: #1a222a;
+      --shadow: 0 1px 2px rgba(0,0,0,.3), 0 10px 30px rgba(0,0,0,.35);
+    }
+  }
+  :root[data-theme="light"] {
+    --paper: #f6f8f9; --panel: #ffffff; --ink: #0f1620; --muted: #59636e; --faint: #8b96a1;
+    --line: #e2e7ec; --line-strong: #d0d8de; --steel: #35607a; --steel-soft: #eaf1f5;
+    --pass: #0f9d63; --pass-soft: #e6f5ed; --skip: #8a97a3; --skip-soft: #eef1f4;
+    --tag-product: #2a5db0; --tag-product-soft: #e9eff9; --tag-test: #5f6b78; --tag-test-soft: #edf0f3;
+    --shadow: 0 1px 2px rgba(15,22,32,.04), 0 8px 24px rgba(15,22,32,.05);
+  }
+  :root[data-theme="dark"] {
+    --paper: #0c1116; --panel: #121a22; --ink: #e8eef3; --muted: #97a3ae; --faint: #6c7883;
+    --line: #212c35; --line-strong: #2c3a45; --steel: #74a7c8; --steel-soft: #16242e;
+    --pass: #37d18b; --pass-soft: #10241b; --skip: #6c7883; --skip-soft: #171f27;
+    --tag-product: #7aa5e8; --tag-product-soft: #16202f; --tag-test: #97a3ae; --tag-test-soft: #1a222a;
+    --shadow: 0 1px 2px rgba(0,0,0,.3), 0 10px 30px rgba(0,0,0,.35);
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: var(--sans);
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+  .wrap { max-width: 860px; margin: 0 auto; padding: clamp(28px, 5vw, 64px) clamp(18px, 4vw, 40px) 80px; }
+
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 12px;
+    letter-spacing: .14em;
+    text-transform: uppercase;
+    color: var(--steel);
+    margin: 0;
+  }
+
+  /* ── Masthead ─────────────────────────────────────────── */
+  .masthead { border-bottom: 1px solid var(--line); padding-bottom: 26px; }
+  h1 {
+    font-size: clamp(28px, 4.6vw, 40px);
+    line-height: 1.08;
+    letter-spacing: -.02em;
+    text-wrap: balance;
+    margin: 12px 0 8px;
+    font-weight: 680;
+  }
+  .lede { color: var(--muted); font-size: 17px; margin: 0; max-width: 60ch; }
+  .meta {
+    font-family: var(--mono);
+    font-size: 12.5px;
+    color: var(--faint);
+    margin-top: 18px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 18px;
+  }
+  .meta b { color: var(--muted); font-weight: 500; }
+
+  /* ── Verdict ──────────────────────────────────────────── */
+  .verdict {
+    margin: 30px 0;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-left: 3px solid var(--pass);
+    border-radius: 12px;
+    box-shadow: var(--shadow);
+    padding: 22px clamp(18px, 3vw, 28px);
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 20px 26px;
+    align-items: center;
+  }
+  .verdict-badge {
+    display: inline-flex; align-items: center; gap: 9px;
+    font-family: var(--mono); font-weight: 600; font-size: 15px;
+    color: var(--pass);
+    background: var(--pass-soft);
+    border: 1px solid color-mix(in srgb, var(--pass) 28%, transparent);
+    padding: 8px 14px; border-radius: 999px; white-space: nowrap;
+  }
+  .verdict-badge .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--pass); box-shadow: 0 0 0 4px color-mix(in srgb, var(--pass) 18%, transparent); }
+  .metrics { display: flex; flex-wrap: wrap; gap: 10px 30px; align-items: baseline; }
+  .metric { display: flex; flex-direction: column; }
+  .metric .n { font-family: var(--mono); font-size: 26px; font-weight: 620; letter-spacing: -.02em; font-variant-numeric: tabular-nums; line-height: 1; }
+  .metric .n.pass { color: var(--pass); }
+  .metric .n.zero { color: var(--ink); }
+  .metric .n.skip { color: var(--skip); }
+  .metric .k { font-family: var(--mono); font-size: 11px; text-transform: uppercase; letter-spacing: .1em; color: var(--faint); margin-top: 5px; }
+
+  /* ── Prose ────────────────────────────────────────────── */
+  .context { color: var(--muted); font-size: 15.5px; max-width: 66ch; }
+  .context b { color: var(--ink); font-weight: 600; }
+  code { font-family: var(--mono); font-size: .89em; background: var(--steel-soft); color: var(--ink); padding: .1em .38em; border-radius: 5px; }
+
+  h2 {
+    font-size: 13px; font-family: var(--mono); text-transform: uppercase; letter-spacing: .12em;
+    color: var(--steel); font-weight: 600;
+    margin: 0 0 2px;
+  }
+  .group { margin-top: 40px; }
+  .group-head { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; border-bottom: 1px solid var(--line); padding-bottom: 10px; }
+  .group-head .count { font-family: var(--mono); font-size: 12px; color: var(--faint); }
+  .group-note { color: var(--muted); font-size: 13.5px; margin: 8px 0 4px; }
+
+  /* ── Spec rows ────────────────────────────────────────── */
+  ul.specs { list-style: none; margin: 6px 0 0; padding: 0; }
+  ul.specs > li { display: grid; grid-template-columns: 20px 1fr auto; gap: 3px 14px; padding: 14px 0; border-bottom: 1px solid var(--line); }
+  ul.specs > li:last-child { border-bottom: 0; }
+  .check { grid-row: span 2; margin-top: 3px; color: var(--pass); }
+  .check svg { display: block; }
+  .spec-name { font-weight: 560; font-size: 15px; color: var(--ink); }
+  .spec-time { font-family: var(--mono); font-size: 12.5px; color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; grid-row: span 2; align-self: start; margin-top: 2px; }
+  .spec-proves { grid-column: 2 / 3; color: var(--muted); font-size: 13.5px; margin: 0; max-width: 62ch; }
+  .fixflag {
+    display: inline-block; font-family: var(--mono); font-size: 10.5px; letter-spacing: .04em;
+    color: var(--steel); background: var(--steel-soft);
+    border: 1px solid color-mix(in srgb, var(--steel) 22%, transparent);
+    padding: 1px 7px; border-radius: 999px; margin-left: 8px; vertical-align: 1.5px; white-space: nowrap;
+  }
+
+  /* ── Terse preflight rows (infra / m0): self-evident names, no "proves" subtext ─ */
+  ul.specs.terse > li { grid-template-columns: 20px 1fr auto; align-items: baseline; padding: 11px 0; }
+  ul.specs.terse .check, ul.specs.terse .spec-time, ul.specs.terse .skip-mark { grid-row: auto; margin-top: 0; }
+  ul.specs.terse .spec-name { font-weight: 520; }
+  .skip-mark { color: var(--skip); display: inline-flex; }
+  .skip-mark svg { display: block; }
+  li.skipped .spec-name { color: var(--muted); }
+  .spec-time.skip { color: var(--skip); }
+
+  /* ── Caught / fixes ───────────────────────────────────── */
+  .caught { margin-top: 48px; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: clamp(20px, 3vw, 30px); box-shadow: var(--shadow); }
+  .flow { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin: 14px 0 6px; font-family: var(--mono); font-size: 13px; }
+  .runpill { display: inline-flex; align-items: baseline; gap: 8px; padding: 8px 14px; border-radius: 10px; border: 1px solid var(--line-strong); background: var(--paper); font-variant-numeric: tabular-nums; }
+  .runpill .lab { color: var(--faint); font-size: 11px; text-transform: uppercase; letter-spacing: .08em; }
+  .runpill .sc { font-weight: 600; }
+  .runpill.r1 .sc { color: var(--amber); }
+  .runpill.r2 .sc { color: var(--ink); }
+  .runpill.r3 .sc { color: var(--pass); }
+  .arrow { color: var(--faint); }
+  .flow .legend { color: var(--faint); font-size: 11.5px; }
+  .wave { font-family: var(--mono); font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: var(--faint); margin: 22px 0 2px; }
+  .fixes { display: grid; gap: 12px; margin-top: 12px; }
+  @media (min-width: 620px) { .fixes { grid-template-columns: 1fr 1fr 1fr; } }
+  .fix { border: 1px solid var(--line); border-radius: 10px; padding: 15px 16px; background: var(--paper); }
+  .fix .tag { display: inline-block; font-family: var(--mono); font-size: 10.5px; letter-spacing: .04em; text-transform: uppercase; padding: 2px 8px; border-radius: 999px; margin-bottom: 9px; }
+  .fix.product .tag { color: var(--tag-product); background: var(--tag-product-soft); }
+  .fix.test .tag { color: var(--tag-test); background: var(--tag-test-soft); }
+  .fix h3 { font-size: 14px; margin: 0 0 5px; font-weight: 620; }
+  .fix p { margin: 0; font-size: 13px; color: var(--muted); }
+  .fix .sha { font-family: var(--mono); font-size: 11.5px; color: var(--faint); margin-top: 9px; }
+
+  /* ── Environment ──────────────────────────────────────── */
+  .env { margin-top: 44px; }
+  .kv { display: grid; grid-template-columns: 1fr; gap: 0; margin-top: 8px; border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+  @media (min-width: 620px) { .kv { grid-template-columns: 1fr 1fr; } }
+  .kv > div { display: grid; grid-template-columns: 128px 1fr; gap: 14px; padding: 12px 16px; border-bottom: 1px solid var(--line); background: var(--panel); }
+  .kv > div:nth-last-child(-n+1) { border-bottom: 0; }
+  @media (min-width: 620px) { .kv > div:nth-last-child(-n+2) { border-bottom: 0; } .kv > div:nth-child(odd) { border-right: 1px solid var(--line); } }
+  .kv dt { font-family: var(--mono); font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--faint); margin: 2px 0 0; }
+  .kv dd { margin: 0; font-size: 13.5px; }
+  .kv dd .m { font-family: var(--mono); font-size: 12.5px; word-break: break-all; }
+  .kv .swatch { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 7px; vertical-align: 1px; }
+
+  .foot { margin-top: 40px; padding-top: 20px; border-top: 1px solid var(--line); color: var(--faint); font-size: 13px; }
+  .foot code { background: var(--skip-soft); }
+</style>
+
+</head>
+<body>
+<div class="wrap">
+  <header class="masthead">
+    <p class="eyebrow">Crystal Backup · Crucible acceptance</p>
+    <h1>Milestone&nbsp;M2.1 — Hardening</h1>
+    <p class="lede">The re-run that gates the 0.2.1 security- &amp; resilience-hardening patch: the full M0+M1+M2 suite on a live cluster and object store, plus a new regression proving the fixed cross-namespace collision defect stays fixed — byte-verified against the seed, not envtest, not mocks.</p>
+    <div class="meta">
+      <span><b>Run</b> 0.2.1 hardening · full suite</span>
+      <span><b>Date</b> 2026-07-19</span>
+      <span><b>Suite</b> ginkgo · infra + m0 + m1 + m2</span>
+      <span><b>Duration</b> 32m21s</span>
+    </div>
+  </header>
+
+  <section class="verdict" aria-label="Verdict">
+    <span class="verdict-badge"><span class="dot"></span>PASS · gate met</span>
+    <div class="metrics">
+      <div class="metric"><span class="n pass">31</span><span class="k">Passed</span></div>
+      <div class="metric"><span class="n zero">0</span><span class="k">Failed</span></div>
+      <div class="metric"><span class="n" style="color:var(--skip)">1</span><span class="k">Skipped</span></div>
+      <div class="metric"><span class="n zero" style="font-size:20px">32m21s</span><span class="k">Wall clock</span></div>
+    </div>
+  </section>
+
+  <p class="context">
+    The crucible runs an <b>independent restic oracle</b> — a throwaway Job running the plain <code>restic</code> CLI against the same S3 repository, wrapped-DEK password and credentials the operator uses — and byte-verifies every restored volume against the seed&rsquo;s <code>sha256sum</code> manifest. A controller that both <b>writes and reports the same wrong thing</b> cannot make a check pass. This run re-validates the <b>0.2.1 hardening patch</b> that followed a full audit of the M0–M2 code: platform health, M0 install, every M1 criterion (now including a <b>same-named-PVC collision</b> regression for the patch&rsquo;s critical fix), and the five M2 restore acceptance tests — on real Ceph&nbsp;RBD / Longhorn / local-path volumes and Hetzner Object Storage, one live cluster. The single skip is the operator-readiness check, which is label-gated on a <em>released</em> image (the run used a <code>:dev</code> build); the operator ran healthy throughout.
+  </p>
+
+  <section class="group">
+    <div class="group-head"><h2>Platform <span style="color:var(--faint)">[infra]</span></h2><span class="count">8 / 8</span></div>
+    <p class="group-note">Is the live cluster itself healthy enough to trust the rest? These run before any Crystal Backup object exists.</p>
+    <ul class="specs terse">
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">All nodes Ready with the expected roles</span>
+        <span class="spec-time">200ms</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">The four storage classes exposed (ceph-block default)</span>
+        <span class="spec-time">200ms</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">Snapshot classes present for the snapshot-capable drivers</span>
+        <span class="spec-time">100ms</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">Ceph reports HEALTH_OK (via the rook toolbox)</span>
+        <span class="spec-time">1.1s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">The Hetzner Object Storage backup bucket is reachable</span>
+        <span class="spec-time">800ms</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">Provisions and snapshots a ceph-block volume</span>
+        <span class="spec-time">20.6s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">Provisions and snapshots a longhorn volume</span>
+        <span class="spec-time">20.5s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">Provisions a local-path volume (the class without snapshot support)</span>
+        <span class="spec-time">10.4s</span>
+      </li>
+    </ul>
+  </section>
+
+  <section class="group">
+    <div class="group-head"><h2>Install <span style="color:var(--faint)">[m0]</span></h2><span class="count">3 / 4 · 1 skipped</span></div>
+    <p class="group-note">Are the CRDs and the Helm chart correctly installed on a real cluster? This 0.2.1 gate ran on a <code>:dev</code> build (the release did not exist yet), so the operator-readiness probe — which is label-gated on a <em>released</em> image — is skipped; the operator ran healthy (1/1 Ready) throughout.</p>
+    <ul class="specs terse">
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">All 12 CRDs Established</span>
+        <span class="spec-time">600ms</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">Chart artifacts present (namespace, deployment, RBAC, service account)</span>
+        <span class="spec-time">300ms</span>
+      </li>
+      <li>
+        <span class="skip-mark" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M5 9h8" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></span>
+        <span class="spec-name" style="color:var(--muted)">Runs the operator — <em>skipped</em>: label-gated on a released image (this gate ran a <code>:dev</code> build; the operator was 1/1 Ready)</span>
+        <span class="spec-time" style="color:var(--skip)">skipped</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">Creates, reads back and deletes a minimal CR of each of the 12 kinds</span>
+        <span class="spec-time">3s</span>
+      </li>
+    </ul>
+  </section>
+
+  <section class="group">
+    <div class="group-head"><h2>M1 · Non-regression</h2><span class="count">15 / 15</span></div>
+    <p class="group-note">Every M1 acceptance criterion re-run on the same cluster — the core engine and cluster-DR plane still hold — plus one <b>new</b> regression added by the 0.2.1 patch for the critical cross-namespace collision fix.</p>
+    <ul class="specs terse">
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">A ClusterBackupLocation provisions one initialized shared repository</span>
+        <span class="spec-time">16.1s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">The shared repository is initialized exactly once, even under concurrent reconciles</span>
+        <span class="spec-time">30.6s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">Only one ClusterBackupLocation may be the default</span>
+        <span class="spec-time">200ms</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">A ClusterBackupSchedule fans out a Backup into every matched namespace</span>
+        <span class="spec-time">6m3.3s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">Every snapshottable PVC lands in the shared repository with the correct restic identity</span>
+        <span class="spec-time">20.5s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">A volume on storage without snapshot support is Skipped, not Failed</span>
+        <span class="spec-time">100ms</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">A namespace with no PVC completes cleanly</span>
+        <span class="spec-time">800ms</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">Leak-check — a run leaves zero residual snapshot objects</span>
+        <span class="spec-time">5m22.8s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">The operator killed mid-run converges via Job re-adoption</span>
+        <span class="spec-time">3m48.1s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">An OOMKilled mover is reported as a failure, not a silent success</span>
+        <span class="spec-time">51.8s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">Discovery projects a Backup per (namespace, run) into existing namespaces</span>
+        <span class="spec-time">2m33.7s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">A projected Backup is a view, not the source of truth</span>
+        <span class="spec-time">2m44.2s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">kubectl get backups lists exactly the restorable set</span>
+        <span class="spec-time">29.2s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">Restores a data snapshot straight from S3 and byte-verifies it against the seed</span>
+        <span class="spec-time">28.3s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name"><span class="tag" style="margin-right:8px; color:var(--tag-product); background:var(--tag-product-soft);">0.2.1</span>Same-named PVCs in two namespaces of one run back up to <b>distinct</b> snapshots (the fixed collision)</span>
+        <span class="spec-time">27.8s</span>
+      </li>
+    </ul>
+  </section>
+
+  <section class="group">
+    <div class="group-head"><h2>M2 · Restore</h2><span class="count">5 / 5</span></div>
+    <p class="group-note">The milestone: self-service and admin restore on real Ceph RBD — every mode and selection byte-verified against the seed, the tamper caught fail-closed, and a deleted namespace brought back from the repository alone.</p>
+    <ul class="specs">
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">Parks without a confirmation, then Overwrite-restores while keeping local extras (R23 + Overwrite)</span>
+        <span class="spec-time">1m3.4s</span>
+        <p class="spec-proves">R23 parks the restore until <code>spec.confirmation</code> equals the namespace; Overwrite then heals the seeded files (a corrupted one is restored) and <b>keeps</b> a local-only file the backup never knew — verified with <code>sha256sum -c</code>.</p>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">Partial-restores ONLY the selected file (R7)</span>
+        <span class="spec-time">41.7s</span>
+        <p class="spec-proves">A file-level <code>include</code> restores exactly the one selected file; every other file in the PVC is left untouched.</p>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">Recreate-restores to an EXACT match (extras removed)</span>
+        <span class="spec-time">31s</span>
+        <p class="spec-proves">Recreate (<code>restic restore --delete</code>) reconciles the volume to the snapshot exactly — the seeded files match and the local extra is gone.</p>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">Fails CLOSED when a tampered projection points at another namespace&rsquo;s run (R14)</span>
+        <span class="spec-time">6s</span>
+        <p class="spec-proves">A forged cluster-origin projection claiming another namespace&rsquo;s run is caught <b>fail-closed</b> by defense in depth — discovery prunes the fake (no matching repository snapshots), the mediated <code>namespace=</code> filter backs it up — and never borrows the foreign snapshot.</p>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">Restores the repo coordinate into a freshly-created namespace, PVC sized from the snapshot tags, data byte-identical</span>
+        <span class="spec-time">1m38.2s</span>
+        <p class="spec-proves">The exit criterion: a deleted namespace is reconstituted from the repository coordinate alone — the target namespace and its PVC are recreated (sized from the <code>pvcsize</code>/<code>pvcclass</code>/<code>pvcmodes</code> snapshot tags) via the <b>pvc-transplant</b> handover, and the data comes back byte-for-byte.</p>
+      </li>
+    </ul>
+  </section>
+
+  <section class="caught">
+    <p class="eyebrow">What the crucible caught</p>
+    <h2 style="color:var(--ink); text-transform:none; font-family:var(--sans); font-size:19px; letter-spacing:-.01em; margin:8px 0 2px;">A full audit of M0–M2 — then this gate proving the fixes hold</h2>
+    <p class="context" style="margin-top:6px;">After M2 shipped, a read-only audit swept the M0–M2 code on five axes: adequacy to spec, code quality, attack / algorithmic / resilience security, and multi-tenant isolation. The tenant-isolation <b>read</b> boundary (the non-forgeable <code>namespace=</code> mediation) and the crypto core came back sound. But it found one <b>critical</b> data-integrity defect in the backup fan-out and three <b>high</b>-severity correctness / security gaps. All were fixed, re-run through the offline gate (unit + envtest + lint, all green), and then re-validated here on real Ceph — <b>first pass, no iteration</b> — including a purpose-built regression the standard seed could never trigger.</p>
+    <div class="flow">
+      <span class="runpill r1"><span class="lab">audit · findings</span><span class="sc">1 critical · 3 high · M/L</span></span>
+      <span class="arrow">→</span>
+      <span class="runpill r2"><span class="lab">fix · offline gate</span><span class="sc">unit + envtest + lint ✓</span></span>
+      <span class="arrow">→</span>
+      <span class="runpill r3"><span class="lab">crucible · 0.2.1</span><span class="sc">31&nbsp;·&nbsp;0&nbsp;·&nbsp;1</span></span>
+      <span class="legend">passed · failed · skipped</span>
+    </div>
+
+    <div class="fixes">
+      <div class="fix product">
+        <span class="tag">critical · C1</span>
+        <h3>Cross-namespace mover name collision</h3>
+        <p>A cluster-DR run fans out one child <code>Backup</code> of the same name into every namespace, and its per-PVC objects share the operator namespace. Named only from <code>(backup, pvc)</code>, two namespaces with a same-named PVC (<code>data</code>, …) collided — the second silently adopted the first&rsquo;s Job, its own volume never backed up. Names are now namespace-qualified. The seed uses distinct PVC names, so a bespoke <b>same-name-in-two-namespaces</b> spec was added — it passes here on real Ceph.</p>
+        <p class="sha">21cf97f</p>
+      </div>
+      <div class="fix product">
+        <span class="tag">high · H1</span>
+        <h3>Mutable repository identity &amp; mode</h3>
+        <p>A location&rsquo;s <code>clusterID</code>/<code>s3.*</code> and <code>mode</code> had no immutability guard — editing them silently re-points the location at a different repository (orphaning every backup) or downgrades WORM. Pinned with update-only CEL, with an envtest.</p>
+        <p class="sha">e0b3e1e</p>
+      </div>
+      <div class="fix product">
+        <span class="tag">high · H2 / H3</span>
+        <h3>Lock-strip race &amp; cross-location GC</h3>
+        <p>The mover⇄unlock quiescence check and Job create weren&rsquo;t atomic, so a stale-lock <code>unlock --remove-all</code> could strip a live mover&rsquo;s lock (create-then-verify closes it). And discovery&rsquo;s projection GC ran cluster-wide, so two locations deleted each other&rsquo;s projections (now location-scoped).</p>
+        <p class="sha">61ecbf8 · e932a8c</p>
+      </div>
+      <div class="fix" style="border-style:dashed; background:transparent;">
+        <span class="tag" style="color:var(--faint); background:var(--skip-soft);">why it matters</span>
+        <h3 style="font-weight:560;">Green offline ≠ correct</h3>
+        <p>The critical collision compiled, linted and passed the full envtest + kind e2e suites — latent only because the seed happens to use distinct PVC names per namespace. A field-shaped regression on real storage is what pins it.</p>
+      </div>
+    </div>
+  </section>
+
+  <p class="foot">
+    <b>One conditional skip —</b> the M0 operator-readiness probe is label-gated on a <em>released</em> operator image; this gate ran a throwaway <code>:dev</code> build (the <code>v0.2.1</code> release is cut from this same commit), so it skipped — the operator itself was 1/1 Ready throughout. Medium/low audit items and the deferred hardening (mover credential scoping / I4, dedicated mover ServiceAccount) are tracked in the <code>CHANGELOG</code>. · Report generated from <code>test/crucible/artifacts/crucible-report.md</code>.
+  </p>
+
+</div>
+</body>
+</html>
