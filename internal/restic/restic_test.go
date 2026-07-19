@@ -438,6 +438,7 @@ func TestForgetArgs(t *testing.T) {
 			"--keep-weekly", "4",
 			"--keep-monthly", "5",
 			"--keep-yearly", "6",
+			"--retry-lock", "5m",
 		)
 		if got := ForgetArgs(r); !reflect.DeepEqual(got, want) {
 			t.Fatalf("ForgetArgs = %#v, want %#v", got, want)
@@ -446,7 +447,7 @@ func TestForgetArgs(t *testing.T) {
 
 	t.Run("subset keeps only the set fields, in order", func(t *testing.T) {
 		r := v1alpha1.RetentionSpec{KeepDaily: 7, KeepYearly: 2}
-		want := append(append([]string{}, base...), "--keep-daily", "7", "--keep-yearly", "2")
+		want := append(append([]string{}, base...), "--keep-daily", "7", "--keep-yearly", "2", "--retry-lock", "5m")
 		if got := ForgetArgs(r); !reflect.DeepEqual(got, want) {
 			t.Fatalf("ForgetArgs = %#v, want %#v", got, want)
 		}
@@ -464,7 +465,7 @@ func TestForgetArgs(t *testing.T) {
 
 	t.Run("non-positive fields are skipped, never emit a negative keep", func(t *testing.T) {
 		r := v1alpha1.RetentionSpec{KeepLast: -5, KeepDaily: 3}
-		want := append(append([]string{}, base...), "--keep-daily", "3")
+		want := append(append([]string{}, base...), "--keep-daily", "3", "--retry-lock", "5m")
 		if got := ForgetArgs(r); !reflect.DeepEqual(got, want) {
 			t.Fatalf("ForgetArgs = %#v, want %#v", got, want)
 		}
@@ -495,6 +496,10 @@ func TestForgetArgsProperty(t *testing.T) {
 			if p.n > 0 {
 				want = append(want, "--keep-"+p.bucket, strconv.FormatInt(int64(p.n), 10))
 			}
+		}
+		// A non-degenerate forget (at least one positive keep) rides out a live mover's lock.
+		if len(want) > 0 {
+			want = append(want, "--retry-lock", "5m")
 		}
 		got := args[4:]
 		if len(got) != len(want) { // avoid the nil-vs-empty-slice DeepEqual pitfall

@@ -1,6 +1,6 @@
 # Crystal Backup
 
-> **Early, real code** — **M0, M1 and M2 have shipped (v0.2.0)**: the core backup engine,
+> **Early, real code** — **M0, M1 and M2 have shipped (v0.2.1)**: the core backup engine,
 > cluster disaster recovery and **restore** are implemented, tested (envtest + kind e2e + a
 > real-cluster crucible suite) and released; most milestones are still ahead. Built in the
 > open with AI assistance. Background & disclaimer: [Project status & disclaimer](#-project-status--disclaimer).
@@ -24,7 +24,7 @@ is restorable, with no pre-existing custom resources and no surviving cluster re
 
 ## ⚠️ Project status & disclaimer
 
-**M0, M1 and M2 have shipped (v0.2.0)** — the core engine, cluster disaster recovery and
+**M0, M1 and M2 have shipped (v0.2.1)** — the core engine, cluster disaster recovery and
 restore are real, tested code — but most of the [roadmap](#roadmap) is still ahead, so this is
 **early and experimental**. Specs, Architecture Decision Records (ADRs) and the roadmap remain
 public and lead the code. It's built in the open, so you can follow — and shape — it as it happens.

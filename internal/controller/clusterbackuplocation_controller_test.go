@@ -116,6 +116,37 @@ func createTestLocation(loc *cbv1.ClusterBackupLocation) {
 
 var _ = Describe("ClusterBackupLocationReconciler", func() {
 
+	It("rejects mutating the repository identity or mode (CEL immutability), but allows retention edits", func() {
+		const name = "cbl-immutable"
+		createKEKSecret("kek-immutable", generateAgeIdentity())
+		createS3CredsSecret("s3-immutable")
+		createTestLocation(newTestLocation(name, "kek-immutable", "s3-immutable", false))
+
+		// A helper that re-Gets the location, applies a mutation, and returns the Update error.
+		mutate := func(f func(l *cbv1.ClusterBackupLocation)) error {
+			var l cbv1.ClusterBackupLocation
+			Expect(k8sClient.Get(ctx, client.ObjectKey{Name: name}, &l)).To(Succeed())
+			f(&l)
+			return k8sClient.Update(ctx, &l)
+		}
+
+		By("mode, clusterID and the s3 identity fields are immutable")
+		Expect(mutate(func(l *cbv1.ClusterBackupLocation) { l.Spec.Mode = cbv1.LocationModeImmutable })).
+			To(HaveOccurred(), "flipping spec.mode must be rejected (WORM downgrade / R18)")
+		Expect(mutate(func(l *cbv1.ClusterBackupLocation) { l.Spec.ClusterID = "different-cluster" })).
+			To(HaveOccurred(), "changing spec.clusterID must be rejected (silent repository re-point)")
+		Expect(mutate(func(l *cbv1.ClusterBackupLocation) { l.Spec.S3.Bucket = "other-bucket" })).
+			To(HaveOccurred(), "changing spec.s3.bucket must be rejected (repository identity)")
+		Expect(mutate(func(l *cbv1.ClusterBackupLocation) { l.Spec.S3.Endpoint = "https://other.example.test" })).
+			To(HaveOccurred(), "changing spec.s3.endpoint must be rejected (repository identity)")
+		Expect(mutate(func(l *cbv1.ClusterBackupLocation) { l.Spec.S3.Prefix = "different-prefix" })).
+			To(HaveOccurred(), "adding/changing spec.s3.prefix must be rejected (repository identity)")
+
+		By("a mutable field (retention) still updates — the rule is scoped, not a blanket freeze")
+		Expect(mutate(func(l *cbv1.ClusterBackupLocation) { l.Spec.Retention = cbv1.RetentionSpec{KeepDaily: 14} })).
+			To(Succeed(), "retention must remain editable on an existing location")
+	})
+
 	It("provisions an owned BackupRepository and reports Ready for a valid location", func() {
 		const name = "cbl-happy"
 		createKEKSecret("kek-happy", generateAgeIdentity())

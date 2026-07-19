@@ -33,9 +33,14 @@ type ClusterErasureSpec struct {
 	Target ErasureTarget `json:"target"`
 
 	// confirmation must equal the target identity (tenant, namespace, or <namespace>/<pvc>; R23).
-	// +required
-	// +kubebuilder:validation:MinLength=1
-	Confirmation string `json:"confirmation"`
+	// Optional (not required) on purpose, mirroring Restore/ClusterRestore: an ABSENT/empty value is
+	// admitted so the controller can park the erasure in phase AwaitingConfirmation until the operator
+	// edits it in — the deliberate two-step for the destructive path. A required+MinLength=1 field
+	// would be rejected by the API server's structural schema BEFORE the confirmation VAP runs, making
+	// the AwaitingConfirmation phase unreachable and contradicting the admission policy (which admits
+	// empty and denies only a non-matching non-empty value).
+	// +optional
+	Confirmation string `json:"confirmation,omitempty"`
 }
 
 // ClusterErasureStatus is the observed state of a ClusterErasure. On Immutable

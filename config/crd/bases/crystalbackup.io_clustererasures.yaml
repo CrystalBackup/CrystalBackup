@@ -53,9 +53,14 @@ spec:
             description: spec defines the desired state of ClusterErasure
             properties:
               confirmation:
-                description: confirmation must equal the target identity (tenant,
-                  namespace, or <namespace>/<pvc>; R23).
-                minLength: 1
+                description: |-
+                  confirmation must equal the target identity (tenant, namespace, or <namespace>/<pvc>; R23).
+                  Optional (not required) on purpose, mirroring Restore/ClusterRestore: an ABSENT/empty value is
+                  admitted so the controller can park the erasure in phase AwaitingConfirmation until the operator
+                  edits it in — the deliberate two-step for the destructive path. A required+MinLength=1 field
+                  would be rejected by the API server's structural schema BEFORE the confirmation VAP runs, making
+                  the AwaitingConfirmation phase unreachable and contradicting the admission policy (which admits
+                  empty and denies only a non-matching non-empty value).
                 type: string
               locationRef:
                 description: locationRef is the ClusterBackupLocation to erase from.
@@ -84,7 +89,6 @@ spec:
                     type: string
                 type: object
             required:
-            - confirmation
             - locationRef
             - target
             type: object

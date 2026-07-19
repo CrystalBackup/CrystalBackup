@@ -4,6 +4,80 @@ All notable changes to Crystal Backup. Versioning follows
 [adr/0014](spec/adr/0014-versioning-and-release.md): milestone `Mn` → minor `0.n.z` on
 major 0; `1.0.0` is a deliberate post-M9 API-stability decision.
 
+## 0.2.1 — M2 hardening (2026-07-19)
+
+A security- and resilience-hardening patch from a full read-only audit of the M0–M2 code
+(adequacy to spec, code quality, attack/algorithmic/resilience security, multi-tenant
+isolation). The tenant-isolation *read* boundary (the I1 `namespace=` mediation) and the
+crypto core were found sound; the fixes below close one critical data-integrity defect in the
+backup fan-out, three high-severity correctness/security gaps, and a set of medium/low items.
+
+### Fixed
+
+- **Cross-namespace mover object-name collision (critical, data loss).** A cluster-DR run fans
+  out one child `Backup` of the same name into every matched namespace, and every per-PVC
+  mover/exposure object (mover Job, creds Secret, temp clone PVC, static VolumeSnapshot, and the
+  cluster-scoped VolumeSnapshotContent) lived in the shared operator namespace named only from
+  `(backup, pvc)`. Two namespaces holding a same-named PVC (`data`, `redis-data`, …) in one run
+  derived colliding names; because every create tolerates `AlreadyExists`, the second namespace
+  silently adopted the first's Job/exposure — its PVC never backed up, its `Backup` falsely
+  recording the first's snapshot or hanging. Names are now namespace-qualified. The restic
+  snapshot itself was always correct (namespace-scoped identity); only the k8s object names
+  lacked the qualifier. New unit + crucible regressions (a homonym PVC in two namespaces of one
+  run) cover it — the seed uses distinct PVC names, so the full suite never exercised it.
+- **`[Cluster]BackupLocation` repository identity and mode were mutable (high).** `spec.mode`
+  and the identity fields (`clusterID`, `s3.endpoint/bucket/prefix`) had no immutability guard:
+  editing an identity field silently re-points the location at a different repository (orphaning
+  every backup), and flipping `mode` Immutable→Standard defeats the R18 WORM intent by
+  re-enabling prune/forget. Now pinned with update-only CEL, with an envtest.
+- **`mover⇄unlock` mutex TOCTOU (high, repo corruption).** The quiescence gate and the mover Job
+  create were not atomic, so a stale-lock `unlock --remove-all` could strip a freshly-created
+  backup mover's repository lock (the drain census lags the cache). The controller now
+  re-verifies quiescence after a fresh create and undoes it if a lock-removal is pending.
+- **Discovery projection GC deleted other locations' projections (high).** `gcProjections` ran
+  cluster-wide; with ≥2 `ClusterBackupLocation`s each location's discovery deleted the other's
+  projections every pass. GC is now scoped to the reconciled location, with an envtest.
+- **No restore progress deadline (medium, liveness).** A restore mover whose pod never starts (a
+  twin pinned to a departed node, an unprovisionable staging PVC) wedged the restore in `Running`
+  forever and, counting in the shared mover census, blocked the repository's maintenance drain.
+  Such a volume now settles `Failed`/`RestoreTimedOut` past a per-volume deadline measured from
+  pod creation, applied only while the pod has never started — a legitimately long restore is
+  never timed out. Decision unit-tested with an injected clock.
+- **`ClusterErasure.spec.confirmation` was required (medium).** Being `+required`+`MinLength=1`,
+  the structural schema rejected an empty value before the confirmation VAP ran, making the
+  documented `AwaitingConfirmation` park-then-confirm flow unreachable. Now optional, matching
+  `Restore`/`ClusterRestore`.
+- **Unanchored `source.time` CEL regex (medium).** The RFC3339 regex had no end anchor, so a
+  malformed value was admitted and then reported with a misleading "not projected yet" gate
+  forever. The regex is anchored, and both restore controllers now gate an unparseable instant
+  (including a shape-valid but impossible date) with a distinct `InvalidSourceTime` reason.
+- **Swallowed `List` errors in restore teardown (medium).** The residue sweep ignored `List`
+  failures before removing the finalizer; they are now logged (the orphan reaper still backstops).
+- **Retention `forget` missing `--retry-lock` (medium).** On a busy shared repo `forget` failed
+  the instant another namespace's mover held the lock, silently dropping retention; it now waits.
+- **Hardening (low).** Orphan reaper selects candidates by a positive per-PVC label so the
+  wrapped-DEK Secret is never a reap candidate; `Restore`/`ClusterRestore` `spec.resources` gain
+  `MaxItems`; docs corrected (`02-api` namespace-selector prose).
+
+### Changed
+
+- **Docs: mover credential scoping (I4) is stated as not-yet-implemented.** The escrow package
+  doc and `03-security-and-tenancy.md` §4 read as if movers held repo-prefix-scoped credentials;
+  in fact every mover receives the location's **root** S3 credentials (STS / per-repo keys are
+  deferred to M6). The invariant now carries an explicit M0–M2 status note: a compromised mover's
+  blast radius is the whole bucket (a leaked-Job-credential threat, not a namespace-user vector —
+  I1/I5/I6 still confine namespace users), and the escrow's protection is the KEK, not the S3 path.
+
+### Deferred (tracked, not in this patch)
+
+- Per-repo mover credential scoping (invariant I4) — an M6 hardening item (STS `AssumeRole` or
+  RGW static per-repo keys). Until then the mover blast radius is documented as the whole bucket.
+- A dedicated tokenless `crystal-mover` ServiceAccount (movers run under the operator-namespace
+  `default` SA with `automountServiceAccountToken: false`, so I6 — zero API access — already
+  holds; the dedicated SA is defense in depth).
+- An `ownerReference`/TTL backstop on the maintenance creds Secret, and an injectable clock for
+  the orphan reaper — both low-severity.
+
 ## 0.2.0 — M2 “Restore” (2026-07-18)
 
 The restore milestone (R2 cornerstone, R6, R7, R14, R23): everything a backup wrote in M1

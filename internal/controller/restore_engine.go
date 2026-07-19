@@ -25,6 +25,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -32,6 +33,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/clock"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -164,6 +166,9 @@ type restoreEngine struct {
 	OperatorNamespace string
 	MoverImage        string
 	Queue             *queue.Manager
+	// Clock is the only source of "now" for the per-volume progress deadline: clock.RealClock in
+	// production, a fake clock in tests (determinism, CLAUDE.md golden rule 1).
+	Clock clock.PassiveClock
 
 	// resolved caches one mediated snapshot resolution per owner (adr/0016 §3): the listing
 	// Job is seconds, the reconcile poll is 5s, so resolution runs once per (owner, run) and
@@ -189,6 +194,18 @@ type restoreEngine struct {
 // maxVolumeAdviseErrors is how many consecutive reconcile-visible errors one volume may
 // produce before it is settled as failed (~5 minutes at the 5s poll, more under backoff).
 const maxVolumeAdviseErrors = 60
+
+// restoreVolumeDeadline bounds how long a restore mover pod may stay UNSTARTED (Pending) before its
+// volume is settled Failed/RestoreTimedOut — the liveness backstop the resilience audit flagged. A
+// mover that never terminates (a twin pinned to a departed/NotReady node, a staging PVC that never
+// provisions, a refused second RWO attach) would otherwise hold the volume in Running forever AND,
+// because restore movers count in the shared mover census (listMoverJobs), block the repository's
+// exclusive-maintenance drain and consume a cluster-wide mover slot indefinitely — one wedged
+// restore volume degrading backups and maintenance for the whole repository. The deadline is
+// measured from the POD's creation and applies ONLY while the pod has never started running, so a
+// legitimately long restic restore (large PVC, slow S3) keeps its pod Running and is never timed
+// out, however long it takes.
+const restoreVolumeDeadline = 30 * time.Minute
 
 // restoreOwnerMoverCap bounds how many of ONE owner's restore movers run at once: a
 // many-volume ClusterRestore must not stampede node attach limits and the S3 endpoint with
@@ -216,6 +233,7 @@ func newRestoreEngine(c client.Client, secretsReader *clientsecrets.ByNameReader
 		OperatorNamespace: operatorNamespace,
 		MoverImage:        moverImage,
 		Queue:             q,
+		Clock:             clock.RealClock{},
 		resolved:          make(map[types.UID]resolvedSnapshots),
 		pinnedSource:      make(map[types.UID]string),
 		unlockOnce:        make(map[string]struct{}),
@@ -471,6 +489,42 @@ func (e *restoreEngine) deleteJobPods(ctx context.Context, jobName string) {
 	}
 }
 
+// moverStuckPending reports whether the restore mover Job's pod(s) have been stuck UNSTARTED
+// (Pending) past restoreVolumeDeadline. It lists the Job's pods (label batchv1.JobNameLabel) and
+// delegates the decision to the pure moverPodsStalled. Fails SAFE: a list error, or no pod yet,
+// returns false — the deadline is a backstop, never a hair-trigger that could fail a healthy
+// restore.
+func (e *restoreEngine) moverStuckPending(ctx context.Context, jobName string) bool {
+	var pods corev1.PodList
+	if err := e.List(ctx, &pods, client.InNamespace(e.OperatorNamespace),
+		client.MatchingLabels{batchv1.JobNameLabel: jobName}); err != nil {
+		return false
+	}
+	return moverPodsStalled(pods.Items, e.Clock.Now(), restoreVolumeDeadline)
+}
+
+// moverPodsStalled is the pure decision behind the per-volume progress deadline: given all of a
+// mover Job's pods (its attempts) it reports whether the mover is stuck unstarted. It returns false
+// — never a timeout — if ANY pod is Running or Succeeded (real progress), or if there is no pod, or
+// if the oldest pod is younger than the deadline. Only when every pod is unstarted (Pending/Unknown/
+// Failed-not-yet-reaped) AND the oldest has aged past the deadline does it report stalled.
+func moverPodsStalled(pods []corev1.Pod, now time.Time, deadline time.Duration) bool {
+	if len(pods) == 0 {
+		return false
+	}
+	oldest := now
+	for i := range pods {
+		switch pods[i].Status.Phase {
+		case corev1.PodRunning, corev1.PodSucceeded:
+			return false // a pod is (or was) making progress — never time out a working restore.
+		}
+		if t := pods[i].CreationTimestamp.Time; t.Before(oldest) {
+			oldest = t
+		}
+	}
+	return now.Sub(oldest) > deadline
+}
+
 // adviseVolume derives one volume's state from live objects and advances it by at most one
 // step: expose the target, admit + create the mover Job, poll it, then finalize the
 // handover. It never writes CR status (the caller aggregates outcomes and is the single
@@ -492,6 +546,15 @@ func (e *restoreEngine) adviseVolume(ctx context.Context, rc *restoreExecContext
 	complete := job.Status.Succeeded >= 1 || jobConditionTrue(&job, batchv1.JobComplete)
 	failed := jobConditionTrue(&job, batchv1.JobFailed) || job.Status.Failed > restoreMoverBackoffLimit
 	if !complete && !failed {
+		// Liveness backstop: a mover whose pod never starts (unschedulable node pin, unbindable
+		// staging PVC, refused second attach) is settled Failed past the deadline rather than
+		// returning pending forever — otherwise it wedges the restore in Running and, counting in
+		// the shared mover census, blocks the repository's maintenance drain. A pod that is (or was)
+		// Running is progressing and never times out. A stuck pod is still Pending — it never opened
+		// the repository, so no stale-lock unlock is needed (unlike the hard-kill path below).
+		if e.moverStuckPending(ctx, jobName) {
+			return volumeOutcome{settled: true, failed: true, reason: "RestoreTimedOut"}, nil
+		}
 		return volumeOutcome{}, nil // still restoring; requeue.
 	}
 

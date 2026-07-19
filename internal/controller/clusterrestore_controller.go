@@ -130,6 +130,18 @@ func (r *ClusterRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 			"destructive restore confirmed for target namespace %s", cr.Spec.Target.Namespace)
 	}
 
+	// (1b) A time-resolved coordinate whose instant cannot parse can never resolve; gate it with a
+	// distinct, self-diagnosing reason rather than the "RunNotFound" gate below, which would retry
+	// forever with a misleading message. The CRD CEL rejects the common typo, but a shape-valid-yet-
+	// impossible date (e.g. month 13) passes CEL and only fails here, and the VAP can be disabled.
+	// Checked before ensureTargetNamespace so a bad instant never creates the target namespace.
+	if t := cr.Spec.Source.Time; t != "" && t != sourceTimeLatest {
+		if _, ok := parseRestoreTime(t); !ok {
+			return r.gate(ctx, &cr, "InvalidSourceTime",
+				fmt.Sprintf("spec.source.time %q is not \"latest\" or a valid RFC3339 timestamp", t))
+		}
+	}
+
 	// (2) Ensure the target namespace exists (creating it is the DR case's whole point).
 	if res, gated, err := r.ensureTargetNamespace(ctx, &cr); gated || err != nil {
 		return res, err

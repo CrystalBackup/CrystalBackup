@@ -23,6 +23,20 @@ import (
 
 // ClusterBackupLocationSpec defines the platform object storage, platform key
 // and maintenance/verification for the one shared cluster DR repository.
+//
+// The repository IDENTITY and the storage MODE are IMMUTABLE after creation (CEL, update-only):
+// clusterID + s3.endpoint/bucket/prefix compose the repository path the operator re-derives every
+// reconcile (status.repositoryURL = <endpoint>/<bucket>/<prefix>/<clusterID>), so editing any of
+// them post-init would silently re-point the location at a DIFFERENT repository — orphaning every
+// backup taken so far — with no data movement. mode is fixed too: it is an object-lock property
+// chosen at repository creation (adr/0005), and allowing Immutable→Standard would defeat the WORM
+// guarantee (R18) by re-enabling prune/forget on a location provisioned append-only. To change any
+// of these, create a new location.
+// +kubebuilder:validation:XValidation:rule="self.mode == oldSelf.mode",message="spec.mode is immutable (create a new location to change it)"
+// +kubebuilder:validation:XValidation:rule="self.clusterID == oldSelf.clusterID",message="spec.clusterID is immutable (it is the repository path segment; changing it re-points the location at a different repository)"
+// +kubebuilder:validation:XValidation:rule="self.s3.endpoint == oldSelf.s3.endpoint",message="spec.s3.endpoint is immutable (repository identity)"
+// +kubebuilder:validation:XValidation:rule="self.s3.bucket == oldSelf.s3.bucket",message="spec.s3.bucket is immutable (repository identity)"
+// +kubebuilder:validation:XValidation:rule="has(self.s3.prefix) == has(oldSelf.s3.prefix) && (!has(self.s3.prefix) || self.s3.prefix == oldSelf.s3.prefix)",message="spec.s3.prefix is immutable (repository identity)"
 type ClusterBackupLocationSpec struct {
 	// default marks this as the default location; exactly one may be default
 	// (enforced by the operator webhook — admission rule 4).

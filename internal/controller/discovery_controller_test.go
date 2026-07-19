@@ -159,6 +159,48 @@ var _ = Describe("DiscoveryReconciler", func() {
 		}, eventuallyTimeout, eventuallyPoll).Should(Succeed())
 	})
 
+	It("leaves another location's projections alone (multi-location GC isolation)", func() {
+		const loc = "disc-loc-iso"
+		const foreignRun = "disc-run-foreign"
+		seedInitializedRepo(loc, "kek-disc-iso", "s3-disc-iso")
+		createTenantNamespace("disc-iso-ns")
+
+		// A projection owned by a DIFFERENT location's repository. loc's discovery must never GC it,
+		// even though its (namespace, run) is absent from loc's inventory — the other location's own
+		// discovery owns its lifecycle. Before the location-scoped GC, loc's pass would delete it with
+		// a false "its repository snapshots are gone", and the two locations would flap each other's
+		// projections every interval.
+		foreign := &cbv1.Backup{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "disc-iso-ns",
+				Name:      foreignRun,
+				Labels: map[string]string{
+					apiconst.LabelOrigin:        apiconst.OriginCluster,
+					apiconst.LabelClusterBackup: foreignRun,
+					apiconst.LabelNamespace:     "disc-iso-ns",
+				},
+				Annotations: map[string]string{apiconst.AnnotationProjected: apiconst.AnnotationProjectedValue},
+			},
+			Spec: cbv1.BackupSpec{LocationRef: cbv1.LocationReference{Kind: "ClusterBackupLocation", Name: "disc-other-location"}},
+		}
+		Expect(k8sClient.Create(ctx, foreign)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(context.Background(), foreign) })
+
+		// loc's repository holds an unrelated run (never the foreign key), so loc's GC pass sees the
+		// foreign projection as "not in my inventory".
+		discoveryLister.set(discDataSnap("id-iso", "disc-iso-ns", "pvc-z", "disc-run-iso-local"))
+		pokeRepository(loc)
+
+		By("loc's discovery completed a full pass (its OWN projection appears)")
+		Eventually(func(g Gomega) {
+			g.Expect(k8sClient.Get(ctx, client.ObjectKey{Namespace: "disc-iso-ns", Name: "disc-run-iso-local"}, &cbv1.Backup{})).To(Succeed())
+		}, eventuallyTimeout, eventuallyPoll).Should(Succeed())
+
+		By("yet the foreign-location projection is untouched")
+		Expect(k8sClient.Get(ctx, client.ObjectKey{Namespace: "disc-iso-ns", Name: foreignRun}, &cbv1.Backup{})).
+			To(Succeed(), "loc's GC must not delete a projection belonging to another location")
+	})
+
 	It("never touches an in-flight execution Backup, but adopts a terminal one", func() {
 		const loc = "disc-loc-adopt"
 		const run = "disc-run-adopt"
