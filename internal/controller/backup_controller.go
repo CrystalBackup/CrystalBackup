@@ -398,7 +398,7 @@ func (r *BackupReconciler) finalize(ctx context.Context, backup *cbv1.Backup) (c
 					"backup", backup.Name, "pvc", vol.Pvc)
 			}
 		}
-		r.deleteMoverJobAndSecret(ctx, moverNamePrefix(backup.Namespace, backup.Name,vol.Pvc))
+		r.deleteMoverJobAndSecret(ctx, moverNamePrefix(backup.Namespace, backup.Name, vol.Pvc))
 	}
 
 	r.Recorder.Eventf(backup, nil, corev1.EventTypeNormal, "Finalizing", "Finalize",
@@ -588,7 +588,7 @@ func (r *BackupReconciler) advanceSnapshotting(ctx context.Context, backup *cbv1
 	}
 
 	identity := restic.DataIdentity(rc.clusterID, rc.tenant, backup.Namespace, vol.Pvc, rc.scheduleRef, rc.run)
-	prefix := moverNamePrefix(backup.Namespace, backup.Name,vol.Pvc)
+	prefix := moverNamePrefix(backup.Namespace, backup.Name, vol.Pvc)
 	moverName := prefix + "-mover"
 	labels := exposureLabels(backup, vol.Pvc)
 
@@ -755,7 +755,7 @@ func activeMoverCount(ctx context.Context, c client.Client, operatorNamespace st
 // report, which ParseMoverResult surfaces as an error) — Fails the volume with a short,
 // secret-free reason. It returns the PVC name on either terminal outcome to request teardown.
 func (r *BackupReconciler) advanceUploading(ctx context.Context, backup *cbv1.Backup, vol *cbv1.VolumeStatus, rc *backupRunContext) (string, error) {
-	moverName := moverNamePrefix(backup.Namespace, backup.Name,vol.Pvc) + "-mover"
+	moverName := moverNamePrefix(backup.Namespace, backup.Name, vol.Pvc) + "-mover"
 
 	var job batchv1.Job
 	if err := r.Get(ctx, client.ObjectKey{Namespace: r.OperatorNamespace, Name: moverName}, &job); err != nil {
@@ -812,7 +812,7 @@ func (r *BackupReconciler) teardownVolume(ctx context.Context, backup *cbv1.Back
 		logf.FromContext(ctx).Error(err, "best-effort exposure cleanup after mover finish failed",
 			"backup", backup.Name, "pvc", pvcName)
 	}
-	r.deleteMoverJobAndSecret(ctx, moverNamePrefix(backup.Namespace, backup.Name,pvcName))
+	r.deleteMoverJobAndSecret(ctx, moverNamePrefix(backup.Namespace, backup.Name, pvcName))
 }
 
 // exposeRequest builds the ExposeRequest for one source PVC, deterministically from the
@@ -828,7 +828,7 @@ func (r *BackupReconciler) exposeRequest(backup *cbv1.Backup, pvc *corev1.Persis
 		PVCName:      pvc.Name,
 		StorageClass: storageClass,
 		Capacity:     pvc.Spec.Resources.Requests[corev1.ResourceStorage],
-		NamePrefix:   moverNamePrefix(backup.Namespace, backup.Name,pvc.Name),
+		NamePrefix:   moverNamePrefix(backup.Namespace, backup.Name, pvc.Name),
 		Labels:       exposureLabels(backup, pvc.Name),
 	}
 }

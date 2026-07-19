@@ -327,7 +327,7 @@ var _ = Describe("BackupReconciler", func() {
 		createChildBackup(ns, run, location)
 
 		By("the reconciler exposes the PVC and creates a mover Job that mounts the temp clone")
-		jobName := waitForMoverJob(ns, run,pvcName)
+		jobName := waitForMoverJob(ns, run, pvcName)
 		var job batchv1.Job
 		Expect(k8sClient.Get(ctx, client.ObjectKey{Namespace: suiteOperatorNamespace, Name: jobName}, &job)).To(Succeed())
 		// The mover Job mounts the temp clone PVC the (stub) exposer created, and carries the
@@ -339,7 +339,7 @@ var _ = Describe("BackupReconciler", func() {
 		Expect(job.OwnerReferences).To(BeEmpty(), "a mover Job must not be owned across namespaces")
 		var clone corev1.PersistentVolumeClaim
 		Expect(k8sClient.Get(ctx,
-			client.ObjectKey{Namespace: suiteOperatorNamespace, Name: tempCloneNameFor(ns, run,pvcName)}, &clone)).To(Succeed())
+			client.ObjectKey{Namespace: suiteOperatorNamespace, Name: tempCloneNameFor(ns, run, pvcName)}, &clone)).To(Succeed())
 
 		By("simulating the mover Job succeeding with a snapshot result")
 		simulateMoverSucceeded(jobName, "node-a", mover.MoverResult{
@@ -366,7 +366,7 @@ var _ = Describe("BackupReconciler", func() {
 			err := k8sClient.Get(ctx, client.ObjectKey{Namespace: suiteOperatorNamespace, Name: jobName}, &batchv1.Job{})
 			g.Expect(apierrors.IsNotFound(err)).To(BeTrue())
 			err = k8sClient.Get(ctx,
-				client.ObjectKey{Namespace: suiteOperatorNamespace, Name: tempCloneNameFor(ns, run,pvcName)}, &corev1.PersistentVolumeClaim{})
+				client.ObjectKey{Namespace: suiteOperatorNamespace, Name: tempCloneNameFor(ns, run, pvcName)}, &corev1.PersistentVolumeClaim{})
 			g.Expect(apierrors.IsNotFound(err)).To(BeTrue())
 		}, initTimeout, initPoll).Should(Succeed())
 	})
@@ -395,7 +395,7 @@ var _ = Describe("BackupReconciler", func() {
 		}, initTimeout, initPoll).Should(Succeed())
 
 		By("the snapshottable volume runs a mover Job that we simulate to success")
-		jobName := waitForMoverJob(ns, run,okPVC)
+		jobName := waitForMoverJob(ns, run, okPVC)
 		simulateMoverSucceeded(jobName, "node-b", mover.MoverResult{
 			OK: true, Operation: string(mover.OpBackup), SnapshotID: "snap-ok", SizeBytes: 10, AddedBytes: 5,
 		})
@@ -480,8 +480,8 @@ var _ = Describe("BackupReconciler", func() {
 		backup := createChildBackup(ns, run, location)
 
 		By("driving the volume to a live exposure + mover Job (Uploading), NOT simulating success")
-		jobName := waitForMoverJob(ns, run,pvcName)
-		cloneName := tempCloneNameFor(ns, run,pvcName)
+		jobName := waitForMoverJob(ns, run, pvcName)
+		cloneName := tempCloneNameFor(ns, run, pvcName)
 		Eventually(func(g Gomega) {
 			g.Expect(k8sClient.Get(ctx,
 				client.ObjectKey{Namespace: suiteOperatorNamespace, Name: cloneName}, &corev1.PersistentVolumeClaim{})).To(Succeed())
