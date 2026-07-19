@@ -28,6 +28,37 @@ import (
 	"github.com/CrystalBackup/CrystalBackup/internal/status"
 )
 
+// TestParseRestoreTime pins the runtime discriminator behind the InvalidSourceTime gate: every
+// form the CRD CEL admits and the controller reads must parse, and a SHAPE-valid but impossible
+// instant (which the anchored CEL regex cannot reject — it only checks shape) must return ok=false
+// so the caller gates with a clear reason instead of the misleading "not projected yet".
+func TestParseRestoreTime(t *testing.T) {
+	valid := []string{
+		"2026-07-01T12:00:00",              // zone-less, read as UTC
+		"2026-07-01T12:00:00Z",             // RFC3339 UTC
+		"2026-07-01T12:00:00+02:00",        // RFC3339 offset
+		"2026-07-01T12:00:00.123456+02:00", // fractional seconds
+	}
+	for _, v := range valid {
+		if _, ok := parseRestoreTime(v); !ok {
+			t.Errorf("parseRestoreTime(%q) = ok:false, want a parsed instant", v)
+		}
+	}
+
+	invalid := []string{
+		"2026-13-45T99:99:99", // shape-valid per the CEL regex, but an impossible date/time
+		"2026-07-01T12:00:00garbage",
+		"not-a-time",
+		"latest", // the sentinel is handled by the caller, never passed to parseRestoreTime
+		"",
+	}
+	for _, v := range invalid {
+		if _, ok := parseRestoreTime(v); ok {
+			t.Errorf("parseRestoreTime(%q) = ok:true, want rejected", v)
+		}
+	}
+}
+
 // TestPlanVolumesSelection pins the 02-api selection semantics: nil ⇒ everything, [] ⇒
 // nothing, OR between items with the FIRST matching item's narrowing winning, an item
 // without names matching every PVC.

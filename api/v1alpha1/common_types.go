@@ -335,7 +335,7 @@ type RestoreSource struct {
 	// CEL rule's cost stays within the apiserver's per-CRD budget.
 	// +optional
 	// +kubebuilder:validation:MaxLength=64
-	// +kubebuilder:validation:XValidation:rule="self == 'latest' || self.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}')",message="time must be \"latest\" or an RFC3339 timestamp"
+	// +kubebuilder:validation:XValidation:rule="self == 'latest' || self.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})?$')",message="time must be \"latest\" or an RFC3339 timestamp"
 	Time string `json:"time,omitempty"`
 	// origin disambiguates when using time.
 	// +optional
@@ -362,7 +362,7 @@ type ClusterRestoreSource struct {
 	// time selects "latest" or an RFC3339 instant.
 	// +optional
 	// +kubebuilder:validation:MaxLength=64
-	// +kubebuilder:validation:XValidation:rule="self == 'latest' || self.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}')",message="time must be \"latest\" or an RFC3339 timestamp"
+	// +kubebuilder:validation:XValidation:rule="self == 'latest' || self.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})?$')",message="time must be \"latest\" or an RFC3339 timestamp"
 	Time string `json:"time,omitempty"`
 }
 

@@ -145,7 +145,19 @@ func (r *RestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return r.awaitConfirmation(ctx, &restore)
 	}
 
-	// (2) Resolve the source Backup IN THIS NAMESPACE (by name, or by time/origin).
+	// (2) A time-resolved source whose instant cannot parse can NEVER resolve, so gate it with a
+	// distinct, self-diagnosing reason rather than the "not projected yet" gate below — which would
+	// otherwise retry forever with a misleading message. The CRD CEL rejects the common typo, but a
+	// shape-valid-yet-impossible date (e.g. month 13) passes CEL and only fails here, and the VAP can
+	// be disabled; both land on a clear InvalidSourceTime instead of a false "still projecting".
+	if t := restore.Spec.Source.Time; t != "" && t != sourceTimeLatest {
+		if _, ok := parseRestoreTime(t); !ok {
+			return r.gate(ctx, &restore, "InvalidSourceTime",
+				fmt.Sprintf("spec.source.time %q is not \"latest\" or a valid RFC3339 timestamp", t))
+		}
+	}
+
+	// (3) Resolve the source Backup IN THIS NAMESPACE (by name, or by time/origin).
 	source, ok, err := r.resolveSource(ctx, &restore)
 	if err != nil {
 		return ctrl.Result{}, err
