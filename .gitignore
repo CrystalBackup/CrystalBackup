@@ -32,3 +32,13 @@ charts/crystal-backup/crds/*.yaml
 *~
 
 .secrets/
+
+# Local image-build artifacts (see build/README.md — melange/apko dev builds at the repo root).
+# melange.rsa is a PRIVATE SIGNING KEY — never commit it.
+/melange.rsa
+/melange.rsa.pub
+/stage-*/
+/packages/
+/sbom/
+/apko.lock.json
+/image-refs.txt

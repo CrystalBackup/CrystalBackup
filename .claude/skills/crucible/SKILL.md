@@ -43,6 +43,19 @@ CONFIRM=yes mise run down        # ALWAYS at the end (or `mise run nuke` if tfst
 phase over `up`. Expect `up` to take 15–25 min (Ceph OSD prepare dominates); use
 long Bash timeouts or background execution.
 
+## Building dev images (pre-release iteration)
+
+Before a released image exists, `components`/`deploy.sh` needs a `:dev` operator
+(and mover) image built from your working tree, **pushed to GHCR** (the cluster
+pulls it), and deployed **by digest**. Full recipe — with the macOS/arm64 gotchas
+(`DOCKER_HOST=unix://$HOME/.rd/docker.sock`, build **x86_64 only**, and the slow
+restic-from-source mover build you should **build once and reuse**) — is in
+`build/README.md` at the repo root. In short: rebuild → `apko publish …:dev` →
+resolve the digest (`docker buildx imagetools inspect …:dev --format
+'{{.Manifest.Digest}}'`) → `OPERATOR_IMAGE_DIGEST=… MOVER_IMAGE_DIGEST=…
+test/crucible/deploy/deploy.sh` (or `helm upgrade --reuse-values --set
+image.digest=…` for an operator-only change) → `mise run test m1`.
+
 ## Interpreting results
 
 `mise run test` prints a **plain-language report** last (also saved to
