@@ -1,10 +1,11 @@
 # Crystal Backup
 
-> **Design / specification stage** — this repository is the public design of Crystal Backup
-> (specs, ADRs, roadmap); code starts at milestone M0, and it's being built in the open with AI
-> assistance. Background & disclaimer: [Project status & disclaimer](#-project-status--disclaimer).
+> **Early, real code** — **M0, M1 and M2 have shipped (v0.2.0)**: the core backup engine,
+> cluster disaster recovery and **restore** are implemented, tested (envtest + kind e2e + a
+> real-cluster crucible suite) and released; most milestones are still ahead. Built in the
+> open with AI assistance. Background & disclaimer: [Project status & disclaimer](#-project-status--disclaimer).
 
-**Crystal Backup** is a design for a Kubernetes operator that provides **multi-tenant,
+**Crystal Backup** is a Kubernetes operator that provides **multi-tenant,
 self-service backup and restore of namespaces** — both **PVC data and Kubernetes manifests** —
 across **two planes**:
 
@@ -23,11 +24,12 @@ is restorable, with no pre-existing custom resources and no surviving cluster re
 
 ## ⚠️ Project status & disclaimer
 
-This repository currently holds **specifications, Architecture Decision Records (ADRs) and a
-roadmap — not software yet**; implementation starts at milestone **M0** (see [Roadmap](#roadmap)).
-It's being built in the open, so you can follow — and shape — the design as it happens.
+**M0, M1 and M2 have shipped (v0.2.0)** — the core engine, cluster disaster recovery and
+restore are real, tested code — but most of the [roadmap](#roadmap) is still ahead, so this is
+**early and experimental**. Specs, Architecture Decision Records (ADRs) and the roadmap remain
+public and lead the code. It's built in the open, so you can follow — and shape — it as it happens.
 
-When code lands it will be **early and experimental for a while**. Please treat it accordingly:
+Please treat it accordingly:
 
 - Try it in a **sandbox**, not on data you can't recreate — and keep your existing backups.
 - **Test your restores** — good practice with any backup tool.
@@ -35,7 +37,7 @@ When code lands it will be **early and experimental for a while**. Please treat 
   authors accept **no liability**. See [LICENSE](LICENSE) (Apache-2.0).
 
 None of this is meant to scare you off — it's an honest "we're early". If the direction resonates,
-**star or watch the repo** and come test it when the first milestones land.
+**star or watch the repo** and try the shipped milestones in a sandbox.
 
 ## 🤖 Built with AI assistance
 

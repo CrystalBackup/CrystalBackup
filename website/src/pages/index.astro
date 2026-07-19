@@ -64,8 +64,8 @@ const compareRows = [
 const milestones = [
   ['M0', 'Scaffolding — CRDs, CI (0-CVE images), test harness', 'done'],
   ['M1', 'Core engine & cluster disaster recovery', 'done', `${base}/reports/crucible-m1.html`],
-  ['M2', 'Restore — self-service & admin', 'here'],
-  ['M3', 'Manifests & cluster-scoped DR', ''],
+  ['M2', 'Restore — self-service & admin', 'done', `${base}/reports/crucible-m2.html`],
+  ['M3', 'Manifests & cluster-scoped DR', 'here'],
   ['M4', 'Consistency hooks, verification & maintenance', ''],
   ['M5', 'Namespace plane, external sync & right-to-erasure', ''],
   ['M6', 'Observability hardening & production beta', ''],
@@ -121,7 +121,7 @@ const description =
       <section class="hero">
         <div class="hero-copy">
           <span class="pill">
-            <span class="dot"></span> Building M2 · M1 shipped (v0.1.0)
+            <span class="dot"></span> Building M3 · M2 shipped (v0.2.0)
           </span>
           <h1>
             Every namespace gets <span class="grad">its own backups.</span>
@@ -297,9 +297,9 @@ const description =
         <p class="eyebrow">Roadmap</p>
         <h2>Releasable, core-first, in the open</h2>
         <p class="section-lead">
-          Each milestone ships something usable. <strong>M0 and M1 have shipped</strong> — CRDs, CI
-          and the core engine and cluster disaster recovery are live (v0.1.0); we’re now building
-          <strong>M2 — Restore</strong>.
+          Each milestone ships something usable. <strong>M0, M1 and M2 have shipped</strong> — CRDs,
+          CI, the core engine, cluster disaster recovery and self-service &amp; admin restore are
+          live (v0.2.0); we’re now building <strong>M3 — Manifests &amp; cluster-scoped DR</strong>.
         </p>
         <ol class="timeline">
           {
@@ -337,7 +337,7 @@ const description =
           <aside class="note">
             <h3>You’re early — and that’s the point</h3>
             <p>
-              M0 and M1 have shipped (v0.1.0) — real, tested code — but it’s still early: most
+              M0, M1 and M2 have shipped (v0.2.0) — real, tested code — but it’s still early: most
               milestones are ahead and it isn’t production-ready yet, so try it in a sandbox, keep
               your existing backups, and use it at your own risk. It’s
               provided <strong>as-is under Apache-2.0</strong>, without warranty. If the direction
@@ -351,7 +351,7 @@ const description =
       <!-- ───────────────────────── cta ───────────────────────── -->
       <section class="cta">
         <h2>Follow the build</h2>
-        <p>The specifications, 15 decision records and the M1 core engine (v0.1.0) are public. Restore is next.</p>
+        <p>The specifications, 16 decision records and self-service &amp; admin restore (v0.2.0) are public. Manifests &amp; cluster-scoped DR are next.</p>
         <div class="hero-cta">
           <a class="btn btn-primary" href={links.gh} target="_blank" rel="noopener">
             <span class="star">★</span> Star / watch on GitHub
