@@ -308,15 +308,16 @@ const description =
               <li class={state}>
                 <span class="ms-id">{id}</span>
                 <span class="ms-label">{label}</span>
-                {state === 'here' && <span class="ms-here">you are here</span>}
-                {state === 'patch' && <span class="ms-patch">hardening</span>}
-                {state === 'done' && !report && <span class="ms-done">done</span>}
-                {report && (Array.isArray(report)
-                  ? report.map(([lbl, href]) => (
-                      <a class="ms-report" href={href} target="_blank" rel="noopener">{lbl}</a>
-                    ))
-                  : <a class="ms-report" href={report} target="_blank" rel="noopener">Crucible report</a>
-                )}
+                <span class="ms-actions">
+                  {state === 'here' && <span class="ms-here">you are here</span>}
+                  {state === 'done' && !report && <span class="ms-done">done</span>}
+                  {report && (Array.isArray(report)
+                    ? report.map(([lbl, href]) => (
+                        <a class="ms-report" href={href} target="_blank" rel="noopener">{lbl}</a>
+                      ))
+                    : <a class="ms-report" href={report} target="_blank" rel="noopener">Crucible report</a>
+                  )}
+                </span>
               </li>
             ))
           }

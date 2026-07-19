@@ -377,15 +377,19 @@
       .ms-report::before { content: "✓ "; }
       .ms-report:hover { background: rgba(63, 200, 245, 0.12); border-color: rgba(63, 200, 245, 0.7); }
       .ms-report:focus-visible { outline: 2px solid var(--cyan); outline-offset: 2px; }
-      /* 0.2.1 hardening patch — a sub-entry between milestones, not a milestone of its own */
-      .timeline li.patch { border-style: dashed; }
-      .timeline li.patch .ms-id { font-size: 0.8rem; color: var(--muted); letter-spacing: -0.01em; align-self: center; }
-      .timeline li.patch .ms-label { font-size: 0.92rem; }
-      .ms-patch {
-        font-size: 0.72rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em;
-        color: var(--muted-2); white-space: nowrap;
-        border: 1px solid var(--brd); border-radius: 999px; padding: 4px 11px;
+      /* actions column: chips + report links laid out side by side, never overlapping */
+      .timeline .ms-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; justify-content: flex-end; }
+      /* 0.2.1 hardening — a sub-entry of M2, indented and connected to the milestone above */
+      .timeline li.patch {
+        margin-left: 42px; border-style: dashed; position: relative;
       }
+      .timeline li.patch::before {
+        content: ""; position: absolute; left: -24px; top: -20px; bottom: 50%; width: 16px;
+        border-left: 2px solid var(--brd); border-bottom: 2px solid var(--brd);
+        border-bottom-left-radius: 9px; pointer-events: none;
+      }
+      .timeline li.patch .ms-id { font-size: 0.82rem; color: var(--muted); letter-spacing: -0.01em; align-self: center; }
+      .timeline li.patch .ms-label { font-size: 0.92rem; }
       .section-foot { margin-top: 20px; color: var(--muted); }
       .section-foot a, .flow-note a { color: var(--cyan); }
 
@@ -458,7 +462,9 @@
         .nav-links > a:not(.btn) { display: none; }
         .cards { grid-template-columns: 1fr; }
         .timeline li { grid-template-columns: 44px 1fr; }
-        .timeline .ms-here, .timeline .ms-done, .timeline .ms-report { grid-column: 2; justify-self: start; }
+        .timeline .ms-actions { grid-column: 2; justify-self: start; }
+        .timeline li.patch { margin-left: 18px; }
+        .timeline li.patch::before { left: -14px; top: -18px; width: 10px; }
         .sep { display: none; }
         .chips { gap: 8px; }
       }
