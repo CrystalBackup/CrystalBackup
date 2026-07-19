@@ -594,8 +594,9 @@ namespaces:
   exclude: ["kube-*", "crystal-backup-system"]
 ```
 
-At least one positive selector (`matchNames` / `matchLabels` / `matchExpressions` /
-`regexp`) must be set; `exclude` is applied last.
+Exactly one **non-empty** positive selector (`matchNames` / `matchLabels` /
+`matchExpressions` / `regexp`) must be set — matching validation rule 8 below and the
+`internal/nsselector` implementation; `exclude` is applied last.
 
 ## Repository sharding (deferred)
 

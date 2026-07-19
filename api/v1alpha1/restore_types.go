@@ -43,8 +43,10 @@ type RestoreSpec struct {
 	// +kubebuilder:default=Overwrite
 	Mode RestoreMode `json:"mode,omitempty"`
 
-	// resources selects manifests to restore (omitted with volumes ⇒ whole namespace).
+	// resources selects manifests to restore (omitted with volumes ⇒ whole namespace). Bounded to
+	// match the volumes cap — an unbounded selector array is an etcd/object-size smell.
 	// +optional
+	// +kubebuilder:validation:MaxItems=128
 	Resources []ResourceSelectorItem `json:"resources,omitempty"`
 
 	// volumes selects PVCs (and optionally files) to restore. Bounded so the per-item CEL

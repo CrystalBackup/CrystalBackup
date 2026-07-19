@@ -60,8 +60,9 @@ spec:
                 - Overwrite
                 type: string
               resources:
-                description: resources selects manifests to restore (omitted with
-                  volumes ⇒ whole namespace).
+                description: |-
+                  resources selects manifests to restore (omitted with volumes ⇒ whole namespace). Bounded to
+                  match the volumes cap — an unbounded selector array is an etcd/object-size smell.
                 items:
                   description: ResourceSelectorItem selects manifests to restore (AND
                     within an item, OR between items).
@@ -118,6 +119,7 @@ spec:
                       type: object
                       x-kubernetes-map-type: atomic
                   type: object
+                maxItems: 128
                 type: array
               source:
                 description: source is a Backup in this namespace (or latest).

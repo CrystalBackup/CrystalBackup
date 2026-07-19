@@ -113,18 +113,23 @@ func (r *OrphanReaper) sweepOnce(ctx context.Context) error {
 	cutoff := time.Now().Add(-r.MinAge)
 
 	// Mover Jobs and their per-Job creds Secrets share the managed-by + per-PVC labels; the temp
-	// clone PVCs and restore staging PVCs carry the same shape. A repository-init Job
-	// (managed-by, no PVC label) is never a candidate — orphaned() requires a per-PVC label.
+	// clone PVCs and restore staging PVCs carry the same shape. The selection requires the per-PVC
+	// label POSITIVELY (HasLabels), not just the managed-by match — orphaned() also demands it, but
+	// keeping it OUT of the candidate set is defense in depth: managed-by-only objects like the
+	// repository-init/maintenance Jobs and, critically, the wrapped-DEK Secret (crystal-dek-<loc>,
+	// the single most catastrophic object to delete) must never be a reap candidate, not merely
+	// spared by one downstream guard.
+	hasPVC := client.HasLabels{apiconst.LabelPVC}
 	var jobs batchv1.JobList
-	if err := r.List(ctx, &jobs, inOperatorNS, sel); err != nil {
+	if err := r.List(ctx, &jobs, inOperatorNS, sel, hasPVC); err != nil {
 		return err
 	}
 	var pvcs corev1.PersistentVolumeClaimList
-	if err := r.List(ctx, &pvcs, inOperatorNS, sel); err != nil {
+	if err := r.List(ctx, &pvcs, inOperatorNS, sel, hasPVC); err != nil {
 		return err
 	}
 	var secrets corev1.SecretList
-	if err := r.List(ctx, &secrets, inOperatorNS, sel); err != nil {
+	if err := r.List(ctx, &secrets, inOperatorNS, sel, hasPVC); err != nil {
 		return err
 	}
 	// Restore-created PersistentVolumes (cluster-scoped) are swept ONLY when they carry the
