@@ -25,9 +25,14 @@ limitations under the License.
 //
 // The object lives at a SIBLING of the repository prefix —
 // "<prefix>/<clusterID>.crystal-meta/wrapped-dek.age" — deliberately OUTSIDE the restic
-// repository root (restic never sees it; a repo copy/check never drags it along) and
-// outside the movers' repo-scoped credential prefix "<prefix>/<clusterID>/*" (invariant I4:
-// only the operator's root credentials reach it).
+// repository root (restic never sees it; a repo copy/check never drags it along). The path is
+// ALSO chosen to sit outside the movers' intended repo-scoped credential prefix
+// "<prefix>/<clusterID>/*" so that once per-repo mover credential scoping (invariant I4) lands, a
+// compromised mover cannot read or overwrite it. NOTE (M0–M2): I4 is NOT yet implemented — movers
+// currently receive the location's ROOT S3 credentials (the STS/per-repo-key minting is deferred to
+// M6, 03-security §13 Q1) — so today a mover credential reaches this object like any other. The
+// effective protection is therefore NOT the path but the encryption: the escrowed bytes are
+// ciphertext under the admin-held KEK.
 //
 // Security note: the escrowed bytes are ciphertext under the admin-held KEK. Writing them
 // to the bucket grants the bucket nothing it did not already have — an attacker with

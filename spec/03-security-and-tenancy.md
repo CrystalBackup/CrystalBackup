@@ -69,6 +69,15 @@ logic checks against this list (cf. roadmap DoD).
   is unavailable: per-repo static keys via the RGW admin ops API. *Namespace plane*: the
   mover receives the user's own Secret — already scoped to the user's bucket by
   construction.
+  **Implementation status (M0–M2): NOT yet implemented.** Every mover (backup, restore,
+  discovery listing) currently receives the location's **root** S3 credentials (`dr-s3`)
+  verbatim — neither STS `AssumeRole` nor the static per-repo-key fallback is wired yet (deferred
+  to M6, §13 Q1). So a compromised mover today can read/write/delete the **whole bucket** — the
+  shared repository of every namespace **and** the wrapped-DEK escrow object — not just a repo
+  prefix. This is a compromised-**mover** blast radius (a leaked Job credential), not a
+  namespace-user vector: I1/I5/I6 still confine what a namespace user can reach. Until I4 lands,
+  the mover's confinement rests on no-token + NetworkPolicy egress + TTL (§6/§7) and the escrow's
+  protection rests on the KEK (ciphertext at rest), not on the S3 path being unreachable.
 - **I5 — No backup pods, keys, or platform Secrets in user namespaces.** Movers and temp
   PVCs live in `crystal-backup-system`. The only objects the operator creates in a user
   namespace are `VolumeSnapshot`s (transient, during a run), transient manifest-mover
@@ -151,8 +160,10 @@ Rules:
   strand it even with the KEK safe in escrow — the KEK alone cannot open the repository without
   the wrapped DEK to unwrap. The operator therefore **escrows the wrapped DEK in the bucket**
   (useless without the KEK) at `<prefix>/<clusterID>.crystal-meta/wrapped-dek.age` — a sibling
-  of the repository prefix, invisible to restic and outside the movers' repo-scoped credential
-  prefix (I4) — rewritten on every DEK ensure/re-wrap. Bare-cluster DR = escrowed KEK + this
+  of the repository prefix, invisible to restic and outside the movers' *intended* repo-scoped
+  credential prefix (I4 — but see I4's status note: until per-repo mover credential scoping lands
+  in M6, movers hold the root bucket credentials and CAN reach this object, so its protection is
+  the KEK, not the S3 path) — rewritten on every DEK ensure/re-wrap. Bare-cluster DR = escrowed KEK + this
   object: creating a `ClusterBackupLocation` whose DEK Secret is missing recovers it from the
   escrow object, then discovery inventories the repo
   ([02-api.md § Repository layout](02-api.md#repository-layout--snapshot-identity)).
