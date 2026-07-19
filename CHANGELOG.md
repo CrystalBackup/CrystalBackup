@@ -73,6 +73,17 @@ longer exist.
   listing Job is only re-adopted when its baked restic argv matches the current filter —
   a leftover listing from before a controller restart can never masquerade as a different
   run's resolution.
+- Validated end to end on real infrastructure (Hetzner RKE2 + Ceph RBD/CephFS + longhorn +
+  Hetzner Object Storage): the full crucible suite is **31/31 green** — every restore mode
+  and selection byte-verified against the seed, the tampered-projection R14 negative caught
+  fail-closed, and a deleted namespace reconstituted from the repository coordinate alone.
+  Two defects only real Ceph could surface were fixed: the **pvc-transplant handover
+  deadlock** — a completed mover pod kept the staging claim pinned by the pvc-protection
+  finalizer, so the handover (which must delete that claim) could never finish; the mover
+  result is now stamped on the Job and the pod deleted each pass, backed by a scoped
+  `pods:delete` grant in the operator namespace — and a **duplicate-plan bug** where a
+  repository holding several snapshots of one PVC under a run made the namespaced restore
+  restore it twice (`restorableVolumes` now dedupes by PVC, like the ClusterRestore path).
 
 ## 0.1.0 — M1 “Core engine & cluster DR” (2026-07-17)
 
