@@ -104,7 +104,9 @@ var _ = Describe("ClusterBackupLocation Webhook", func() {
 		It("admits an update that keeps an existing default the default", func() {
 			primary := location("primary", true)
 			Expect(k8sClient.Create(ctx, primary)).To(Succeed())
-			primary.Spec.ClusterID = "renamed-cluster"
+			// Mutate a MUTABLE field: the repository identity (clusterID/s3.*) and mode are pinned by
+			// CEL immutability, so a self-update must touch something editable like retention.
+			primary.Spec.Retention = crystalbackupiov1alpha1.RetentionSpec{KeepDaily: 7}
 			Expect(k8sClient.Update(ctx, primary)).To(Succeed(),
 				"the default location must be able to update itself")
 		})
