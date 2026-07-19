@@ -35,6 +35,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"k8s.io/client-go/tools/events"
@@ -649,8 +650,14 @@ func teardownRestoreResidue(ctx context.Context, e *restoreEngine, rc *restoreEx
 		rc.ownerLabelKey:        rc.ownerName,
 		apiconst.LabelNamespace: rc.targetNamespace,
 	}
+	// A failed List here means this fast-path sweep cannot see the residue it would clean; log it
+	// (matching the best-effort-with-a-log discipline of deleteJobAndSecret / teardownVolume) and
+	// press on — the finalizer is removed regardless, and the orphan reaper independently re-discovers
+	// and reclaims these same labelled objects once the owner is gone. Silent swallowing hid that gap.
 	var jobs batchv1.JobList
-	if err := e.List(ctx, &jobs, client.InNamespace(e.OperatorNamespace), sel); err == nil {
+	if err := e.List(ctx, &jobs, client.InNamespace(e.OperatorNamespace), sel); err != nil {
+		logf.FromContext(ctx).Error(err, "restore teardown: listing residual mover Jobs failed; orphan reaper will backstop", "owner", rc.ownerID)
+	} else {
 		for i := range jobs.Items {
 			if pvc := jobs.Items[i].Labels[apiconst.LabelPVC]; pvc != "" {
 				e.teardownVolume(ctx, rc, &restoreVolumePlan{pvc: pvc})
@@ -659,7 +666,9 @@ func teardownRestoreResidue(ctx context.Context, e *restoreEngine, rc *restoreEx
 	}
 	// Staging claims whose Job is already gone (crash between job delete and cleanup).
 	var pvcs corev1.PersistentVolumeClaimList
-	if err := e.List(ctx, &pvcs, client.InNamespace(e.OperatorNamespace), sel); err == nil {
+	if err := e.List(ctx, &pvcs, client.InNamespace(e.OperatorNamespace), sel); err != nil {
+		logf.FromContext(ctx).Error(err, "restore teardown: listing residual staging PVCs failed; orphan reaper will backstop", "owner", rc.ownerID)
+	} else {
 		for i := range pvcs.Items {
 			if pvc := pvcs.Items[i].Labels[apiconst.LabelPVC]; pvc != "" {
 				e.teardownVolume(ctx, rc, &restoreVolumePlan{pvc: pvc})
@@ -668,7 +677,9 @@ func teardownRestoreResidue(ctx context.Context, e *restoreEngine, rc *restoreEx
 	}
 	// Twin/transplant PVs whose staging claim is already gone.
 	var pvs corev1.PersistentVolumeList
-	if err := e.List(ctx, &pvs, sel); err == nil {
+	if err := e.List(ctx, &pvs, sel); err != nil {
+		logf.FromContext(ctx).Error(err, "restore teardown: listing residual twin/transplant PVs failed; orphan reaper will backstop", "owner", rc.ownerID)
+	} else {
 		for i := range pvs.Items {
 			if pvc := pvs.Items[i].Labels[apiconst.LabelPVC]; pvc != "" {
 				e.teardownVolume(ctx, rc, &restoreVolumePlan{pvc: pvc})
