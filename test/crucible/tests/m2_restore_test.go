@@ -168,11 +168,14 @@ exit 0`)
 	})
 
 	It("fails CLOSED when a tampered projection points at another namespace's run (R14 storage negative)", func() {
-		// Simulate the worst-case projection tamper (only an admin can even do this — users
-		// cannot write cluster-origin Backups): a Backup in THIS namespace claiming the c-db
-		// run and its snapshot IDs. The mediated resolution lists the repository under
-		// namespace=m2-restore + run=crucible-restore — which holds NOTHING — so the restore
-		// must gate on SnapshotNotFound, never borrow the foreign snapshot.
+		// Simulate the worst-case projection tamper: a cluster-origin Backup in THIS namespace
+		// claiming the c-db run and its snapshot IDs. The M2 user-isolation VAP already forbids
+		// ordinary identities from writing cluster-origin Backups (the first line of defense),
+		// so the tamper is authored AS THE OPERATOR — modelling a buggy/compromised projection
+		// that slipped past admission. This spec proves the LAST line of defense (I1, the
+		// storage mediation): the resolution lists the repository under namespace=m2-restore +
+		// run=crucible-restore — which holds NOTHING — so the restore gates on SnapshotNotFound
+		// and never borrows the foreign snapshot.
 		foreignRun := "crucible-restore" // the m1 off-cluster spec's run of c-db
 		tampered := &cbv1.Backup{
 			ObjectMeta: metav1.ObjectMeta{
@@ -188,7 +191,7 @@ exit 0`)
 				LocationRef: cbv1.LocationReference{Kind: "ClusterBackupLocation", Name: m1LocationName},
 			},
 		}
-		Expect(k8s.Create(ctx, tampered)).To(Succeed())
+		Expect(k8sAsOperator.Create(ctx, tampered)).To(Succeed())
 		DeferCleanup(func() { _ = k8s.Delete(ctx, tampered) })
 		tampered.Status.Phase = "Completed"
 		now := metav1.Now()
@@ -196,7 +199,7 @@ exit 0`)
 		tampered.Status.Volumes = []cbv1.VolumeStatus{{
 			Pvc: "data", Phase: "Completed", SnapshotID: "0000000000000000000000000000000000000000000000000000000000000000",
 		}}
-		Expect(k8s.Status().Update(ctx, tampered)).To(Succeed())
+		Expect(k8sAsOperator.Status().Update(ctx, tampered)).To(Succeed())
 
 		restore("m2-negative", cbv1.RestoreSpec{
 			Source:       cbv1.RestoreSource{Backup: foreignRun},
@@ -212,9 +215,17 @@ exit 0`)
 			g.Expect(k8s.Get(ctx, client.ObjectKey{Namespace: nsName, Name: "m2-negative"}, &r)).To(Succeed())
 			cond := status.FindCondition(r.Status.Conditions, "Ready")
 			g.Expect(cond).NotTo(BeNil())
-			g.Expect(cond.Reason).To(Equal("SnapshotNotFound"),
-				"the mediated filter must resolve nothing for this namespace (phase=%q, reason=%q)",
-				r.Status.Phase, cond.Reason)
-		}, 10*time.Minute, 5*time.Second).Should(Succeed())
+			// Fail CLOSED — the restore never borrows the foreign snapshot. TWO defense layers
+			// can catch the tamper and the faster one wins: discovery reconciles projected
+			// Backups against repository state and PRUNES this fake (its run has no snapshots in
+			// THIS namespace) ⇒ SourceBackupNotFound; if the fake outlived discovery, the
+			// mediated resolution lists namespace=<ns> + run=<foreign> and finds nothing ⇒
+			// SnapshotNotFound. The storage-mediation layer is isolated in envtest
+			// (TestMediatedFilterNamespaceIndependence); here we assert the end-to-end result.
+			g.Expect(cond.Reason).To(BeElementOf("SourceBackupNotFound", "SnapshotNotFound"),
+				"the tamper must be caught fail-closed (phase=%q, reason=%q)", r.Status.Phase, cond.Reason)
+			g.Expect(r.Status.Phase).To(Equal(string(status.RestorePhasePending)),
+				"a fail-closed restore stays Pending — it must never restore foreign data")
+		}, 3*time.Minute, 5*time.Second).Should(Succeed())
 	})
 })

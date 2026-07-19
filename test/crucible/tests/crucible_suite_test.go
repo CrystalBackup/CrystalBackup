@@ -36,15 +36,25 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	clientscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	cbv1 "github.com/CrystalBackup/CrystalBackup/api/v1alpha1"
 )
 
+// operatorSAUser is the operator ServiceAccount username the admission VAPs exempt via their
+// matchConditions. Tests that must set up operator-only state (e.g. a cluster-origin projected
+// Backup, which the user-isolation VAP forbids ordinary identities from writing) impersonate it.
+const operatorSAUser = "system:serviceaccount:crystal-backup-system:crystal-backup-operator"
+
 var (
 	k8s client.Client
-	ctx = context.Background()
+	// k8sAsOperator impersonates the operator SA — it bypasses the tenant-facing admission
+	// VAPs (which exempt that identity), letting a spec reach a controller/storage backstop
+	// that the admission layer would otherwise stop at creation.
+	k8sAsOperator client.Client
+	ctx           = context.Background()
 )
 
 func TestCrucible(t *testing.T) {
@@ -66,6 +76,11 @@ var _ = BeforeSuite(func() {
 	Expect(cbv1.AddToScheme(sc)).To(Succeed())
 
 	k8s, err = client.New(cfg, client.Options{Scheme: sc})
+	Expect(err).NotTo(HaveOccurred())
+
+	opCfg := rest.CopyConfig(cfg)
+	opCfg.Impersonate = rest.ImpersonationConfig{UserName: operatorSAUser}
+	k8sAsOperator, err = client.New(opCfg, client.Options{Scheme: sc})
 	Expect(err).NotTo(HaveOccurred())
 })
 

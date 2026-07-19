@@ -107,7 +107,7 @@ cd /data
 mkdir -p alpha beta
 for i in 1 2 3; do head -c $((i * 1024)) /dev/urandom > alpha/file$i.bin; done
 head -c 4096 /dev/urandom > beta/blob.bin
-find . -type f | sort | xargs sha256sum > MANIFEST.sha256
+find . -type f ! -name 'MANIFEST.*' | sort | xargs sha256sum > MANIFEST.sha256
 cp MANIFEST.sha256 MANIFEST.copy
 sync`
 
