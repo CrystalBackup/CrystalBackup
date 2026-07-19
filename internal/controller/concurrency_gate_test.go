@@ -84,7 +84,7 @@ var _ = Describe("Backup mover concurrency gate", func() {
 		DeferCleanup(func() { _ = k8sClient.Delete(context.Background(), parent) })
 
 		createChildBackup(ns, run, location)
-		moverName := moverJobNameFor(run, pvcName)
+		moverName := moverJobNameFor(ns, run, pvcName)
 
 		By("the volume reaches Snapshotting but its mover Job is withheld while the slot is taken")
 		Eventually(func(g Gomega) {

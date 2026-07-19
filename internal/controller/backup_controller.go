@@ -398,7 +398,7 @@ func (r *BackupReconciler) finalize(ctx context.Context, backup *cbv1.Backup) (c
 					"backup", backup.Name, "pvc", vol.Pvc)
 			}
 		}
-		r.deleteMoverJobAndSecret(ctx, moverNamePrefix(backup.Name, vol.Pvc))
+		r.deleteMoverJobAndSecret(ctx, moverNamePrefix(backup.Namespace, backup.Name,vol.Pvc))
 	}
 
 	r.Recorder.Eventf(backup, nil, corev1.EventTypeNormal, "Finalizing", "Finalize",
@@ -588,7 +588,7 @@ func (r *BackupReconciler) advanceSnapshotting(ctx context.Context, backup *cbv1
 	}
 
 	identity := restic.DataIdentity(rc.clusterID, rc.tenant, backup.Namespace, vol.Pvc, rc.scheduleRef, rc.run)
-	prefix := moverNamePrefix(backup.Name, vol.Pvc)
+	prefix := moverNamePrefix(backup.Namespace, backup.Name,vol.Pvc)
 	moverName := prefix + "-mover"
 	labels := exposureLabels(backup, vol.Pvc)
 
@@ -735,7 +735,7 @@ func activeMoverCount(ctx context.Context, c client.Client, operatorNamespace st
 // report, which ParseMoverResult surfaces as an error) — Fails the volume with a short,
 // secret-free reason. It returns the PVC name on either terminal outcome to request teardown.
 func (r *BackupReconciler) advanceUploading(ctx context.Context, backup *cbv1.Backup, vol *cbv1.VolumeStatus, rc *backupRunContext) (string, error) {
-	moverName := moverNamePrefix(backup.Name, vol.Pvc) + "-mover"
+	moverName := moverNamePrefix(backup.Namespace, backup.Name,vol.Pvc) + "-mover"
 
 	var job batchv1.Job
 	if err := r.Get(ctx, client.ObjectKey{Namespace: r.OperatorNamespace, Name: moverName}, &job); err != nil {
@@ -792,7 +792,7 @@ func (r *BackupReconciler) teardownVolume(ctx context.Context, backup *cbv1.Back
 		logf.FromContext(ctx).Error(err, "best-effort exposure cleanup after mover finish failed",
 			"backup", backup.Name, "pvc", pvcName)
 	}
-	r.deleteMoverJobAndSecret(ctx, moverNamePrefix(backup.Name, pvcName))
+	r.deleteMoverJobAndSecret(ctx, moverNamePrefix(backup.Namespace, backup.Name,pvcName))
 }
 
 // exposeRequest builds the ExposeRequest for one source PVC, deterministically from the
@@ -808,7 +808,7 @@ func (r *BackupReconciler) exposeRequest(backup *cbv1.Backup, pvc *corev1.Persis
 		PVCName:      pvc.Name,
 		StorageClass: storageClass,
 		Capacity:     pvc.Spec.Resources.Requests[corev1.ResourceStorage],
-		NamePrefix:   moverNamePrefix(backup.Name, pvc.Name),
+		NamePrefix:   moverNamePrefix(backup.Namespace, backup.Name,pvc.Name),
 		Labels:       exposureLabels(backup, pvc.Name),
 	}
 }
@@ -997,12 +997,22 @@ func resticBackupArgs(id restic.Identity) []string {
 	return append(args, "--pack-size", "64", "--retry-lock", "5m")
 }
 
-// moverNamePrefix is the deterministic per-PVC NamePrefix "<backup>-<pvc>", sanitized to a
-// DNS-1123 name and capped (with a hash suffix on overflow) so the derived Job name stays within
-// the 63-char label limit. Deterministic in (backup, pvc), so every reconcile — and a restarted
-// controller — derives identical exposure/Job/Secret names.
-func moverNamePrefix(backupName, pvcName string) string {
-	return sanitizeDNSName(backupName+"-"+pvcName, moverNamePrefixMax)
+// moverNamePrefix is the deterministic per-PVC NamePrefix "<namespace>-<backup>-<pvc>",
+// sanitized to a DNS-1123 name and capped (with a hash suffix on overflow) so the derived Job
+// name stays within the 63-char label limit. Deterministic in (namespace, backup, pvc), so every
+// reconcile — and a restarted controller — derives identical exposure/Job/Secret names.
+//
+// The namespace is LOAD-BEARING, not cosmetic: a cluster-DR run fans out one child Backup of the
+// SAME name (the run) into every matched namespace, and all per-PVC mover/exposure objects live
+// in the single shared operator namespace (plus the cluster-scoped static VSC). Without the
+// namespace in the name, two namespaces holding a same-named PVC (the norm: "data", "redis-data")
+// in one run would derive colliding names; every Create tolerates AlreadyExists, so the second
+// namespace would silently adopt the first's Job/exposure and either record the first's snapshot
+// as its own (data loss + false success) or hang once the first tore down. Qualifying by namespace
+// keeps every (namespace, run, pvc) object unique. The restic snapshot itself was always correct
+// (DataIdentity is namespace-scoped); only the k8s object names lacked the qualifier.
+func moverNamePrefix(namespace, backupName, pvcName string) string {
+	return sanitizeDNSName(namespace+"-"+backupName+"-"+pvcName, moverNamePrefixMax)
 }
 
 // sanitizeDNSName lowercases raw, collapses every run of non-[a-z0-9] into a single '-', trims
