@@ -23,6 +23,17 @@ import (
 
 // BackupLocationSpec is the namespace user's own external object storage and their
 // own key, isolated by construction (their bucket, credentials and key).
+//
+// Repository identity (clusterID + s3.endpoint/bucket/prefix) and storage mode are IMMUTABLE
+// after creation (CEL, update-only), mirroring ClusterBackupLocation: they compose the repository
+// path, so an edit would silently re-point the location at a different repository, and mode is an
+// object-lock property fixed at repository creation. clusterID is optional here (it defaults from
+// the default ClusterBackupLocation), so its rule tolerates absent↔absent but rejects any change.
+// +kubebuilder:validation:XValidation:rule="self.mode == oldSelf.mode",message="spec.mode is immutable (create a new location to change it)"
+// +kubebuilder:validation:XValidation:rule="has(self.clusterID) == has(oldSelf.clusterID) && (!has(self.clusterID) || self.clusterID == oldSelf.clusterID)",message="spec.clusterID is immutable"
+// +kubebuilder:validation:XValidation:rule="self.s3.endpoint == oldSelf.s3.endpoint",message="spec.s3.endpoint is immutable (repository identity)"
+// +kubebuilder:validation:XValidation:rule="self.s3.bucket == oldSelf.s3.bucket",message="spec.s3.bucket is immutable (repository identity)"
+// +kubebuilder:validation:XValidation:rule="has(self.s3.prefix) == has(oldSelf.s3.prefix) && (!has(self.s3.prefix) || self.s3.prefix == oldSelf.s3.prefix)",message="spec.s3.prefix is immutable (repository identity)"
 type BackupLocationSpec struct {
 	// mode selects Standard (prunable) or Immutable (object-lock; no prune).
 	// +optional

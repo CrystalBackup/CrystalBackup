@@ -176,6 +176,19 @@ spec:
             - encryption
             - s3
             type: object
+            x-kubernetes-validations:
+            - message: spec.mode is immutable (create a new location to change it)
+              rule: self.mode == oldSelf.mode
+            - message: spec.clusterID is immutable
+              rule: has(self.clusterID) == has(oldSelf.clusterID) && (!has(self.clusterID)
+                || self.clusterID == oldSelf.clusterID)
+            - message: spec.s3.endpoint is immutable (repository identity)
+              rule: self.s3.endpoint == oldSelf.s3.endpoint
+            - message: spec.s3.bucket is immutable (repository identity)
+              rule: self.s3.bucket == oldSelf.s3.bucket
+            - message: spec.s3.prefix is immutable (repository identity)
+              rule: has(self.s3.prefix) == has(oldSelf.s3.prefix) && (!has(self.s3.prefix)
+                || self.s3.prefix == oldSelf.s3.prefix)
           status:
             description: status defines the observed state of BackupLocation
             properties:
