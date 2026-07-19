@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"maps"
 	"path"
@@ -422,6 +423,54 @@ func (e *restoreEngine) driveVolumes(ctx context.Context, rc *restoreExecContext
 	return d
 }
 
+// resolveMoverOutcome returns a terminal restore mover Job's result. On SUCCESS it stamps the
+// result on the Job (AnnotationMoverResult) and deletes the completed mover pod — the pod
+// otherwise keeps the staging claim pinned by the pvc-protection finalizer, deadlocking the
+// pvc-transplant handover (which must delete the staging claim to re-point the PV). The Job
+// (Succeeded=1) stays as the durable "mover ran" marker, and the annotation is the durable
+// record RestoredBytes is read from once the pod is gone (a later pass, or after a restart).
+//
+// Returns (result, moverErr, transientErr): moverErr is a mover-side failure (unreadable /
+// not-OK) that settles the volume failed; transientErr is an infra error (the stamp patch)
+// the caller requeues on. On a FAILED Job the pod is left in place so the hard-kill / blank-
+// message detection still works and the unlock path can fire.
+func (e *restoreEngine) resolveMoverOutcome(ctx context.Context, job *batchv1.Job, jobFailed bool) (mover.MoverResult, error, error) {
+	if enc := job.Annotations[apiconst.AnnotationMoverResult]; enc != "" {
+		var cached mover.MoverResult
+		if json.Unmarshal([]byte(enc), &cached) == nil {
+			return cached, nil, nil // captured on an earlier pass; the pod is already gone.
+		}
+	}
+	result, _, rerr := readMoverResult(ctx, e.Client, e.OperatorNamespace, job.Name)
+	if jobFailed || rerr != nil || !result.OK {
+		return result, rerr, nil // settle failed; leave the pod for diagnostics/hard-kill detection.
+	}
+	enc, err := json.Marshal(result)
+	if err != nil {
+		return result, nil, fmt.Errorf("encode mover result for Job %s: %w", job.Name, err)
+	}
+	patch, err := json.Marshal(map[string]any{
+		"metadata": map[string]any{"annotations": map[string]string{apiconst.AnnotationMoverResult: string(enc)}},
+	})
+	if err != nil {
+		return result, nil, fmt.Errorf("build mover-result patch for Job %s: %w", job.Name, err)
+	}
+	if err := e.Patch(ctx, job, client.RawPatch(types.MergePatchType, patch)); err != nil {
+		return result, nil, fmt.Errorf("stamp mover result on Job %s: %w", job.Name, err)
+	}
+	return result, nil, nil
+}
+
+// deleteJobPods best-effort deletes a Job's pods (by the job-name label) so a COMPLETED mover
+// pod stops pinning the staging claim's pvc-protection finalizer. Best-effort: the reaper and
+// the eventual Job teardown backstop it.
+func (e *restoreEngine) deleteJobPods(ctx context.Context, jobName string) {
+	if err := e.DeleteAllOf(ctx, &corev1.Pod{}, client.InNamespace(e.OperatorNamespace),
+		client.MatchingLabels{batchv1.JobNameLabel: jobName}); err != nil && !apierrors.IsNotFound(err) {
+		logf.FromContext(ctx).Error(err, "Best-effort delete of completed restore mover pod failed", "job", jobName)
+	}
+}
+
 // adviseVolume derives one volume's state from live objects and advances it by at most one
 // step: expose the target, admit + create the mover Job, poll it, then finalize the
 // handover. It never writes CR status (the caller aggregates outcomes and is the single
@@ -446,7 +495,10 @@ func (e *restoreEngine) adviseVolume(ctx context.Context, rc *restoreExecContext
 		return volumeOutcome{}, nil // still restoring; requeue.
 	}
 
-	result, _, rerr := readMoverResult(ctx, e.Client, e.OperatorNamespace, jobName)
+	result, rerr, terr := e.resolveMoverOutcome(ctx, &job, failed)
+	if terr != nil {
+		return volumeOutcome{}, terr // transient (e.g. the annotation patch) — requeue, do not settle.
+	}
 	if failed || rerr != nil || !result.OK {
 		// A BLANK/unparseable termination message means the mover was hard-killed and may
 		// have died holding the repository lock — clear it exactly as the backup path does.
@@ -460,6 +512,14 @@ func (e *restoreEngine) adviseVolume(ctx context.Context, rc *restoreExecContext
 		}
 		return volumeOutcome{settled: true, failed: true, reason: moverFailureReason(result, rerr)}, nil
 	}
+
+	// The mover succeeded and its result is captured durably on the Job. Delete the completed
+	// mover pod NOW — a finished pod keeps the staging claim pinned by the pvc-protection
+	// finalizer, which deadlocks the pvc-transplant handover (Finalize can never delete the
+	// staging claim). Idempotent and retried every pass: a delete that lost a race, or that
+	// was forbidden before the pods/delete grant reached the API server, self-heals on the
+	// next reconcile. The Job (Succeeded=1) stays as the durable "mover ran" marker.
+	e.deleteJobPods(ctx, jobName)
 
 	// The data landed in the staging volume; complete the handover. The mechanism kind was
 	// pinned on the Job at creation — never re-resolved from the (mutating) target state.

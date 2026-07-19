@@ -586,6 +586,16 @@ var _ = Describe("ClusterRestore controller", func() {
 			OK: true, Operation: string(mover.OpRestore), RestoredBytes: 4096,
 		})
 
+		By("freeing the completed mover pod so it stops pinning the staging claim (crucible pvc-protection deadlock)")
+		Eventually(func(g Gomega) {
+			perr := k8sClient.Get(ctx, client.ObjectKey{Namespace: suiteOperatorNamespace, Name: jobName + "-pod"}, &corev1.Pod{})
+			g.Expect(apierrors.IsNotFound(perr)).To(BeTrue(), "the completed restore mover pod must be deleted during the handover")
+			var job batchv1.Job
+			g.Expect(k8sClient.Get(ctx, client.ObjectKey{Namespace: suiteOperatorNamespace, Name: jobName}, &job)).To(Succeed())
+			g.Expect(job.Annotations).To(HaveKey(apiconst.AnnotationMoverResult),
+				"the mover result must be stamped durably on the Job before the pod is deleted")
+		}, initTimeout, initPoll).Should(Succeed())
+
 		By("driving the transplant handover: labels+Retain land, then the staging claim goes")
 		Eventually(func(g Gomega) {
 			var gotPV corev1.PersistentVolume

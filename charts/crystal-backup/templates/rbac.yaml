@@ -164,6 +164,12 @@ rules:
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
+  # Completed mover pods: a restore's pvc-transplant handover deletes the finished mover pod
+  # so it stops pinning the staging claim's pvc-protection finalizer (the handover must delete
+  # that claim to re-point the PV). Scoped to the operator namespace — mover pods live only here.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["delete", "deletecollection"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

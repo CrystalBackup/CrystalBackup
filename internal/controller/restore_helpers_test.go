@@ -18,12 +18,14 @@ package controller
 
 import (
 	"math/rand"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	cbv1 "github.com/CrystalBackup/CrystalBackup/api/v1alpha1"
 	"github.com/CrystalBackup/CrystalBackup/internal/restic"
+	"github.com/CrystalBackup/CrystalBackup/internal/status"
 )
 
 // TestPlanVolumesSelection pins the 02-api selection semantics: nil ⇒ everything, [] ⇒
@@ -180,6 +182,27 @@ func TestDataSnapshotsByPVC(t *testing.T) {
 	}
 	if got["data"].ID != "new" {
 		t.Errorf("data snapshot = %s, want the newest (new)", got["data"].ID)
+	}
+}
+
+// TestRestorableVolumes pins that a source Backup projecting DUPLICATE entries for one PVC
+// (a repository holding several snapshots of it under one run — reused run name, retried
+// backup) yields ONE restorable name, so the restore builds one plan per PVC. Incomplete /
+// snapshot-less entries are excluded.
+func TestRestorableVolumes(t *testing.T) {
+	source := &cbv1.Backup{}
+	source.Status.Volumes = []cbv1.VolumeStatus{
+		{Pvc: "data", Phase: status.VolumePhaseCompleted, SnapshotID: "aaa"},
+		{Pvc: "data", Phase: status.VolumePhaseCompleted, SnapshotID: "bbb"}, // duplicate PVC
+		{Pvc: "logs", Phase: status.VolumePhaseCompleted, SnapshotID: "ccc"},
+		{Pvc: "cache", Phase: status.VolumePhaseFailed, SnapshotID: "ddd"}, // not completed
+		{Pvc: "tmp", Phase: status.VolumePhaseCompleted, SnapshotID: ""},   // no snapshot
+	}
+	got := restorableVolumes(source)
+	slices.Sort(got)
+	want := []string{"data", "logs"}
+	if !slices.Equal(got, want) {
+		t.Errorf("restorableVolumes = %v, want %v (dedupe by PVC; only completed+snapshotted)", got, want)
 	}
 }
 

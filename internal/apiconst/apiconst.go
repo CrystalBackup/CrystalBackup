@@ -150,6 +150,15 @@ const (
 	// controller restart without re-resolving live state (the original bound PV — the only
 	// object VolumeAttachments reference — may be unreachable by then).
 	AnnotationExposureNode = Domain + "/exposure-node"
+	// AnnotationMoverResult stamps a restore mover's successful result (JSON MoverResult) on
+	// its Job the moment the Job completes. The pvc-transplant handover then deletes the
+	// completed mover POD — a completed pod keeps the kubelet/pvc-protection reference on the
+	// staging claim, which blocks the staging deletion the handover needs (a real deadlock on
+	// clusters with the pvc-protection controller). With the pod gone its termination message
+	// is unreadable, so this annotation is the DURABLE record a later handover pass (or a
+	// restarted controller) reads RestoredBytes from. The Job itself (Succeeded=1) stays as
+	// the "this volume's mover ran" marker so the volume is never re-restored.
+	AnnotationMoverResult = Domain + "/mover-result"
 )
 
 // Origin label values (see LabelOrigin).

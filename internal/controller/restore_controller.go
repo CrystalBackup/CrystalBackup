@@ -102,6 +102,7 @@ func NewRestoreReconciler(
 // +kubebuilder:rbac:groups=crystalbackup.io,resources=backups;clusterbackuplocations;backuplocations;backuprepositories,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;delete
 // +kubebuilder:rbac:groups="",resources=persistentvolumes,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=pods,verbs=delete
 // +kubebuilder:rbac:groups=storage.k8s.io,resources=storageclasses;volumeattachments,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
 
@@ -556,12 +557,24 @@ func restoreResolveJobName(ownerID string) string {
 // restorableVolumes lists the PVCs a source Backup can restore: volumes that completed
 // with a recorded snapshot.
 func restorableVolumes(source *cbv1.Backup) []string {
+	seen := make(map[string]struct{}, len(source.Status.Volumes))
 	out := make([]string, 0, len(source.Status.Volumes))
 	for i := range source.Status.Volumes {
 		v := &source.Status.Volumes[i]
-		if v.Phase == status.VolumePhaseCompleted && v.SnapshotID != "" {
-			out = append(out, v.Pvc)
+		if v.Phase != status.VolumePhaseCompleted || v.SnapshotID == "" {
+			continue
 		}
+		// ONE plan per PVC. A projected Backup normally lists each PVC once, but a repository
+		// can hold SEVERAL snapshots of one PVC under a single run (e.g. a re-used run name,
+		// or a retried backup), which the discovery projection surfaces as duplicate volume
+		// entries. The mediated resolution (dataSnapshotsByPVC) already collapses those to the
+		// newest snapshot, so a duplicate here would only restore the same PVC twice — mirror
+		// the ClusterRestore path, which builds plans from the deduped byPVC keys.
+		if _, dup := seen[v.Pvc]; dup {
+			continue
+		}
+		seen[v.Pvc] = struct{}{}
+		out = append(out, v.Pvc)
 	}
 	return out
 }
