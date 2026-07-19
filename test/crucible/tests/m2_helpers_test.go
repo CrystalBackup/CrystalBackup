@@ -20,6 +20,7 @@ package crucible
 
 import (
 	"fmt"
+	"os/exec"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -85,7 +86,17 @@ func m2VolumeJob(ns, pvcName, name, script string) (bool, string) {
 		g.Expect(final.Status.Succeeded+final.Status.Failed).To(BeNumerically(">", 0),
 			"%s Job %s/%s has not finished (active=%d)", name, ns, job.Name, final.Status.Active)
 	}, 10*time.Minute, 5*time.Second).Should(Succeed())
-	return final.Status.Succeeded > 0, m1PodLogs(job.Name)
+	return final.Status.Succeeded > 0, m2JobLog(ns, job.Name)
+}
+
+// m2JobLog best-effort fetches a Job's pod logs from the job's OWN namespace (m2 seed /
+// mutate / verify Jobs run in the TENANT namespace, not the operator namespace m1PodLogs
+// assumes). Best-effort: on a successful Job the log is decorative, so a fetch hiccup must
+// never fail a passing seed; on failure it is the diagnostic surfaced by the caller.
+func m2JobLog(ns, jobName string) string {
+	GinkgoHelper()
+	out, _ := exec.Command("kubectl", "-n", ns, "logs", "job/"+jobName, "--tail=-1").Output()
+	return string(out)
 }
 
 // m2SeedScript writes a deterministic corpus (a few files across two directories) plus its

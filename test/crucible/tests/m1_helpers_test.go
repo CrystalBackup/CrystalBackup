@@ -129,9 +129,8 @@ func m1EnsurePlatformSecrets() {
 
 // m1CreateLocation creates a Standard-mode ClusterBackupLocation for the DR bucket (from the
 // environment), wired to the platform KEK and S3 Secrets and clusterID m1ClusterID.
-func m1CreateLocation(name string, isDefault bool) *cbv1.ClusterBackupLocation {
-	GinkgoHelper()
-	loc := &cbv1.ClusterBackupLocation{
+func m1LocationObject(name string, isDefault bool) *cbv1.ClusterBackupLocation {
+	return &cbv1.ClusterBackupLocation{
 		ObjectMeta: metav1.ObjectMeta{Name: name},
 		Spec: cbv1.ClusterBackupLocationSpec{
 			Default:   isDefault,
@@ -158,8 +157,21 @@ func m1CreateLocation(name string, isDefault bool) *cbv1.ClusterBackupLocation {
 			},
 		},
 	}
+}
+
+// m1CreateLocation builds and creates a location, asserting the create succeeds.
+func m1CreateLocation(name string, isDefault bool) *cbv1.ClusterBackupLocation {
+	GinkgoHelper()
+	loc := m1LocationObject(name, isDefault)
 	Expect(k8s.Create(ctx, loc)).To(Succeed(), "create ClusterBackupLocation %s", name)
 	return loc
+}
+
+// m1TryCreateLocation builds and creates a location, RETURNING the create error (nil on
+// success) instead of asserting — for tests that must observe an admission denial (the
+// single-default webhook, adr/0010).
+func m1TryCreateLocation(name string, isDefault bool) error {
+	return k8s.Create(ctx, m1LocationObject(name, isDefault))
 }
 
 // m1DeleteLocation best-effort deletes a ClusterBackupLocation (cleanup; ignores NotFound).
