@@ -23,10 +23,48 @@ import (
 	"testing"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
 	cbv1 "github.com/CrystalBackup/CrystalBackup/api/v1alpha1"
 	"github.com/CrystalBackup/CrystalBackup/internal/restic"
 	"github.com/CrystalBackup/CrystalBackup/internal/status"
 )
+
+// TestMoverPodsStalled pins the per-volume progress-deadline decision: a mover is "stalled" only
+// when every one of its pods is unstarted AND the oldest has aged past the deadline — a Running or
+// Succeeded pod (a legitimately long restore) is never timed out, and neither is a young pod or a
+// Job with no pod yet.
+func TestMoverPodsStalled(t *testing.T) {
+	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
+	const deadline = 30 * time.Minute
+	pod := func(phase corev1.PodPhase, ageMin int) corev1.Pod {
+		return corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{CreationTimestamp: metav1.NewTime(now.Add(-time.Duration(ageMin) * time.Minute))},
+			Status:     corev1.PodStatus{Phase: phase},
+		}
+	}
+	cases := []struct {
+		name string
+		pods []corev1.Pod
+		want bool
+	}{
+		{"no pod yet", nil, false},
+		{"pending under the deadline", []corev1.Pod{pod(corev1.PodPending, 10)}, false},
+		{"pending past the deadline", []corev1.Pod{pod(corev1.PodPending, 45)}, true},
+		{"running past the deadline never times out", []corev1.Pod{pod(corev1.PodRunning, 120)}, false},
+		{"succeeded never times out", []corev1.Pod{pod(corev1.PodSucceeded, 120)}, false},
+		{"one running among an old pending never times out", []corev1.Pod{pod(corev1.PodPending, 45), pod(corev1.PodRunning, 5)}, false},
+		{"all pending, oldest past the deadline", []corev1.Pod{pod(corev1.PodPending, 45), pod(corev1.PodPending, 5)}, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := moverPodsStalled(c.pods, now, deadline); got != c.want {
+				t.Errorf("moverPodsStalled = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
 
 // TestParseRestoreTime pins the runtime discriminator behind the InvalidSourceTime gate: every
 // form the CRD CEL admits and the controller reads must parse, and a SHAPE-valid but impossible
