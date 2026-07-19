@@ -42,6 +42,17 @@ const (
 // the way SecretMountPath / CacheDir are.
 const tmpDir = "/tmp"
 
+// Capability names the security contexts below add/drop; named once (they recur across the
+// per-operation sets).
+const (
+	capAll         corev1.Capability = "ALL"
+	capChown       corev1.Capability = "CHOWN"
+	capDACOverride corev1.Capability = "DAC_OVERRIDE"
+	capFowner      corev1.Capability = "FOWNER"
+	capMknod       corev1.Capability = "MKNOD"
+	capSetfcap     corev1.Capability = "SETFCAP"
+)
+
 // operationFlag is the CLI flag the crystal-mover shim reads to select its operation
 // (`--operation <op>`); BuildJob passes it as the first arg, before restic's "--" separator.
 const operationFlag = "--operation"
@@ -57,16 +68,22 @@ const (
 	envGoMemLimit   = "GOMEMLIMIT"
 )
 
-// PVCMount identifies the source volume of a DATA (backup) job. Its presence on a
-// JobRequest is what makes a Job a data job rather than a maintenance job.
+// PVCMount identifies the data volume of a DATA job. Its presence on a JobRequest is what
+// makes a Job a data job rather than a maintenance job.
 type PVCMount struct {
-	// ClaimName is the PersistentVolumeClaim to snapshot.
+	// ClaimName is the PersistentVolumeClaim to snapshot (backup) or fill (restore).
 	ClaimName string
-	// MountPath is where the claim is mounted — READ-ONLY — inside the mover. The caller
-	// sets it to the restic backup path (e.g. /data/<ns>/<pvc>) so the snapshot's stored
-	// path equals its restic identity (see internal/restic.Identity.Path). BuildJob does
-	// NOT invent its own mount path; it mounts exactly here.
+	// MountPath is where the claim is mounted inside the mover. A backup caller sets it to
+	// the restic backup path (e.g. /data/<ns>/<pvc>) so the snapshot's stored path equals
+	// its restic identity (see internal/restic.Identity.Path); a restore caller sets it to
+	// the neutral restore root its --target points into. BuildJob does NOT invent its own
+	// mount path; it mounts exactly here.
 	MountPath string
+	// ReadWrite mounts the claim writable. Only OpRestore sets it — it fills the target
+	// PVC — and it defaults to false so every other data job keeps the backup guarantee
+	// that a mover can never mutate the data it is copying (read-only at both the volume
+	// source and the mount).
+	ReadWrite bool
 }
 
 // JobRequest is the fully-resolved description of one mover Job. Every field is a value the
@@ -95,6 +112,8 @@ type JobRequest struct {
 	// Labels are stamped on BOTH the Job and its pod template (for discovery/selection).
 	Labels map[string]string
 	// BackoffLimit and TTLSeconds map to the Job's backoffLimit and ttlSecondsAfterFinished.
+	// TTLSeconds == NoTTL leaves ttlSecondsAfterFinished UNSET: the Job persists until its
+	// owner deletes it (used when the Job itself is the caller's durable state).
 	BackoffLimit int32
 	TTLSeconds   int32
 	// GoMemLimit, when non-empty, sets GOMEMLIMIT to cap the mover's Go heap; skipped when
@@ -109,6 +128,10 @@ type JobRequest struct {
 	// kubernetes.io/hostname, whenUnsatisfiable=ScheduleAnyway) selecting pods by these labels, so a
 	// wide fan-out's movers prefer distinct nodes instead of piling onto one. Empty ⇒ no constraint.
 	SpreadOverLabels map[string]string
+	// NodeName, when non-empty, pins the pod to that node (PodSpec.nodeName, bypassing the
+	// scheduler). Only the restore twin-PV path sets it — an RWO volume attached on exactly
+	// one node must be mounted from that same node (adr/0016 §2); empty everywhere else.
+	NodeName string
 }
 
 // BuildJob assembles the batchv1.Job for one mover run, exactly per the package's runtime
@@ -129,18 +152,18 @@ func BuildJob(req JobRequest) *batchv1.Job {
 		Env:          moverEnv(req),
 		VolumeMounts: mounts,
 		Resources:    req.Resources,
-		// root + DAC_OVERRIDE lets the mover read every source file regardless of owner or
-		// mode (a backup must be able to read data it does not own), while everything else is
-		// stripped: no privilege escalation, a read-only root filesystem (only the cache and
-		// tmp emptyDirs are writable), all other capabilities dropped, default seccomp.
+		// root + a per-operation capability set (see moverCapabilities), while everything
+		// else is stripped: no privilege escalation, a read-only root filesystem (only the
+		// cache and tmp emptyDirs are writable), all other capabilities dropped, default
+		// seccomp.
 		SecurityContext: &corev1.SecurityContext{
 			RunAsUser:                ptrTo[int64](0),
 			RunAsGroup:               ptrTo[int64](0),
 			AllowPrivilegeEscalation: ptrTo(false),
 			ReadOnlyRootFilesystem:   ptrTo(true),
 			Capabilities: &corev1.Capabilities{
-				Drop: []corev1.Capability{"ALL"},
-				Add:  []corev1.Capability{"DAC_OVERRIDE"},
+				Drop: []corev1.Capability{capAll},
+				Add:  moverCapabilities(req.Operation),
 			},
 			SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 		},
@@ -164,7 +187,7 @@ func BuildJob(req JobRequest) *batchv1.Job {
 		},
 		Spec: batchv1.JobSpec{
 			BackoffLimit:            ptrTo(req.BackoffLimit),
-			TTLSecondsAfterFinished: ptrTo(req.TTLSeconds),
+			TTLSecondsAfterFinished: ttlSeconds(req.TTLSeconds),
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: copyLabels(req.Labels)},
 				Spec: corev1.PodSpec{
@@ -176,12 +199,29 @@ func BuildJob(req JobRequest) *batchv1.Job {
 						SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 					},
 					TopologySpreadConstraints: spreadConstraints(req.SpreadOverLabels),
-					Containers:                []corev1.Container{container},
-					Volumes:                   volumes,
+					// Empty for every job except a same-node-pinned restore (JobRequest.NodeName).
+					NodeName:   req.NodeName,
+					Containers: []corev1.Container{container},
+					Volumes:    volumes,
 				},
 			},
 		},
 	}
+}
+
+// moverCapabilities returns the capability set added on top of Drop:ALL for one operation.
+// Every operation reads files it does not own, so DAC_OVERRIDE is universal. A RESTORE
+// additionally re-creates metadata (R10): CHOWN (arbitrary uid/gid ownership), FOWNER
+// (mode/timestamp changes on files it now owns as root-with-DAC), SETFCAP
+// (security.capability xattrs) and MKNOD (device nodes). All five are in the container
+// runtime's default set, so PSA `baseline` on the operator namespace still admits the pod
+// (03-security-and-tenancy.md §6); trusted.* xattrs would need CAP_SYS_ADMIN and are
+// documented as NOT restored. The list order is pinned for byte-reproducible Job specs.
+func moverCapabilities(op Operation) []corev1.Capability {
+	if op == OpRestore {
+		return []corev1.Capability{capChown, capDACOverride, capFowner, capMknod, capSetfcap}
+	}
+	return []corev1.Capability{capDACOverride}
 }
 
 // spreadConstraints returns the soft topology-spread constraint selecting pods by labels, or nil
@@ -240,8 +280,9 @@ func awsCredEnv(key, secretName string) corev1.EnvVar {
 
 // moverVolumes builds the volumes and their matching mounts. Every job gets the read-only
 // Secret mount plus the two writable scratch emptyDirs (cache, tmp) that a read-only root
-// filesystem requires. A data job (req.PVC != nil) additionally gets the source PVC mounted
-// read-only at req.PVC.MountPath; a maintenance job gets no data volume at all.
+// filesystem requires. A data job (req.PVC != nil) additionally gets the PVC mounted at
+// req.PVC.MountPath — read-only unless the caller set PVCMount.ReadWrite (restore); a
+// maintenance job gets no data volume at all.
 func moverVolumes(req JobRequest) ([]corev1.Volume, []corev1.VolumeMount) {
 	volumes := []corev1.Volume{
 		{
@@ -262,21 +303,24 @@ func moverVolumes(req JobRequest) ([]corev1.Volume, []corev1.VolumeMount) {
 	}
 
 	if req.PVC != nil {
+		// Read-only at the volume source as well as the mount unless this is a restore
+		// (PVCMount.ReadWrite): a backup must never be able to mutate the very data it is
+		// copying (defence in depth beyond the mount), while a restore's entire job is to
+		// write the target.
+		readOnly := !req.PVC.ReadWrite
 		volumes = append(volumes, corev1.Volume{
 			Name: volumeData,
 			VolumeSource: corev1.VolumeSource{
 				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
 					ClaimName: req.PVC.ClaimName,
-					// Read-only at the volume source as well as the mount: a backup must never be
-					// able to mutate the very data it is copying (defence in depth beyond the mount).
-					ReadOnly: true,
+					ReadOnly:  readOnly,
 				},
 			},
 		})
 		mounts = append(mounts, corev1.VolumeMount{
 			Name:      volumeData,
 			MountPath: req.PVC.MountPath,
-			ReadOnly:  true,
+			ReadOnly:  readOnly,
 		})
 	}
 	return volumes, mounts

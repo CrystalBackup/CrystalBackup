@@ -165,3 +165,66 @@ func (m *DEKManager) unwrapDEK(secret *corev1.Secret, name string) (string, erro
 	}
 	return string(pt), nil
 }
+
+// WrappedDEK returns the stored wrapped-DEK ciphertext for a location, with found=false
+// when no DEK Secret exists yet. It never unwraps: the caller is the bucket-escrow
+// re-assert path (adr/0016 / 03-security §4), which mirrors the CIPHERTEXT — useless
+// without the KEK — into the location's bucket.
+func (m *DEKManager) WrappedDEK(ctx context.Context, locationName string) ([]byte, bool, error) {
+	name := DEKSecretName(locationName)
+	var secret corev1.Secret
+	err := m.client.Get(ctx, client.ObjectKey{Namespace: m.operatorNamespace, Name: name}, &secret)
+	switch {
+	case apierrors.IsNotFound(err):
+		return nil, false, nil
+	case err != nil:
+		return nil, false, fmt.Errorf("keys: get DEK secret %s/%s: %w", m.operatorNamespace, name, err)
+	}
+	wrapped, ok := secret.Data[DEKSecretKey]
+	if !ok || len(wrapped) == 0 {
+		return nil, false, fmt.Errorf("keys: DEK secret %s is missing data key %q", name, DEKSecretKey)
+	}
+	return wrapped, true, nil
+}
+
+// AdoptWrappedDEK persists an EXISTING wrapped DEK recovered from the bucket escrow —
+// the bare-cluster DR bootstrap (03-security §4): the in-cluster Secret is gone, but the
+// ciphertext survived in the bucket and the admin re-supplied the KEK. The blob is
+// validated (it must unwrap under the current KEK) BEFORE it is persisted, so a corrupt or
+// foreign-KEK object can never shadow the location's key; and an already-existing Secret is
+// NEVER overwritten — if one exists with different bytes, that Secret wins (the one-DEK-
+// for-life invariant) and the mismatch is surfaced as an error for the operator to resolve.
+func (m *DEKManager) AdoptWrappedDEK(ctx context.Context, locationName string, wrapped []byte) error {
+	name := DEKSecretName(locationName)
+	if _, err := m.wrapper.Unwrap(wrapped); err != nil {
+		return fmt.Errorf("keys: recovered wrapped DEK for %s does not unwrap under the current KEK: %w", name, err)
+	}
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: m.operatorNamespace,
+			Labels: map[string]string{
+				labelManagedByKey: labelAppValue,
+				labelNameKey:      labelAppValue,
+			},
+		},
+		Type: corev1.SecretTypeOpaque,
+		Data: map[string][]byte{DEKSecretKey: wrapped},
+	}
+	err := m.client.Create(ctx, secret)
+	switch {
+	case err == nil:
+		return nil
+	case apierrors.IsAlreadyExists(err):
+		existing, found, getErr := m.WrappedDEK(ctx, locationName)
+		if getErr != nil {
+			return getErr
+		}
+		if found && string(existing) == string(wrapped) {
+			return nil // a concurrent recovery won with the same bytes: converged.
+		}
+		return fmt.Errorf("keys: DEK secret %s already exists with different content; refusing to overwrite (one DEK for life)", name)
+	default:
+		return fmt.Errorf("keys: create recovered DEK secret %s/%s: %w", m.operatorNamespace, name, err)
+	}
+}

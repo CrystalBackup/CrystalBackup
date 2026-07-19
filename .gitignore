@@ -31,6 +31,9 @@ charts/crystal-backup/crds/*.yaml
 *.swo
 *~
 
+# macOS
+.DS_Store
+
 .secrets/
 
 # Local image-build artifacts (see build/README.md — melange/apko dev builds at the repo root).

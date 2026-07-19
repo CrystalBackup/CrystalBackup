@@ -77,6 +77,39 @@ const (
 	// (test/crucible/tests/m1_reliability_test.go) use to find and tear down the objects a
 	// Backup leaves behind, so it is stamped on EVERY exposure object and mover Job.
 	LabelPVC = Domain + "/pvc"
+
+	// LabelRestore records the owning namespaced Restore on every object a restore creates in
+	// the operator namespace (the staging PVC, the twin PV, the restore mover Job and its creds
+	// Secret). Its value is the Restore name; LabelNamespace carries the Restore's namespace.
+	// It is how the orphan reaper resolves a restore-owned object to its owner instead of
+	// misreading LabelClusterBackup as a Backup run (M2, adr/0016).
+	LabelRestore = Domain + "/restore"
+
+	// LabelClusterRestore is LabelRestore's cluster-plane sibling: the owning ClusterRestore's
+	// name on the objects an admin restore creates. ClusterRestore is cluster-scoped, so the
+	// owner lookup needs no namespace; LabelNamespace on these objects carries the TARGET
+	// namespace for correlation only.
+	LabelClusterRestore = Domain + "/cluster-restore"
+
+	// LabelPVRole marks the PersistentVolume objects a restore creates or adopts, so the
+	// reaper and the leak-check can find them without sweeping every PV in the cluster:
+	// PVRoleTwin on the twin PV aliasing a bound target volume, PVRoleTransplant on a
+	// dynamically-provisioned volume mid-handover (removed when the transplant completes and
+	// the volume becomes the user's — a restored PVC/PV must never look operator-owned).
+	LabelPVRole = Domain + "/pv-role"
+
+	// LabelExposureKind pins, on a restore mover Job, which target-exposure mechanism the
+	// volume was STARTED with (rexposer.KindTransplant or KindTwin). The success path
+	// finalizes with this pinned kind rather than re-resolving from the live target state —
+	// which the handover itself mutates, so a re-resolution mid-handover would misclassify
+	// the volume (adr/0016).
+	LabelExposureKind = Domain + "/exposure-kind"
+)
+
+// LabelPVRole values (see LabelPVRole).
+const (
+	PVRoleTwin       = "twin"
+	PVRoleTransplant = "transplant"
 )
 
 // Standard Kubernetes "managed-by" label stamped on the operator-owned objects a backup
@@ -105,6 +138,27 @@ const (
 	AnnotationProjected = Domain + "/projected"
 	// AnnotationProjectedValue is the truthy value discovery sets AnnotationProjected to.
 	AnnotationProjectedValue = "true"
+
+	// AnnotationRestoredFrom is stamped on a PVC a restore CREATED (the pvc-transplant
+	// handover, adr/0016) with the originating run name. It is informational provenance for
+	// the user — deliberately an annotation, not a label, and never accompanied by the
+	// operator's managed-by/reaper labels: a restored PVC is the USER'S object and must never
+	// be selectable by the reaper or the leak-check.
+	AnnotationRestoredFrom = Domain + "/restored-from"
+	// AnnotationExposureNode is stamped on a pv-twin STAGING claim at creation with the node
+	// the target volume was singly attached on: the exposure's node pin must survive a
+	// controller restart without re-resolving live state (the original bound PV — the only
+	// object VolumeAttachments reference — may be unreachable by then).
+	AnnotationExposureNode = Domain + "/exposure-node"
+	// AnnotationMoverResult stamps a restore mover's successful result (JSON MoverResult) on
+	// its Job the moment the Job completes. The pvc-transplant handover then deletes the
+	// completed mover POD — a completed pod keeps the kubelet/pvc-protection reference on the
+	// staging claim, which blocks the staging deletion the handover needs (a real deadlock on
+	// clusters with the pvc-protection controller). With the pod gone its termination message
+	// is unreadable, so this annotation is the DURABLE record a later handover pass (or a
+	// restarted controller) reads RestoredBytes from. The Job itself (Succeeded=1) stays as
+	// the "this volume's mover ran" marker so the volume is never re-restored.
+	AnnotationMoverResult = Domain + "/mover-result"
 )
 
 // Origin label values (see LabelOrigin).
@@ -133,6 +187,15 @@ const (
 	// cancel / no leak on delete" guarantee). It is distinct from FinalizerRepository: a Backup
 	// is a namespaced unit of execution, not the cluster-scoped repository.
 	FinalizerBackup = Domain + "/backup"
+
+	// FinalizerRestore guards a Restore delete: live restore movers, staging PVCs, twin PVs
+	// and any mid-handover transplant volume are torn down/reclaimed before the object goes
+	// (M2, adr/0016). The "-teardown" suffix keeps the finalizer string distinct from the
+	// LabelRestore key, which shares the bare "/restore" path.
+	FinalizerRestore = Domain + "/restore-teardown"
+
+	// FinalizerClusterRestore is FinalizerRestore's cluster-plane sibling on ClusterRestore.
+	FinalizerClusterRestore = Domain + "/cluster-restore-teardown"
 )
 
 // RunTimestampLayout is the Go reference-time layout for the timestamp segment of a

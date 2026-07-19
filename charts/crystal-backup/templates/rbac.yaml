@@ -72,15 +72,31 @@ rules:
   - apiGroups: [""]
     resources: ["persistentvolumeclaims"]
     verbs: ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
+  # PersistentVolumes: full write for the restore target exposure (adr/0016) — the
+  # pvc-transplant handover labels/Retains and re-points a provisioned PV, the pv-twin path
+  # creates and deletes a Retain-only alias PV, and the reaper reclaims unfinished
+  # transplants. Never used to touch a delivered user volume (its labels are stripped at
+  # handover completion).
   - apiGroups: [""]
     resources: ["persistentvolumes"]
-    verbs: ["get", "list", "watch"]
+    verbs: ["create", "delete", "get", "list", "patch", "update", "watch"]
   # StorageClasses: read-only. The exposer resolves a PVC's CSI provisioner from its
-  # StorageClass (adr/0003) to pick the snapshot strategy and match a VolumeSnapshotClass.
+  # StorageClass (adr/0003) to pick the snapshot strategy and match a VolumeSnapshotClass;
+  # the restore transplant reads the class's reclaimPolicy to hand the volume over.
   # StorageClass is cluster-scoped, so the manager's informer for it is unavoidably
   # cluster-wide — hence a ClusterRole grant, not a namespaced one.
   - apiGroups: ["storage.k8s.io"]
     resources: ["storageclasses"]
+    verbs: ["get", "list", "watch"]
+  # VolumeAttachments: read-only — the pv-twin path pins the restore mover onto the one
+  # node a singly-attached RWO target volume is attached to (adr/0016 §2).
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["volumeattachments"]
+    verbs: ["get", "list", "watch"]
+  # Nodes: read-only — the pin above is dropped when that node is gone or NotReady (a stale
+  # attachment must not wedge the mover Pending on an unschedulable node).
+  - apiGroups: [""]
+    resources: ["nodes"]
     verbs: ["get", "list", "watch"]
   # Namespaces: read + create (ClusterRestore targets).
   - apiGroups: [""]
@@ -148,6 +164,12 @@ rules:
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"]
+  # Completed mover pods: a restore's pvc-transplant handover deletes the finished mover pod
+  # so it stops pinning the staging claim's pvc-protection finalizer (the handover must delete
+  # that claim to re-point the PV). Scoped to the operator namespace — mover pods live only here.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["delete", "deletecollection"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

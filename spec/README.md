@@ -52,6 +52,8 @@ Architecture Decision Records live in [adr/](adr/). Key ones:
 - [0012 — Container images: apko + Wolfi base, SLSA L3+ provenance](adr/0012-container-images-apko-wolfi-slsa.md)
 - [0013 — External backup synchronization to a secondary location](adr/0013-external-backup-sync.md)
 - [0014 — Versioning & release scheme (SemVer; milestone → minor on major 0)](adr/0014-versioning-and-release.md)
+- [0015 — Per-repository exclusive-queue serialization (movers are readers, maintenance ops are writers)](adr/0015-per-repository-exclusive-queue-serialization.md)
+- [0016 — Restore execution: operator-namespace movers, PV-level target exposure, server-side snapshot resolution](adr/0016-restore-execution-and-target-exposure.md)
 
 ## Research
 

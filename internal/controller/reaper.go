@@ -18,10 +18,12 @@ package controller
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -68,9 +70,10 @@ type OrphanReaper struct {
 }
 
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;delete
+// +kubebuilder:rbac:groups="",resources=persistentvolumes,verbs=get;list;watch;patch;delete
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;delete
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;delete
-// +kubebuilder:rbac:groups=crystalbackup.io,resources=backups,verbs=get;list;watch
+// +kubebuilder:rbac:groups=crystalbackup.io,resources=backups;restores;clusterrestores,verbs=get;list;watch
 
 // Start runs the sweep loop until ctx is cancelled. It satisfies manager.Runnable. It applies the
 // production defaults for Interval and MinAge here (not in sweepOnce), so a caller can drive
@@ -110,8 +113,8 @@ func (r *OrphanReaper) sweepOnce(ctx context.Context) error {
 	cutoff := time.Now().Add(-r.MinAge)
 
 	// Mover Jobs and their per-Job creds Secrets share the managed-by + per-PVC labels; the temp
-	// clone PVCs carry the same exposure labels. A repository-init Job (managed-by, no PVC label) is
-	// never a candidate — reapObjects requires a per-PVC label.
+	// clone PVCs and restore staging PVCs carry the same shape. A repository-init Job
+	// (managed-by, no PVC label) is never a candidate — orphaned() requires a per-PVC label.
 	var jobs batchv1.JobList
 	if err := r.List(ctx, &jobs, inOperatorNS, sel); err != nil {
 		return err
@@ -122,6 +125,15 @@ func (r *OrphanReaper) sweepOnce(ctx context.Context) error {
 	}
 	var secrets corev1.SecretList
 	if err := r.List(ctx, &secrets, inOperatorNS, sel); err != nil {
+		return err
+	}
+	// Restore-created PersistentVolumes (cluster-scoped) are swept ONLY when they carry the
+	// pv-role marker: a twin PV is an alias whose deletion is always safe (reclaimPolicy
+	// Retain by construction), and a still-labeled transplant PV is an unfinished handover
+	// whose volume must be reclaimed — a DELIVERED transplant was unlabeled at Finalize, so
+	// the reaper can never see (or touch) a restored user volume.
+	var pvs corev1.PersistentVolumeList
+	if err := r.List(ctx, &pvs, client.HasLabels{apiconst.LabelPVRole}); err != nil {
 		return err
 	}
 
@@ -151,26 +163,98 @@ func (r *OrphanReaper) sweepOnce(ctx context.Context) error {
 	for i := range secrets.Items {
 		reap(&secrets.Items[i])
 	}
+	for i := range pvs.Items {
+		r.reapRestorePV(ctx, &pvs.Items[i], cutoff)
+	}
 	return nil
 }
 
-// orphaned reports whether one exposure object should be reaped: it must be older than the cutoff,
-// carry a per-PVC label (so it is a per-PVC exposure object, not a repository-init Job), and its
-// owning Backup must be gone — or present but with this PVC's volume already terminal (or absent),
-// meaning the backup's own teardown should already have removed it. A Backup that is being deleted
-// is left to its finalizer; a volume still in flight is live and never reaped.
+// reapRestorePV handles one labeled restore PV. A twin is deleted like any residue (the PV
+// object only — Retain). An unfinished transplant is handed back to the provisioner by
+// restoring reclaimPolicy Delete; the PV controller then reclaims the released volume and
+// removes the object, so storage is freed exactly once and never by a bare object delete.
+func (r *OrphanReaper) reapRestorePV(ctx context.Context, pv *corev1.PersistentVolume, cutoff time.Time) {
+	log := logf.FromContext(ctx).WithName("orphan-reaper")
+	orphaned, err := r.orphaned(ctx, pv, cutoff)
+	if err != nil {
+		log.Error(err, "Orphan reaper: restore PV orphan check failed", "pv", pv.Name)
+		return
+	}
+	if !orphaned {
+		return
+	}
+	switch pv.Labels[apiconst.LabelPVRole] {
+	case apiconst.PVRoleTwin:
+		if err := r.Delete(ctx, pv); err != nil && !apierrors.IsNotFound(err) {
+			log.Error(err, "Orphan reaper: twin PV delete failed", "pv", pv.Name)
+			return
+		}
+		log.Info("Orphan reaper: reaped leftover twin PV", "pv", pv.Name)
+	case apiconst.PVRoleTransplant:
+		// Defensive delivered-check (mirror of rexposer.Cleanup's): a final claim BOUND to
+		// this PV outside the operator namespace means the handover in fact succeeded and
+		// only the label-strip/policy-restore tail was missed (a crash between two writes).
+		// Finish that tail — NEVER reclaim delivered user data.
+		if ref := pv.Spec.ClaimRef; ref != nil && ref.Namespace != r.OperatorNamespace {
+			var final corev1.PersistentVolumeClaim
+			if err := r.Get(ctx, client.ObjectKey{Namespace: ref.Namespace, Name: ref.Name}, &final); err == nil &&
+				final.Spec.VolumeName == pv.Name {
+				base := pv.DeepCopy()
+				pv.Spec.PersistentVolumeReclaimPolicy = r.classReclaimPolicy(ctx, pv.Spec.StorageClassName)
+				for k := range pv.Labels {
+					if strings.HasPrefix(k, apiconst.Domain+"/") {
+						delete(pv.Labels, k)
+					}
+				}
+				if err := r.Patch(ctx, pv, client.MergeFrom(base)); err != nil {
+					log.Error(err, "Orphan reaper: delivered-transplant handover tail failed", "pv", pv.Name)
+					return
+				}
+				log.Info("Orphan reaper: finished a delivered transplant's handover tail", "pv", pv.Name)
+				return
+			}
+		}
+		if pv.Spec.PersistentVolumeReclaimPolicy == corev1.PersistentVolumeReclaimDelete {
+			return // already handed back; the PV controller owns it from here.
+		}
+		base := pv.DeepCopy()
+		pv.Spec.PersistentVolumeReclaimPolicy = corev1.PersistentVolumeReclaimDelete
+		if err := r.Patch(ctx, pv, client.MergeFrom(base)); err != nil {
+			log.Error(err, "Orphan reaper: transplant PV reclaim patch failed", "pv", pv.Name)
+			return
+		}
+		log.Info("Orphan reaper: reclaimed unfinished transplant PV", "pv", pv.Name)
+	}
+}
+
+// orphaned reports whether one exposure object should be reaped: it must be older than the
+// cutoff, carry a per-PVC label (so it is a per-PVC exposure object, not a repository-init
+// Job), and its OWNER must be gone or done with it. The owner is resolved by the object's
+// own labels: a restore label (crystalbackup.io/restore or /cluster-restore) resolves a
+// Restore/ClusterRestore whose terminal phase means its teardown should already have run; a
+// cluster-backup label resolves the owning Backup, with the per-PVC volume-phase check. An
+// owner that is being deleted is left to its finalizer; live work is never reaped.
 func (r *OrphanReaper) orphaned(ctx context.Context, obj client.Object, cutoff time.Time) (bool, error) {
 	labels := obj.GetLabels()
-	pvc := labels[apiconst.LabelPVC]
-	run := labels[apiconst.LabelClusterBackup]
-	ns := labels[apiconst.LabelNamespace]
-	if pvc == "" || run == "" || ns == "" {
+	if labels[apiconst.LabelPVC] == "" {
 		return false, nil // not a per-PVC exposure object (e.g. a repository-init Job).
 	}
 	if obj.GetCreationTimestamp().After(cutoff) {
 		return false, nil // too young — a live reconcile may still be settling its status.
 	}
 
+	switch {
+	case labels[apiconst.LabelRestore] != "":
+		return r.restoreOrphaned(ctx, labels[apiconst.LabelNamespace], labels[apiconst.LabelRestore])
+	case labels[apiconst.LabelClusterRestore] != "":
+		return r.clusterRestoreOrphaned(ctx, labels[apiconst.LabelClusterRestore])
+	}
+
+	run := labels[apiconst.LabelClusterBackup]
+	ns := labels[apiconst.LabelNamespace]
+	if run == "" || ns == "" {
+		return false, nil // no resolvable owner shape; leave it alone.
+	}
 	var backup cbv1.Backup
 	if err := r.Get(ctx, client.ObjectKey{Namespace: ns, Name: run}, &backup); err != nil {
 		if apierrors.IsNotFound(err) {
@@ -182,11 +266,60 @@ func (r *OrphanReaper) orphaned(ctx context.Context, obj client.Object, cutoff t
 		return false, nil // being deleted — its finalizer owns the teardown.
 	}
 	for i := range backup.Status.Volumes {
-		if backup.Status.Volumes[i].Pvc == pvc {
+		if backup.Status.Volumes[i].Pvc == labels[apiconst.LabelPVC] {
 			return volumePhaseTerminal(backup.Status.Volumes[i].Phase), nil
 		}
 	}
 	return true, nil // the Backup no longer tracks this PVC — its exposure is residue.
+}
+
+// restoreOrphaned resolves a restore-owned object: reap when the owning Restore is gone or
+// terminal (its teardown should already have removed the object); leave live or deleting
+// owners to their own machinery.
+func (r *OrphanReaper) restoreOrphaned(ctx context.Context, namespace, name string) (bool, error) {
+	if namespace == "" {
+		return false, nil
+	}
+	var restore cbv1.Restore
+	if err := r.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, &restore); err != nil {
+		if apierrors.IsNotFound(err) {
+			return true, nil
+		}
+		return false, err
+	}
+	if !restore.DeletionTimestamp.IsZero() {
+		return false, nil
+	}
+	return status.IsTerminalRestorePhase(restore.Status.Phase), nil
+}
+
+// clusterRestoreOrphaned is restoreOrphaned's cluster-scoped sibling.
+func (r *OrphanReaper) clusterRestoreOrphaned(ctx context.Context, name string) (bool, error) {
+	var cr cbv1.ClusterRestore
+	if err := r.Get(ctx, client.ObjectKey{Name: name}, &cr); err != nil {
+		if apierrors.IsNotFound(err) {
+			return true, nil
+		}
+		return false, err
+	}
+	if !cr.DeletionTimestamp.IsZero() {
+		return false, nil
+	}
+	return status.IsTerminalRestorePhase(cr.Status.Phase), nil
+}
+
+// classReclaimPolicy resolves the reclaim policy a delivered volume should end with: its
+// StorageClass's policy, Delete when the class is unset/gone (mirrors
+// rexposer.storageClassReclaimPolicy for the reaper's handover-tail path).
+func (r *OrphanReaper) classReclaimPolicy(ctx context.Context, scName string) corev1.PersistentVolumeReclaimPolicy {
+	if scName == "" {
+		return corev1.PersistentVolumeReclaimDelete
+	}
+	var sc storagev1.StorageClass
+	if err := r.Get(ctx, client.ObjectKey{Name: scName}, &sc); err != nil || sc.ReclaimPolicy == nil {
+		return corev1.PersistentVolumeReclaimDelete
+	}
+	return *sc.ReclaimPolicy
 }
 
 // volumePhaseTerminal reports whether a per-PVC volume phase is terminal, so its exposure objects

@@ -93,6 +93,15 @@ setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
 			echo "Creating Kind cluster '$(KIND_CLUSTER)'..."; \
 			$(KIND) create cluster --name $(KIND_CLUSTER) --config test/e2e/kind-config.yaml $(if $(KIND_IMAGE),--image $(KIND_IMAGE),) ;; \
 	esac
+	@# Raise the inotify limits inside every node: Docker Desktop's Linux VM ships defaults far
+	@# too low for a whole control plane + CSI + operator of file watchers, which surfaces as
+	@# kube-proxy/snapshot-controller CrashLoopBackOff with "too many open files" (the standard
+	@# kind gotcha, https://kind.sigs.k8s.io/docs/user/known-issues/#pod-errors-due-to-too-many-open-files).
+	@# Idempotent and a no-op on hosts already configured; applied on every run so a pre-existing
+	@# cluster is fixed too.
+	@for node in $$($(KIND) get nodes --name $(KIND_CLUSTER)); do \
+		docker exec "$$node" sysctl -q -w fs.inotify.max_user_watches=524288 fs.inotify.max_user_instances=512; \
+	done
 
 .PHONY: install-test-e2e-infra
 install-test-e2e-infra: setup-test-e2e ## Install external-snapshotter + csi-driver-host-path + SeaweedFS (S3) into the e2e Kind cluster.

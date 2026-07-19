@@ -82,6 +82,57 @@ const (
 	ClusterBackupPhaseFailed          ClusterBackupPhase = "Failed"
 )
 
+// RestorePhase is the aggregate phase of a Restore or ClusterRestore
+// (status.phase — both kinds share one enum in api/v1alpha1).
+// AwaitingConfirmation exists ONLY here: it parks a destructive restore until
+// spec.confirmation equals the target (R23); Running coarsens every in-flight
+// per-volume state (restores keep no persisted per-volume phase list — the live
+// mover Jobs are the ground truth, adr/0016).
+type RestorePhase string
+
+// Restore aggregate phases. Enum source: RestoreStatus.Phase /
+// ClusterRestoreStatus.Phase in api/v1alpha1.
+const (
+	RestorePhasePending              RestorePhase = "Pending"
+	RestorePhaseAwaitingConfirmation RestorePhase = "AwaitingConfirmation"
+	RestorePhaseRunning              RestorePhase = "Running"
+	RestorePhaseCompleted            RestorePhase = "Completed"
+	RestorePhasePartiallyFailed      RestorePhase = "PartiallyFailed"
+	RestorePhaseFailed               RestorePhase = "Failed"
+)
+
+// IsTerminalRestorePhase reports whether a Restore/ClusterRestore phase string is one of
+// the three terminal phases. Exported so the controllers AND the crucible suite share the
+// one definition — a future phase added here can then never desynchronize a poller.
+func IsTerminalRestorePhase(phase string) bool {
+	switch RestorePhase(phase) {
+	case RestorePhaseCompleted, RestorePhasePartiallyFailed, RestorePhaseFailed:
+		return true
+	default:
+		return false
+	}
+}
+
+// RollUpRestoreOutcomes maps a settled restore's per-volume tallies to its
+// terminal phase. Unlike the backup roll-ups it takes counts, not a phase list:
+// a restore keeps no persisted per-volume phases (the mover Jobs are the ground
+// truth), so the caller tallies settled volumes and this fixes the mapping:
+//
+//	n == 0          -> Completed        (an empty selection restores nothing)
+//	f == 0          -> Completed
+//	f > 0 && c > 0  -> PartiallyFailed  (some volumes landed beside failures)
+//	f > 0 && c == 0 -> Failed
+func RollUpRestoreOutcomes(completed, failed int) RestorePhase {
+	switch {
+	case failed == 0:
+		return RestorePhaseCompleted
+	case completed > 0:
+		return RestorePhasePartiallyFailed
+	default:
+		return RestorePhaseFailed
+	}
+}
+
 // RollUpVolumePhases maps the set of per-PVC VolumePhases in a Backup to the
 // Backup's aggregate phase. It is one of the two DISTINCT roll-ups in this
 // package (RollUpBackupPhases aggregates one level up) and must not stand in for

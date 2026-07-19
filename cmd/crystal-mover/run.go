@@ -39,26 +39,36 @@ const (
 	maxStderrTailBytes = 4096
 )
 
-// jsonFlag is restic's global --json flag. ensureBackupJSON ensures it on a backup so the shim
-// can parse the machine-readable summary off stdout; named once here rather than repeated.
+// jsonFlag is restic's global --json flag. ensureSummaryJSON ensures it on the summary-parsed
+// operations so the shim can read the machine-readable summary off stdout; named once here
+// rather than repeated.
 const jsonFlag = "--json"
 
-// knownOperation reports whether op is one of the five mover operations. It is written as an
-// exhaustive switch over the mover.Op* constants (not a map) so adding a sixth operation is a
+// knownOperation reports whether op is one of the mover operations. It is written as an
+// exhaustive switch over the mover.Op* constants (not a map) so adding a new operation is a
 // compile-time prompt to decide how the shim should treat it, rather than a silent default.
 func knownOperation(op string) bool {
 	switch mover.Operation(op) {
-	case mover.OpBackup, mover.OpInit, mover.OpForget, mover.OpPrune, mover.OpCheck,
-		mover.OpSnapshots, mover.OpUnlock:
+	case mover.OpBackup, mover.OpRestore, mover.OpInit, mover.OpForget, mover.OpPrune,
+		mover.OpCheck, mover.OpSnapshots, mover.OpUnlock:
 		return true
 	default:
 		return false
 	}
 }
 
-// ensureBackupJSON guarantees `restic backup` runs with --json, so the shim can parse a
-// machine-readable summary (snapshot id, sizes) off stdout. It is:
-//   - a no-op for every non-backup operation — their outcome is just the exit code, and forcing
+// parsesJSONSummary reports whether op's success is verified by parsing a machine-readable
+// summary off restic's --json stdout: backup (snapshot id + sizes) and restore (restored
+// bytes). These are the two operations whose stdout is captured instead of teed to the pod
+// log, and for which ensureSummaryJSON forces --json.
+func parsesJSONSummary(op string) bool {
+	return op == string(mover.OpBackup) || op == string(mover.OpRestore)
+}
+
+// ensureSummaryJSON guarantees the summary-parsed operations (backup, restore — see
+// parsesJSONSummary) run with --json, so the shim can parse a machine-readable summary
+// (snapshot id + sizes, restored bytes) off stdout. It is:
+//   - a no-op for every other operation — their outcome is just the exit code, and forcing
 //     --json there would only add noise to the pod log; and
 //   - a no-op when the caller already supplied --json, so the flag is never passed twice.
 //
@@ -66,8 +76,8 @@ func knownOperation(op string) bool {
 // array and can never mutate the caller's argv in place — the caller keeps ownership of the
 // slice it passed in. --json is restic's global (persistent) flag, recognised anywhere after the
 // subcommand, so appending it at the end is safe regardless of the other args.
-func ensureBackupJSON(operation string, resticArgv []string) []string {
-	if operation != string(mover.OpBackup) {
+func ensureSummaryJSON(operation string, resticArgv []string) []string {
+	if !parsesJSONSummary(operation) {
 		return resticArgv
 	}
 	if slices.Contains(resticArgv, jsonFlag) {
@@ -85,11 +95,12 @@ func ensureBackupJSON(operation string, resticArgv []string) []string {
 // `--json` summary to stdout, and trusting that would report a snapshot the repository does not
 // actually hold — so only a clean (nil-error) run is ever eligible for success.
 //
-// On a clean backup a parseable summary is REQUIRED. `restic backup` can exit 0 having merely
-// skipped unreadable files, but with no summary object there is no snapshot id to record, so
-// "exit 0, no summary" is deliberately a failure rather than a success with an empty id — the
-// caller must be able to tell "backup finished" from "backup produced nothing". Every other
-// operation carries no payload, so a clean exit is simply OK with just the operation echoed.
+// On a clean backup or restore a parseable summary is REQUIRED. `restic backup` can exit 0
+// having merely skipped unreadable files, but with no summary object there is no snapshot id
+// (or restored-bytes accounting) to record, so "exit 0, no summary" is deliberately a failure
+// rather than a success with an empty payload — the caller must be able to tell "finished"
+// from "produced nothing". Every other operation carries no payload, so a clean exit is
+// simply OK with just the operation echoed.
 func buildResult(operation string, resticStdout []byte, resticErr error) mover.MoverResult {
 	if resticErr != nil {
 		// Repository init is IDEMPOTENT against a shared repository (adr/0009): `restic init`
@@ -108,7 +119,8 @@ func buildResult(operation string, resticStdout []byte, resticErr error) mover.M
 			Error:     clampError(resticErr),
 		}
 	}
-	if operation == string(mover.OpBackup) {
+	switch operation {
+	case string(mover.OpBackup):
 		summary, err := mover.ParseBackupSummary(resticStdout)
 		if err != nil {
 			// restic returned success but we could not read a summary: refuse to fabricate a
@@ -120,6 +132,18 @@ func buildResult(operation string, resticStdout []byte, resticErr error) mover.M
 			}
 		}
 		return mover.SummaryToResult(summary)
+	case string(mover.OpRestore):
+		summary, err := mover.ParseRestoreSummary(resticStdout)
+		if err != nil {
+			// Same refusal as backup: a clean exit whose summary cannot be read is a truncated
+			// stream, not a verified restore.
+			return mover.MoverResult{
+				OK:        false,
+				Operation: operation,
+				Error:     clampError(err),
+			}
+		}
+		return mover.RestoreSummaryToResult(summary)
 	}
 	return mover.MoverResult{OK: true, Operation: operation}
 }

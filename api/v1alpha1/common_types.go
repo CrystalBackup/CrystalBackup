@@ -29,6 +29,7 @@ type LocalObjectReference struct {
 	// name of the referent.
 	// +required
 	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
 	Name string `json:"name"`
 }
 
@@ -301,6 +302,7 @@ type ResourceSelectorItem struct {
 }
 
 // VolumeSelectorItem selects PVCs (and optionally files within them) to restore.
+// When several items match the same PVC, the FIRST matching item wins (02-api.md).
 type VolumeSelectorItem struct {
 	// names of PVCs (whole-PVC restore).
 	// +optional
@@ -311,18 +313,29 @@ type VolumeSelectorItem struct {
 	// exclude is a list of file globs to skip.
 	// +optional
 	Exclude []string `json:"exclude,omitempty"`
-	// targetPath overrides the restore root within the PVC.
+	// targetPath overrides the restore root within the PVC (empty or "/" ⇒ the PVC root).
+	// It is resolved inside the PVC and must not contain ".." segments. Bounded so the CEL
+	// rule's cost stays within the apiserver's per-CRD budget.
 	// +optional
+	// +kubebuilder:validation:MaxLength=256
+	// +kubebuilder:validation:XValidation:rule="!self.split('/').exists(p, p == '..')",message="targetPath must not contain '..' segments"
 	TargetPath string `json:"targetPath,omitempty"`
 }
 
 // RestoreSource identifies a Backup in the same namespace (self-service Restore).
+// Exactly one of backup and time must be set (CEL); origin only refines time.
+// +kubebuilder:validation:XValidation:rule="has(self.backup) != has(self.time)",message="exactly one of source.backup and source.time must be set"
+// +kubebuilder:validation:XValidation:rule="!has(self.origin) || has(self.time)",message="source.origin is only valid together with source.time"
 type RestoreSource struct {
 	// backup names a Backup in this namespace.
 	// +optional
+	// +kubebuilder:validation:MaxLength=253
 	Backup string `json:"backup,omitempty"`
-	// time selects "latest" or an RFC3339 instant instead of a named backup.
+	// time selects "latest" or an RFC3339 instant instead of a named backup. Bounded so the
+	// CEL rule's cost stays within the apiserver's per-CRD budget.
 	// +optional
+	// +kubebuilder:validation:MaxLength=64
+	// +kubebuilder:validation:XValidation:rule="self == 'latest' || self.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}')",message="time must be \"latest\" or an RFC3339 timestamp"
 	Time string `json:"time,omitempty"`
 	// origin disambiguates when using time.
 	// +optional
@@ -331,6 +344,8 @@ type RestoreSource struct {
 }
 
 // ClusterRestoreSource identifies a repository coordinate for an admin restore.
+// Exactly one of backup and time must be set (CEL).
+// +kubebuilder:validation:XValidation:rule="has(self.backup) != has(self.time)",message="exactly one of source.backup and source.time must be set"
 type ClusterRestoreSource struct {
 	// locationRef is the source ClusterBackupLocation.
 	// +required
@@ -338,12 +353,16 @@ type ClusterRestoreSource struct {
 	// namespace is the origin namespace (repository tag filter).
 	// +required
 	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
 	Namespace string `json:"namespace"`
 	// backup names a run; alternatively use time.
 	// +optional
+	// +kubebuilder:validation:MaxLength=253
 	Backup string `json:"backup,omitempty"`
 	// time selects "latest" or an RFC3339 instant.
 	// +optional
+	// +kubebuilder:validation:MaxLength=64
+	// +kubebuilder:validation:XValidation:rule="self == 'latest' || self.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}')",message="time must be \"latest\" or an RFC3339 timestamp"
 	Time string `json:"time,omitempty"`
 }
 
@@ -352,6 +371,7 @@ type ClusterRestoreTarget struct {
 	// namespace to restore into.
 	// +required
 	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
 	Namespace string `json:"namespace"`
 	// createNamespace creates the target namespace if absent (non-destructive).
 	// +optional

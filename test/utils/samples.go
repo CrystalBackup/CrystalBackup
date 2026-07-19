@@ -62,12 +62,17 @@ func SampleObjects(namespace string) []client.Object {
 			ObjectMeta: metav1.ObjectMeta{Name: "dr-run-1"},
 			Spec: cbv1.ClusterBackupSpec{ClusterBackupRunSpec: cbv1.ClusterBackupRunSpec{
 				LocationRef: cbv1.LocalObjectReference{Name: drPrimary},
+				// A namespaces selector is REQUIRED by admission rule 8 (exactly one positive
+				// form); a run with no selector is rejected by the chart's VAP set (adr/0010).
+				Namespaces: cbv1.NamespaceSelector{Regexp: "^c-.+$"},
 			}},
 		},
 		&cbv1.ClusterRestore{
 			ObjectMeta: metav1.ObjectMeta{Name: "recover-x"},
 			Spec: cbv1.ClusterRestoreSpec{
-				Source:       cbv1.ClusterRestoreSource{LocationRef: cbv1.LocalObjectReference{Name: drPrimary}, Namespace: cTeamX},
+				Source: cbv1.ClusterRestoreSource{
+					LocationRef: cbv1.LocalObjectReference{Name: drPrimary}, Namespace: cTeamX, Backup: "dr-run-1",
+				},
 				Target:       cbv1.ClusterRestoreTarget{Namespace: "c-team-x-restored", CreateNamespace: true},
 				Confirmation: "c-team-x-restored",
 			},

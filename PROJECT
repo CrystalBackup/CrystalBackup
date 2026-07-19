@@ -16,6 +16,9 @@ resources:
   kind: ClusterBackupLocation
   path: github.com/CrystalBackup/CrystalBackup/api/v1alpha1
   version: v1alpha1
+  webhooks:
+    validation: true
+    webhookVersion: v1
 - api:
     crdVersion: v1
     namespaced: true

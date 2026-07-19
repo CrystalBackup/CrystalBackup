@@ -29,6 +29,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	cbv1 "github.com/CrystalBackup/CrystalBackup/api/v1alpha1"
+	"github.com/CrystalBackup/CrystalBackup/internal/client/secrets"
 	"github.com/CrystalBackup/CrystalBackup/internal/mover"
 	"github.com/CrystalBackup/CrystalBackup/internal/repo/queue"
 	"github.com/CrystalBackup/CrystalBackup/internal/restic"
@@ -124,9 +125,21 @@ func (r *BackupReconciler) maybeEnqueueRetentionForget(ctx context.Context, back
 		return // no keep policy set: never run a forget that would delete everything.
 	}
 	name := maintenanceResourceName(backup.Name, "forget")
-	r.enqueueRepoMaintenance(ctx, rc, queue.OpForget, name, mover.OpForget, argv)
+	enqueueRepoMaintenance(ctx, r.Queue, r.maintenanceDeps(), rc.repoName, queue.OpForget, name,
+		mover.OpForget, argv, rc.repoURL, rc.dek, rc.s3CredsSecret)
 	r.Recorder.Eventf(backup, nil, corev1.EventTypeNormal, "RetentionEnqueued", "EnqueueRetention",
 		"retention forget enqueued on repository %s", rc.repoName)
+}
+
+// maintenanceDeps assembles the shared maintenance-op dependency bundle from this
+// reconciler's fields.
+func (r *BackupReconciler) maintenanceDeps() repoMaintenanceDeps {
+	return repoMaintenanceDeps{
+		Client:            r.Client,
+		Secrets:           r.Secrets,
+		OperatorNamespace: r.OperatorNamespace,
+		MoverImage:        r.MoverImage,
+	}
 }
 
 // enqueueStaleLockUnlock clears a repository lock a mover may have left behind when it was hard-
@@ -136,7 +149,8 @@ func (r *BackupReconciler) maybeEnqueueRetentionForget(ctx context.Context, back
 // backup crashing, say — is harmless.
 func (r *BackupReconciler) enqueueStaleLockUnlock(ctx context.Context, backup *cbv1.Backup, rc *backupRunContext) {
 	name := maintenanceResourceName(backup.Name, "unlock")
-	r.enqueueRepoMaintenance(ctx, rc, queue.OpUnlock, name, mover.OpUnlock, restic.UnlockArgs())
+	enqueueRepoMaintenance(ctx, r.Queue, r.maintenanceDeps(), rc.repoName, queue.OpUnlock, name,
+		mover.OpUnlock, restic.UnlockArgs(), rc.repoURL, rc.dek, rc.s3CredsSecret)
 	r.Recorder.Eventf(backup, nil, corev1.EventTypeWarning, "StaleLockUnlockEnqueued", "EnqueueUnlock",
 		"a mover was hard-killed; stale-lock unlock enqueued on repository %s", rc.repoName)
 }
@@ -150,16 +164,19 @@ func maintenanceOpBlocksMovers(op mover.Operation) bool {
 }
 
 // waitForMoverQuiescence blocks until no data-mover Job is running (or ctx expires), so an
-// `unlock --remove-all` never strips a live backup's lock out from under it. It is the drain-wait
-// half of the per-repo backup⇄unlock mutex; the reader side (moverSlotBlocked) holds NEW movers
-// back while this op is in-flight, so the running movers it waits on monotonically drain. It
-// conservatively waits on ALL data movers — M1 has one shared cluster repository; a per-repository
-// wait arrives with the namespace plane (M5). Bounded by ctx; a timeout is returned to the caller.
-func (r *BackupReconciler) waitForMoverQuiescence(ctx context.Context) error {
+// `unlock --remove-all` never strips a live backup's or restore's lock out from under it. It is
+// the drain-wait half of the per-repo mover⇄unlock mutex; the reader side (each controller's
+// mover-admission gate on QuiescenceRequired) holds NEW movers back while this op is in-flight,
+// so the running movers it waits on monotonically drain. It conservatively waits on ALL data
+// movers — backup AND restore movers both hold repository locks and both carry the per-PVC
+// label the census selects on. A package function (not a method): the Backup controller and the
+// restore engine share the one implementation of the adr/0015 writer-side drain. Bounded by
+// ctx; a timeout is returned to the caller.
+func waitForMoverQuiescence(ctx context.Context, c client.Client, operatorNamespace string) error {
 	ticker := time.NewTicker(moverQuiescencePoll)
 	defer ticker.Stop()
 	for {
-		n, err := r.activeMoverCount(ctx)
+		n, err := activeMoverCount(ctx, c, operatorNamespace)
 		if err != nil {
 			return fmt.Errorf("counting in-flight movers before an exclusive lock removal: %w", err)
 		}
@@ -174,22 +191,35 @@ func (r *BackupReconciler) waitForMoverQuiescence(ctx context.Context) error {
 	}
 }
 
+// repoMaintenanceDeps bundles the primitives a maintenance op body needs, so the shared
+// package functions below take one value instead of five loose parameters. Both the Backup
+// controller and the restore engine assemble it from their own fields; the queue itself is
+// passed at the enqueue call because that is the only place it is used.
+type repoMaintenanceDeps struct {
+	client.Client
+	Secrets           *secrets.ByNameReader
+	OperatorNamespace string
+	MoverImage        string
+}
+
 // enqueueRepoMaintenance schedules a maintenance mover op on the repository's exclusive queue and
 // returns immediately. It is FIRE-AND-FORGET: the Handle is intentionally dropped because these ops
 // are best-effort and the queue runs the closure to completion whether or not anyone awaits it.
-// repoKey is rc.repoName (the BackupRepository name == the location name), which is exactly the key
+// repoKey is repoName (the BackupRepository name == the location name), which is exactly the key
 // the BackupRepository controller uses, so init/forget/unlock all share one serialisation lane per
 // repository. The only enqueue error is ErrStopped (queue shutting down), which is logged and
-// dropped — a best-effort op skipped at shutdown is reapplied by the next trigger.
-func (r *BackupReconciler) enqueueRepoMaintenance(ctx context.Context, rc *backupRunContext, kind queue.OpKind, name string, op mover.Operation, resticArgs []string) {
-	// Capture the primitives (not the per-reconcile rc pointer) so the closure, which runs later in
-	// the queue worker goroutine, is a pure function of stable values.
-	repoURL, dek, s3CredsSecret := rc.repoURL, rc.dek, rc.s3CredsSecret
-	if _, err := r.Queue.Enqueue(rc.repoName, kind, func(opCtx context.Context) error {
-		return r.runRepoMaintenance(opCtx, name, op, resticArgs, repoURL, dek, s3CredsSecret)
+// dropped — a best-effort op skipped at shutdown is reapplied by the next trigger. A package
+// function shared by the Backup controller and the restore engine (a crashed restore mover leaves
+// the same un-stale lock a crashed backup mover does — adr/0015).
+func enqueueRepoMaintenance(ctx context.Context, q *queue.Manager, deps repoMaintenanceDeps,
+	repoName string, kind queue.OpKind, name string, op mover.Operation, resticArgs []string,
+	repoURL, dek, s3CredsSecret string,
+) {
+	if _, err := q.Enqueue(repoName, kind, func(opCtx context.Context) error {
+		return runRepoMaintenance(opCtx, deps, name, op, resticArgs, repoURL, dek, s3CredsSecret)
 	}); err != nil {
 		logf.FromContext(ctx).Info("repository maintenance op not enqueued (queue stopping); skipping",
-			"op", string(op), "repository", rc.repoName, "err", err.Error())
+			"op", string(op), "repository", repoName, "err", err.Error())
 	}
 }
 
@@ -199,33 +229,33 @@ func (r *BackupReconciler) enqueueRepoMaintenance(ctx context.Context, rc *backu
 // best-effort deletes the Job + Secret before returning — the orphan reaper never touches these
 // (they carry no per-PVC label), so cleanup is this function's own responsibility. It writes no CR
 // status; its error resolves the (dropped) queue Handle and is logged by the worker.
-func (r *BackupReconciler) runRepoMaintenance(opCtx context.Context, name string, op mover.Operation, resticArgs []string, repoURL, dek, s3CredsSecret string) error {
+func runRepoMaintenance(opCtx context.Context, deps repoMaintenanceDeps, name string, op mover.Operation, resticArgs []string, repoURL, dek, s3CredsSecret string) error {
 	ctx, cancel := context.WithTimeout(opCtx, maintenanceJobDeadline)
 	defer cancel()
 	// LIFO defer order: this runs BEFORE cancel(), so ctx is still live for the delete when the op
 	// finished normally; the detached context inside covers the deadline/shutdown case.
-	defer r.deleteMaintenanceResources(opCtx, name)
+	defer deleteMaintenanceResources(opCtx, deps, name)
 
-	// Drain-wait half of the per-repo backup⇄unlock mutex: an op that force-removes locks
-	// (`unlock --remove-all`) must not run while a backup holds a live lock. The reader side
-	// (moverSlotBlocked → QuiescenceRequired) already holds NEW movers back — this op is in-flight
-	// on the queue by now — so the in-flight movers this waits on only drain. Bounded by ctx
-	// (maintenanceJobDeadline); a timeout returns an error and, being best-effort, the op is
-	// reapplied by the next trigger.
+	// Drain-wait half of the per-repo mover⇄unlock mutex: an op that force-removes locks
+	// (`unlock --remove-all`) must not run while a backup or restore holds a live lock. The
+	// reader side (each controller's admission gate on QuiescenceRequired) already holds NEW
+	// movers back — this op is in-flight on the queue by now — so the in-flight movers this
+	// waits on only drain. Bounded by ctx (maintenanceJobDeadline); a timeout returns an error
+	// and, being best-effort, the op is reapplied by the next trigger.
 	if maintenanceOpBlocksMovers(op) {
-		if err := r.waitForMoverQuiescence(ctx); err != nil {
+		if err := waitForMoverQuiescence(ctx, deps.Client, deps.OperatorNamespace); err != nil {
 			return err
 		}
 	}
 
 	labels := maintenanceJobLabels()
-	if err := r.ensureMoverCredsSecret(ctx, name, dek, s3CredsSecret, labels); err != nil {
+	if err := ensureMoverCredsSecret(ctx, deps, name, dek, s3CredsSecret, labels); err != nil {
 		return err
 	}
 	job := mover.BuildJob(mover.JobRequest{
 		Name:         name,
-		Namespace:    r.OperatorNamespace,
-		Image:        r.MoverImage,
+		Namespace:    deps.OperatorNamespace,
+		Image:        deps.MoverImage,
 		Operation:    op,
 		ResticArgs:   resticArgs,
 		RepoURL:      repoURL,
@@ -235,13 +265,13 @@ func (r *BackupReconciler) runRepoMaintenance(opCtx context.Context, name string
 		TTLSeconds:   maintenanceJobTTLSeconds,
 		Labels:       labels,
 	})
-	// No ownerReference: the Job is in the operator namespace and the triggering Backup is in a
-	// tenant namespace, so a cross-namespace ownerRef is illegal. It is tracked by its deterministic
-	// name and cleaned up explicitly below.
-	if err := r.Create(ctx, job); err != nil && !apierrors.IsAlreadyExists(err) {
-		return fmt.Errorf("create %s job %s/%s: %w", op, r.OperatorNamespace, name, err)
+	// No ownerReference: the Job is in the operator namespace and the triggering CR is in a
+	// tenant namespace (or cluster-scoped), so an ownerRef is illegal/impossible. It is tracked
+	// by its deterministic name and cleaned up explicitly below.
+	if err := deps.Create(ctx, job); err != nil && !apierrors.IsAlreadyExists(err) {
+		return fmt.Errorf("create %s job %s/%s: %w", op, deps.OperatorNamespace, name, err)
 	}
-	return r.waitForMaintenanceJob(ctx, name)
+	return waitForMaintenanceJob(ctx, deps.Client, deps.OperatorNamespace, name)
 }
 
 // waitForMaintenanceJob polls the maintenance Job until terminal success (Succeeded >= 1 / the
@@ -249,27 +279,27 @@ func (r *BackupReconciler) runRepoMaintenance(opCtx context.Context, name string
 // limit), honouring ctx (the op deadline or Manager.Stop). It mirrors the BackupRepository
 // controller's waitForInitJob; a failed maintenance Job is a returned error the (dropped) Handle
 // carries, and the op is reapplied by the next trigger.
-func (r *BackupReconciler) waitForMaintenanceJob(ctx context.Context, jobName string) error {
-	key := client.ObjectKey{Namespace: r.OperatorNamespace, Name: jobName}
+func waitForMaintenanceJob(ctx context.Context, c client.Client, operatorNamespace, jobName string) error {
+	key := client.ObjectKey{Namespace: operatorNamespace, Name: jobName}
 	ticker := time.NewTicker(maintenanceJobPollInterval)
 	defer ticker.Stop()
 
 	for {
 		var job batchv1.Job
-		if err := r.Get(ctx, key, &job); err != nil {
-			return fmt.Errorf("get maintenance job %s/%s: %w", r.OperatorNamespace, jobName, err)
+		if err := c.Get(ctx, key, &job); err != nil {
+			return fmt.Errorf("get maintenance job %s/%s: %w", operatorNamespace, jobName, err)
 		}
 		if job.Status.Succeeded >= 1 || jobConditionTrue(&job, batchv1.JobComplete) {
 			return nil
 		}
 		if jobConditionTrue(&job, batchv1.JobFailed) || job.Status.Failed > maintenanceJobBackoffLimit {
 			return fmt.Errorf("maintenance job %s/%s failed (failed pods=%d, backoffLimit=%d)",
-				r.OperatorNamespace, jobName, job.Status.Failed, maintenanceJobBackoffLimit)
+				operatorNamespace, jobName, job.Status.Failed, maintenanceJobBackoffLimit)
 		}
 
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("maintenance job %s/%s did not complete: %w", r.OperatorNamespace, jobName, ctx.Err())
+			return fmt.Errorf("maintenance job %s/%s did not complete: %w", operatorNamespace, jobName, ctx.Err())
 		case <-ticker.C:
 		}
 	}
@@ -279,18 +309,18 @@ func (r *BackupReconciler) waitForMaintenanceJob(ctx context.Context, jobName st
 // and its job-scoped creds Secret. It runs on a context DETACHED from the op context (which may
 // already be cancelled by the op deadline or Manager.Stop) so the DEK-bearing Secret is reclaimed
 // promptly rather than lingering until its own delete; failures are logged, never returned.
-func (r *BackupReconciler) deleteMaintenanceResources(opCtx context.Context, name string) {
+func deleteMaintenanceResources(opCtx context.Context, deps repoMaintenanceDeps, name string) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(opCtx), maintenanceCleanupTimeout)
 	defer cancel()
 	log := logf.FromContext(ctx)
 
 	fg := metav1.DeletePropagationForeground
-	job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: r.OperatorNamespace}}
-	if err := r.Delete(ctx, job, &client.DeleteOptions{PropagationPolicy: &fg}); err != nil && !apierrors.IsNotFound(err) {
+	job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: deps.OperatorNamespace}}
+	if err := deps.Delete(ctx, job, &client.DeleteOptions{PropagationPolicy: &fg}); err != nil && !apierrors.IsNotFound(err) {
 		log.Error(err, "best-effort delete of maintenance job failed", "job", name)
 	}
-	sec := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: r.OperatorNamespace}}
-	if err := r.Delete(ctx, sec); err != nil && !apierrors.IsNotFound(err) {
+	sec := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: deps.OperatorNamespace}}
+	if err := deps.Delete(ctx, sec); err != nil && !apierrors.IsNotFound(err) {
 		log.Error(err, "best-effort delete of maintenance creds secret failed", "secret", name)
 	}
 }

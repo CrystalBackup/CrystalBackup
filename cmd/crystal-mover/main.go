@@ -48,7 +48,7 @@ limitations under the License.
 //
 // main() is deliberately thin: it parses flags, wires restic's stdio, execs it, and hands the
 // captured stdout + run error to the pure decision funcs in run.go (buildResult,
-// ensureBackupJSON, writeResult), which is where all the testable logic lives.
+// ensureSummaryJSON, writeResult), which is where all the testable logic lives.
 package main
 
 import (
@@ -69,7 +69,8 @@ func main() {
 	// controller would have to guess about.
 	fs := flag.NewFlagSet("crystal-mover", flag.ContinueOnError)
 	operation := fs.String("operation", "",
-		"the mover operation to run: one of backup, init, forget, prune, check (mover.Op* values)")
+		"the mover operation to run: one of backup, restore, init, forget, prune, check, snapshots, "+
+			"unlock (mover.Op* values)")
 	terminationLog := fs.String("termination-log", mover.TerminationMessagePath,
 		"path the MoverResult JSON is written to; defaults to the kubelet's termination message file, "+
 			"overridable so tests can point it at a temp file")
@@ -94,9 +95,9 @@ func main() {
 		fail(*terminationLog, *operation, fmt.Errorf("no restic argv after the %q separator", "--"))
 	}
 
-	// For a backup, guarantee restic emits a machine-readable summary we can parse; a no-op for
-	// every other operation and when the caller already passed --json.
-	resticArgv = ensureBackupJSON(*operation, resticArgv)
+	// For a backup or restore, guarantee restic emits a machine-readable summary we can parse;
+	// a no-op for every other operation and when the caller already passed --json.
+	resticArgv = ensureSummaryJSON(*operation, resticArgv)
 
 	// Inherit the environment the Job set (RESTIC_REPOSITORY, RESTIC_PASSWORD_FILE, RESTIC_CACHE_DIR,
 	// AWS_*, ...): a nil cmd.Env means "use the current process environment", so the shim passes
@@ -109,11 +110,11 @@ func main() {
 	var stdout bytes.Buffer
 	stderrTail := &tailWriter{max: maxStderrTailBytes}
 	cmd.Stderr = io.MultiWriter(os.Stderr, stderrTail)
-	if *operation == string(mover.OpBackup) {
-		// A backup's stdout is restic's --json firehose (status objects then the summary): capture
-		// it for parsing but keep it OUT of the pod log. The human-useful signal for a backup —
-		// warnings about unreadable files — is on stderr, which we stream; teeing the JSON stream
-		// on top would only bury it.
+	if parsesJSONSummary(*operation) {
+		// A backup's or restore's stdout is restic's --json firehose (status objects then the
+		// summary): capture it for parsing but keep it OUT of the pod log. The human-useful
+		// signal — warnings about unreadable/unrestorable files — is on stderr, which we
+		// stream; teeing the JSON stream on top would only bury it.
 		cmd.Stdout = &stdout
 	} else {
 		// Maintenance stdout is human-readable result text (init/forget/prune/check output); tee it

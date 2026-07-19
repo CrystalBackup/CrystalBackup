@@ -62,15 +62,18 @@ var buildInfoDesc = prometheus.NewDesc(
 // repeated names are defined once): the originating schedule, the location, and the cluster
 // identity (resolved from a location's clusterID).
 const (
-	scheduleLabel = "schedule"
-	locationLabel = "location"
-	clusterLabel  = "cluster"
+	namespaceLabel = "namespace"
+	tenantLabel    = "tenant"
+	originLabel    = "origin"
+	scheduleLabel  = "schedule"
+	locationLabel  = "location"
+	clusterLabel   = "cluster"
 )
 
 // backupLabels / clusterBackupLabels are the label sets of the two metric families,
 // in the fixed order the metric values are appended below.
 var (
-	backupLabels        = []string{"namespace", "tenant", scheduleLabel, "origin", locationLabel, clusterLabel}
+	backupLabels        = []string{namespaceLabel, tenantLabel, scheduleLabel, originLabel, locationLabel, clusterLabel}
 	clusterBackupLabels = []string{scheduleLabel, locationLabel, clusterLabel}
 
 	backupLastSuccessDesc = prometheus.NewDesc(
@@ -130,6 +133,9 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- clusterBackupLastSuccessDesc
 	ch <- clusterBackupNamespacesMatchedDesc
 	ch <- clusterBackupNamespacesFailedDesc
+	ch <- restoreLastSuccessDesc
+	ch <- restoreLastBytesDesc
+	ch <- restoreFailuresDesc
 }
 
 // Collect implements prometheus.Collector. It reads the live objects once and emits
@@ -144,12 +150,40 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 	clusterByLocation := c.locationClusterIDs(ctx)
 
 	var backups cbv1.BackupList
-	if err := c.reader.List(ctx, &backups); err == nil {
+	backupsListed := c.reader.List(ctx, &backups) == nil
+	if backupsListed {
 		collectBackups(ch, backups.Items, clusterByLocation)
 	}
 	var runs cbv1.ClusterBackupList
 	if err := c.reader.List(ctx, &runs); err == nil {
 		collectClusterBackups(ch, runs.Items, clusterByLocation)
+	}
+
+	// The unified restore family (M2, 05-observability §2.3). A namespaced Restore's
+	// origin/location/tenant/cluster resolve through its source Backup — joined against the
+	// Backups already listed above via a one-pass index (never a per-restore linear scan:
+	// the scrape cost must stay O(backups + restores), not their product).
+	sourceByKey := make(map[[2]string]restoreSourceInfo, len(backups.Items))
+	if backupsListed {
+		for i := range backups.Items {
+			b := &backups.Items[i]
+			sourceByKey[[2]string{b.Namespace, b.Name}] = restoreSourceInfo{
+				tenant:   b.Labels[apiconst.LabelTenant],
+				origin:   b.Labels[apiconst.LabelOrigin],
+				location: b.Spec.LocationRef.Name,
+				cluster:  clusterByLocation[b.Spec.LocationRef.Name],
+			}
+		}
+	}
+	resolveSource := func(namespace, backupName string) restoreSourceInfo {
+		return sourceByKey[[2]string{namespace, backupName}]
+	}
+	var restores cbv1.RestoreList
+	var clusterRestores cbv1.ClusterRestoreList
+	restoresListed := c.reader.List(ctx, &restores) == nil
+	clusterRestoresListed := c.reader.List(ctx, &clusterRestores) == nil
+	if restoresListed || clusterRestoresListed {
+		collectRestores(ch, restores.Items, clusterRestores.Items, resolveSource, clusterByLocation)
 	}
 }
 

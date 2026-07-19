@@ -21,6 +21,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"slices"
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
@@ -141,6 +142,23 @@ func NewJobSnapshotLister(
 // pod's log and parses it. On success it best-effort deletes the one-shot Job + Secret so a stale
 // inventory can never be re-read; on any failure it returns a wrapped error and discovery retries.
 func (l *JobSnapshotLister) List(ctx context.Context, repo *cbv1.BackupRepository) ([]restic.Snapshot, error) {
+	return l.list(ctx, repo, discoveryResourceName(repo.Name), restic.SnapshotsArgs())
+}
+
+// ListFiltered is List with a server-side tag filter and a caller-chosen Job name: the
+// mediated-restore resolution primitive (adr/0016 §3). The filter tags are AND-combined
+// with the base crystalbackup marker INSIDE the restic invocation
+// (restic.SnapshotsFilterArgs), so the repository itself only ever returns the filtered
+// snapshots — for a cluster-origin restore that filter is namespace=<the CR's namespace>,
+// derived server-side and unforgeable. The caller supplies a deterministic per-purpose
+// jobName so a restore resolution never collides with (or re-adopts) a discovery inventory.
+func (l *JobSnapshotLister) ListFiltered(ctx context.Context, repo *cbv1.BackupRepository, jobName string, filterTags ...string) ([]restic.Snapshot, error) {
+	return l.list(ctx, repo, jobName, restic.SnapshotsFilterArgs(filterTags...))
+}
+
+// list is the shared body of List/ListFiltered: one snapshots Job named jobName running
+// resticArgs, its log parsed as the snapshot array.
+func (l *JobSnapshotLister) list(ctx context.Context, repo *cbv1.BackupRepository, jobName string, resticArgs []string) ([]restic.Snapshot, error) {
 	ctx, cancel := context.WithTimeout(ctx, discoveryJobDeadline)
 	defer cancel()
 
@@ -159,19 +177,18 @@ func (l *JobSnapshotLister) List(ctx context.Context, repo *cbv1.BackupRepositor
 		return nil, err
 	}
 
-	name := discoveryResourceName(repo.Name)
-	if err := l.ensureCredsSecret(ctx, repo, name, dek, cbl.Spec.S3.CredentialsSecretRef.Name); err != nil {
+	if err := l.ensureCredsSecret(ctx, repo, jobName, dek, cbl.Spec.S3.CredentialsSecretRef.Name); err != nil {
 		return nil, err
 	}
-	if err := l.ensureSnapshotsJob(ctx, repo, name, repoURL); err != nil {
-		return nil, err
-	}
-
-	if err := l.waitForJob(ctx, name); err != nil {
+	if err := l.ensureSnapshotsJob(ctx, repo, jobName, repoURL, resticArgs); err != nil {
 		return nil, err
 	}
 
-	log, err := l.readPodLog(ctx, name)
+	if err := l.waitForJob(ctx, jobName); err != nil {
+		return nil, err
+	}
+
+	log, err := l.readPodLog(ctx, jobName)
 	if err != nil {
 		return nil, err
 	}
@@ -183,7 +200,7 @@ func (l *JobSnapshotLister) List(ctx context.Context, repo *cbv1.BackupRepositor
 
 	// The inventory is captured: reclaim the one-shot Job and Secret so the NEXT List builds a fresh
 	// Job (never re-reads this run's stale log). Best-effort — the TTL and the orphan reaper backstop.
-	l.cleanup(ctx, name)
+	l.cleanup(ctx, jobName)
 	return snaps, nil
 }
 
@@ -254,16 +271,18 @@ func (l *JobSnapshotLister) ensureCredsSecret(ctx context.Context, repo *cbv1.Ba
 	return nil
 }
 
-// ensureSnapshotsJob creates the maintenance mover Job that runs `restic snapshots --json --tag
-// crystalbackup` (no data volume). Owned by the repository (GC on repository delete); tolerates
-// AlreadyExists so a restart mid-inventory re-adopts the running Job rather than leaking a second.
-func (l *JobSnapshotLister) ensureSnapshotsJob(ctx context.Context, repo *cbv1.BackupRepository, name, repoURL string) error {
+// ensureSnapshotsJob creates the maintenance mover Job that runs the given `restic
+// snapshots` argv (no data volume) — the base listing for discovery, a tag-filtered one for
+// a mediated restore resolution. Owned by the repository (GC on repository delete);
+// tolerates AlreadyExists so a restart mid-inventory re-adopts the running Job rather than
+// leaking a second.
+func (l *JobSnapshotLister) ensureSnapshotsJob(ctx context.Context, repo *cbv1.BackupRepository, name, repoURL string, resticArgs []string) error {
 	job := mover.BuildJob(mover.JobRequest{
 		Name:         name,
 		Namespace:    l.OperatorNamespace,
 		Image:        l.MoverImage,
 		Operation:    mover.OpSnapshots,
-		ResticArgs:   restic.SnapshotsArgs(),
+		ResticArgs:   resticArgs,
 		RepoURL:      repoURL,
 		SecretName:   name,
 		PVC:          nil,
@@ -274,8 +293,26 @@ func (l *JobSnapshotLister) ensureSnapshotsJob(ctx context.Context, repo *cbv1.B
 	if err := controllerutil.SetControllerReference(repo, job, l.Scheme); err != nil {
 		return fmt.Errorf("set controller reference on discovery job %s: %w", name, err)
 	}
-	if err := l.Create(ctx, job); err != nil && !apierrors.IsAlreadyExists(err) {
-		return fmt.Errorf("create discovery job %s/%s: %w", l.OperatorNamespace, name, err)
+	if err := l.Create(ctx, job); err != nil {
+		if !apierrors.IsAlreadyExists(err) {
+			return fmt.Errorf("create discovery job %s/%s: %w", l.OperatorNamespace, name, err)
+		}
+		// Re-adoption guard: the Job NAME is deterministic per purpose, but its restic argv
+		// was baked at creation — a leftover Job can carry a DIFFERENT filter than this
+		// call's (a restarted controller re-pinning "latest" onto a newer run), and adopting
+		// it would parse the OLD filter's output as the new filter's result: a restore
+		// executing one run while status and provenance attest another. Identical argv ⇒
+		// adopt (the normal restart path); anything else is superseded and retried.
+		var existing batchv1.Job
+		if gerr := l.Get(ctx, client.ObjectKey{Namespace: l.OperatorNamespace, Name: name}, &existing); gerr != nil {
+			return fmt.Errorf("inspect existing discovery job %s/%s: %w", l.OperatorNamespace, name, gerr)
+		}
+		if len(existing.Spec.Template.Spec.Containers) == 0 ||
+			!slices.Equal(existing.Spec.Template.Spec.Containers[0].Args, job.Spec.Template.Spec.Containers[0].Args) {
+			l.cleanup(ctx, name)
+			return fmt.Errorf("discovery job %s/%s carried stale arguments and was superseded; retrying",
+				l.OperatorNamespace, name)
+		}
 	}
 	return nil
 }

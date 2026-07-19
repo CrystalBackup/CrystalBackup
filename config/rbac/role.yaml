@@ -8,7 +8,15 @@ rules:
   - ""
   resources:
   - namespaces
-  - pods
+  verbs:
+  - create
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - nodes
   verbs:
   - get
   - list
@@ -26,12 +34,7 @@ rules:
 - apiGroups:
   - ""
   resources:
-  - pods/log
-  verbs:
-  - get
-- apiGroups:
-  - ""
-  resources:
+  - persistentvolumes
   - secrets
   verbs:
   - create
@@ -41,6 +44,21 @@ rules:
   - patch
   - update
   - watch
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  verbs:
+  - delete
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - pods/log
+  verbs:
+  - get
 - apiGroups:
   - ""
   - events.k8s.io
@@ -64,6 +82,14 @@ rules:
 - apiGroups:
   - crystalbackup.io
   resources:
+  - backuplocations
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - crystalbackup.io
+  resources:
   - backuprepositories
   - backups
   - clusterbackups
@@ -81,6 +107,8 @@ rules:
   - backuprepositories/finalizers
   - backups/finalizers
   - clusterbackuplocations/finalizers
+  - clusterrestores/finalizers
+  - restores/finalizers
   verbs:
   - update
 - apiGroups:
@@ -91,6 +119,8 @@ rules:
   - clusterbackuplocations/status
   - clusterbackups/status
   - clusterbackupschedules/status
+  - clusterrestores/status
+  - restores/status
   verbs:
   - get
   - patch
@@ -100,6 +130,8 @@ rules:
   resources:
   - clusterbackuplocations
   - clusterbackupschedules
+  - clusterrestores
+  - restores
   verbs:
   - get
   - list
@@ -131,6 +163,7 @@ rules:
   - storage.k8s.io
   resources:
   - storageclasses
+  - volumeattachments
   verbs:
   - get
   - list

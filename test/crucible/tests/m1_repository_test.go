@@ -211,7 +211,15 @@ var _ = Describe("M1 — shared cluster-DR repository lifecycle", Label("m1"), O
 		Expect(dr.Spec.Default).To(BeTrue(), "the shared location %q must be the default", m1LocationName)
 
 		By(`When I create a second ClusterBackupLocation "dr2" also marked default`)
-		m1CreateLocation(secondName, true)
+		// M2 adds a single-default admission WEBHOOK (adr/0010): a second default is rejected
+		// at ADMISSION — the strongest enforcement of "only one default". When the webhook is
+		// disabled or fails open (failurePolicy: Ignore), the create lands and the controller's
+		// MultipleDefaults condition is the backstop, asserted below. Either satisfies rule 4.
+		if err := m1TryCreateLocation(secondName, true); err != nil {
+			Expect(err.Error()).To(ContainSubstring("default"),
+				"the second-default create was rejected, but not for being a duplicate default: %v", err)
+			return
+		}
 
 		By("Then one of the two locations reports condition MultipleDefaults=true")
 		By("And the operator never silently treats both as the default")

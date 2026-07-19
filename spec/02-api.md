@@ -236,6 +236,9 @@ spec:
     include: ["apiextensions.k8s.io/CustomResourceDefinition", "storage.k8s.io/StorageClass/*"]
     exclude: []                                # admin-only; apply order CRDs→cluster-scoped→namespaced
   confirmation: "c-team-x-restored"            # required iff the op modifies existing objects
+  # source, mode and target.namespace are IMMUTABLE after creation (CEL): a mid-run edit
+  # would mix two repository coordinates (or drift the labels of already-created objects).
+  # confirmation and the selection lists stay mutable.
 status:
   phase: Completed                             # Pending|AwaitingConfirmation|Running|Completed|PartiallyFailed|Failed
   restoredResources: 148
@@ -417,6 +420,9 @@ spec:
     - names: ["uploads"]
       include: ["images/2026/**"]      # a single folder of a single PVC
   confirmation: "c-team-x"             # required iff the op modifies existing objects
+  # source and mode are IMMUTABLE after creation (CEL); confirmation and the selection
+  # lists stay mutable. `time` accepts "latest" or an RFC3339 instant (a zone-less
+  # `YYYY-MM-DDThh:mm:ss` is read as UTC); a time-resolved source is pinned once resolved.
 status:
   phase: Completed                     # Pending|AwaitingConfirmation|Running|Completed|PartiallyFailed|Failed
   restoredResources: 0
@@ -496,6 +502,7 @@ Rationale in [adr/0009](adr/0009-shared-cluster-repo-tag-tenancy.md).
 | **host** | `<clusterID>` | which cluster; multi-cluster into one bucket; retention grouping key |
 | **paths** | `/data/<namespace>/<pvc>` (data) · `/manifests/<namespace>` (namespace manifests) · `/cluster-manifests` (cluster-scoped objects, one per run — [adr/0011](adr/0011-cluster-scoped-dr.md)) | **identity + per-PVC retention** (`--group-by host,paths`) + clean subtree restore |
 | **tags** | `crystalbackup`, `tenant=<t>`, `namespace=<ns>`, `pvc=<name>`, `kind=data\|manifests\|cluster-manifests`, `schedule=<name>`, `run=<backup>` | filtering, right-to-erasure (`forget --tag`), discovery, correlation |
+| **tags** (PVC-meta, `kind=data` only, since 0.2) | `pvcsize=<bytes>` (requested capacity), `pvcclass=<storageClassName>` (omitted if none), `pvcmodes=<RWO[+ROX][+RWX][+RWOP]>` (sorted, `+`-joined) | **informational**, additive: let `ClusterRestore` recreate a PVC (size/class/modes) from the repo alone when the namespace and its CRs are gone ([adr/0016](adr/0016-restore-execution-and-target-exposure.md)). Pre-0.2 snapshots lack them → documented fallback (logical size rounded up to GiB + headroom, target default class, RWO) |
 
 - **Retention** (per PVC): `restic forget --tag crystalbackup --group-by host,paths --keep-*`
   → groups by `(clusterID, namespace, pvc)`; manifests are their own chain.
@@ -505,6 +512,16 @@ Rationale in [adr/0009](adr/0009-shared-cluster-repo-tag-tenancy.md).
   subtree at the target root.
 - **Discovery**: the `run` tag is the stable identity that groups a namespace's snapshots
   into one `Backup` (`metadata.name == run`).
+
+**Wrapped-DEK bucket escrow** (cluster plane, since 0.2 —
+[03-security-and-tenancy.md §4](03-security-and-tenancy.md), [adr/0004](adr/0004-encryption-key-management.md)):
+the operator mirrors the wrapped platform DEK (the age ciphertext of Secret
+`crystal-dek-<location>`; useless without the KEK) to the object
+`<prefix>/<clusterID>.crystal-meta/wrapped-dek.age` — a **sibling** of the repository prefix,
+so it is invisible to restic, excluded from the movers' repo-scoped credentials (I4), and
+survives total cluster loss. It is (re)written whenever the DEK Secret is ensured or
+re-wrapped; on location add, a missing in-cluster DEK Secret is **recovered from this object**
+(bare-cluster DR bootstrap = escrowed KEK + this object + a `ClusterBackupLocation`).
 
 ## Discovery (repository→Backup projection)
 
@@ -553,7 +570,13 @@ volumes:                             # a PVC is restored iff ANY item matches
 ```
 
 Defaults: **both `resources` and `volumes` omitted ⇒ whole namespace**. A present field
-(even `[]`) restores only what it lists (`[]` ⇒ nothing of that kind).
+(even `[]`) restores only what it lists (`[]` ⇒ nothing of that kind). When several
+`volumes[]` items match the same PVC, the **first matching item wins** (its
+`include`/`exclude`/`targetPath` apply) — one PVC is restored by exactly one mover pass.
+On `Restore.spec.source` and `ClusterRestore.spec.source`, `backup` and `time` are
+**mutually exclusive and one is required** (CEL on the CRD). An item's `targetPath` is
+resolved **within** the PVC (empty or `/` ⇒ the PVC root) and must not contain `..`
+segments (CEL).
 
 Manifest restore applies transformations (storageClass mapping, sanitized fields) and an
 apply order — see [04-manifest-backup.md](04-manifest-backup.md).
@@ -602,7 +625,7 @@ blocking check (single-default uniqueness), is scoped to this project's CRDs, an
 | 5 | `credentialsSecretRef`/`repositoryPasswordSecretRef` on a `BackupLocation` are same-namespace (name-only). | **VAP** (Deny) |
 | 6 | `Immutable` mode forbids `maintenance.pruneSchedule`. | **VAP** (Deny) |
 | 7 | **Denied namespaces** — tenant-facing CRs rejected in a configurable deny-list (default `kube-*`, `crystal-backup-system`, and any incumbent backup tool's namespace). The list is a **ConfigMap** bound to the policy via `paramRef`. | **VAP** (Deny, parameterized) |
-| 8 | `namespaces` selector must set exactly one positive form + optional `exclude`. | **VAP** (Deny) |
+| 8 | `namespaces` selector must set exactly one **non-empty** positive form + optional `exclude` (an empty list/map counts as unset, mirroring the engine; the operator SA is exempt — the engine re-validates at execution). | **VAP** (Deny) |
 | 9 | **External sync target** — `spec.sourceLocationRef.name != spec.destinationLocationRef.name` on `BackupExternalSync` **and** `ClusterBackupExternalSync` (a self-referential `Mirror` sync would `forget`/`prune` its own source). Static field inequality. | **VAP** (Deny) |
 
 Defaulting (e.g. `clusterID` from the default `ClusterBackupLocation`, the generated repository

@@ -439,17 +439,27 @@ func (r *BackupReconciler) resolveRun(ctx context.Context, backup *cbv1.Backup) 
 // after. On any failure it returns ok=false with a Secret-naming reason/message (never key
 // material) for the caller to fold into the Ready condition.
 func (r *BackupReconciler) ensureDEK(ctx context.Context, loc *cbv1.ClusterBackupLocation) (dek, reason, message string, ok bool) {
+	return resolvePlatformDEKCommon(ctx, r.Client, r.Secrets, r.OperatorNamespace, loc)
+}
+
+// resolvePlatformDEKCommon is the shared platform-DEK resolution: KEK Secret → age wrapper →
+// mint-once/reuse-forever DEK. A package function because the Backup controller AND both
+// restore controllers need it identically; failures carry a Secret-naming reason/message
+// (never key material) for the caller's Ready condition.
+func resolvePlatformDEKCommon(ctx context.Context, c client.Client, secretsReader *secrets.ByNameReader,
+	operatorNamespace string, loc *cbv1.ClusterBackupLocation,
+) (dek, reason, message string, ok bool) {
 	kekName := loc.Spec.Encryption.ClusterKEKSecretRef.Name
 
-	identity, err := r.Secrets.GetValue(ctx, r.OperatorNamespace, kekName, kekIdentityDataKey)
+	identity, err := secretsReader.GetValue(ctx, operatorNamespace, kekName, kekIdentityDataKey)
 	if err != nil {
-		return "", "KEKUnavailable", fmt.Sprintf("read cluster KEK secret %s/%s: %v", r.OperatorNamespace, kekName, err), false
+		return "", "KEKUnavailable", fmt.Sprintf("read cluster KEK secret %s/%s: %v", operatorNamespace, kekName, err), false
 	}
 	wrapper, err := keys.NewAgeWrapper(string(identity))
 	if err != nil {
-		return "", "KEKInvalid", fmt.Sprintf("parse cluster KEK secret %s/%s: %v", r.OperatorNamespace, kekName, err), false
+		return "", "KEKInvalid", fmt.Sprintf("parse cluster KEK secret %s/%s: %v", operatorNamespace, kekName, err), false
 	}
-	d, err := keys.NewDEKManager(r.Client, wrapper, r.OperatorNamespace).EnsureDEK(ctx, loc.Name)
+	d, err := keys.NewDEKManager(c, wrapper, operatorNamespace).EnsureDEK(ctx, loc.Name)
 	if err != nil {
 		return "", "DEKUnavailable", fmt.Sprintf("ensure platform DEK for location %s: %v", loc.Name, err), false
 	}
@@ -582,6 +592,27 @@ func (r *BackupReconciler) advanceSnapshotting(ctx context.Context, backup *cbv1
 	moverName := prefix + "-mover"
 	labels := exposureLabels(backup, vol.Pvc)
 
+	resticArgs := resticBackupArgs(identity)
+	// PVC-meta tags (adr/0016 §4, best-effort): record the source claim's requested
+	// capacity/class/modes on the snapshot so ClusterRestore can recreate the PVC from the
+	// repository alone. Informational and additive — a claim that vanished between exposure
+	// and now simply yields a snapshot without them (the documented fallback covers it).
+	var srcPVC corev1.PersistentVolumeClaim
+	if err := r.Get(ctx, client.ObjectKey{Namespace: backup.Namespace, Name: vol.Pvc}, &srcPVC); err == nil {
+		storageClass := ""
+		if srcPVC.Spec.StorageClassName != nil {
+			storageClass = *srcPVC.Spec.StorageClassName
+		}
+		modes := make([]string, 0, len(srcPVC.Spec.AccessModes))
+		for _, m := range srcPVC.Spec.AccessModes {
+			modes = append(modes, string(m))
+		}
+		capacity := srcPVC.Spec.Resources.Requests[corev1.ResourceStorage]
+		for _, tag := range restic.PVCMetaTags(capacity.Value(), storageClass, modes) {
+			resticArgs = append(resticArgs, "--tag", tag)
+		}
+	}
+
 	// Cluster-wide mover concurrency gate. If this volume's mover Job does not exist yet and the
 	// cascade is already at maxConcurrentMovers, hold the volume in Snapshotting (its exposure stays
 	// ready) and requeue for a free slot. An already-existing Job means we are re-adopting after a
@@ -592,7 +623,7 @@ func (r *BackupReconciler) advanceSnapshotting(ctx context.Context, backup *cbv1
 		return nil
 	}
 
-	if err := r.ensureMoverCredsSecret(ctx, moverName, rc.dek, rc.s3CredsSecret, labels); err != nil {
+	if err := ensureMoverCredsSecret(ctx, r.maintenanceDeps(), moverName, rc.dek, rc.s3CredsSecret, labels); err != nil {
 		return err
 	}
 
@@ -601,7 +632,7 @@ func (r *BackupReconciler) advanceSnapshotting(ctx context.Context, backup *cbv1
 		Namespace:    r.OperatorNamespace,
 		Image:        r.MoverImage,
 		Operation:    mover.OpBackup,
-		ResticArgs:   resticBackupArgs(identity),
+		ResticArgs:   resticArgs,
 		RepoURL:      rc.repoURL,
 		SecretName:   moverName,
 		PVC:          &mover.PVCMount{ClaimName: exposure.ExposedPVCName, MountPath: identity.Path},
@@ -640,7 +671,7 @@ func (r *BackupReconciler) moverSlotBlocked(ctx context.Context, moverName, repo
 		return false, fmt.Errorf("get mover Job %s/%s for the mover admission gate: %w", r.OperatorNamespace, moverName, err)
 	}
 
-	// (a) Repository backup⇄unlock mutex (reader side): hold a new mover back while a lock-removing
+	// (a) Repository mover⇄unlock mutex (reader side): hold a new mover back while a lock-removing
 	// op is queued/running for this repo. Independent of the concurrency limit (unset by default).
 	if r.Queue != nil && repoName != "" && r.Queue.QuiescenceRequired(repoName) {
 		return true, nil
@@ -651,7 +682,7 @@ func (r *BackupReconciler) moverSlotBlocked(ctx context.Context, moverName, repo
 	if limit <= 0 {
 		return false, nil
 	}
-	movers, err := r.listMoverJobs(ctx)
+	movers, err := listMoverJobs(ctx, r.Client, r.OperatorNamespace)
 	if err != nil {
 		return false, fmt.Errorf("list mover Jobs for the concurrency gate: %w", err)
 	}
@@ -660,10 +691,12 @@ func (r *BackupReconciler) moverSlotBlocked(ctx context.Context, moverName, repo
 
 // listMoverJobs returns the per-PVC data-mover Jobs in the operator namespace — those carrying the
 // managed-by AND a per-PVC label, so repository-init/maintenance Jobs (managed-by, no PVC label) are
-// excluded. Shared by the concurrency gate and the unlock drain-wait.
-func (r *BackupReconciler) listMoverJobs(ctx context.Context) ([]batchv1.Job, error) {
+// excluded. Backup AND restore movers both carry these labels, so the census spans both — exactly
+// what the concurrency gate and the unlock drain-wait need (a restore holds a repository lock like
+// a backup does, adr/0015). A package function shared with the restore engine.
+func listMoverJobs(ctx context.Context, c client.Client, operatorNamespace string) ([]batchv1.Job, error) {
 	var jobs batchv1.JobList
-	if err := r.List(ctx, &jobs, client.InNamespace(r.OperatorNamespace),
+	if err := c.List(ctx, &jobs, client.InNamespace(operatorNamespace),
 		client.MatchingLabels{apiconst.LabelManagedBy: apiconst.ManagedByValue}); err != nil {
 		return nil, err
 	}
@@ -678,10 +711,10 @@ func (r *BackupReconciler) listMoverJobs(ctx context.Context) ([]batchv1.Job, er
 
 // activeMoverCount counts the data-mover Jobs still occupying a slot: per-PVC, not terminal, and not
 // being deleted — a torn-down crashed mover (DeletionTimestamp set by teardownVolume) must not hold
-// the unlock drain-wait open. It is the reader census the backup⇄unlock mutex drains before an
+// the unlock drain-wait open. It is the reader census the mover⇄unlock mutex drains before an
 // exclusive lock-removal runs.
-func (r *BackupReconciler) activeMoverCount(ctx context.Context) (int, error) {
-	movers, err := r.listMoverJobs(ctx)
+func activeMoverCount(ctx context.Context, c client.Client, operatorNamespace string) (int, error) {
+	movers, err := listMoverJobs(ctx, c, operatorNamespace)
 	if err != nil {
 		return 0, err
 	}
@@ -725,7 +758,7 @@ func (r *BackupReconciler) advanceUploading(ctx context.Context, backup *cbv1.Ba
 		return "", nil // still running; requeue
 	}
 
-	result, node, rerr := r.readMoverResult(ctx, moverName)
+	result, node, rerr := readMoverResult(ctx, r.Client, r.OperatorNamespace, moverName)
 	vol.Node = node
 	switch {
 	case complete && rerr == nil && result.OK:
@@ -820,18 +853,19 @@ func (r *BackupReconciler) cleanupVolumeExposure(ctx context.Context, backup *cb
 // password (mounted file) and the two S3 credentials as env (secretKeyRef). It reads the S3
 // credentials from the location's credentials Secret through the uncached reader (I3) and
 // tolerates AlreadyExists so a re-reconcile re-adopts. The exposure labels are stamped so the
-// reaper can find it.
-func (r *BackupReconciler) ensureMoverCredsSecret(ctx context.Context, name, dek, s3CredsSecret string, labels map[string]string) error {
-	accessKey, err := r.Secrets.GetValue(ctx, r.OperatorNamespace, s3CredsSecret, mover.SecretKeyAWSAccessKeyID)
+// reaper can find it. A package function shared by the Backup controller, the maintenance ops
+// and the restore engine — one definition of the per-Job credential shape.
+func ensureMoverCredsSecret(ctx context.Context, deps repoMaintenanceDeps, name, dek, s3CredsSecret string, labels map[string]string) error {
+	accessKey, err := deps.Secrets.GetValue(ctx, deps.OperatorNamespace, s3CredsSecret, mover.SecretKeyAWSAccessKeyID)
 	if err != nil {
-		return fmt.Errorf("read S3 access key from secret %s/%s: %w", r.OperatorNamespace, s3CredsSecret, err)
+		return fmt.Errorf("read S3 access key from secret %s/%s: %w", deps.OperatorNamespace, s3CredsSecret, err)
 	}
-	secretKey, err := r.Secrets.GetValue(ctx, r.OperatorNamespace, s3CredsSecret, mover.SecretKeyAWSSecretAccessKey)
+	secretKey, err := deps.Secrets.GetValue(ctx, deps.OperatorNamespace, s3CredsSecret, mover.SecretKeyAWSSecretAccessKey)
 	if err != nil {
-		return fmt.Errorf("read S3 secret key from secret %s/%s: %w", r.OperatorNamespace, s3CredsSecret, err)
+		return fmt.Errorf("read S3 secret key from secret %s/%s: %w", deps.OperatorNamespace, s3CredsSecret, err)
 	}
 	creds := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: r.OperatorNamespace, Labels: labels},
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: deps.OperatorNamespace, Labels: labels},
 		Type:       corev1.SecretTypeOpaque,
 		Data: map[string][]byte{
 			mover.SecretKeyResticPassword:     []byte(dek),
@@ -839,8 +873,8 @@ func (r *BackupReconciler) ensureMoverCredsSecret(ctx context.Context, name, dek
 			mover.SecretKeyAWSSecretAccessKey: secretKey,
 		},
 	}
-	if err := r.Create(ctx, creds); err != nil && !apierrors.IsAlreadyExists(err) {
-		return fmt.Errorf("create mover creds secret %s/%s: %w", r.OperatorNamespace, name, err)
+	if err := deps.Create(ctx, creds); err != nil && !apierrors.IsAlreadyExists(err) {
+		return fmt.Errorf("create mover creds secret %s/%s: %w", deps.OperatorNamespace, name, err)
 	}
 	return nil
 }
@@ -849,23 +883,38 @@ func (r *BackupReconciler) ensureMoverCredsSecret(ctx context.Context, name, dek
 // container's termination message and parses it (mover.ParseMoverResult), returning the result
 // and the node the pod ran on. A blank message parses to an error — the load-bearing signal that
 // the mover was killed before it could report (OOMKilled/SIGKILL) — which the caller turns into a
-// volume failure.
-func (r *BackupReconciler) readMoverResult(ctx context.Context, jobName string) (mover.MoverResult, string, error) {
+// volume failure. A package function shared with the restore engine.
+func readMoverResult(ctx context.Context, c client.Client, operatorNamespace, jobName string) (mover.MoverResult, string, error) {
 	var pods corev1.PodList
-	if err := r.List(ctx, &pods,
-		client.InNamespace(r.OperatorNamespace),
+	if err := c.List(ctx, &pods,
+		client.InNamespace(operatorNamespace),
 		client.MatchingLabels{batchv1.JobNameLabel: jobName}); err != nil {
 		return mover.MoverResult{}, "", fmt.Errorf("list mover pods for job %s: %w", jobName, err)
 	}
+	// With backoffLimit retries a Complete Job can retain BOTH a failed and a succeeded pod,
+	// and list order is arbitrary — prefer the exit-0 attempt's message so a retried-then-
+	// successful run is never misread as its own earlier failure; fall back to any
+	// terminated pod (all attempts failed, or a hard kill left a blank message).
+	var fallback *corev1.Pod
 	for i := range pods.Items {
 		pod := &pods.Items[i]
 		cs := pod.Status.ContainerStatuses
-		if len(cs) > 0 && cs[0].State.Terminated != nil {
+		if len(cs) == 0 || cs[0].State.Terminated == nil {
+			continue
+		}
+		if cs[0].State.Terminated.ExitCode == 0 {
 			result, err := mover.ParseMoverResult(cs[0].State.Terminated.Message)
 			return result, pod.Spec.NodeName, err
 		}
+		if fallback == nil {
+			fallback = pod
+		}
 	}
-	return mover.MoverResult{}, "", fmt.Errorf("no terminated mover pod found for job %s/%s", r.OperatorNamespace, jobName)
+	if fallback != nil {
+		result, err := mover.ParseMoverResult(fallback.Status.ContainerStatuses[0].State.Terminated.Message)
+		return result, fallback.Spec.NodeName, err
+	}
+	return mover.MoverResult{}, "", fmt.Errorf("no terminated mover pod found for job %s/%s", operatorNamespace, jobName)
 }
 
 // deleteMoverJobAndSecret best-effort deletes the mover Job and its creds Secret (both named
@@ -878,17 +927,7 @@ func (r *BackupReconciler) readMoverResult(ctx context.Context, jobName string) 
 // envtest (it runs only apiserver + etcd, no GC controller), leaving the Job wedged in
 // Terminating forever. Background achieves the same teardown in both environments.
 func (r *BackupReconciler) deleteMoverJobAndSecret(ctx context.Context, prefix string) {
-	log := logf.FromContext(ctx)
-	name := prefix + "-mover"
-	background := metav1.DeletePropagationBackground
-	job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: r.OperatorNamespace}}
-	if err := r.Delete(ctx, job, &client.DeleteOptions{PropagationPolicy: &background}); err != nil && !apierrors.IsNotFound(err) {
-		log.Error(err, "best-effort delete of mover job failed", "job", name)
-	}
-	sec := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: r.OperatorNamespace}}
-	if err := r.Delete(ctx, sec); err != nil && !apierrors.IsNotFound(err) {
-		log.Error(err, "best-effort delete of mover creds secret failed", "secret", name)
-	}
+	deleteJobAndSecret(ctx, r.Client, r.OperatorNamespace, prefix+"-mover")
 }
 
 // SetupWithManager registers this reconciler. It watches Backup directly and, via a label-based

@@ -55,6 +55,35 @@ func kubectl(args ...string) (string, error) {
 	return utils.Run(exec.Command("kubectl", args...))
 }
 
+// deployOperatorFresh installs the CRDs, deploys the manager, then RESTARTS its Deployment
+// and waits for the rollout: `kind load docker-image` replaces an image under the SAME tag
+// without touching running pods, so on a REUSED e2e cluster an unchanged manifest would
+// silently keep the previous build's pod serving — every spec would then exercise stale
+// code. On a fresh CI cluster the restart is a cheap no-op roll of a just-created
+// Deployment. Idempotent, shared by every Ordered container that needs the operator
+// (Ginkgo randomizes container order, so each must be self-sufficient).
+func deployOperatorFresh() {
+	GinkgoHelper()
+	By("installing CRDs and deploying the controller-manager (idempotent)")
+	_, err := utils.Run(exec.Command("make", "install"))
+	Expect(err).NotTo(HaveOccurred(), "Failed to install CRDs")
+	_, err = utils.Run(exec.Command("make", "deploy", fmt.Sprintf("IMG=%s", managerImage)))
+	Expect(err).NotTo(HaveOccurred(), "Failed to deploy the controller-manager")
+
+	By("restarting the manager so the freshly loaded image is the one running")
+	ns := ""
+	Eventually(func(g Gomega) { ns = getOperatorNamespace(g) }, 2*time.Minute, 3*time.Second).Should(Succeed())
+	deploys, err := kubectl("get", "deploy", "-n", ns, "-l", "control-plane=controller-manager", "-o", "name")
+	Expect(err).NotTo(HaveOccurred(), "listing the manager Deployment")
+	for _, d := range utils.GetNonEmptyLines(deploys) {
+		name := strings.TrimSpace(d)
+		_, err = kubectl("rollout", "restart", "-n", ns, name)
+		Expect(err).NotTo(HaveOccurred(), "restarting %s", name)
+		_, err = kubectl("rollout", "status", "-n", ns, name, "--timeout=3m")
+		Expect(err).NotTo(HaveOccurred(), "waiting for %s to roll out", name)
+	}
+}
+
 // ---- name-prefix-agnostic discovery helpers -------------------------------------------
 
 // getOperatorNamespace returns the namespace of the controller-manager pod. Kubebuilder
@@ -121,13 +150,7 @@ var _ = Describe("Crystal Backup operator (M0)", Ordered, func() {
 	// Deploy the operator once for this container: install CRDs, then `make deploy`, then
 	// discover the operator's runtime resources by label/suffix.
 	BeforeAll(func() {
-		By("installing CRDs")
-		_, err := utils.Run(exec.Command("make", "install"))
-		Expect(err).NotTo(HaveOccurred(), "Failed to install CRDs")
-
-		By("deploying the controller-manager")
-		_, err = utils.Run(exec.Command("make", "deploy", fmt.Sprintf("IMG=%s", managerImage)))
-		Expect(err).NotTo(HaveOccurred(), "Failed to deploy the controller-manager")
+		deployOperatorFresh()
 
 		By("discovering the deployed operator resources (namePrefix-agnostic)")
 		Eventually(func(g Gomega) {

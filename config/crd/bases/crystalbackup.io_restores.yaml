@@ -124,6 +124,7 @@ spec:
                 properties:
                   backup:
                     description: backup names a Backup in this namespace.
+                    maxLength: 253
                     type: string
                   origin:
                     description: origin disambiguates when using time.
@@ -132,15 +133,28 @@ spec:
                     - namespace
                     type: string
                   time:
-                    description: time selects "latest" or an RFC3339 instant instead
-                      of a named backup.
+                    description: |-
+                      time selects "latest" or an RFC3339 instant instead of a named backup. Bounded so the
+                      CEL rule's cost stays within the apiserver's per-CRD budget.
+                    maxLength: 64
                     type: string
+                    x-kubernetes-validations:
+                    - message: time must be "latest" or an RFC3339 timestamp
+                      rule: self == 'latest' || self.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}')
                 type: object
+                x-kubernetes-validations:
+                - message: exactly one of source.backup and source.time must be set
+                  rule: has(self.backup) != has(self.time)
+                - message: source.origin is only valid together with source.time
+                  rule: '!has(self.origin) || has(self.time)'
               volumes:
-                description: volumes selects PVCs (and optionally files) to restore.
+                description: |-
+                  volumes selects PVCs (and optionally files) to restore. Bounded so the per-item CEL
+                  cost stays within the apiserver's per-CRD budget.
                 items:
-                  description: VolumeSelectorItem selects PVCs (and optionally files
-                    within them) to restore.
+                  description: |-
+                    VolumeSelectorItem selects PVCs (and optionally files within them) to restore.
+                    When several items match the same PVC, the FIRST matching item wins (02-api.md).
                   properties:
                     exclude:
                       description: exclude is a list of file globs to skip.
@@ -159,14 +173,26 @@ spec:
                         type: string
                       type: array
                     targetPath:
-                      description: targetPath overrides the restore root within the
-                        PVC.
+                      description: |-
+                        targetPath overrides the restore root within the PVC (empty or "/" ⇒ the PVC root).
+                        It is resolved inside the PVC and must not contain ".." segments. Bounded so the CEL
+                        rule's cost stays within the apiserver's per-CRD budget.
+                      maxLength: 256
                       type: string
+                      x-kubernetes-validations:
+                      - message: targetPath must not contain '..' segments
+                        rule: '!self.split(''/'').exists(p, p == ''..'')'
                   type: object
+                maxItems: 128
                 type: array
             required:
             - source
             type: object
+            x-kubernetes-validations:
+            - message: spec.source is immutable
+              rule: self.source == oldSelf.source
+            - message: spec.mode is immutable
+              rule: self.mode == oldSelf.mode
           status:
             description: status defines the observed state of Restore
             properties:

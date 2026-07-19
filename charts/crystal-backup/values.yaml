@@ -184,3 +184,24 @@ terminationGracePeriodSeconds: 10
 # label on metrics/backups for multi-cluster fleets (R20). RESERVED for M0 — it is
 # not yet wired into the manager flags; a later milestone consumes it.
 clusterID: ""
+
+# Admission (adr/0010, spec/02-api.md §Validation): every static blocking rule ships as a
+# ValidatingAdmissionPolicy versioned with the CRDs; the one dynamic rule (single-default
+# location) is the operator webhook, fail-open by design.
+admission:
+  vap:
+    # -- Install the ValidatingAdmissionPolicy set (R23 confirmation, user isolation,
+    # immutable-forbids-prune, denied namespaces, selector shape, sync distinctness).
+    # Requires Kubernetes >= 1.30 (VAP GA), the chart's supported floor.
+    enabled: true
+  webhook:
+    # -- Serve the single-default-ClusterBackupLocation webhook (failurePolicy: Ignore) with
+    # a chart-generated certificate. Disabling it leaves the controller-side
+    # MultipleDefaults condition as the only guard against a second default location.
+    enabled: true
+  # -- Namespaces where tenant-facing CrystalBackup CRs are denied (VAP rule 7). Plain names
+  # or "*"-suffixed prefixes; rendered into the paramRef ConfigMap, so it can also be edited
+  # in-cluster post-install. Add any incumbent backup tool's namespace here.
+  deniedNamespaces:
+    - "kube-*"
+    - crystal-backup-system
