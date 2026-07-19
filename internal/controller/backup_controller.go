@@ -646,8 +646,28 @@ func (r *BackupReconciler) advanceSnapshotting(ctx context.Context, backup *cbv1
 	// No ownerReference: the mover Job is in the operator namespace and the Backup in a tenant
 	// namespace, so a cross-namespace ownerRef is illegal. The Job is tracked by its
 	// deterministic name + labels and re-adopted by Get (AlreadyExists on Create).
-	if err := r.Create(ctx, job); err != nil && !apierrors.IsAlreadyExists(err) {
-		return fmt.Errorf("create mover Job %s/%s: %w", r.OperatorNamespace, moverName, err)
+	created := false
+	if err := r.Create(ctx, job); err != nil {
+		if !apierrors.IsAlreadyExists(err) {
+			return fmt.Errorf("create mover Job %s/%s: %w", r.OperatorNamespace, moverName, err)
+		}
+	} else {
+		created = true
+	}
+
+	// Create-then-verify closes the mover⇄unlock TOCTOU (adr/0015): moverSlotBlocked's
+	// QuiescenceRequired check and this Create are not atomic (separated by two Secret reads + a
+	// create), so a stale-lock unlock can be enqueued in between. If we just created this Job and a
+	// lock-removing op is now pending for the repo, undo the Create and hold the volume in
+	// Snapshotting — otherwise the unlock's drain census (which reads the cached client and lags
+	// informer propagation) could miss this fresh Job and run `unlock --remove-all` while it holds a
+	// repository lock, the exact corruption the mutex exists to prevent. Only the fresh-create path
+	// needs this: a re-adopted (pre-existing) Job is already cache-visible to the drain. moverBlocking
+	// is incremented at unlock-enqueue and held for the whole pending+in-flight lifetime, so this
+	// re-check cannot miss a concurrently-enqueued unlock.
+	if created && r.Queue != nil && rc.repoName != "" && r.Queue.QuiescenceRequired(rc.repoName) {
+		r.deleteMoverJobAndSecret(ctx, prefix)
+		return nil // stay in Snapshotting; a requeue picks a clean slot once the unlock resolves.
 	}
 
 	vol.Phase = status.VolumePhaseUploading
