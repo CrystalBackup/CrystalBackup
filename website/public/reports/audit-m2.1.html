@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Crystal Backup — M0–M2 Security &amp; Resilience Audit (0.2.1)</title>
+<style>
+  :root {
+    --paper:#f6f8f9; --panel:#ffffff; --ink:#0f1620; --muted:#59636e; --faint:#8b96a1;
+    --line:#e2e7ec; --line-strong:#d0d8de; --steel:#35607a; --steel-soft:#eaf1f5;
+    --pass:#0f9d63; --pass-soft:#e6f5ed;
+    --crit:#c0392b; --crit-soft:#fbeae7; --high:#b6791f; --high-soft:#f7efdf;
+    --med:#2a5db0; --med-soft:#e9eff9; --low:#5f6b78; --low-soft:#edf0f3;
+    --shadow:0 1px 2px rgba(15,22,32,.04),0 8px 24px rgba(15,22,32,.05);
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    --mono:ui-monospace,"SF Mono","JetBrains Mono","Cascadia Code",Menlo,Consolas,monospace;
+  }
+  @media (prefers-color-scheme:dark){:root{
+    --paper:#0c1116; --panel:#121a22; --ink:#e8eef3; --muted:#97a3ae; --faint:#6c7883;
+    --line:#212c35; --line-strong:#2c3a45; --steel:#74a7c8; --steel-soft:#16242e;
+    --pass:#37d18b; --pass-soft:#10241b;
+    --crit:#e8776b; --crit-soft:#2a1512; --high:#d6a24e; --high-soft:#241c10;
+    --med:#7aa5e8; --med-soft:#16202f; --low:#97a3ae; --low-soft:#1a222a;
+    --shadow:0 1px 2px rgba(0,0,0,.3),0 10px 30px rgba(0,0,0,.35);
+  }}
+  :root[data-theme="light"]{--paper:#f6f8f9;--panel:#fff;--ink:#0f1620;--muted:#59636e;--faint:#8b96a1;--line:#e2e7ec;--steel:#35607a;--pass:#0f9d63;--pass-soft:#e6f5ed;--crit:#c0392b;--crit-soft:#fbeae7;--high:#b6791f;--high-soft:#f7efdf;--med:#2a5db0;--med-soft:#e9eff9;--low:#5f6b78;--low-soft:#edf0f3;}
+  :root[data-theme="dark"]{--paper:#0c1116;--panel:#121a22;--ink:#e8eef3;--muted:#97a3ae;--faint:#6c7883;--line:#212c35;--steel:#74a7c8;--pass:#37d18b;--pass-soft:#10241b;--crit:#e8776b;--crit-soft:#2a1512;--high:#d6a24e;--high-soft:#241c10;--med:#7aa5e8;--med-soft:#16202f;--low:#97a3ae;--low-soft:#1a222a;}
+  *{box-sizing:border-box;}
+  html{-webkit-text-size-adjust:100%;}
+  body{margin:0;background:var(--paper);color:var(--ink);font-family:var(--sans);line-height:1.6;font-size:16px;}
+  .wrap{max-width:820px;margin:0 auto;padding:56px 24px 80px;}
+  .eyebrow{font-family:var(--mono);font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--steel);margin:0 0 14px;}
+  h1{font-size:38px;line-height:1.1;letter-spacing:-.02em;margin:0 0 12px;}
+  .lede{font-size:18px;color:var(--muted);margin:0 0 20px;}
+  .meta{font-family:var(--mono);font-size:12.5px;color:var(--faint);display:flex;flex-wrap:wrap;gap:18px;padding-bottom:22px;border-bottom:1px solid var(--line);}
+  .meta b{color:var(--muted);font-weight:600;}
+  .verdict{margin:26px 0;padding:20px 22px;background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--pass);border-radius:12px;box-shadow:var(--shadow);}
+  .verdict .head{display:flex;align-items:center;gap:10px;font-weight:640;font-size:15px;margin-bottom:4px;}
+  .verdict .dot{width:9px;height:9px;border-radius:50%;background:var(--pass);display:inline-block;}
+  .verdict p{margin:8px 0 0;color:var(--muted);font-size:14.5px;}
+  h2{font-size:20px;letter-spacing:-.01em;margin:38px 0 6px;}
+  .axes{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:14px 0 8px;}
+  @media (max-width:560px){.axes{grid-template-columns:1fr;}}
+  .axis{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:13px 15px;box-shadow:var(--shadow);}
+  .axis .name{font-size:13px;color:var(--muted);margin-bottom:3px;}
+  .axis .verdict-line{font-weight:620;font-size:14.5px;display:flex;align-items:center;gap:7px;}
+  .axis .verdict-line .ok{color:var(--pass);}
+  .axis .verdict-line .warn{color:var(--high);}
+  table{width:100%;border-collapse:collapse;margin:10px 0 4px;font-size:14px;}
+  th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--line);vertical-align:top;}
+  th{font-size:11.5px;letter-spacing:.05em;text-transform:uppercase;color:var(--faint);font-weight:600;}
+  td .sha{font-family:var(--mono);font-size:12px;color:var(--steel);}
+  .sev{font-family:var(--mono);font-size:11px;font-weight:700;padding:2px 8px;border-radius:20px;white-space:nowrap;}
+  .sev.c{color:var(--crit);background:var(--crit-soft);} .sev.h{color:var(--high);background:var(--high-soft);}
+  .sev.m{color:var(--med);background:var(--med-soft);} .sev.l{color:var(--low);background:var(--low-soft);}
+  code{font-family:var(--mono);font-size:.86em;background:var(--steel-soft);color:var(--steel);padding:1px 5px;border-radius:5px;}
+  p{margin:12px 0;} .muted{color:var(--muted);}
+  .foot{margin-top:34px;padding-top:18px;border-top:1px solid var(--line);font-size:13px;color:var(--faint);}
+  a{color:var(--steel);}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <p class="eyebrow">Crystal Backup · Code audit</p>
+  <h1>M0–M2 Security &amp; Resilience Audit</h1>
+  <p class="lede">A read-only sweep of the shipped M0–M2 code — the input to the 0.2.1 hardening patch — across five axes: adequacy to spec, code quality, security (attack / algorithmic / resilience), and multi-tenant isolation.</p>
+  <div class="meta">
+    <span><b>Scope</b> ~33k LOC Go · 12 CRDs · 16 ADRs</span>
+    <span><b>Method</b> 5 parallel read-only auditors + direct verification</span>
+    <span><b>Date</b> 2026-07-19</span>
+    <span><b>Outcome</b> 0.2.1</span>
+  </div>
+
+  <section class="verdict">
+    <div class="head"><span class="dot"></span>Design sound · one critical implementation defect, all fixed in 0.2.1</div>
+    <p>The multi-tenant <b>read</b> boundary — the non-forgeable, server-derived <code>namespace=</code> mediation (invariant I1) — and the crypto core (no KEK generation, CSPRNG DEK, age wrap/unwrap, escrow validated-before-trust, secrets never on argv or in logs) were traced end-to-end and found sound. The audit surfaced <b>1 critical</b> data-integrity defect in the backup fan-out, <b>3 high</b>-severity correctness/security gaps, and a set of medium/low items — all fixed and re-validated (unit + envtest + lint green; crucible 31/0 on real Ceph).</p>
+  </section>
+
+  <h2>Verdict by axis</h2>
+  <div class="axes">
+    <div class="axis"><div class="name">Isolation — confidentiality (read)</div><div class="verdict-line"><span class="ok">✓ Holds</span> — I1 mediation non-forgeable</div></div>
+    <div class="axis"><div class="name">Isolation — integrity / availability</div><div class="verdict-line"><span class="warn">▲ 1 critical</span> — fan-out name collision (fixed)</div></div>
+    <div class="axis"><div class="name">Security — attack surface / crypto</div><div class="verdict-line"><span class="ok">✓ Sound</span> — 1 posture doc fix (I4)</div></div>
+    <div class="axis"><div class="name">Security — algorithmic / resilience</div><div class="verdict-line"><span class="warn">▲ gaps</span> — deadline, TOCTOU, GC (fixed)</div></div>
+    <div class="axis"><div class="name">Adequacy to spec</div><div class="verdict-line"><span class="warn">▲ targeted</span> — immutability, confirmation, regex</div></div>
+    <div class="axis"><div class="name">Code quality</div><div class="verdict-line"><span class="ok">✓ High</span> — few precise gaps</div></div>
+  </div>
+
+  <h2>Findings &amp; fixes</h2>
+  <table>
+    <thead><tr><th>Sev</th><th>Finding</th><th>Fix</th></tr></thead>
+    <tbody>
+      <tr><td><span class="sev c">CRIT</span></td><td><b>Cross-namespace mover object-name collision.</b> Per-PVC mover/exposure objects, named only from <code>(backup, pvc)</code> in the shared operator namespace, collided when two namespaces held a same-named PVC in one run — the second silently adopted the first&rsquo;s Job (data loss / false success). Not a confidentiality breach (mediation held).</td><td>Namespace-qualify names + unit &amp; crucible regression. <span class="sha">21cf97f</span></td></tr>
+      <tr><td><span class="sev h">HIGH</span></td><td><b>Location repository identity &amp; mode mutable.</b> <code>clusterID</code>/<code>s3.*</code>/<code>mode</code> had no immutability guard → silent repository re-point / WORM downgrade.</td><td>Update-only CEL + envtest. <span class="sha">e0b3e1e</span></td></tr>
+      <tr><td><span class="sev h">HIGH</span></td><td><b>mover⇄unlock TOCTOU.</b> A stale-lock <code>unlock --remove-all</code> could strip a freshly-created mover&rsquo;s repository lock (drain census lags the cache).</td><td>Create-then-verify. <span class="sha">61ecbf8</span></td></tr>
+      <tr><td><span class="sev h">HIGH</span></td><td><b>Discovery projection GC unscoped.</b> Ran cluster-wide, so ≥2 locations deleted each other&rsquo;s projections every pass.</td><td>Scope GC to the reconciled location + envtest. <span class="sha">e932a8c</span></td></tr>
+      <tr><td><span class="sev m">MED</span></td><td><b>No restore progress deadline.</b> A never-starting mover wedged the restore and blocked the repository maintenance drain.</td><td>Per-volume deadline (injected clock). <span class="sha">65156bf</span></td></tr>
+      <tr><td><span class="sev m">MED</span></td><td><b>ClusterErasure confirmation required</b> made <code>AwaitingConfirmation</code> unreachable; <b>unanchored <code>source.time</code> regex</b> → misleading stuck status; <b>swallowed restore-teardown List errors</b>; <b><code>forget</code> missing <code>--retry-lock</code></b>.</td><td>Four targeted fixes. <span class="sha">877784b · 0d9662e · 7cdc292 · c570436</span></td></tr>
+      <tr><td><span class="sev m">MED</span></td><td><b>Docs overstated mover credential scoping (I4).</b> Movers hold root S3 creds; STS/per-repo keys are deferred to M6 — the escrow&rsquo;s protection is the KEK, not the S3 path.</td><td>Honesty fix to the invariant + escrow docs. <span class="sha">228b585</span></td></tr>
+      <tr><td><span class="sev l">LOW</span></td><td>Reaper label selector made positive (wrapped-DEK Secret never a reap candidate); <code>spec.resources</code> bounded; <code>02-api</code> prose corrected.</td><td>Hardening batch. <span class="sha">7f1bc4c</span></td></tr>
+    </tbody>
+  </table>
+
+  <h2>Deferred (tracked, not in 0.2.1)</h2>
+  <p class="muted">Per-repo mover credential scoping (invariant <b>I4</b> — STS <code>AssumeRole</code> or RGW static per-repo keys, an M6 hardening item); a dedicated tokenless <code>crystal-mover</code> ServiceAccount (movers already run with <code>automountServiceAccountToken: false</code>, so I6 holds — this is defense in depth); an <code>ownerReference</code>/TTL backstop on the maintenance creds Secret; an injectable clock for the orphan reaper. All low-severity and recorded in the <code>CHANGELOG</code>.</p>
+
+  <p class="foot">
+    Method: five independent read-only auditors (isolation, crypto, restore resilience, code quality / API, M1 core &amp; concurrency), each tracing the code to <code>file:line</code>, with the critical and high findings re-verified by hand against the source. Fixes gated by <code>make test</code> (unit + envtest), <code>golangci-lint</code>, and the live-Ceph crucible — see the <a href="./crucible-m2.1.html">M2.1 crucible report</a>.
+  </p>
+</div>
+</body>
+</html>
