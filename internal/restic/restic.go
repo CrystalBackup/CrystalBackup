@@ -310,6 +310,15 @@ func ForgetArgs(r v1alpha1.RetentionSpec) []string {
 	keep("weekly", r.KeepWeekly)
 	keep("monthly", r.KeepMonthly)
 	keep("yearly", r.KeepYearly)
+	// --retry-lock rides out a live mover's repository lock, exactly like the backup and restore
+	// paths. The per-repo queue serializes forget only against init/unlock, NOT against readers
+	// (backup/restore movers), so on a busy shared repo forget would otherwise fail the moment a
+	// cross-namespace mover holds the lock — silently dropping retention until a quiet window. It
+	// waits behind the lock instead. Appended only when a real keep policy was emitted (the caller
+	// must not run an all-zero forget anyway); on the degenerate all-zero result len(args) is still 4.
+	if len(args) > 4 {
+		args = append(args, "--retry-lock", "5m")
+	}
 	return args
 }
 
