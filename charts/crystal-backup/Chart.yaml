@@ -8,11 +8,11 @@ type: application
 
 # Chart (packaging) version — SemVer. May bump independently of appVersion for
 # packaging-only changes (adr/0014-versioning-and-release.md).
-version: 0.2.0
+version: 0.2.1
 
 # One release train: operator image, mover image, crystalctl and this appVersion
 # share one version string (adr/0014; milestone→minor on major 0 — M2 → 0.2.z).
-appVersion: "0.2.0"
+appVersion: "0.2.1"
 
 # The chart ships the VAP-first admission model since M2 (adr/0010): the
 # ValidatingAdmissionPolicy API is GA in 1.30, which is therefore the supported floor
