@@ -152,7 +152,8 @@ func (r *DiscoveryReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	}
 
 	// (2) GC projections whose snapshots are gone (post-forget); never touch execution Backups.
-	if err := r.gcProjections(ctx, repoKeys); err != nil {
+	// Scoped to THIS repository's location so multiple locations never GC each other's projections.
+	if err := r.gcProjections(ctx, repo.Name, repoKeys); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -241,12 +242,17 @@ func (r *DiscoveryReconciler) projectGroup(ctx context.Context, repo *cbv1.Backu
 	return nil
 }
 
-// gcProjections deletes every projected (cluster-origin, AnnotationProjected) Backup whose
-// (namespace, run) group is no longer in the repository — its snapshots were forgotten, so the
-// projection must go (CR lifetime = data lifetime). It filters to projections by annotation, so a
-// still-executing (non-projected) Backup is never deleted here. Deleting a Backup never runs restic
-// forget; this only removes the now-meaningless view.
-func (r *DiscoveryReconciler) gcProjections(ctx context.Context, repoKeys map[restic.NamespaceRun]struct{}) error {
+// gcProjections deletes every projected (cluster-origin, AnnotationProjected) Backup of THIS
+// location's repository whose (namespace, run) group is no longer in the repository — its snapshots
+// were forgotten, so the projection must go (CR lifetime = data lifetime). It filters to projections
+// by annotation, so a still-executing (non-projected) Backup is never deleted here, AND by
+// locationName: discovery runs one reconcile per BackupRepository, and repoKeys is only this
+// repository's inventory, so without the location filter a cluster with two or more
+// ClusterBackupLocations would have each location's discovery delete the OTHER location's
+// projections every pass (a false "its repository snapshots are gone"), the two mutually flapping
+// each other's restore points in and out of the API. Deleting a Backup never runs restic forget;
+// this only removes the now-meaningless view.
+func (r *DiscoveryReconciler) gcProjections(ctx context.Context, locationName string, repoKeys map[restic.NamespaceRun]struct{}) error {
 	var projections cbv1.BackupList
 	if err := r.List(ctx, &projections, client.MatchingLabels{apiconst.LabelOrigin: apiconst.OriginCluster}); err != nil {
 		return fmt.Errorf("list projected Backups: %w", err)
@@ -255,6 +261,9 @@ func (r *DiscoveryReconciler) gcProjections(ctx context.Context, repoKeys map[re
 		b := &projections.Items[i]
 		if b.Annotations[apiconst.AnnotationProjected] != apiconst.AnnotationProjectedValue {
 			continue // an execution Backup, not a discovery projection — leave it alone.
+		}
+		if b.Spec.LocationRef.Name != locationName {
+			continue // a projection of a DIFFERENT location's repository — its own discovery owns it.
 		}
 		key := restic.NamespaceRun{Namespace: b.Namespace, Run: b.Name}
 		if _, live := repoKeys[key]; live {
