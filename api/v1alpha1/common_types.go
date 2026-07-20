@@ -299,6 +299,96 @@ type ResourceSelectorItem struct {
 	// include is a list of <group>/<Kind>[/<name>] globs.
 	// +optional
 	Include []string `json:"include,omitempty"`
+	// exclude removes from what selector and include selected, so an item reads
+	// "these kinds, minus these". Applied after both (04-manifest-backup.md §5.4).
+	// The backup-time default exclusions already applied at capture and cannot be
+	// re-included here.
+	// +optional
+	Exclude []string `json:"exclude,omitempty"`
+}
+
+// ManifestOptions tunes what the namespace manifest dump captures
+// (03-security-and-tenancy.md §10).
+type ManifestOptions struct {
+	// excludeSecretData stores Secret manifests with data/stringData stripped and the
+	// annotation crystalbackup.io/secret-data-excluded: "true". Restore recreates them
+	// empty, carrying the same annotation, so a workload that needs the values fails
+	// visibly instead of silently coming back with wrong ones.
+	//
+	// This is an opt-out from a deliberate default: a full namespace recovery (R15) needs
+	// the Secrets, and the control on them is the repository key — admin-only on the shared
+	// DR repo, the user's own on a user location. Excluding the data trades recoverability
+	// for a smaller blast radius if that key is ever compromised.
+	// +optional
+	ExcludeSecretData bool `json:"excludeSecretData,omitempty"`
+}
+
+// RestoreResourceOutcome is what happened to one manifest during a restore.
+// +kubebuilder:validation:Enum=Created;Configured;Recreated;Failed
+type RestoreResourceOutcome string
+
+const (
+	// RestoreResourceCreated means the object did not exist and was created.
+	RestoreResourceCreated RestoreResourceOutcome = "Created"
+	// RestoreResourceConfigured means an existing object was server-side applied (Overwrite).
+	RestoreResourceConfigured RestoreResourceOutcome = "Configured"
+	// RestoreResourceRecreated means an existing object was deleted then created (Recreate).
+	RestoreResourceRecreated RestoreResourceOutcome = "Recreated"
+	// RestoreResourceFailed means the object could not be applied; the restore continued.
+	RestoreResourceFailed RestoreResourceOutcome = "Failed"
+)
+
+// Caps on the per-resource restore report. A restore over a large namespace would otherwise
+// grow status without bound — the 1 MiB etcd object limit is a hard ceiling, and a status
+// that cannot be written loses the whole report, not just its tail.
+const (
+	// MaxRestoreResourceEntries is the most per-resource entries kept in status.
+	MaxRestoreResourceEntries = 100
+	// MaxRestoreChangedPaths is the most changed field paths kept per entry.
+	MaxRestoreChangedPaths = 20
+)
+
+// RestoreResourcesStatus is the per-resource detail of a manifest restore
+// (04-manifest-backup.md §5.4). Additive to the restoredResources counter of 02-api.md.
+type RestoreResourcesStatus struct {
+	// failedCount is how many resources failed to apply. A restore reports per-resource
+	// failures and continues; it does not abort on the first one.
+	// +optional
+	FailedCount int32 `json:"failedCount,omitempty"`
+	// truncated is true when entries were dropped to stay within the caps, so a reader can
+	// tell an empty tail from a complete report.
+	// +optional
+	Truncated bool `json:"truncated,omitempty"`
+	// entries records non-trivial outcomes only — a plain Created is the expected case and
+	// would drown the interesting ones. Capped at MaxRestoreResourceEntries.
+	// +optional
+	// +kubebuilder:validation:MaxItems=100
+	Entries []RestoreResourceEntry `json:"entries,omitempty"`
+}
+
+// RestoreResourceEntry is one resource's outcome in a manifest restore.
+type RestoreResourceEntry struct {
+	// group is the API group ("" for the core group).
+	// +optional
+	Group string `json:"group,omitempty"`
+	// kind is the PascalCase kind.
+	// +optional
+	Kind string `json:"kind,omitempty"`
+	// name of the object.
+	// +optional
+	Name string `json:"name,omitempty"`
+	// outcome of the apply. In a dry run this is the PLANNED action, not an observed one.
+	// +optional
+	Outcome RestoreResourceOutcome `json:"outcome,omitempty"`
+	// reason carries the server's error when outcome is Failed (a nodePort collision, a
+	// finalizer holding a Recreate delete, a CRD absent in the target cluster).
+	// +optional
+	Reason string `json:"reason,omitempty"`
+	// changed lists the field paths a server-side apply modified (Overwrite). Capped at
+	// MaxRestoreChangedPaths per entry.
+	// +optional
+	// +kubebuilder:validation:MaxItems=20
+	Changed []string `json:"changed,omitempty"`
 }
 
 // VolumeSelectorItem selects PVCs (and optionally files within them) to restore.
@@ -479,6 +569,9 @@ type ClusterBackupRunSpec struct {
 	// +optional
 	// +kubebuilder:default=true
 	IncludeManifests *bool `json:"includeManifests,omitempty"`
+	// manifestOptions tunes what the manifest dump captures (03-security-and-tenancy.md §10).
+	// +optional
+	ManifestOptions ManifestOptions `json:"manifestOptions,omitempty"`
 	// clusterResources captures cluster-scoped objects for full DR (adr/0011).
 	// +optional
 	ClusterResources ClusterResourceCaptureSpec `json:"clusterResources,omitempty"`

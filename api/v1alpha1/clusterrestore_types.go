@@ -68,6 +68,14 @@ type ClusterRestoreSpec struct {
 	// confirmation must equal target.namespace when the operation modifies existing objects (R23).
 	// +optional
 	Confirmation string `json:"confirmation,omitempty"`
+
+	// dryRun runs the whole pipeline — ordering, selection, mapping, mode resolution — with
+	// server-side dry-run applies, persists nothing, and writes the plan to
+	// status.resources. On the cluster plane this matters most: a ClusterRestore can
+	// recreate CRDs and cluster RBAC, and seeing the plan first is the difference between a
+	// reviewed DR and a hopeful one (04-manifest-backup.md §5.4).
+	// +optional
+	DryRun bool `json:"dryRun,omitempty"`
 }
 
 // ClusterRestoreStatus is the observed state of a ClusterRestore.
@@ -79,6 +87,10 @@ type ClusterRestoreStatus struct {
 	// restoredResources count.
 	// +optional
 	RestoredResources int32 `json:"restoredResources,omitempty"`
+	// resources is the per-resource detail of the manifest half (04-manifest-backup.md §5.4).
+	// Under dryRun it holds the PLAN rather than an observed outcome.
+	// +optional
+	Resources *RestoreResourcesStatus `json:"resources,omitempty"`
 	// restoredVolumes count.
 	// +optional
 	RestoredVolumes int32 `json:"restoredVolumes,omitempty"`

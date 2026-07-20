@@ -58,6 +58,13 @@ type RestoreSpec struct {
 	// confirmation must equal this namespace when the operation modifies existing objects (R23).
 	// +optional
 	Confirmation string `json:"confirmation,omitempty"`
+
+	// dryRun runs the whole pipeline — ordering, selection, mode resolution — with
+	// server-side dry-run applies, persists nothing, and writes the plan to
+	// status.resources. The point is to let an operator see what a destructive restore
+	// WOULD do before committing to it (04-manifest-backup.md §5.4).
+	// +optional
+	DryRun bool `json:"dryRun,omitempty"`
 }
 
 // RestoreStatus is the observed state of a Restore.
@@ -69,6 +76,10 @@ type RestoreStatus struct {
 	// restoredResources count.
 	// +optional
 	RestoredResources int32 `json:"restoredResources,omitempty"`
+	// resources is the per-resource detail of the manifest half (04-manifest-backup.md §5.4).
+	// Under dryRun it holds the PLAN rather than an observed outcome.
+	// +optional
+	Resources *RestoreResourcesStatus `json:"resources,omitempty"`
 	// restoredVolumes count.
 	// +optional
 	RestoredVolumes int32 `json:"restoredVolumes,omitempty"`

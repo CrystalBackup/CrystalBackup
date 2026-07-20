@@ -171,6 +171,14 @@ const (
 // hooks when HooksSpec.HonorAnnotations is true (e.g. "crystalbackup.io/pre-backup-command").
 const AnnotationPreBackupPrefix = Domain + "/pre-backup-"
 
+// AnnotationSecretDataExcluded marks a Secret manifest captured with its data/stringData
+// stripped, under manifestOptions.excludeSecretData (03-security-and-tenancy.md §10). It is
+// written at BACKUP time and preserved through restore, so the restored Secret exists but is
+// empty and says so. That is the point: a workload that needs the values fails visibly on a
+// missing key rather than silently starting with the wrong ones, and an operator reading the
+// object can tell "excluded by policy" from "the backup lost it".
+const AnnotationSecretDataExcluded = Domain + "/secret-data-excluded"
+
 // Finalizers guarding the delete contract of the cluster-DR lifecycle owners.
 // spec/02-api.md does not fix the exact strings (an open question surfaced during
 // M1 planning); these pin them. Deleting a location or repository never erases repo

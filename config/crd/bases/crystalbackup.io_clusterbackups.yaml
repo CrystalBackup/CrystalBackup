@@ -305,6 +305,23 @@ spec:
                 required:
                 - name
                 type: object
+              manifestOptions:
+                description: manifestOptions tunes what the manifest dump captures
+                  (03-security-and-tenancy.md §10).
+                properties:
+                  excludeSecretData:
+                    description: |-
+                      excludeSecretData stores Secret manifests with data/stringData stripped and the
+                      annotation crystalbackup.io/secret-data-excluded: "true". Restore recreates them
+                      empty, carrying the same annotation, so a workload that needs the values fails
+                      visibly instead of silently coming back with wrong ones.
+
+                      This is an opt-out from a deliberate default: a full namespace recovery (R15) needs
+                      the Secrets, and the control on them is the repository key — admin-only on the shared
+                      DR repo, the user's own on a user location. Excluding the data trades recoverability
+                      for a smaller blast radius if that key is ever compromised.
+                    type: boolean
+                type: object
               maxConcurrentMovers:
                 description: maxConcurrentMovers caps parallel mover Jobs.
                 format: int32
