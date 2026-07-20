@@ -225,6 +225,12 @@ type resolvedSnapshots struct {
 	run       string
 	byPVC     map[string]restic.Snapshot
 	manifests []restic.Snapshot
+	// clusterManifests is a ClusterRestore's run kind=cluster-manifests listing, resolved by a
+	// SEPARATE filtered listing and cached here so the per-pass plan derivation never re-lists. It
+	// cannot ride the volume listing's namespace= filter: a cluster-manifests snapshot carries no
+	// namespace tag (restic.ClusterManifestsIdentity), so a namespace-filtered listing can never
+	// return it. Empty for a namespaced Restore, which has no cluster-scoped half.
+	clusterManifests []restic.Snapshot
 }
 
 // newRestoreEngine wires an engine from the owning reconciler's primitives.
@@ -312,6 +318,33 @@ func (e *restoreEngine) storeResolution(owner types.UID, run string,
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.resolved[owner] = resolvedSnapshots{run: run, byPVC: byPVC, manifests: manifestSnaps}
+}
+
+// cachedClusterResolution returns a ClusterRestore's cached resolution iff it matches run: the
+// per-PVC data snapshots AND the run's cluster-manifests listing. The ClusterRestore twin of
+// cachedResolution — it returns the cluster-manifests listing where the namespaced one returns the
+// kind=manifests listing, because the two restore kinds resolve their manifest half from different
+// filters.
+func (e *restoreEngine) cachedClusterResolution(owner types.UID, run string) (map[string]restic.Snapshot, []restic.Snapshot, bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	r, ok := e.resolved[owner]
+	if !ok || r.run != run {
+		return nil, nil, false
+	}
+	return r.byPVC, r.clusterManifests, true
+}
+
+// storeClusterResolution caches a ClusterRestore's mediated resolution: the per-PVC data snapshots
+// AND the run's cluster-manifests listing (resolved by a SEPARATE filtered listing). Distinct from
+// storeResolution so the cluster-manifests listing lands in its own field and the intent is explicit
+// at the call site; forgetResolution drops the whole entry on terminal/finalize either way.
+func (e *restoreEngine) storeClusterResolution(owner types.UID, run string,
+	byPVC map[string]restic.Snapshot, clusterManifestSnaps []restic.Snapshot,
+) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.resolved[owner] = resolvedSnapshots{run: run, byPVC: byPVC, clusterManifests: clusterManifestSnaps}
 }
 
 // forgetListing drops ONLY the cached snapshot listing — the source pin and the per-volume

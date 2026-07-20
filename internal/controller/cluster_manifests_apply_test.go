@@ -57,12 +57,13 @@ var _ = Describe("manifest applier — cluster-scoped path (real API server)", f
 	})
 
 	storageClass := func(name, provisioner string) *unstructured.Unstructured {
-		return &unstructured.Unstructured{Object: map[string]any{
+		o := &unstructured.Unstructured{Object: map[string]any{
 			"apiVersion":  "storage.k8s.io/v1",
 			"kind":        "StorageClass",
-			"metadata":    map[string]any{"name": name},
 			"provisioner": provisioner,
 		}}
+		o.SetName(name)
+		return o
 	}
 
 	// writeClusterSnapshot lays out a cluster-manifests tree exactly as ClusterDumper does — the

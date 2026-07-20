@@ -63,6 +63,10 @@ spec:
             # The cluster-scoped capture grant (adr/0011 §1), bound as a transient
             # ClusterRoleBinding for one ClusterBackup run. Enumerated, not "*".
             - --cluster-manifest-reader-cluster-role={{ include "crystal-backup.fullname" . }}-cluster-manifest-reader
+            # The cluster-scoped RESTORE grant (adr/0011 §2) — the writer twin, bound as a
+            # transient ClusterRoleBinding for one ClusterRestore. The most privileged grant in
+            # the system; recreates CRDs and cluster RBAC. Enumerated, never standing.
+            - --cluster-manifest-writer-cluster-role={{ include "crystal-backup.fullname" . }}-cluster-manifest-writer
             {{- end }}
             {{- with .Values.extraArgs }}
             {{- toYaml . | nindent 12 }}

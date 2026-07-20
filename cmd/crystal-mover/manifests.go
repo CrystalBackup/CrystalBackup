@@ -34,6 +34,10 @@ import (
 	"github.com/CrystalBackup/CrystalBackup/internal/sanitize"
 )
 
+// envTrue is the value the mover's boolean environment flags carry when set. The operator
+// writes it (fmt "%t") and the shim compares against it, so it is named once here.
+const envTrue = "true"
+
 // dumpManifests reads the namespace from the API server and writes the sanitized tree that
 // restic is about to back up.
 //
@@ -82,7 +86,7 @@ func dumpManifests(ctx context.Context) (*manifests.Index, error) {
 		Namespace:         namespace,
 		ClusterID:         os.Getenv(mover.EnvManifestsClusterID),
 		BackupName:        os.Getenv(mover.EnvManifestsBackupName),
-		ExcludeSecretData: os.Getenv(mover.EnvManifestsExcludeSecretData) == "true",
+		ExcludeSecretData: os.Getenv(mover.EnvManifestsExcludeSecretData) == envTrue,
 	}, dest)
 	if err != nil {
 		return nil, fmt.Errorf("dump %s: %w", namespace, err)
@@ -222,7 +226,7 @@ func applyManifests(ctx context.Context) (*manifests.Report, error) {
 		SourceDir:           sourceDir,
 		TargetNamespace:     targetNamespace,
 		Mode:                manifests.RestoreMode(os.Getenv(mover.EnvManifestsMode)),
-		DryRun:              os.Getenv(mover.EnvManifestsDryRun) == "true",
+		DryRun:              os.Getenv(mover.EnvManifestsDryRun) == envTrue,
 		Selection:           compiled,
 		StorageClassMapping: classMapping,
 	}
@@ -291,7 +295,7 @@ func applyClusterManifests(ctx context.Context) (*manifests.Report, error) {
 	opts := manifests.ApplyOptions{
 		SourceDir:     sourceDir,
 		Mode:          manifests.RestoreMode(os.Getenv(mover.EnvManifestsMode)),
-		DryRun:        os.Getenv(mover.EnvManifestsDryRun) == "true",
+		DryRun:        os.Getenv(mover.EnvManifestsDryRun) == envTrue,
 		Selection:     compiled,
 		ClusterScoped: true,
 	}

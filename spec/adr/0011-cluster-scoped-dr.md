@@ -59,9 +59,24 @@ admin-only, and confirmation-gated.**
 ### 2. Restore (selective, opt-in, admin-only)
 
 - `ClusterRestore.spec.clusterResources` (`include`/`exclude`) selects **which** cluster-scoped
-  objects to restore. **Omitted ⇒ nothing cluster-scoped is restored** — the safe default; the
-  admin opts in explicitly. There is **no** cluster-scoped restore on the namespaced `Restore`
-  path (it is structurally namespace-confined, R14).
+  objects to restore. It is a **pointer**, so its three states are: **omitted ⇒ nothing
+  cluster-scoped is restored** (the safe default; the admin opts in explicitly); **present with
+  an empty `include` ⇒ every cluster-scoped object in the snapshot** (the snapshot is already the
+  curated capture of §1, and the pointer's presence is the explicit opt-in, so there is nothing
+  more to name); **present with a non-empty `include` ⇒ only the matching kinds/names**. `exclude`
+  always subtracts, last. There is **no** cluster-scoped restore on the namespaced `Restore` path
+  (it is structurally namespace-confined, R14).
+- **storageClassMapping does not touch cluster-scoped objects.** A restored `PersistentVolume`
+  keeps its captured `spec.storageClassName` — a PV represents an already-provisioned volume, so
+  remapping its class would not re-provision anything; the mapping applies only to the PVCs on the
+  volume-data path (04-manifest-backup.md §5.3). An explicit v1 non-goal.
+- **Cross-tree ordering is by sequencing, not one Job.** The cluster-scoped objects live in a
+  `kind=cluster-manifests` snapshot and the namespace's objects in `kind=manifests`/`kind=data`
+  ones; the ClusterRestore runs the cluster-scoped restore Job to completion *before* it drives
+  the volumes, so the StorageClasses and CRDs exist before anything binds to them. (Restoring the
+  namespace's own **manifests** — its Deployments, Services — through a `ClusterRestore` reuses the
+  namespaced resources[] engine and lands as a follow-up; a `ClusterRestore` today restores the
+  cluster-scoped objects and the volume data.)
 - **Apply order**: cluster-scoped **first**, so namespaced objects bind — `CustomResourceDefinition`s
   → other cluster-scoped (StorageClasses, PriorityClasses, IngressClasses, ClusterRoles/Bindings,
   PVs) → **namespaces** → namespaced objects. `Recreate`/`Overwrite` mode and the R23 `confirmation`

@@ -102,6 +102,7 @@ const (
 	suiteManifestWriterRole        = "crystal-backup-manifest-writer"
 	suiteManifestReaderRole        = "crystal-backup-manifest-reader"
 	suiteClusterManifestReaderRole = "crystal-backup-cluster-manifest-reader"
+	suiteClusterManifestWriterRole = "crystal-backup-cluster-manifest-writer"
 )
 
 var _ = BeforeSuite(func() {
@@ -258,6 +259,8 @@ var _ = BeforeSuite(func() {
 		restoreLister,
 		suiteOperatorNamespace,
 		suiteMoverImage,
+		suiteManifestMoverSA,
+		suiteClusterManifestWriterRole,
 		mgr.GetEventRecorder("clusterrestore"),
 		repoQueue,
 	).SetupWithManager(mgr)).To(Succeed())

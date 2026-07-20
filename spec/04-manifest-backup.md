@@ -241,6 +241,11 @@ target class). Application points:
    PVC (mode `Recreate`, fresh PVC), so a PVC's class is identical whether it arrives
    through its manifest or through the data path.
 
+The map touches **PVCs only**. A restored cluster-scoped `PersistentVolume` keeps its captured
+`spec.storageClassName` unchanged: a PV represents an already-provisioned volume, so rewriting
+its class would rename a label without re-provisioning anything (adr/0011 §2). An explicit v1
+non-goal, not an oversight.
+
 Both points share one implementation, so mapping semantics cannot diverge. The namespaced
 `Restore` restores into **its own namespace** and exposes no `storageClassMapping`
 (same-cluster, same classes) — remapping is a `ClusterRestore` (cross-cluster /
