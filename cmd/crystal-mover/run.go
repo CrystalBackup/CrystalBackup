@@ -50,7 +50,7 @@ const jsonFlag = "--json"
 func knownOperation(op string) bool {
 	switch mover.Operation(op) {
 	case mover.OpBackup, mover.OpRestore, mover.OpInit, mover.OpForget, mover.OpPrune,
-		mover.OpCheck, mover.OpSnapshots, mover.OpUnlock:
+		mover.OpCheck, mover.OpSnapshots, mover.OpUnlock, mover.OpManifestsBackup:
 		return true
 	default:
 		return false
@@ -62,7 +62,10 @@ func knownOperation(op string) bool {
 // bytes). These are the two operations whose stdout is captured instead of teed to the pod
 // log, and for which ensureSummaryJSON forces --json.
 func parsesJSONSummary(op string) bool {
-	return op == string(mover.OpBackup) || op == string(mover.OpRestore)
+	// manifests-backup ends in a `restic backup` of the dumped tree, so it produces and needs
+	// the same summary as any other backup — the snapshot id is what the controller records.
+	return op == string(mover.OpBackup) || op == string(mover.OpRestore) ||
+		op == string(mover.OpManifestsBackup)
 }
 
 // ensureSummaryJSON guarantees the summary-parsed operations (backup, restore — see
@@ -120,7 +123,7 @@ func buildResult(operation string, resticStdout []byte, resticErr error) mover.M
 		}
 	}
 	switch operation {
-	case string(mover.OpBackup):
+	case string(mover.OpBackup), string(mover.OpManifestsBackup):
 		summary, err := mover.ParseBackupSummary(resticStdout)
 		if err != nil {
 			// restic returned success but we could not read a summary: refuse to fabricate a
@@ -131,7 +134,7 @@ func buildResult(operation string, resticStdout []byte, resticErr error) mover.M
 				Error:     clampError(err),
 			}
 		}
-		return mover.SummaryToResult(summary)
+		return mover.SummaryToResult(mover.Operation(operation), summary)
 	case string(mover.OpRestore):
 		summary, err := mover.ParseRestoreSummary(resticStdout)
 		if err != nil {

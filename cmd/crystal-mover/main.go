@@ -53,12 +53,14 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"flag"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 
+	"github.com/CrystalBackup/CrystalBackup/internal/manifests"
 	"github.com/CrystalBackup/CrystalBackup/internal/mover"
 )
 
@@ -93,6 +95,19 @@ func main() {
 	// The restic subcommand and its args are mandatory; without them there is nothing to run.
 	if len(resticArgv) == 0 {
 		fail(*terminationLog, *operation, fmt.Errorf("no restic argv after the %q separator", "--"))
+	}
+
+	// A manifest backup has a step BEFORE restic: read the namespace from the API server and
+	// write the sanitized tree that restic is about to snapshot. A failure here is fatal on
+	// purpose — backing up an empty or half-written directory would produce a snapshot that
+	// reports success and restores to nothing, which is the worst outcome a backup tool has.
+	var manifestIndex *manifests.Index
+	if mover.Operation(*operation) == mover.OpManifestsBackup {
+		idx, err := dumpManifests(context.Background())
+		if err != nil {
+			fail(*terminationLog, *operation, err)
+		}
+		manifestIndex = idx
 	}
 
 	// For a backup or restore, guarantee restic emits a machine-readable summary we can parse;
@@ -133,7 +148,16 @@ func main() {
 		}
 	}
 
-	report(*terminationLog, buildResult(*operation, stdout.Bytes(), runErr))
+	result := buildResult(*operation, stdout.Bytes(), runErr)
+	// Fold the dump's accounting into the result the controller reads. Only on success: a
+	// resource count attached to a failed snapshot would claim a capture the repository does
+	// not hold.
+	if manifestIndex != nil && result.OK {
+		// A namespace's object count fits an int32 by orders of magnitude.
+		result.ResourceCount = int32(manifestIndex.ResourceCount) //nolint:gosec // bounded above
+		result.IncompleteManifests = len(manifestIndex.Warnings) > 0
+	}
+	report(*terminationLog, result)
 }
 
 // report is the shim's single exit point once a MoverResult exists. It persists the result to

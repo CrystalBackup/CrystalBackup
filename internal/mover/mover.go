@@ -93,6 +93,13 @@ const (
 	// OpUnlock removes stale repository locks (`restic unlock`) so an OOM-killed mover's lock
 	// cannot wedge the next run. Maintenance shape (no PVC).
 	OpUnlock Operation = "unlock"
+	// OpManifestsBackup dumps a namespace's Kubernetes resources and backs the tree up (R15,
+	// spec/04-manifest-backup.md §2.3). It is the ONLY operation that talks to the API server:
+	// the dump must not go through exec/stdout (delta 8), so the mover reads the objects and
+	// writes them to the repository itself. That makes it the sole exception to the zero-API
+	// mover invariant (I6) — it runs under crystal-manifest-mover with an automounted token
+	// and a transient RoleBinding, never under the zero-RBAC crystal-mover.
+	OpManifestsBackup Operation = "manifests-backup"
 )
 
 // Filesystem layout inside the mover container. These paths are a two-sided contract: the
@@ -131,6 +138,30 @@ const (
 	// the kubelet reads the container's termination message from. Exported so the shim and
 	// the Job spec name the exact same path (BuildJob pins it on the container).
 	TerminationMessagePath = "/dev/termination-log"
+
+	// ManifestsRoot is where the manifest emptyDir is mounted, and it is chosen to EQUAL the
+	// restic path prefix of restic.ManifestsIdentity ("/manifests/<namespace>"). restic
+	// records the absolute path it was given, so the dump destination and the snapshot's
+	// stored path are the same string by construction — exactly as a data job mounts its PVC
+	// at /data/<ns>/<pvc> rather than somewhere neutral. Writing the dump anywhere else would
+	// silently store the snapshot under the wrong path and break every retention group and
+	// restore that keys on it.
+	ManifestsRoot = "/manifests"
+)
+
+// Environment the manifest mover reads. The mover has no config file and no flags beyond
+// --operation; everything else arrives as env, so these are the contract between the Job
+// builder and the shim.
+const (
+	// EnvManifestsNamespace is the namespace to dump. The destination directory is
+	// ManifestsRoot + "/" + this, which is what makes it agree with the restic identity.
+	EnvManifestsNamespace = "CRYSTAL_MANIFESTS_NAMESPACE"
+	// EnvManifestsClusterID is recorded in index.json.
+	EnvManifestsClusterID = "CRYSTAL_MANIFESTS_CLUSTER_ID"
+	// EnvManifestsBackupName is the run name (the `run` tag), recorded in index.json.
+	EnvManifestsBackupName = "CRYSTAL_MANIFESTS_BACKUP_NAME"
+	// EnvManifestsExcludeSecretData is "true" when manifestOptions.excludeSecretData is set.
+	EnvManifestsExcludeSecretData = "CRYSTAL_MANIFESTS_EXCLUDE_SECRET_DATA"
 )
 
 // Secret data keys the per-Job Secret must carry. The restic password is consumed as a

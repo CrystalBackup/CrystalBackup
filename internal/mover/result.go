@@ -51,6 +51,16 @@ type MoverResult struct {
 	// RestoredBytes is the bytes a successful restore actually wrote into the target PVC
 	// (restic restore's bytes_restored); zero for every other operation.
 	RestoredBytes int64 `json:"restoredBytes,omitempty"`
+	// ResourceCount is how many objects a manifest backup actually captured; zero for every
+	// other operation. It feeds Backup.status.manifests.resourceCount.
+	ResourceCount int32 `json:"resourceCount,omitempty"`
+	// IncompleteManifests is true when a manifest dump could not enumerate everything — an
+	// RBAC 403 on one kind, an aggregated API that was down. The dump deliberately continues
+	// past those, so without this flag a partial capture would be indistinguishable from a
+	// complete one, and a restore would silently be missing kinds nobody knew about. The
+	// controller turns it into ManifestsComplete=False; the detail lives in the snapshot's
+	// index.json, which is too large for the 4096-byte termination message.
+	IncompleteManifests bool `json:"incompleteManifests,omitempty"`
 	// Error is a human-readable failure reason, set only when OK is false. It is advisory
 	// (for status/events); control flow keys off OK, not off this string.
 	Error string `json:"error,omitempty"`
@@ -167,10 +177,15 @@ func ParseBackupSummary(resticStdout []byte) (ResticBackupSummary, error) {
 // tests agree: total_bytes_processed -> SizeBytes (apparent size),
 // data_added -> AddedBytes (incremental cost), and Operation is always "backup" (only a
 // backup produces this summary shape).
-func SummaryToResult(s ResticBackupSummary) MoverResult {
+// The operation is a parameter rather than a hardcoded OpBackup because more than one
+// operation now ends in `restic backup` and therefore lands here: a manifest backup produces
+// the same summary shape. Echoing "backup" for a manifests-backup would defeat the one thing
+// MoverResult.Operation exists for — letting the controller check it got the result it asked
+// for — and it would do so silently.
+func SummaryToResult(op Operation, s ResticBackupSummary) MoverResult {
 	return MoverResult{
 		OK:         true,
-		Operation:  string(OpBackup),
+		Operation:  string(op),
 		SnapshotID: s.SnapshotID,
 		SizeBytes:  s.TotalBytesProcessed,
 		AddedBytes: s.DataAdded,

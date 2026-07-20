@@ -30,10 +30,11 @@ import (
 const (
 	containerName = "mover"
 
-	volumeSecret = "mover-secret" // the per-Job Secret: restic password + AWS creds
-	volumeCache  = "restic-cache" // restic cache emptyDir (writable)
-	volumeTmp    = "tmp"          // /tmp emptyDir (writable)
-	volumeData   = "data-source"  // the source PVC (data jobs only), mounted read-only
+	volumeSecret    = "mover-secret" // the per-Job Secret: restic password + AWS creds
+	volumeCache     = "restic-cache" // restic cache emptyDir (writable)
+	volumeTmp       = "tmp"          // /tmp emptyDir (writable)
+	volumeManifests = "manifests"    // the manifest dump scratch emptyDir (manifest jobs only)
+	volumeData      = "data-source"  // the source PVC (data jobs only), mounted read-only
 )
 
 // tmpDir is both the TMPDIR env value and the mount path of the tmp emptyDir. restic and
@@ -132,6 +133,18 @@ type JobRequest struct {
 	// scheduler). Only the restore twin-PV path sets it — an RWO volume attached on exactly
 	// one node must be mounted from that same node (adr/0016 §2); empty everywhere else.
 	NodeName string
+	// ServiceAccountName, when non-empty, runs the pod under that ServiceAccount AND
+	// automounts its token. Empty — the default for every data and maintenance job — keeps
+	// the zero-API posture of I6: the namespace default SA with its token not even mounted.
+	//
+	// Only the manifest mover sets this (crystal-manifest-mover), because it is the one
+	// operation that must read the API server. Making it opt-in rather than a parameter with
+	// a default means a new job shape cannot acquire API access by forgetting a field.
+	ServiceAccountName string
+	// ManifestsVolume adds the writable emptyDir the manifest dump writes into, mounted at
+	// ManifestsRoot. Only the manifest operations set it; the tree it holds is a namespace's
+	// manifests, which are small, so an unsized emptyDir is proportionate.
+	ManifestsVolume bool
 }
 
 // BuildJob assembles the batchv1.Job for one mover run, exactly per the package's runtime
@@ -192,9 +205,14 @@ func BuildJob(req JobRequest) *batchv1.Job {
 				ObjectMeta: metav1.ObjectMeta{Labels: copyLabels(req.Labels)},
 				Spec: corev1.PodSpec{
 					RestartPolicy: corev1.RestartPolicyNever,
-					// A mover talks to S3 and the source PVC only; it never calls the Kubernetes
-					// API, so its SA token must not be mounted (least privilege, smaller blast radius).
-					AutomountServiceAccountToken: ptrTo(false),
+					// A data or maintenance mover talks to S3 and the source PVC only; it never
+					// calls the Kubernetes API, so its SA token must not be mounted (least
+					// privilege, smaller blast radius). The single exception is the manifest
+					// mover, whose whole job IS reading the API server (I6): it names a
+					// ServiceAccount, and the token follows the account rather than being a
+					// separate knob that could be set without one.
+					ServiceAccountName:           req.ServiceAccountName,
+					AutomountServiceAccountToken: ptrTo(req.ServiceAccountName != ""),
 					SecurityContext: &corev1.PodSecurityContext{
 						SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 					},
@@ -300,6 +318,17 @@ func moverVolumes(req JobRequest) ([]corev1.Volume, []corev1.VolumeMount) {
 		{Name: volumeSecret, MountPath: SecretMountPath, ReadOnly: true},
 		{Name: volumeCache, MountPath: CacheDir},
 		{Name: volumeTmp, MountPath: tmpDir},
+	}
+
+	if req.ManifestsVolume {
+		// Writable scratch the manifest dump writes the namespace tree into, at exactly the
+		// path restic will be asked to back up (ManifestsRoot). Separate from the restic cache
+		// so the two cannot crowd each other out of one emptyDir's budget.
+		volumes = append(volumes, corev1.Volume{
+			Name:         volumeManifests,
+			VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+		})
+		mounts = append(mounts, corev1.VolumeMount{Name: volumeManifests, MountPath: ManifestsRoot})
 	}
 
 	if req.PVC != nil {
