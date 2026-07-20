@@ -69,7 +69,7 @@ func TestSelectionMatching(t *testing.T) {
 			name:      "include on group/Kind/name pins one object",
 			selection: Selection{Items: []SelectionItem{{Include: []string{"apps/StatefulSet/postgres"}}}},
 			selected:  []resource{pgStateful},
-			rejected:  []resource{webDeploy, resource{"apps", "StatefulSet", "redis", nil}},
+			rejected:  []resource{webDeploy, {"apps", "StatefulSet", "redis", nil}},
 		},
 		{
 			// The core group elided — "Secret/db-creds" is Kind/name, not group/Kind. Getting
@@ -77,7 +77,7 @@ func TestSelectionMatching(t *testing.T) {
 			name:      "the core group may be elided",
 			selection: Selection{Items: []SelectionItem{{Include: []string{"Secret/db-creds"}}}},
 			selected:  []resource{dbSecret},
-			rejected:  []resource{webDeploy, resource{"", "Secret", "other", nil}},
+			rejected:  []resource{webDeploy, {"", "Secret", "other", nil}},
 		},
 		{
 			name:      "the core group may be spelled core",

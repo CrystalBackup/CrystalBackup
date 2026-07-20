@@ -57,6 +57,9 @@ spec:
             # release-prefixed, so the operator must be told what the chart actually created.
             - --manifest-mover-service-account={{ include "crystal-backup.manifestMoverServiceAccountName" . }}
             - --manifest-reader-cluster-role={{ include "crystal-backup.fullname" . }}-manifest-reader
+            # The restore-side grant. Separate from the reader on purpose: the operator hands
+            # out whichever one the operation needs, and nothing binds both.
+            - --manifest-writer-cluster-role={{ include "crystal-backup.fullname" . }}-manifest-writer
             {{- end }}
             {{- with .Values.extraArgs }}
             {{- toYaml . | nindent 12 }}

@@ -99,6 +99,7 @@ const suiteMoverImage = "crystal-mover:test"
 // which is what exercises the transient-grant path.
 const (
 	suiteManifestMoverSA    = "crystal-backup-manifest-mover"
+	suiteManifestWriterRole = "crystal-backup-manifest-writer"
 	suiteManifestReaderRole = "crystal-backup-manifest-reader"
 )
 
@@ -239,6 +240,8 @@ var _ = BeforeSuite(func() {
 		restoreLister,
 		suiteOperatorNamespace,
 		suiteMoverImage,
+		suiteManifestMoverSA,
+		suiteManifestWriterRole,
 		mgr.GetEventRecorder("restore"),
 		repoQueue,
 	).SetupWithManager(mgr)).To(Succeed())

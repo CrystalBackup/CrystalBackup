@@ -153,10 +153,7 @@ func (a *Applier) Apply(ctx context.Context, opts ApplyOptions) (*Report, error)
 		return nil, err
 	}
 
-	planned, report, err := a.plan(idx, opts)
-	if err != nil {
-		return nil, err
-	}
+	planned, report := a.plan(idx, opts)
 
 	for i := range planned {
 		a.applyOne(ctx, &planned[i], opts, report)
@@ -175,7 +172,7 @@ func (a *Applier) readIndex(dir string) (*Index, error) {
 // plan reads, filters, transforms and orders the manifests before a single API call is made.
 // Doing it in one pass up front means the ordering is over the objects that will actually be
 // applied, not over the snapshot's contents.
-func (a *Applier) plan(idx *Index, opts ApplyOptions) ([]plannedResource, *Report, error) {
+func (a *Applier) plan(idx *Index, opts ApplyOptions) ([]plannedResource, *Report) {
 	report := &Report{}
 	planned := make([]plannedResource, 0, len(idx.Resources))
 
@@ -222,7 +219,7 @@ func (a *Applier) plan(idx *Index, opts ApplyOptions) ([]plannedResource, *Repor
 		}
 		return strings.Compare(x.entry.Name, y.entry.Name)
 	})
-	return planned, report, nil
+	return planned, report
 }
 
 func readManifest(path string) (*unstructured.Unstructured, error) {
@@ -230,7 +227,7 @@ func readManifest(path string) (*unstructured.Unstructured, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read manifest: %w", err)
 	}
-	var m map[string]interface{}
+	var m map[string]any
 	if err := yaml.Unmarshal(raw, &m); err != nil {
 		return nil, fmt.Errorf("parse manifest %s: %w", filepath.Base(path), err)
 	}

@@ -81,6 +81,7 @@ func main() {
 	var moverImage string
 	var manifestMoverSA string
 	var manifestReaderRole string
+	var manifestWriterRole string
 	// defaultOperatorNamespace resolves the operator's own namespace before flags are parsed:
 	// $POD_NAMESPACE (set via the downward API in the Helm chart / manifest) if present, else
 	// the Helm chart's own default, apiconst.DefaultOperatorNamespace. This is where every
@@ -100,6 +101,11 @@ func main() {
 	flag.StringVar(&manifestReaderRole, "manifest-reader-cluster-role", "",
 		"ClusterRole the operator binds TRANSIENTLY into a tenant namespace for a manifest backup "+
 			"(read on all namespaced kinds). Never bound standing; see spec/03 §5.")
+	flag.StringVar(&manifestWriterRole, "manifest-writer-cluster-role", "",
+		"ClusterRole the operator binds TRANSIENTLY into a target namespace for a manifest RESTORE "+
+			"(create/update/delete on arbitrary namespaced kinds). This is the largest grant in the "+
+			"system (spec/03 §5): it is bound for one Job's lifetime in one namespace, never standing, "+
+			"and widening it requires an ADR. Empty disables the resources[] half of a restore.")
 	flag.StringVar(&moverImage, "mover-image", "",
 		"Container image for the mover Jobs (repository init and, later, backup/restore/maintenance). "+
 			"REQUIRED for real backups — the Helm chart and the crucible set it; an empty value is tolerated "+
@@ -377,6 +383,8 @@ func main() {
 		snapshotLister,
 		operatorNamespace,
 		moverImage,
+		manifestMoverSA,
+		manifestWriterRole,
 		mgr.GetEventRecorder("restore"),
 		repoQueue,
 	).SetupWithManager(mgr); err != nil {

@@ -34,21 +34,31 @@ const (
 	phaseEverythingElse
 	phaseWorkloads
 	phaseNetworking
-	// phaseCount is the number of phases, so a loop over them cannot fall out of step with
-	// the constants above.
-	phaseCount = phaseNetworking
 )
 
 // coreGroup is the unnamed API group, spelled out where a map key needs it.
 const coreGroup = ""
 
 const (
-	groupApps          = "apps"
-	groupBatch         = "batch"
-	groupRBAC          = "rbac.authorization.k8s.io"
-	groupNetworking    = "networking.k8s.io"
+	groupApps       = "apps"
+	groupBatch      = "batch"
+	groupRBAC       = "rbac.authorization.k8s.io"
+	groupNetworking = "networking.k8s.io"
+
 	kindPVC            = "PersistentVolumeClaim"
 	kindServiceAccount = "ServiceAccount"
+	kindRole           = "Role"
+	kindRoleBinding    = "RoleBinding"
+	kindConfigMap      = "ConfigMap"
+	kindDeployment     = "Deployment"
+	kindStatefulSet    = "StatefulSet"
+	kindDaemonSet      = "DaemonSet"
+	kindReplicaSet     = "ReplicaSet"
+	kindJob            = "Job"
+	kindCronJob        = "CronJob"
+	kindPod            = "Pod"
+	kindIngress        = "Ingress"
+	kindNetworkPolicy  = "NetworkPolicy"
 )
 
 // phaseByKind pins the kinds §5.1 names to their phase. Keyed on group AND kind rather than
@@ -57,25 +67,25 @@ const (
 var phaseByKind = map[schema.GroupKind]int{
 	{Group: coreGroup, Kind: kindServiceAccount}: phaseServiceAccounts,
 
-	{Group: groupRBAC, Kind: "Role"}:        phaseRBAC,
-	{Group: groupRBAC, Kind: "RoleBinding"}: phaseRBAC,
+	{Group: groupRBAC, Kind: kindRole}:        phaseRBAC,
+	{Group: groupRBAC, Kind: kindRoleBinding}: phaseRBAC,
 
-	{Group: coreGroup, Kind: "ConfigMap"}: phaseConfigAndSecrets,
-	{Group: coreGroup, Kind: "Secret"}:    phaseConfigAndSecrets,
+	{Group: coreGroup, Kind: kindConfigMap}: phaseConfigAndSecrets,
+	{Group: coreGroup, Kind: kindSecret}:    phaseConfigAndSecrets,
 
 	{Group: coreGroup, Kind: kindPVC}: phasePVCs,
 
-	{Group: groupApps, Kind: "Deployment"}:  phaseWorkloads,
-	{Group: groupApps, Kind: "StatefulSet"}: phaseWorkloads,
-	{Group: groupApps, Kind: "DaemonSet"}:   phaseWorkloads,
-	{Group: groupApps, Kind: "ReplicaSet"}:  phaseWorkloads,
-	{Group: groupBatch, Kind: "Job"}:        phaseWorkloads,
-	{Group: groupBatch, Kind: "CronJob"}:    phaseWorkloads,
-	{Group: coreGroup, Kind: "Pod"}:         phaseWorkloads,
+	{Group: groupApps, Kind: kindDeployment}:  phaseWorkloads,
+	{Group: groupApps, Kind: kindStatefulSet}: phaseWorkloads,
+	{Group: groupApps, Kind: kindDaemonSet}:   phaseWorkloads,
+	{Group: groupApps, Kind: kindReplicaSet}:  phaseWorkloads,
+	{Group: groupBatch, Kind: kindJob}:        phaseWorkloads,
+	{Group: groupBatch, Kind: kindCronJob}:    phaseWorkloads,
+	{Group: coreGroup, Kind: kindPod}:         phaseWorkloads,
 
-	{Group: coreGroup, Kind: "Service"}:             phaseNetworking,
-	{Group: groupNetworking, Kind: "Ingress"}:       phaseNetworking,
-	{Group: groupNetworking, Kind: "NetworkPolicy"}: phaseNetworking,
+	{Group: coreGroup, Kind: kindService}:             phaseNetworking,
+	{Group: groupNetworking, Kind: kindIngress}:       phaseNetworking,
+	{Group: groupNetworking, Kind: kindNetworkPolicy}: phaseNetworking,
 }
 
 // applyPhase returns the phase a resource belongs to. Anything §5.1 does not name — custom

@@ -215,11 +215,16 @@ const restoreVolumeDeadline = 30 * time.Minute
 // cross-kind semaphore stays deferred (see the backup controller's task #22 note).
 const restoreOwnerMoverCap = 4
 
-// resolvedSnapshots is one cached mediated resolution: the run it was resolved for and the
-// kind=data snapshots by PVC name.
+// resolvedSnapshots is one cached mediated resolution: the run it was resolved for, the
+// kind=data snapshots by PVC name, and the run's kind=manifests snapshot.
+//
+// The manifests snapshot is cached ALONGSIDE the data ones rather than re-listed, because both
+// halves must come from the same listing: a re-list between them could straddle a run that is
+// still uploading and pair one run's volumes with another's manifests.
 type resolvedSnapshots struct {
-	run   string
-	byPVC map[string]restic.Snapshot
+	run       string
+	byPVC     map[string]restic.Snapshot
+	manifests []restic.Snapshot
 }
 
 // newRestoreEngine wires an engine from the owning reconciler's primitives.
@@ -290,21 +295,23 @@ func (e *restoreEngine) clearVolumeError(key string) {
 }
 
 // cachedResolution returns the cached mediated resolution for owner iff it matches run.
-func (e *restoreEngine) cachedResolution(owner types.UID, run string) (map[string]restic.Snapshot, bool) {
+func (e *restoreEngine) cachedResolution(owner types.UID, run string) (map[string]restic.Snapshot, []restic.Snapshot, bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	r, ok := e.resolved[owner]
 	if !ok || r.run != run {
-		return nil, false
+		return nil, nil, false
 	}
-	return r.byPVC, true
+	return r.byPVC, r.manifests, true
 }
 
 // storeResolution caches a mediated resolution; forgetResolution drops it (terminal/finalize).
-func (e *restoreEngine) storeResolution(owner types.UID, run string, byPVC map[string]restic.Snapshot) {
+func (e *restoreEngine) storeResolution(owner types.UID, run string,
+	byPVC map[string]restic.Snapshot, manifestSnaps []restic.Snapshot,
+) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	e.resolved[owner] = resolvedSnapshots{run: run, byPVC: byPVC}
+	e.resolved[owner] = resolvedSnapshots{run: run, byPVC: byPVC, manifests: manifestSnaps}
 }
 
 // forgetListing drops ONLY the cached snapshot listing — the source pin and the per-volume

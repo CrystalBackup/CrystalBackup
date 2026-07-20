@@ -108,7 +108,7 @@ func (r *BackupReconciler) advanceManifests(
 	err = r.Get(ctx, client.ObjectKey{Namespace: r.OperatorNamespace, Name: jobName}, &job)
 	switch {
 	case apierrors.IsNotFound(err):
-		return false, "", r.startManifestsJob(ctx, backup, rc, prefix, jobName, excludeSecretData)
+		return false, "", r.startManifestsJob(ctx, backup, rc, jobName, excludeSecretData)
 	case err != nil:
 		return false, "", fmt.Errorf("get manifest mover Job %s/%s: %w", r.OperatorNamespace, jobName, err)
 	}
@@ -179,7 +179,7 @@ func (r *BackupReconciler) startManifestsJob(
 	ctx context.Context,
 	backup *cbv1.Backup,
 	rc *backupRunContext,
-	prefix, jobName string,
+	jobName string,
 	excludeSecretData bool,
 ) error {
 	labels := manifestsLabels(backup)

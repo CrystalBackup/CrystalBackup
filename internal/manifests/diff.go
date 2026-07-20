@@ -32,7 +32,7 @@ const MaxChangedPaths = 20
 // Overwrite — "what did this actually touch?" — which a bare Configured cannot.
 //
 // Sorted and capped, so the report is deterministic and bounded.
-func changedPaths(before, after map[string]interface{}, limit int) []string {
+func changedPaths(before, after map[string]any, limit int) []string {
 	var paths []string
 	diffMaps(before, after, "", &paths)
 	slices.Sort(paths)
@@ -58,7 +58,7 @@ var serverOwnedPaths = map[string]bool{
 	"metadata.annotations.kubectl.kubernetes.io/last-applied-configuration": true,
 }
 
-func diffMaps(before, after map[string]interface{}, prefix string, out *[]string) {
+func diffMaps(before, after map[string]any, prefix string, out *[]string) {
 	// Walk the union of keys: a field the apply ADDED is as much a change as one it altered,
 	// and a field it removed likewise.
 	seen := make(map[string]bool, len(before)+len(after))
@@ -92,9 +92,9 @@ func diffMaps(before, after map[string]interface{}, prefix string, out *[]string
 // the whole "data" block. Lists are compared whole: an element-wise path would need the
 // server's merge keys to be meaningful, and "spec.ports" is a more honest answer than
 // "spec.ports[2].nodePort" derived from a positional guess.
-func diffValues(before, after interface{}, path string, out *[]string) {
-	bm, bok := before.(map[string]interface{})
-	am, aok := after.(map[string]interface{})
+func diffValues(before, after any, path string, out *[]string) {
+	bm, bok := before.(map[string]any)
+	am, aok := after.(map[string]any)
 	if bok && aok {
 		diffMaps(bm, am, path, out)
 		return

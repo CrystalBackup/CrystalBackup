@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path"
+	"slices"
 	"strings"
 	"unicode"
 
@@ -215,10 +216,8 @@ func parseResourcePattern(raw string) (resourcePattern, error) {
 		return resourcePattern{}, fmt.Errorf(
 			"pattern %q has %d segments; the form is <group>/<Kind>[/<name>]", raw, len(segs))
 	}
-	for _, s := range segs {
-		if s == "" {
-			return resourcePattern{}, fmt.Errorf("pattern %q has an empty segment", raw)
-		}
+	if slices.Contains(segs, "") {
+		return resourcePattern{}, fmt.Errorf("pattern %q has an empty segment", raw)
 	}
 
 	p := resourcePattern{group: matchAll, kind: matchAll, name: matchAll}

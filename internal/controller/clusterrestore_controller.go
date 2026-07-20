@@ -250,7 +250,7 @@ func (r *ClusterRestoreReconciler) prepare(ctx context.Context, cr *cbv1.Cluster
 	// pinned for the restore's lifetime by the cache itself (cleared on terminal): a newer
 	// run uploading mid-restore can never flip the remaining volumes onto a different run.
 	coordinate := cr.Spec.Source.Namespace + "/" + cr.Spec.Source.Backup + "/" + cr.Spec.Source.Time
-	byPVC, cached := r.Engine.cachedResolution(cr.UID, coordinate)
+	byPVC, _, cached := r.Engine.cachedResolution(cr.UID, coordinate)
 	if !cached {
 		snaps, err := r.Lister.ListFiltered(ctx, &repo, restoreResolveJobName(clusterRestoreOwnerID(cr.Name)),
 			restic.Tag(restic.TagKeyNamespace, cr.Spec.Source.Namespace))
@@ -280,7 +280,8 @@ func (r *ClusterRestoreReconciler) prepare(ctx context.Context, cr *cbv1.Cluster
 		}
 		r.Recorder.Eventf(cr, nil, corev1.EventTypeNormal, "RunResolved", "ResolveRun",
 			"restoring run %q of namespace %s", run, cr.Spec.Source.Namespace)
-		r.Engine.storeResolution(cr.UID, coordinate, byPVC)
+		// The cluster-scoped restore's manifest half lands with L9; nothing caches manifests here yet.
+		r.Engine.storeResolution(cr.UID, coordinate, byPVC, nil)
 	}
 
 	run := runOf(byPVC)
