@@ -1,0 +1,175 @@
+{{- if .Values.networkPolicy.create }}
+################################################################################
+# Network posture for crystal-backup-system (spec/03-security-and-tenancy.md §7).
+#
+# Why this matters more here than in a typical operator: until I4 lands (repo-scoped,
+# short-lived mover credentials — deferred to M6), every mover receives the location's ROOT S3
+# credentials. Invariant I4 names three compensating controls for that window — no token,
+# NetworkPolicy egress, and TTL — and before this file existed only the first was real. A
+# compromised mover could reach any cluster-internal service.
+#
+# The shape is default-deny plus narrow allowances, so a pod shape added later starts with no
+# connectivity and has to be granted it deliberately, rather than inheriting everything.
+#
+# ENFORCEMENT IS THE CNI'S JOB. Some CNIs (notably kind's default kindnet) accept NetworkPolicy
+# objects and enforce nothing. These policies are therefore not a control you can assume from
+# their presence — verify on the target CNI. The crucible runs on Canal, which does enforce.
+################################################################################
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "crystal-backup.fullname" . }}-default-deny
+  namespace: {{ include "crystal-backup.namespace" . }}
+  labels:
+    {{- include "crystal-backup.labels" . | nindent 4 }}
+spec:
+  # Empty selector = every pod in the namespace, including ones that do not exist yet.
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+################################################################################
+# DNS for every pod in the namespace. Without it nothing resolves the S3 endpoint or the API
+# server, and every allowance below is moot.
+################################################################################
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "crystal-backup.fullname" . }}-allow-dns
+  namespace: {{ include "crystal-backup.namespace" . }}
+  labels:
+    {{- include "crystal-backup.labels" . | nindent 4 }}
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+      to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.dnsNamespace }}
+---
+################################################################################
+# Movers: egress to object storage on 443, and NOWHERE inside the cluster.
+#
+# `except` carries the actual security property. Allowing 0.0.0.0/0:443 outright would let a
+# compromised mover reach in-cluster services on 443 — the API server, an admission webhook,
+# another tenant's workload — which is the SSRF pivot §7 exists to block. The excluded ranges
+# default to the private address space because pod, service and node networks all live there;
+# an S3 endpoint on a private address needs an explicit extraEgress entry, which is the right
+# trade: the default is closed and the exception is visible in values.
+################################################################################
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "crystal-backup.fullname" . }}-mover-egress
+  namespace: {{ include "crystal-backup.namespace" . }}
+  labels:
+    {{- include "crystal-backup.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/managed-by: {{ .Values.networkPolicy.moverManagedByValue }}
+  policyTypes: [Egress]
+  egress:
+    - ports:
+        - port: 443
+          protocol: TCP
+      to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              {{- range .Values.networkPolicy.clusterInternalCIDRs }}
+              - {{ . | quote }}
+              {{- end }}
+    {{- with .Values.networkPolicy.extraMoverEgress }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+---
+################################################################################
+# Manifest movers ONLY: egress to the Kubernetes API server.
+#
+# The podSelector is what makes §7's "granted to crystal-manifest-mover pods only" real. It
+# selects on crystalbackup.io/mover-role=manifest, which the controller stamps on the manifest
+# Job and on nothing else — a data mover, which holds the repository credentials, is not
+# selected by this policy and so cannot reach the API server at all.
+################################################################################
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "crystal-backup.fullname" . }}-manifest-mover-apiserver
+  namespace: {{ include "crystal-backup.namespace" . }}
+  labels:
+    {{- include "crystal-backup.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      crystalbackup.io/mover-role: manifest
+  policyTypes: [Egress]
+  egress:
+    - ports:
+        - port: {{ .Values.networkPolicy.apiServerPort }}
+          protocol: TCP
+      to:
+        {{- if .Values.networkPolicy.apiServerCIDRs }}
+        {{- range .Values.networkPolicy.apiServerCIDRs }}
+        - ipBlock:
+            cidr: {{ . | quote }}
+        {{- end }}
+        {{- else }}
+        # No apiServerCIDRs configured: allow the port broadly rather than break the manifest
+        # mover outright. Narrow this to the API server's address on a cluster where you know
+        # it — an unnarrowed rule is a working default, not a good one.
+        - ipBlock:
+            cidr: 0.0.0.0/0
+        {{- end }}
+---
+################################################################################
+# The operator: API server, plus the location endpoints it probes. Ingress on the webhook and
+# metrics ports.
+################################################################################
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "crystal-backup.fullname" . }}-operator
+  namespace: {{ include "crystal-backup.namespace" . }}
+  labels:
+    {{- include "crystal-backup.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "crystal-backup.selectorLabels" . | nindent 6 }}
+  policyTypes: [Ingress, Egress]
+  egress:
+    # API server + object-storage endpoints (reachability probes). The operator is trusted
+    # with cluster-wide reads by design, so it is not confined the way a mover is.
+    - ports:
+        - port: {{ .Values.networkPolicy.apiServerPort }}
+          protocol: TCP
+        - port: 443
+          protocol: TCP
+      to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+    {{- with .Values.networkPolicy.extraOperatorEgress }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  ingress:
+    # Webhooks, called by the API server.
+    - ports:
+        - port: {{ .Values.networkPolicy.webhookPort }}
+          protocol: TCP
+    # Metrics, from the monitoring namespace only when one is named.
+    - ports:
+        - port: {{ .Values.networkPolicy.metricsPort }}
+          protocol: TCP
+      {{- with .Values.networkPolicy.monitoringNamespace }}
+      from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ . }}
+      {{- end }}
+{{- end }}

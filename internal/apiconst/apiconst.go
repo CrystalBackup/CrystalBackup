@@ -112,6 +112,33 @@ const (
 	PVRoleTransplant = "transplant"
 )
 
+// LabelMoverRole distinguishes what a mover pod is allowed to talk to, so a NetworkPolicy can
+// select on it. spec/03-security-and-tenancy.md §7 grants API-server egress to manifest movers
+// ONLY — and a NetworkPolicy selects pods by label, not by ServiceAccount, so without this
+// label that clause is unenforceable prose. Stamped by the controller on every mover Job.
+const LabelMoverRole = Domain + "/mover-role"
+
+// LabelMoverJob names the mover Job a transient RoleBinding accompanies. The reaper checks
+// that Job's liveness to decide whether the binding is orphaned, and a leaked binding names
+// its own cause rather than being an unexplained grant in someone's namespace.
+const LabelMoverJob = Domain + "/mover-job"
+
+// LabelOperatorNS records which operator namespace created a transient RoleBinding. The
+// binding lives in a TENANT namespace, so without this the reaper cannot tell a binding it
+// owns from one an operator in another namespace owns — and reaping someone else's would
+// break their in-flight run.
+const LabelOperatorNS = Domain + "/operator-namespace"
+
+// LabelMoverRole values.
+const (
+	// MoverRoleData is a data or maintenance mover: S3 and (for data jobs) one PVC. No API
+	// access, no token — invariant I6.
+	MoverRoleData = "data"
+	// MoverRoleManifest is a manifest mover: additionally reaches the API server, because
+	// reading or writing objects IS its operation (I6's sole exception).
+	MoverRoleManifest = "manifest"
+)
+
 // Standard Kubernetes "managed-by" label stamped on the operator-owned objects a backup
 // creates (the per-PVC exposure objects and the mover Jobs), so the orphan reaper can select
 // every CrystalBackup-managed workload object with one label. It intentionally reuses the

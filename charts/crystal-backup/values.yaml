@@ -205,3 +205,57 @@ admission:
   deniedNamespaces:
     - "kube-*"
     - crystal-backup-system
+
+# -- Manifest mover (R15, R22): the one mover identity that reaches the API server.
+manifestMover:
+  # -- Name of the manifest mover ServiceAccount (defaults to
+  # "<fullname>-manifest-mover"). spec/03 §5 calls this identity
+  # "crystal-manifest-mover"; that is the role, this is the object name, and it is
+  # release-prefixed so two installs in one cluster cannot collide.
+  serviceAccountName: ""
+
+# -- Network posture for crystal-backup-system (spec/03-security-and-tenancy.md §7).
+# Default-deny plus narrow allowances, so a pod shape added later starts with no
+# connectivity rather than inheriting everything.
+#
+# NOTE: enforcement is the CNI's job. Some CNIs accept these objects and enforce
+# nothing (kind's default kindnet among them), so their presence is not by itself
+# evidence the confinement holds — verify on your CNI.
+networkPolicy:
+  # -- Install the NetworkPolicies. Until I4 lands (repo-scoped mover credentials,
+  # M6) this egress confinement is one of only two real controls on a compromised
+  # mover holding root S3 credentials, so it defaults ON.
+  create: true
+  # -- Namespace running cluster DNS, selected by kubernetes.io/metadata.name.
+  dnsNamespace: kube-system
+  # -- The app.kubernetes.io/managed-by value the operator stamps on mover pods.
+  # Must match internal/apiconst.ManagedByValue.
+  moverManagedByValue: crystal-backup
+  # -- Cluster-internal ranges movers must NOT reach on 443. This list is what stops
+  # a compromised mover pivoting to in-cluster services (SSRF); it defaults to the
+  # private address space because pod, service and node networks live there. An S3
+  # endpoint on a private address therefore needs an explicit extraMoverEgress entry
+  # — the default is closed and the exception is visible here.
+  clusterInternalCIDRs:
+    - 10.0.0.0/8
+    - 172.16.0.0/12
+    - 192.168.0.0/16
+    - 169.254.0.0/16
+    - 127.0.0.0/8
+  # -- Extra egress rules for movers, e.g. an on-prem S3 endpoint on a private
+  # address that clusterInternalCIDRs otherwise excludes.
+  extraMoverEgress: []
+  # -- Extra egress rules for the operator.
+  extraOperatorEgress: []
+  # -- API server address range(s). Empty allows the port broadly, which works but
+  # is not narrow; set it to your API server's address to close the gap.
+  apiServerCIDRs: []
+  # -- API server port.
+  apiServerPort: 443
+  # -- Operator webhook port (ingress from the API server).
+  webhookPort: 9443
+  # -- Operator metrics port.
+  metricsPort: 8443
+  # -- Namespace allowed to scrape metrics. Empty allows any source on the metrics
+  # port.
+  monitoringNamespace: ""

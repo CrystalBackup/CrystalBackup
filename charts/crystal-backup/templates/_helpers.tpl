@@ -72,6 +72,18 @@ Operator ServiceAccount name (defaults to "<fullname>-operator").
 {{- end -}}
 
 {{/*
+Manifest mover ServiceAccount name (defaults to "<fullname>-manifest-mover").
+
+Named after the chart release like every other cluster-visible object, so two installs in one
+cluster cannot collide on it. spec/03 §5 calls this identity "crystal-manifest-mover"; that is
+the ROLE, this is the OBJECT, and the operator is told the resolved name rather than assuming
+either — a hardcoded cluster-scoped name is a collision waiting for the second install.
+*/}}
+{{- define "crystal-backup.manifestMoverServiceAccountName" -}}
+{{- default (printf "%s-manifest-mover" (include "crystal-backup.fullname" .)) .Values.manifestMover.serviceAccountName -}}
+{{- end -}}
+
+{{/*
 Fully-resolved operator image reference. Prefers the immutable digest pin; falls
 back to a tag (default: appVersion) only when no digest is configured.
 */}}
