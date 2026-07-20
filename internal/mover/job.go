@@ -141,10 +141,15 @@ type JobRequest struct {
 	// operation that must read the API server. Making it opt-in rather than a parameter with
 	// a default means a new job shape cannot acquire API access by forgetting a field.
 	ServiceAccountName string
-	// ManifestsVolume adds the writable emptyDir the manifest dump writes into, mounted at
-	// ManifestsRoot. Only the manifest operations set it; the tree it holds is a namespace's
-	// manifests, which are small, so an unsized emptyDir is proportionate.
+	// ManifestsVolume adds the writable emptyDir the manifest dump writes into. Only the manifest
+	// operations set it; the tree it holds is small, so an unsized emptyDir is proportionate.
 	ManifestsVolume bool
+	// ManifestsMountPath is where that emptyDir is mounted. Empty defaults to ManifestsRoot, so
+	// every existing caller keeps its behaviour; the cluster-manifests capture sets it to
+	// ClusterManifestsRoot, because its dump writes there and the root filesystem is read-only.
+	// The mount path MUST equal the directory the dump writes to, or the dump fails on a
+	// read-only filesystem.
+	ManifestsMountPath string
 }
 
 // BuildJob assembles the batchv1.Job for one mover run, exactly per the package's runtime
@@ -321,14 +326,19 @@ func moverVolumes(req JobRequest) ([]corev1.Volume, []corev1.VolumeMount) {
 	}
 
 	if req.ManifestsVolume {
-		// Writable scratch the manifest dump writes the namespace tree into, at exactly the
-		// path restic will be asked to back up (ManifestsRoot). Separate from the restic cache
-		// so the two cannot crowd each other out of one emptyDir's budget.
+		// Writable scratch the manifest dump writes its tree into, at exactly the path restic
+		// will be asked to back up. Separate from the restic cache so the two cannot crowd each
+		// other out of one emptyDir's budget. The mount path defaults to ManifestsRoot and is
+		// ClusterManifestsRoot for a cluster-scoped capture.
+		mountPath := req.ManifestsMountPath
+		if mountPath == "" {
+			mountPath = ManifestsRoot
+		}
 		volumes = append(volumes, corev1.Volume{
 			Name:         volumeManifests,
 			VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
 		})
-		mounts = append(mounts, corev1.VolumeMount{Name: volumeManifests, MountPath: ManifestsRoot})
+		mounts = append(mounts, corev1.VolumeMount{Name: volumeManifests, MountPath: mountPath})
 	}
 
 	if req.PVC != nil {

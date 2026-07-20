@@ -17,6 +17,8 @@ limitations under the License.
 package manifests
 
 import (
+	"encoding/json"
+	"fmt"
 	"strings"
 
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -38,21 +40,24 @@ import (
 // Keyed on group AND kind, like the apply phases: a CRD is free to define its own Kind called
 // StorageClass, and it does not belong in a DR allow-list just for sharing a name.
 const (
+	kindCRD                = "CustomResourceDefinition"
+	kindStorageClass       = "StorageClass"
+	kindPersistentVolume   = "PersistentVolume"
 	kindClusterRole        = "ClusterRole"
 	kindClusterRoleBinding = "ClusterRoleBinding"
 )
 
 var ClusterAllowKinds = map[schema.GroupKind]bool{
-	{Group: "apiextensions.k8s.io", Kind: "CustomResourceDefinition"}: true,
-	{Group: "storage.k8s.io", Kind: "StorageClass"}:                   true,
-	{Group: "snapshot.storage.k8s.io", Kind: "VolumeSnapshotClass"}:   true,
-	{Group: groupNetworking, Kind: "IngressClass"}:                    true,
-	{Group: "scheduling.k8s.io", Kind: "PriorityClass"}:               true,
-	{Group: "node.k8s.io", Kind: "RuntimeClass"}:                      true,
-	{Group: groupRBAC, Kind: kindClusterRole}:                         true,
-	{Group: groupRBAC, Kind: kindClusterRoleBinding}:                  true,
+	{Group: groupAPIExtensions, Kind: kindCRD}:                      true,
+	{Group: groupStorage, Kind: kindStorageClass}:                   true,
+	{Group: "snapshot.storage.k8s.io", Kind: "VolumeSnapshotClass"}: true,
+	{Group: groupNetworking, Kind: "IngressClass"}:                  true,
+	{Group: "scheduling.k8s.io", Kind: "PriorityClass"}:             true,
+	{Group: "node.k8s.io", Kind: "RuntimeClass"}:                    true,
+	{Group: groupRBAC, Kind: kindClusterRole}:                       true,
+	{Group: groupRBAC, Kind: kindClusterRoleBinding}:                true,
 	// PV specs, for the PV↔PVC rebinding story.
-	{Group: coreGroup, Kind: "PersistentVolume"}: true,
+	{Group: coreGroup, Kind: kindPersistentVolume}: true,
 }
 
 // systemNamePrefix marks the control plane's own RBAC objects. They are excluded by default
@@ -85,9 +90,38 @@ type ClusterCaptureOptions struct {
 	// default (ClusterAllowKinds) rather than "everything": a cluster-scoped capture that
 	// defaulted to the whole cluster would sweep in every add-on's objects and make the
 	// snapshot both enormous and dangerous to restore.
-	Include []string
+	Include []string `json:"include,omitempty"`
 	// Exclude is applied after Include.
-	Exclude []string
+	Exclude []string `json:"exclude,omitempty"`
+}
+
+// EncodeClusterCaptureOptions renders the cluster-scoped selection for the mover's environment
+// (mover.EnvClusterManifestsSelection). Like EncodeSelection it is JSON rather than a flag
+// because everything after the shim's "--" separator belongs to restic verbatim. Only the two
+// selection slices travel the wire; the resolved ClusterSelector is rebuilt on the far side with
+// CompileClusterSelector, so the compile (and its glob validation) happens in the mover, once.
+func EncodeClusterCaptureOptions(opts ClusterCaptureOptions) (string, error) {
+	b, err := json.Marshal(opts)
+	if err != nil {
+		return "", fmt.Errorf("encode cluster capture options: %w", err)
+	}
+	return string(b), nil
+}
+
+// DecodeClusterCaptureOptions parses what EncodeClusterCaptureOptions wrote. An EMPTY string
+// decodes to the zero value — an empty Include, which CompileClusterSelector reads as the curated
+// default allow-list (adr/0011 §1), NOT as "capture everything cluster-scoped". That is what a
+// run naming no selection meant, and what an older operator with no concept of narrowing would
+// have sent: capture the DR-relevant defaults, on by default.
+func DecodeClusterCaptureOptions(encoded string) (ClusterCaptureOptions, error) {
+	if strings.TrimSpace(encoded) == "" {
+		return ClusterCaptureOptions{}, nil
+	}
+	var opts ClusterCaptureOptions
+	if err := json.Unmarshal([]byte(encoded), &opts); err != nil {
+		return ClusterCaptureOptions{}, fmt.Errorf("decode cluster capture options: %w", err)
+	}
+	return opts, nil
 }
 
 // ClusterSelector decides which cluster-scoped objects a run captures.

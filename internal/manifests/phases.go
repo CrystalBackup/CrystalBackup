@@ -40,10 +40,12 @@ const (
 const coreGroup = ""
 
 const (
-	groupApps       = "apps"
-	groupBatch      = "batch"
-	groupRBAC       = "rbac.authorization.k8s.io"
-	groupNetworking = "networking.k8s.io"
+	groupApps          = "apps"
+	groupBatch         = "batch"
+	groupRBAC          = "rbac.authorization.k8s.io"
+	groupNetworking    = "networking.k8s.io"
+	groupStorage       = "storage.k8s.io"
+	groupAPIExtensions = "apiextensions.k8s.io"
 
 	kindPVC            = "PersistentVolumeClaim"
 	kindServiceAccount = "ServiceAccount"

@@ -97,13 +97,22 @@ func main() {
 		fail(*terminationLog, *operation, fmt.Errorf("no restic argv after the %q separator", "--"))
 	}
 
-	// A manifest backup has a step BEFORE restic: read the namespace from the API server and
-	// write the sanitized tree that restic is about to snapshot. A failure here is fatal on
-	// purpose — backing up an empty or half-written directory would produce a snapshot that
-	// reports success and restores to nothing, which is the worst outcome a backup tool has.
+	// A manifest backup — namespaced or cluster-scoped — has a step BEFORE restic: read the
+	// objects from the API server and write the sanitized tree that restic is about to snapshot.
+	// A failure here is fatal on purpose — backing up an empty or half-written directory would
+	// produce a snapshot that reports success and restores to nothing, which is the worst outcome
+	// a backup tool has. Both variants fold their ResourceCount + IncompleteManifests into the
+	// result identically below (the count/partial signal is the same shape for either plane).
 	var manifestIndex *manifests.Index
-	if mover.Operation(*operation) == mover.OpManifestsBackup {
+	switch mover.Operation(*operation) {
+	case mover.OpManifestsBackup:
 		idx, err := dumpManifests(context.Background())
+		if err != nil {
+			fail(*terminationLog, *operation, err)
+		}
+		manifestIndex = idx
+	case mover.OpClusterManifestsBackup:
+		idx, err := dumpClusterManifests(context.Background())
 		if err != nil {
 			fail(*terminationLog, *operation, err)
 		}

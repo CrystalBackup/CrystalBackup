@@ -98,6 +98,72 @@ func dumpManifests(ctx context.Context) (*manifests.Index, error) {
 	return idx, nil
 }
 
+// dumpClusterManifests reads the cluster's CLUSTER-SCOPED objects from the API server and writes
+// the sanitized tree that restic is about to back up (adr/0011 §1). It is the cluster-plane
+// sibling of dumpManifests and shares its shape exactly: it is the ONE place this mover touches
+// Kubernetes, it runs BEFORE restic, and a failure here is fatal — `restic backup` over an empty
+// or half-written directory would produce a snapshot that looks successful and restores to
+// nothing, the single worst outcome a backup tool has.
+//
+// It differs from dumpManifests only in what the feature is about: there is no namespace (the
+// capture spans the whole cluster and its snapshot belongs to none), and the selection arrives
+// JSON-encoded in the environment, compiled here into the ClusterSelector the dump drives. A
+// malformed selection is fatal rather than degrading into "capture everything cluster-scoped".
+func dumpClusterManifests(ctx context.Context) (*manifests.Index, error) {
+	opts, err := manifests.DecodeClusterCaptureOptions(os.Getenv(mover.EnvClusterManifestsSelection))
+	if err != nil {
+		return nil, err
+	}
+	selector, err := manifests.CompileClusterSelector(opts)
+	if err != nil {
+		// A malformed selection must never degrade into "capture everything cluster-scoped": that
+		// would sweep in every add-on's cluster-scoped objects and make the snapshot both enormous
+		// and dangerous to restore.
+		return nil, fmt.Errorf("cluster selection: %w", err)
+	}
+
+	cfg, err := rest.InClusterConfig()
+	if err != nil {
+		return nil, fmt.Errorf("in-cluster config (the cluster-manifest mover needs an automounted "+
+			"ServiceAccount token — see spec/03-security-and-tenancy.md I6): %w", err)
+	}
+	disco, err := discovery.NewDiscoveryClientForConfig(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("discovery client: %w", err)
+	}
+	dyn, err := dynamic.NewForConfig(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("dynamic client: %w", err)
+	}
+	s, err := sanitize.New()
+	if err != nil {
+		return nil, fmt.Errorf("sanitizer: %w", err)
+	}
+
+	d := &manifests.ClusterDumper{Disco: disco, Dynamic: dyn, Sanitizer: s, Selector: selector}
+	// The destination is ClusterManifestsRoot, byte-for-byte the path restic will record
+	// (restic.ClusterManifestsIdentity). There is no per-namespace suffix — one run writes one
+	// cluster-manifests snapshot at the fixed path — so, unlike dumpManifests, nothing is appended.
+	dest := mover.ClusterManifestsRoot
+
+	idx, err := d.Dump(ctx, manifests.ClusterOptions{
+		ClusterID:  os.Getenv(mover.EnvClusterManifestsClusterID),
+		BackupName: os.Getenv(mover.EnvClusterManifestsBackupName),
+	}, dest)
+	if err != nil {
+		return nil, fmt.Errorf("cluster dump: %w", err)
+	}
+
+	// The pod log is where an operator looks first; the full detail is in index.json inside the
+	// snapshot, which survives the pod.
+	fmt.Fprintf(os.Stderr, "crystal-mover: captured %d cluster-scoped resource(s) into %s\n",
+		idx.ResourceCount, dest)
+	for _, w := range idx.Warnings {
+		fmt.Fprintf(os.Stderr, "crystal-mover: WARNING %s/%s: %s\n", w.Group, w.Kind, w.Message)
+	}
+	return idx, nil
+}
+
 // applyManifests applies a restored manifest tree to the target namespace
 // (spec/04-manifest-backup.md §5). The mirror of dumpManifests, and it runs on the other side
 // of restic: the tree must exist before there is anything to apply.

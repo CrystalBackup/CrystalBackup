@@ -51,7 +51,7 @@ func knownOperation(op string) bool {
 	switch mover.Operation(op) {
 	case mover.OpBackup, mover.OpRestore, mover.OpInit, mover.OpForget, mover.OpPrune,
 		mover.OpCheck, mover.OpSnapshots, mover.OpUnlock,
-		mover.OpManifestsBackup, mover.OpManifestsRestore:
+		mover.OpManifestsBackup, mover.OpManifestsRestore, mover.OpClusterManifestsBackup:
 		return true
 	default:
 		return false
@@ -65,10 +65,12 @@ func knownOperation(op string) bool {
 func parsesJSONSummary(op string) bool {
 	// manifests-backup ends in a `restic backup` of the dumped tree, so it produces and needs
 	// the same summary as any other backup — the snapshot id is what the controller records.
+	// cluster-manifests-backup is its cluster-plane sibling and ends in the same `restic backup`.
 	// manifests-restore likewise BEGINS with a `restic restore`, whose summary proves the tree
 	// actually landed before the apply reads a single file from it.
 	return op == string(mover.OpBackup) || op == string(mover.OpRestore) ||
-		op == string(mover.OpManifestsBackup) || op == string(mover.OpManifestsRestore)
+		op == string(mover.OpManifestsBackup) || op == string(mover.OpManifestsRestore) ||
+		op == string(mover.OpClusterManifestsBackup)
 }
 
 // ensureSummaryJSON guarantees the summary-parsed operations (backup, restore — see
@@ -126,7 +128,7 @@ func buildResult(operation string, resticStdout []byte, resticErr error) mover.M
 		}
 	}
 	switch operation {
-	case string(mover.OpBackup), string(mover.OpManifestsBackup):
+	case string(mover.OpBackup), string(mover.OpManifestsBackup), string(mover.OpClusterManifestsBackup):
 		summary, err := mover.ParseBackupSummary(resticStdout)
 		if err != nil {
 			// restic returned success but we could not read a summary: refuse to fabricate a

@@ -53,6 +53,33 @@ func TestBuildResultBackupSuccess(t *testing.T) {
 	}
 }
 
+// TestBuildResultClusterManifestsBackupSuccess proves the cluster-scoped manifest backup is
+// wired through the SAME summary parse as any other `restic backup`: it must yield the snapshot
+// id and sizes, and — crucially — echo its OWN operation, not "backup". Operation exists so the
+// controller can check it got the result it asked for, and a cluster-manifests-backup reporting
+// "backup" would defeat exactly that.
+func TestBuildResultClusterManifestsBackupSuccess(t *testing.T) {
+	got := buildResult(string(mover.OpClusterManifestsBackup), []byte(sampleBackupSummaryStream), nil)
+	want := mover.MoverResult{
+		OK:         true,
+		Operation:  "cluster-manifests-backup",
+		SnapshotID: "abc123def456",
+		SizeBytes:  2048,
+		AddedBytes: 1536,
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("buildResult(cluster-manifests-backup, summary, nil) = %+v, want %+v", got, want)
+	}
+	// It is a summary-parsed operation (its success is verified off restic's --json stdout), so
+	// the shim must force --json exactly as it does for a plain backup.
+	if countArg(ensureSummaryJSON(string(mover.OpClusterManifestsBackup), []string{"backup", "/cluster-manifests"}), "--json") != 1 {
+		t.Error("cluster-manifests-backup must run with --json so its summary can be parsed")
+	}
+	if !knownOperation(string(mover.OpClusterManifestsBackup)) {
+		t.Error("cluster-manifests-backup must be a known operation")
+	}
+}
+
 // TestBuildResultBackupExitZeroNoSummary is the load-bearing "success but empty" case: restic
 // exited 0 (nil error) yet emitted no summary object. There is no snapshot id to record, so the
 // shim MUST report failure rather than a success with an empty id.
