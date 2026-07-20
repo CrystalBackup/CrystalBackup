@@ -25,3 +25,9 @@ description = "Key-handling unit tests use FABRICATED / invalid age keys as fixt
 paths = [
   '''internal/keys/keys_test\.go''',
 ]
+
+[[allowlists]]
+description = "The sanitization golden corpus is FIXTURE Kubernetes objects (spec/adr/0007). It necessarily contains Secret-shaped manifests — proving Secrets are captured, excluded or emptied correctly is the point of several cases — and their values are fabricated. Narrowed to the corpus directory so a real secret anywhere else is still caught."
+paths = [
+  '''internal/sanitize/testdata/.*''',
+]

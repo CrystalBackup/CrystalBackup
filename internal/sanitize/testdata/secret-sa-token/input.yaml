@@ -7,5 +7,5 @@ metadata:
   annotations:
     kubernetes.io/service-account.name: default
 type: kubernetes.io/service-account-token
-data:
-  token: ZmFrZS10b2tlbg==
+# No data block on purpose: E7 excludes this Secret by its TYPE, so a token value would add
+# nothing to the fixture except a secret-scanner false positive.
