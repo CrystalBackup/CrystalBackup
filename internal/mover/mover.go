@@ -100,6 +100,15 @@ const (
 	// mover invariant (I6) — it runs under crystal-manifest-mover with an automounted token
 	// and a transient RoleBinding, never under the zero-RBAC crystal-mover.
 	OpManifestsBackup Operation = "manifests-backup"
+	// OpManifestsRestore restores a manifest snapshot and APPLIES the tree to a target
+	// namespace (spec/04-manifest-backup.md §5). The mirror of OpManifestsBackup, and the
+	// second half of I6's sole exception: it runs under crystal-manifest-mover with a
+	// transient RoleBinding to crystal-manifest-writer — create/update/delete on arbitrary
+	// kinds in ONE namespace for ONE Job's lifetime, the largest grant in the system.
+	//
+	// It is the mirror in a second way that matters to the shim: the API work runs AFTER
+	// restic here, not before. restic writes the tree, then the shim applies it.
+	OpManifestsRestore Operation = "manifests-restore"
 )
 
 // Filesystem layout inside the mover container. These paths are a two-sided contract: the
@@ -147,6 +156,14 @@ const (
 	// silently store the snapshot under the wrong path and break every retention group and
 	// restore that keys on it.
 	ManifestsRoot = "/manifests"
+
+	// ManifestsRestoreDir is where the restic half of a manifest restore lands the tree, and
+	// therefore where the apply reads index.json from. A SUBDIRECTORY of ManifestsRoot rather
+	// than the root itself: on backup that root is the dump's parent, and reusing it here would
+	// make one path mean "tree being written out" in one operation and "tree being read in" in
+	// the other. They never run in the same pod, so nothing would break — but a future reader
+	// deciding whether it is safe to clear the directory deserves an unambiguous answer.
+	ManifestsRestoreDir = ManifestsRoot + "/restore"
 )
 
 // Environment the manifest mover reads. The mover has no config file and no flags beyond
@@ -162,6 +179,26 @@ const (
 	EnvManifestsBackupName = "CRYSTAL_MANIFESTS_BACKUP_NAME"
 	// EnvManifestsExcludeSecretData is "true" when manifestOptions.excludeSecretData is set.
 	EnvManifestsExcludeSecretData = "CRYSTAL_MANIFESTS_EXCLUDE_SECRET_DATA"
+
+	// EnvManifestsRestoreDir is where restic restored the manifest tree, and therefore where
+	// the apply reads index.json from. Passed explicitly rather than re-derived: the RESTORE
+	// target has no reason to equal the captured path — a ClusterRestore may send another
+	// cluster's namespace into a differently-named one — so the one thing the shim must not do
+	// is guess it.
+	EnvManifestsRestoreDir = "CRYSTAL_MANIFESTS_RESTORE_DIR"
+	// EnvManifestsMode is the Restore's spec.mode ("Overwrite" or "Recreate").
+	EnvManifestsMode = "CRYSTAL_MANIFESTS_MODE"
+	// EnvManifestsDryRun is "true" for a spec.dryRun restore: the full pipeline runs against
+	// the API server with dryRun=All and nothing is persisted.
+	EnvManifestsDryRun = "CRYSTAL_MANIFESTS_DRY_RUN"
+	// EnvManifestsSelection is the JSON-encoded manifests.Selection resolved from the
+	// Restore's resources[]. It travels as env rather than argv because everything after the
+	// shim's "--" separator belongs to restic verbatim. An UNSET variable means "restore
+	// everything", which is what an operator with no concept of narrowing meant.
+	EnvManifestsSelection = "CRYSTAL_MANIFESTS_SELECTION"
+	// EnvManifestsStorageClassMapping is the JSON-encoded map[string]string of
+	// ClusterRestore.spec.target.storageClassMapping, applied to PVC manifests (§5.3).
+	EnvManifestsStorageClassMapping = "CRYSTAL_MANIFESTS_STORAGE_CLASS_MAPPING"
 )
 
 // Secret data keys the per-Job Secret must carry. The restic password is consumed as a

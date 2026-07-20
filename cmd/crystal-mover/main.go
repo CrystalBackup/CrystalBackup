@@ -157,6 +157,17 @@ func main() {
 		result.ResourceCount = int32(manifestIndex.ResourceCount) //nolint:gosec // bounded above
 		result.IncompleteManifests = len(manifestIndex.Warnings) > 0
 	}
+
+	// A manifest restore has its step AFTER restic: the tree has to exist before anything can
+	// be applied. Gated on result.OK because applying a half-restored tree would create a
+	// partial namespace and report it as a restore.
+	if mover.Operation(*operation) == mover.OpManifestsRestore && result.OK {
+		applied, err := applyManifests(context.Background())
+		if err != nil {
+			fail(*terminationLog, *operation, err)
+		}
+		result = reportToResult(result, applied)
+	}
 	report(*terminationLog, result)
 }
 

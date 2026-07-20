@@ -18,12 +18,16 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 
 	"k8s.io/client-go/discovery"
+	"k8s.io/client-go/discovery/cached/memory"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/restmapper"
 
 	"github.com/CrystalBackup/CrystalBackup/internal/manifests"
 	"github.com/CrystalBackup/CrystalBackup/internal/mover"
@@ -92,4 +96,117 @@ func dumpManifests(ctx context.Context) (*manifests.Index, error) {
 		fmt.Fprintf(os.Stderr, "crystal-mover: WARNING %s/%s: %s\n", w.Group, w.Kind, w.Message)
 	}
 	return idx, nil
+}
+
+// applyManifests applies a restored manifest tree to the target namespace
+// (spec/04-manifest-backup.md §5). The mirror of dumpManifests, and it runs on the other side
+// of restic: the tree must exist before there is anything to apply.
+//
+// A failure here means the restore did not happen, so it is reported as a failed run — but a
+// per-RESOURCE failure is not: those are counted, listed and stepped over, because a restore
+// that stops at the first bad object leaves a namespace in a state nobody asked for (adr/0007).
+func applyManifests(ctx context.Context) (*manifests.Report, error) {
+	targetNamespace := os.Getenv(mover.EnvManifestsNamespace)
+	if targetNamespace == "" {
+		return nil, fmt.Errorf("%s is not set; the manifest mover cannot guess its target namespace",
+			mover.EnvManifestsNamespace)
+	}
+	sourceDir := os.Getenv(mover.EnvManifestsRestoreDir)
+	if sourceDir == "" {
+		return nil, fmt.Errorf("%s is not set; the apply cannot guess where restic put the tree",
+			mover.EnvManifestsRestoreDir)
+	}
+
+	selection, err := manifests.DecodeSelection(os.Getenv(mover.EnvManifestsSelection))
+	if err != nil {
+		return nil, err
+	}
+	compiled, err := selection.Compile()
+	if err != nil {
+		// A malformed selector must never degrade into "restore everything": that would turn a
+		// narrow, deliberate restore into a namespace-wide one, in Overwrite or Recreate mode.
+		return nil, fmt.Errorf("selection: %w", err)
+	}
+	classMapping, err := decodeStorageClassMapping(os.Getenv(mover.EnvManifestsStorageClassMapping))
+	if err != nil {
+		return nil, err
+	}
+
+	cfg, err := rest.InClusterConfig()
+	if err != nil {
+		return nil, fmt.Errorf("in-cluster config (the manifest mover needs an automounted "+
+			"ServiceAccount token — see spec/03-security-and-tenancy.md I6): %w", err)
+	}
+	disco, err := discovery.NewDiscoveryClientForConfig(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("discovery client: %w", err)
+	}
+	dyn, err := dynamic.NewForConfig(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("dynamic client: %w", err)
+	}
+
+	// A deferred mapper resolves kinds against the TARGET cluster's discovery, which is what
+	// makes "no matches for kind" the honest per-resource answer for a custom resource whose
+	// CRD was never installed here (§5.1).
+	mapper := restmapper.NewDeferredDiscoveryRESTMapper(memory.NewMemCacheClient(disco))
+
+	a := &manifests.Applier{Dynamic: dyn, Mapper: mapper}
+	opts := manifests.ApplyOptions{
+		SourceDir:           sourceDir,
+		TargetNamespace:     targetNamespace,
+		Mode:                manifests.RestoreMode(os.Getenv(mover.EnvManifestsMode)),
+		DryRun:              os.Getenv(mover.EnvManifestsDryRun) == "true",
+		Selection:           compiled,
+		StorageClassMapping: classMapping,
+	}
+
+	report, err := a.Apply(ctx, opts)
+	if err != nil {
+		return nil, fmt.Errorf("apply into %s: %w", targetNamespace, err)
+	}
+
+	// The pod log carries the FULL report; the termination message carries only what fits in
+	// 4096 bytes. An operator chasing a specific object needs this, and it is the only place
+	// the untruncated list exists.
+	dry := ""
+	if opts.DryRun {
+		dry = " (dry run, nothing persisted)"
+	}
+	fmt.Fprintf(os.Stderr, "crystal-mover: applied %d, failed %d, skipped %d in %s%s\n",
+		report.Applied, report.Failed, report.Skipped, targetNamespace, dry)
+	for _, e := range report.Entries {
+		fmt.Fprintf(os.Stderr, "crystal-mover: %s %s/%s/%s %s %s\n",
+			e.Outcome, e.Group, e.Kind, e.Name, e.Reason, strings.Join(e.Changed, ","))
+	}
+	return report, nil
+}
+
+// decodeStorageClassMapping reads the JSON map the operator passed. An empty value is the
+// namespaced Restore's normal case — it exposes no storageClassMapping at all (§5.3).
+func decodeStorageClassMapping(encoded string) (map[string]string, error) {
+	if strings.TrimSpace(encoded) == "" {
+		return nil, nil
+	}
+	var m map[string]string
+	if err := json.Unmarshal([]byte(encoded), &m); err != nil {
+		return nil, fmt.Errorf("decode %s: %w", mover.EnvManifestsStorageClassMapping, err)
+	}
+	return m, nil
+}
+
+// reportToResult folds the apply's accounting into the MoverResult the controller reads.
+func reportToResult(result mover.MoverResult, report *manifests.Report) mover.MoverResult {
+	// Counts are bounded by a namespace's object count, orders of magnitude below int32.
+	result.RestoredResources = int32(report.Applied) //nolint:gosec // bounded above
+	result.FailedResources = int32(report.Failed)    //nolint:gosec // bounded above
+	result.SkippedResources = int32(report.Skipped)  //nolint:gosec // bounded above
+	for _, e := range report.Entries {
+		result.ResourceEntries = append(result.ResourceEntries, mover.ResourceEntry{
+			Group: e.Group, Kind: e.Kind, Name: e.Name,
+			Outcome: string(e.Outcome), Reason: e.Reason, Changed: e.Changed,
+		})
+	}
+	// Trim to what the kubelet will actually carry. The counts survive any amount of trimming.
+	return result.Fit()
 }

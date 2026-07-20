@@ -203,7 +203,9 @@ func TestSummaryToResult(t *testing.T) {
 		SizeBytes:  2048,
 		AddedBytes: 1536,
 	}
-	if got != want {
+	// DeepEqual rather than ==: MoverResult now carries the per-resource restore report, and a
+	// struct with a slice field is not comparable.
+	if !reflect.DeepEqual(got, want) {
 		t.Errorf("SummaryToResult = %+v, want %+v", got, want)
 	}
 	if got.Operation != string(OpBackup) {

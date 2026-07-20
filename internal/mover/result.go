@@ -61,9 +61,106 @@ type MoverResult struct {
 	// controller turns it into ManifestsComplete=False; the detail lives in the snapshot's
 	// index.json, which is too large for the 4096-byte termination message.
 	IncompleteManifests bool `json:"incompleteManifests,omitempty"`
+	// RestoredResources is how many manifests a manifest restore applied; zero for every other
+	// operation. It feeds Restore.status.restoredResources.
+	RestoredResources int32 `json:"restoredResources,omitempty"`
+	// FailedResources is how many manifests could not be applied. A manifest restore reports
+	// per-resource failures and CONTINUES (adr/0007), so this being non-zero on an OK result is
+	// the normal shape of a partial restore, not a contradiction.
+	FailedResources int32 `json:"failedResources,omitempty"`
+	// SkippedResources is how many manifests the selection excluded, so "applied 3" is
+	// distinguishable from "the snapshot only had 3".
+	SkippedResources int32 `json:"skippedResources,omitempty"`
+	// ResourceEntries are the non-trivial per-resource outcomes, already trimmed to fit the
+	// termination message (see Fit).
+	ResourceEntries []ResourceEntry `json:"resourceEntries,omitempty"`
+	// ResourcesTruncated is true when entries were dropped to fit, so a reader can tell an
+	// empty tail from a complete report.
+	ResourcesTruncated bool `json:"resourcesTruncated,omitempty"`
 	// Error is a human-readable failure reason, set only when OK is false. It is advisory
 	// (for status/events); control flow keys off OK, not off this string.
 	Error string `json:"error,omitempty"`
+}
+
+// ResourceEntry is one manifest's outcome on the wire. It mirrors the API's
+// RestoreResourceEntry but is declared here because this is the transport format, and the
+// mover must not import the API types.
+type ResourceEntry struct {
+	Group   string   `json:"g,omitempty"`
+	Kind    string   `json:"k,omitempty"`
+	Name    string   `json:"n,omitempty"`
+	Outcome string   `json:"o,omitempty"`
+	Reason  string   `json:"r,omitempty"`
+	Changed []string `json:"c,omitempty"`
+}
+
+// TerminationMessageLimit is the kubelet's cap on a termination message. Past it the message
+// is TRUNCATED, not rejected — which for a JSON payload means the controller reads a string
+// that fails to parse and reports "the mover never reported" for a run that in fact succeeded.
+// Everything below exists to make sure that cannot happen.
+const TerminationMessageLimit = 4096
+
+// resultSizeMargin leaves room under the cap. The exact encoded length depends on characters
+// this code does not control (a server error string, a resource name), so the budget is met
+// with slack rather than to the byte.
+const resultSizeMargin = 256
+
+// maxReasonLength bounds one server error before it is ever considered for the budget. A
+// webhook rejection can run to hundreds of characters and a single verbose one would otherwise
+// evict every other entry.
+const maxReasonLength = 180
+
+// Fit trims the per-resource report until the encoded result fits the termination message.
+//
+// The counts (RestoredResources, FailedResources) are NEVER dropped: they are the accounting a
+// controller reports, and they are a handful of bytes. Only entries go, and failures go LAST —
+// a user with a partial restore needs the failures far more than the list of objects that were
+// merely updated. Whatever is dropped is recorded in the pod log by the caller and flagged by
+// ResourcesTruncated, so a truncated report never passes as a complete one.
+func (r MoverResult) Fit() MoverResult {
+	for i := range r.ResourceEntries {
+		if len(r.ResourceEntries[i].Reason) > maxReasonLength {
+			r.ResourceEntries[i].Reason = r.ResourceEntries[i].Reason[:maxReasonLength] + "…"
+		}
+	}
+	if r.encodedLen() <= TerminationMessageLimit-resultSizeMargin {
+		return r
+	}
+
+	// Failures last: sort them to the front and drop from the tail.
+	ordered := make([]ResourceEntry, 0, len(r.ResourceEntries))
+	for _, e := range r.ResourceEntries {
+		if e.Outcome == OutcomeFailedWire {
+			ordered = append(ordered, e)
+		}
+	}
+	for _, e := range r.ResourceEntries {
+		if e.Outcome != OutcomeFailedWire {
+			ordered = append(ordered, e)
+		}
+	}
+	r.ResourceEntries = ordered
+
+	for len(r.ResourceEntries) > 0 && r.encodedLen() > TerminationMessageLimit-resultSizeMargin {
+		r.ResourceEntries = r.ResourceEntries[:len(r.ResourceEntries)-1]
+		r.ResourcesTruncated = true
+	}
+	return r
+}
+
+// OutcomeFailedWire is the Failed outcome as it travels on the wire. Declared here so Fit can
+// prioritise failures without importing the package that produces them.
+const OutcomeFailedWire = "Failed"
+
+func (r MoverResult) encodedLen() int {
+	encoded, err := r.Encode()
+	if err != nil {
+		// A MoverResult cannot fail to marshal (only scalars, strings and slices of them). If
+		// it somehow did, claim the budget is blown so the caller trims rather than emits
+		// something oversized.
+		return TerminationMessageLimit + 1
+	}
+	return len(encoded)
 }
 
 // Encode marshals the result to the compact JSON string the shim writes to

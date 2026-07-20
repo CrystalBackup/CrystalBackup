@@ -190,6 +190,31 @@ func RestoreArgs(snapshotID, snapshotPath, targetPath string, deleteExtras bool,
 	return append(args, flagSparse, "--retry-lock", "5m")
 }
 
+// ManifestsRestoreArgs builds the restic argv for the restic half of a manifest restore:
+//
+//	restore <snapshotID>:/manifests/<sourceNamespace> --target <targetDir> --overwrite always --retry-lock 5m
+//
+// It takes NO mode and NO include/exclude, and both omissions are deliberate.
+//
+// spec.mode governs how objects already in the TARGET NAMESPACE are reconciled — server-side
+// apply versus delete-then-create — which happens later, against the API server. It says
+// nothing about files, so --delete has nothing to reconcile here: the destination is a fresh
+// emptyDir in a pod that was created moments ago. Passing --delete would be harmless and
+// misleading, implying a file-level semantic the mode does not have.
+//
+// Selection is likewise not restic's business. resources[] selects by group/Kind/name and by
+// LABEL, and a label lives inside the file — so the narrowing must happen after parsing, in
+// the applier. Restoring the whole tree and filtering in the apply is not a shortcut; it is
+// the only order in which a label selector can be evaluated at all.
+func ManifestsRestoreArgs(snapshotID, snapshotPath, targetDir string) []string {
+	return []string{
+		restoreCmd, snapshotID + ":" + snapshotPath,
+		flagTarget, targetDir,
+		flagOverwrite, overwriteAlways,
+		"--retry-lock", "5m",
+	}
+}
+
 // SnapshotsFilterArgs is the restic argv for a FILTERED snapshot listing:
 //
 //	snapshots --json --tag crystalbackup[,<k=v>...]

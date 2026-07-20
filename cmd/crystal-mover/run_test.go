@@ -46,7 +46,9 @@ func TestBuildResultBackupSuccess(t *testing.T) {
 		SizeBytes:  2048,
 		AddedBytes: 1536,
 	}
-	if got != want {
+	// DeepEqual rather than ==: MoverResult now carries the per-resource restore report, so it
+	// has a slice field and is no longer comparable.
+	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("buildResult(backup, summary, nil) = %+v, want %+v", got, want)
 	}
 }

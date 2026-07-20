@@ -50,7 +50,8 @@ const jsonFlag = "--json"
 func knownOperation(op string) bool {
 	switch mover.Operation(op) {
 	case mover.OpBackup, mover.OpRestore, mover.OpInit, mover.OpForget, mover.OpPrune,
-		mover.OpCheck, mover.OpSnapshots, mover.OpUnlock, mover.OpManifestsBackup:
+		mover.OpCheck, mover.OpSnapshots, mover.OpUnlock,
+		mover.OpManifestsBackup, mover.OpManifestsRestore:
 		return true
 	default:
 		return false
@@ -64,8 +65,10 @@ func knownOperation(op string) bool {
 func parsesJSONSummary(op string) bool {
 	// manifests-backup ends in a `restic backup` of the dumped tree, so it produces and needs
 	// the same summary as any other backup — the snapshot id is what the controller records.
+	// manifests-restore likewise BEGINS with a `restic restore`, whose summary proves the tree
+	// actually landed before the apply reads a single file from it.
 	return op == string(mover.OpBackup) || op == string(mover.OpRestore) ||
-		op == string(mover.OpManifestsBackup)
+		op == string(mover.OpManifestsBackup) || op == string(mover.OpManifestsRestore)
 }
 
 // ensureSummaryJSON guarantees the summary-parsed operations (backup, restore — see
@@ -135,7 +138,7 @@ func buildResult(operation string, resticStdout []byte, resticErr error) mover.M
 			}
 		}
 		return mover.SummaryToResult(mover.Operation(operation), summary)
-	case string(mover.OpRestore):
+	case string(mover.OpRestore), string(mover.OpManifestsRestore):
 		summary, err := mover.ParseRestoreSummary(resticStdout)
 		if err != nil {
 			// Same refusal as backup: a clean exit whose summary cannot be read is a truncated
@@ -146,7 +149,12 @@ func buildResult(operation string, resticStdout []byte, resticErr error) mover.M
 				Error:     clampError(err),
 			}
 		}
-		return mover.RestoreSummaryToResult(summary)
+		result := mover.RestoreSummaryToResult(summary)
+		// RestoreSummaryToResult stamps OpRestore, which is right for the data path and wrong
+		// here: Operation exists so a controller can check it got the result it asked for, and
+		// a manifest restore reporting "restore" would defeat exactly that.
+		result.Operation = operation
+		return result
 	}
 	return mover.MoverResult{OK: true, Operation: operation}
 }
