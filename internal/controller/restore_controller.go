@@ -224,14 +224,21 @@ func (r *RestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{RequeueAfter: restorePollInterval}, nil
 	}
 
+	// The roll-up is over UNITS OF WORK, and a resource is one just as a volume is. Both counts
+	// have to include both halves or the phase misreports: feeding in resource failures while
+	// `completed` still counted volumes alone turned a restore that applied 138 objects and
+	// failed 3 — with no volumes at all — into Failed rather than PartiallyFailed, because the
+	// roll-up saw "nothing succeeded".
+	//
 	// A resource that failed to apply degrades the restore exactly as a failed volume does: the
 	// user asked for a namespace back and part of it is not there. Reporting Completed over a
 	// non-zero failedCount would be the one lie this status must never tell.
-	failed := drive.failedCount
+	completed, failed := drive.completed, drive.failedCount
 	if restore.Status.Resources != nil {
+		completed += int(restore.Status.RestoredResources)
 		failed += int(restore.Status.Resources.FailedCount)
 	}
-	phase := status.RollUpRestoreOutcomes(drive.completed, failed)
+	phase := status.RollUpRestoreOutcomes(completed, failed)
 	restore.Status.Phase = string(phase)
 	restore.Status.RestoredVolumes = int32(drive.completed)
 	restore.Status.RestoredBytes = drive.restoredBytes

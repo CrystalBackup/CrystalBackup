@@ -70,6 +70,13 @@ spec:
                 description: |-
                   resources selects manifests to restore (omitted with volumes ⇒ whole namespace). Bounded to
                   match the volumes cap — an unbounded selector array is an etcd/object-size smell.
+                  NOTE: no `omitempty`. A PRESENT-but-empty list means "restore nothing of this kind",
+                  while an omitted one means "everything" (spec/02-api.md § Restore selection model), and
+                  `omitempty` erases exactly that difference on the way OUT: a Go client sending an empty
+                  slice would emit no field at all, and the operator would read it back as omitted and
+                  restore the whole namespace. That is the failure mode this model must never have —
+                  crystalctl's `--data-only` writes `resources: []`, and it would widen to everything in
+                  Overwrite or Recreate mode against a live namespace.
                 items:
                   description: ResourceSelectorItem selects manifests to restore (AND
                     within an item, OR between items).
@@ -169,6 +176,7 @@ spec:
                 description: |-
                   volumes selects PVCs (and optionally files) to restore. Bounded so the per-item CEL
                   cost stays within the apiserver's per-CRD budget.
+                  No `omitempty`, for the same reason as resources above.
                 items:
                   description: |-
                     VolumeSelectorItem selects PVCs (and optionally files within them) to restore.
