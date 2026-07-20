@@ -94,6 +94,14 @@ var (
 // SIMULATE the Job's outcome by patching its status.
 const suiteMoverImage = "crystal-mover:test"
 
+// The manifest mover identity and grant, as the chart would resolve them. envtest has no
+// kubelet so no Job ever runs, but the RoleBinding IS really created against the API server,
+// which is what exercises the transient-grant path.
+const (
+	suiteManifestMoverSA    = "crystal-backup-manifest-mover"
+	suiteManifestReaderRole = "crystal-backup-manifest-reader"
+)
+
 var _ = BeforeSuite(func() {
 	logf.SetLogger(zap.New(zap.WriteTo(GinkgoWriter), zap.UseDevMode(true)))
 
@@ -176,6 +184,8 @@ var _ = BeforeSuite(func() {
 		&stubExposerRegistry{client: mgr.GetClient(), operatorNamespace: suiteOperatorNamespace},
 		suiteOperatorNamespace,
 		suiteMoverImage,
+		suiteManifestMoverSA,
+		suiteManifestReaderRole,
 		mgr.GetEventRecorder("backup"),
 		// The same shared exclusive queue as the BackupRepository controller. In envtest no backup
 		// sets a retention policy and no mover is simulated as hard-killed, so the forget/unlock

@@ -79,6 +79,8 @@ func main() {
 	var tlsOpts []func(*tls.Config)
 	var operatorNamespace string
 	var moverImage string
+	var manifestMoverSA string
+	var manifestReaderRole string
 	// defaultOperatorNamespace resolves the operator's own namespace before flags are parsed:
 	// $POD_NAMESPACE (set via the downward API in the Helm chart / manifest) if present, else
 	// the Helm chart's own default, apiconst.DefaultOperatorNamespace. This is where every
@@ -90,6 +92,14 @@ func main() {
 	flag.StringVar(&operatorNamespace, "operator-namespace", defaultOperatorNamespace,
 		"Namespace where cluster-plane platform Secrets (the cluster KEK, DR S3 credentials, wrapped DEKs) live. "+
 			"Defaults to $POD_NAMESPACE (downward API) or, if unset, "+apiconst.DefaultOperatorNamespace+".")
+	flag.StringVar(&manifestMoverSA, "manifest-mover-service-account", "",
+		"ServiceAccount the manifest mover Jobs run as — the ONE mover identity that reaches the "+
+			"API server (spec/03-security-and-tenancy.md I6). Configured rather than derived because "+
+			"the chart release-prefixes cluster-visible names so two installs cannot collide. Empty "+
+			"disables manifest capture.")
+	flag.StringVar(&manifestReaderRole, "manifest-reader-cluster-role", "",
+		"ClusterRole the operator binds TRANSIENTLY into a tenant namespace for a manifest backup "+
+			"(read on all namespaced kinds). Never bound standing; see spec/03 §5.")
 	flag.StringVar(&moverImage, "mover-image", "",
 		"Container image for the mover Jobs (repository init and, later, backup/restore/maintenance). "+
 			"REQUIRED for real backups — the Helm chart and the crucible set it; an empty value is tolerated "+
@@ -292,6 +302,8 @@ func main() {
 		exposer.NewRegistry(mgr.GetClient(), operatorNamespace),
 		operatorNamespace,
 		moverImage,
+		manifestMoverSA,
+		manifestReaderRole,
 		mgr.GetEventRecorder("backup"),
 		// The SAME per-repository exclusive queue the BackupRepository controller uses: the Backup
 		// controller enqueues retention-forget and stale-lock-unlock on it, serialised per repository

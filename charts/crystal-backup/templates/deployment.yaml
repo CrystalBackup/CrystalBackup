@@ -51,6 +51,13 @@ spec:
             # digest-pinned via the moverImage helper. The operator reads no default for this — a
             # cluster that never sets it can init/inspect CRs but cannot move data.
             - --mover-image={{ include "crystal-backup.moverImage" . }}
+            {{- if .Values.rbac.create }}
+            # The manifest mover's identity and the ClusterRole the operator binds transiently
+            # into a tenant namespace for a capture. Passed rather than derived: these names are
+            # release-prefixed, so the operator must be told what the chart actually created.
+            - --manifest-mover-service-account={{ include "crystal-backup.manifestMoverServiceAccountName" . }}
+            - --manifest-reader-cluster-role={{ include "crystal-backup.fullname" . }}-manifest-reader
+            {{- end }}
             {{- with .Values.extraArgs }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

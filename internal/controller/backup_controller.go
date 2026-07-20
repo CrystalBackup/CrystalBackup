@@ -118,7 +118,13 @@ type BackupReconciler struct {
 	// MoverImage is the image the mover Jobs run. Required for real backups; empty is tolerated
 	// only because envtest simulates the Job outcome and never runs it.
 	MoverImage string
-	Recorder   events.EventRecorder
+	// ManifestMoverServiceAccount and ManifestReaderClusterRole name the identity and grant of
+	// the manifest mover. They are CONFIGURED, not derived: the chart release-prefixes every
+	// cluster-scoped object so two installs cannot collide, so the operator must be told the
+	// resolved names rather than reconstructing them from a convention it does not own.
+	ManifestMoverServiceAccount string
+	ManifestReaderClusterRole   string
+	Recorder                    events.EventRecorder
 	// Queue is the per-repository exclusive work queue, SHARED with the BackupRepository controller
 	// (main.go constructs one and passes it to both). The Backup controller enqueues the two
 	// repository maintenance ops it triggers — retention forget after a successful backup, and a
@@ -136,18 +142,21 @@ func NewBackupReconciler(
 	secretsReader *secrets.ByNameReader,
 	exposers ExposerRegistry,
 	operatorNamespace, moverImage string,
+	manifestMoverSA, manifestReaderRole string,
 	recorder events.EventRecorder,
 	q *queue.Manager,
 ) *BackupReconciler {
 	return &BackupReconciler{
-		Client:            c,
-		Scheme:            scheme,
-		Secrets:           secretsReader,
-		Exposers:          exposers,
-		OperatorNamespace: operatorNamespace,
-		MoverImage:        moverImage,
-		Recorder:          recorder,
-		Queue:             q,
+		Client:                      c,
+		Scheme:                      scheme,
+		Secrets:                     secretsReader,
+		Exposers:                    exposers,
+		OperatorNamespace:           operatorNamespace,
+		MoverImage:                  moverImage,
+		ManifestMoverServiceAccount: manifestMoverSA,
+		ManifestReaderClusterRole:   manifestReaderRole,
+		Recorder:                    recorder,
+		Queue:                       q,
 	}
 }
 
@@ -308,18 +317,41 @@ func (r *BackupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		teardownPVC = tp
 	}
 
+	// (10b) The manifest half, driven independently of the volumes. A PVC the CSI driver cannot
+	// snapshot is reported Skipped and the namespace still gets its manifests (02-api.md): the
+	// two halves fail for unrelated reasons, and coupling them would lose one to the other's bad
+	// day.
+	manifestsDone, teardownManifests, err := r.advanceManifests(ctx, &backup, rc,
+		includeManifests(run), run.ManifestOptions.ExcludeSecretData)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
 	// (11) Single status writer: roll the per-volume phases up, record a terminal condition +
 	// backupTime once, and write status exactly once.
-	res, err := r.writeStatus(ctx, &backup)
+	res, err := r.writeStatus(ctx, &backup, manifestsDone)
 	if err != nil {
 		// Status not persisted (e.g. a write conflict): return WITHOUT tearing down, so the mover
 		// Job survives and the next reconcile re-reads and re-records the same terminal result.
 		return res, err
 	}
+	// A Backup whose volumes are all terminal but whose manifests are still in flight must keep
+	// being reconciled: writeStatus only reasons about volumes, so without this the run would go
+	// quiet holding a running manifest Job and never record its snapshot.
+	if !manifestsDone && res.IsZero() {
+		res = ctrl.Result{RequeueAfter: backupPollInterval}
+	}
+
 	// The terminal result is now durable: safe to tear the just-finished volume's exposure + Job
 	// down (best-effort; idempotent).
 	if teardownPVC != "" {
 		r.teardownVolume(ctx, &backup, teardownPVC)
+	}
+	// Same rule for the manifest half, and it matters more there: its residue includes the
+	// transient RoleBinding, so tearing down before the write persisted would delete a grant the
+	// very next reconcile re-creates for a second dump of the same namespace.
+	if teardownManifests != "" {
+		r.teardownManifests(ctx, &backup, teardownManifests)
 	}
 	// (12) Retention: once the Backup has reached a successful terminal phase, apply the LOCATION's
 	// per-PVC keep policy with one `restic forget` on the repository's exclusive queue (skipped on
@@ -332,11 +364,28 @@ func (r *BackupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	return res, nil
 }
 
+// includeManifests resolves the run's includeManifests, which defaults to TRUE: a namespace
+// backup without its manifests restores data into nothing, so the safe default is to capture
+// them and the explicit act is to opt out.
+func includeManifests(run *cbv1.ClusterBackupRunSpec) bool {
+	return run.IncludeManifests == nil || *run.IncludeManifests
+}
+
 // writeStatus rolls the per-volume phases up into the Backup phase, records the headline
 // condition (and backupTime on first reaching a terminal phase), writes status once, and returns
 // the requeue decision: none once terminal, a short poll while volumes are still in flight.
-func (r *BackupReconciler) writeStatus(ctx context.Context, backup *cbv1.Backup) (ctrl.Result, error) {
+func (r *BackupReconciler) writeStatus(ctx context.Context, backup *cbv1.Backup, manifestsDone bool) (ctrl.Result, error) {
 	phase := string(status.RollUpVolumePhases(backup.Status.Volumes))
+	// A Backup is not finished while its manifest half is still running, even when every volume
+	// is. Letting the roll-up go terminal here would trip the already-terminal short-circuit at
+	// the top of Reconcile, and the capture in flight would never have its result recorded —
+	// leaving a snapshot in the repository that no Backup object points at, which is exactly the
+	// kind of silent loss the discovery model cannot repair (the run tag would be orphaned).
+	//
+	// Uploading is the honest phase for it: bytes are still going to the repository.
+	if !manifestsDone && isTerminalBackupPhase(phase) {
+		phase = string(status.BackupPhaseUploading)
+	}
 	backup.Status.Phase = phase
 
 	terminal := isTerminalBackupPhase(phase)
@@ -400,6 +449,12 @@ func (r *BackupReconciler) finalize(ctx context.Context, backup *cbv1.Backup) (c
 		}
 		r.deleteMoverJobAndSecret(ctx, moverNamePrefix(backup.Namespace, backup.Name, vol.Pvc))
 	}
+
+	// The manifest half leaves residue of its own, and one piece of it is a live privilege: the
+	// transient RoleBinding in the tenant namespace. Unconditional because status may not name
+	// it — a Backup deleted between the Job create and the first status write has a running
+	// capture and nothing recorded — and because both deletes tolerate NotFound.
+	r.teardownManifests(ctx, backup, manifestsJobPrefix(backup.Namespace, backup.Name))
 
 	r.Recorder.Eventf(backup, nil, corev1.EventTypeNormal, "Finalizing", "Finalize",
 		"tearing down live exposures and mover Jobs; no repository data is erased (adr/0009)")

@@ -59,9 +59,16 @@ fmt: ## Run go fmt against code.
 vet: ## Run go vet against code.
 	go vet ./...
 
+# TEST_TIMEOUT overrides go test's 10-minute default, which the envtest controller suite now
+# exceeds on its own. That default does not fail a test — it PANICS the binary, so a suite that
+# merely grew past it reports as a hang with no failing spec named, which is the least
+# actionable signal CI can give. Each spec's Eventually budget is 90s, so a handful of genuine
+# failures alone can spend most of this.
+TEST_TIMEOUT ?= 20m
+
 .PHONY: test
 test: manifests generate fmt vet setup-envtest ## Run tests.
-	KUBEBUILDER_ASSETS="$(shell "$(ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(LOCALBIN)" -p path)" go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out
+	KUBEBUILDER_ASSETS="$(shell "$(ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(LOCALBIN)" -p path)" go test $$(go list ./... | grep -v /e2e) -timeout $(TEST_TIMEOUT) -coverprofile cover.out
 
 # TODO(user): To use a different vendor for e2e tests, modify the setup under 'tests/e2e'.
 # The default setup assumes Kind is pre-installed and builds/loads the Manager Docker image locally.
