@@ -390,7 +390,14 @@ func (a *Applier) recreate(
 func (a *Applier) deleteAndWait(ctx context.Context, ri dynamic.ResourceInterface, name string, uid types.UID) error {
 	// Preconditions pin the delete to the object we read: without them a retry could delete a
 	// replacement that appeared in between.
-	policy := metav1.DeletePropagationForeground
+	//
+	// BACKGROUND propagation, not foreground. Foreground reads as the careful choice — wait for
+	// the dependents, then the object — but it works by adding a `foregroundDeletion` finalizer
+	// that only the garbage collector removes. That makes every Recreate wait on a healthy GC
+	// controller, and turns a degraded one into a restore where every object times out and
+	// reports Failed. There is also nothing to wait for: S5 strips ownerReferences at backup, so
+	// restored objects are unowned and the set being replaced has no dependents of its own.
+	policy := metav1.DeletePropagationBackground
 	err := ri.Delete(ctx, name, metav1.DeleteOptions{
 		Preconditions:     &metav1.Preconditions{UID: &uid},
 		PropagationPolicy: &policy,

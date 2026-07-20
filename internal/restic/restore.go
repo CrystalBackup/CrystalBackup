@@ -148,6 +148,11 @@ const (
 	flagInclude   = "--include"
 	flagExclude   = "--exclude"
 	flagSparse    = "--sparse"
+	// flagRetryLock rides out a transient repository lock instead of failing the run outright;
+	// retryLockFor is how long. Every command that touches a locked repository uses the same
+	// budget, so it is named once rather than repeated at each call site.
+	flagRetryLock = "--retry-lock"
+	retryLockFor  = "5m"
 )
 
 // overwriteAlways is the --overwrite policy both restore modes share: files present in both
@@ -187,7 +192,7 @@ func RestoreArgs(snapshotID, snapshotPath, targetPath string, deleteExtras bool,
 	for _, p := range excludes {
 		args = append(args, flagExclude, p)
 	}
-	return append(args, flagSparse, "--retry-lock", "5m")
+	return append(args, flagSparse, flagRetryLock, retryLockFor)
 }
 
 // ManifestsRestoreArgs builds the restic argv for the restic half of a manifest restore:
@@ -211,7 +216,7 @@ func ManifestsRestoreArgs(snapshotID, snapshotPath, targetDir string) []string {
 		restoreCmd, snapshotID + ":" + snapshotPath,
 		flagTarget, targetDir,
 		flagOverwrite, overwriteAlways,
-		"--retry-lock", "5m",
+		flagRetryLock, retryLockFor,
 	}
 }
 

@@ -9,3 +9,9 @@
 # Re-include Go module files
 !go.mod
 !go.sum
+
+# Re-include files consumed by //go:embed. These are Go SOURCE as far as the compiler is
+# concerned — a missing one fails the build with "pattern <file>: no matching files found" —
+# but the allowlist above only re-includes *.go, so an embedded non-Go file is invisible here
+# while building fine everywhere else. Add every new embed target to this list.
+!internal/sanitize/rules.yaml
