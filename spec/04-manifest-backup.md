@@ -213,10 +213,21 @@ e.g. `ClusterRestore` into a fresh namespace via `target.createNamespace` — is
 non-destructive and needs no confirmation.
 
 Caveats: a `Recreate` delete honors finalizers — an object stuck on a finalizer is
-reported `Failed` (reason surfaced), never force-deleted, and the restore continues.
+reported `Failed` (reason surfaced), never force-deleted, and the restore continues. It
+deletes with **background** propagation: `foreground` works by adding a
+`foregroundDeletion` finalizer only the garbage collector removes, which would make every
+`Recreate` wait on a healthy GC controller, and ownerReferences are stripped at backup
+anyway (§4.3) so the replaced objects have no dependents to wait for.
+
 Under `Overwrite`, server-side apply resolves field ownership per Kubernetes conflict
-rules; ownerReferences were stripped at backup (§4.3), so restored objects are unowned
-in either mode.
+rules — that is the *merge* semantics (list keys, atomic vs granular fields), not a refusal
+to take ownership. The apply is **forced** (`force: true`). Without it, an apply conflicts
+with whatever manager already owns each field — `kubectl`, Helm, a controller — which in a
+real namespace is nearly every pre-existing object, so `Overwrite` would fail on precisely
+what it exists to reconcile; the §6 e2e (a pre-created *drifted* ConfigMap that `Overwrite`
+must SSA-merge) is unsatisfiable otherwise. Force takes ownership; it does not prune, so
+"objects and fields present in the target but absent from the backup are kept" still holds.
+ownerReferences were stripped at backup, so restored objects are unowned in either mode.
 
 ### 5.3 storageClassMapping
 
@@ -243,8 +254,12 @@ cross-namespace) concern.
   (labels) **and** `include` select, `exclude` removes. `include`/`exclude` entries are
   globs over the stored path `<group>/<Kind>[/<name>]` (§3; the core group may be written
   `core` or elided) — e.g. `apps/Deployment`, `apps/StatefulSet/postgres`, `Secret/db-creds`,
-  `postgresql.cnpg.io/Cluster/db`, `apps/*`. `resources` omitted **and** `volumes` omitted
-  ⇒ whole namespace; `resources: []` ⇒ no manifests. The default exclusions (§2.2) already
+  `postgresql.cnpg.io/Cluster/db`, `apps/*`. Each list defaults
+  **independently**: `resources` omitted ⇒ every manifest, whatever `volumes` says (so
+  "both omitted ⇒ whole namespace" is the common case of that rule, not a special one);
+  `resources: []` ⇒ no manifests. The CLI is the tie-breaker that fixes this reading —
+  `--data-only` writes `resources: []` explicitly, which it would not need to do if
+  omitting the field already meant none ([06-cli.md](06-cli.md)). The default exclusions (§2.2) already
   happened at **backup** time and cannot be re-included.
 - **Dry-run** (`spec.dryRun: true`, reserved — additive to the 02-api.md contract, lands
   at M3): runs the full pipeline (ordering, selection, mapping, mode resolution) with
@@ -291,9 +306,11 @@ Metrics carry the origin `namespace` label per R19; the catalogue lives in
 
 ## 7. Open questions
 
-1. `spec.dryRun` and `status.resources` are additive to the 02-api.md contract (already
-   listed in its *Reserved / pending fields*) — to be merged into 02-api.md when M3
-   development starts (same-PR rule of the DoD).
+1. ~~`spec.dryRun` and `status.resources` are additive to the 02-api.md contract~~ —
+   **resolved (M3)**: both are now in [02-api.md](02-api.md) as the contract, `dryRun`
+   top-level rather than nested under a `manifests` block (one selection model and one mode
+   serve both halves of a restore, so a per-half switch would be inventing a distinction
+   that does not exist).
 2. Should E9 (VolumeSnapshot exclusion) become opt-out for same-cluster restores where
    the VolumeSnapshotContents still exist? Deferred; default stays excluded.
 3. Helm release Secrets (`type: helm.sh/release.v1`) are currently **kept** so `helm`
