@@ -1,0 +1,10 @@
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshot
+metadata:
+  name: crystal-data-postgres-0-20260712
+  namespace: c-team-x
+  uid: 44000001-0000-4000-8000-000000000001
+spec:
+  source:
+    persistentVolumeClaimName: data-postgres-0
+  volumeSnapshotClassName: ceph-block-snap

@@ -1,0 +1,18 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: platform-admins
+  uid: 9b6dae92-0000-4000-8000-000000000001
+  resourceVersion: "58000"
+  creationTimestamp: "2026-07-01T08:00:00Z"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+  - apiGroup: rbac.authorization.k8s.io
+    kind: Group
+    name: platform-sre
+  - kind: ServiceAccount
+    name: automation
+    namespace: platform

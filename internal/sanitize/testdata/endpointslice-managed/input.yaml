@@ -1,0 +1,16 @@
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata:
+  name: web-abc12
+  namespace: c-team-x
+  uid: ee000001-0000-4000-8000-000000000001
+  labels:
+    kubernetes.io/service-name: web
+    endpointslice.kubernetes.io/managed-by: endpointslice-controller.k8s.io
+addressType: IPv4
+endpoints:
+  - addresses:
+      - 10.42.1.15
+ports:
+  - name: http
+    port: 8080

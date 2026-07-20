@@ -125,10 +125,21 @@ implemented in-house: neat's behavior is a reference, not a dependency.
 
 | # | Kind | Rule |
 |---|---|---|
-| S10 | `Service` | Strip `spec.clusterIP`, `spec.clusterIPs`, `spec.ipFamilies`. **Preserve `spec.ports[].nodePort` and `spec.healthCheckNodePort`** (agreed decision; Velero only does this behind `--preserve-nodeports`). |
+| S10 | `Service` | Strip `spec.clusterIP`, `spec.clusterIPs`, `spec.ipFamilies` — **except the literal value `None`, which is kept** (see below). **Preserve `spec.ports[].nodePort` and `spec.healthCheckNodePort`** (agreed decision; Velero only does this behind `--preserve-nodeports`). |
 | S11 | `PersistentVolumeClaim` | Strip `spec.volumeName` (PV binding is cluster-local); strip `spec.dataSource` and `spec.dataSourceRef` (source objects excluded per E9; data comes back through the volume restore path); strip annotations `pv.kubernetes.io/bind-completed`, `pv.kubernetes.io/bound-by-controller`, `volume.beta.kubernetes.io/storage-provisioner`, `volume.kubernetes.io/storage-provisioner`, `volume.kubernetes.io/selected-node`; strip finalizer `kubernetes.io/pvc-protection` (re-added by the control plane). **Keep `spec.storageClassName`** — it is the input of storageClassMapping (§5.3). |
 | S12 | `Pod` (standalone) | Strip `spec.nodeName`, `spec.priority` (derived from kept `priorityClassName`), deprecated `spec.serviceAccount` alias; strip projected token volumes named `kube-api-access-*` and their volumeMounts. |
 | S13 | `Deployment` | Strip annotation `deployment.kubernetes.io/revision`. |
+
+**Headless Services (`clusterIP: None`) — corrected 2026-07-20.** The rule above originally
+stripped `spec.clusterIP` unconditionally. That is wrong for exactly one value: `None` is not
+an address the API server allocated, it is how a headless Service is *declared*. Stripping it
+restores the Service as an ordinary ClusterIP Service with a virtual IP, which silently
+removes the per-pod DNS records (`<pod>.<svc>.<ns>.svc.cluster.local`) that every StatefulSet
+governed by it depends on — so a clustered database comes back unable to resolve its own
+members, failing at the application layer long after the restore reported success. The
+sanitizer therefore keeps `clusterIP` and `clusterIPs` when their value is `None`, and strips
+them otherwise. Found by the golden corpus (§6) before the rule ever ran on real data, which
+is the corpus doing its job.
 
 NodePort / LoadBalancer notes: a preserved `nodePort` may collide in the target cluster;
 the apply then fails for that Service and is reported per-resource (§5.4) — it is never

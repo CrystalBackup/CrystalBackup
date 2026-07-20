@@ -1,0 +1,10 @@
+apiVersion: crystalbackup.io/v1alpha1
+kind: Backup
+metadata:
+  name: dr-daily-20260712-020000
+  namespace: c-team-x
+  uid: 55000001-0000-4000-8000-000000000001
+spec:
+  scheduleRef: dr-daily
+  locationRef:
+    name: dr-primary

@@ -1,0 +1,28 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  namespace: c-team-x
+  uid: 6e3a7b69-0000-4000-8000-000000000001
+  resourceVersion: "55000"
+  generation: 4
+  creationTimestamp: "2026-07-01T14:00:00Z"
+  annotations:
+    deployment.kubernetes.io/revision: "4"
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+        - name: web
+          image: nginx:1.27
+status:
+  availableReplicas: 2
+  observedGeneration: 4
+  readyReplicas: 2

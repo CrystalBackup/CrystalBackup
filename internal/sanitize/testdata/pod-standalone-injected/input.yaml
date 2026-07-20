@@ -1,0 +1,43 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: debug-shell
+  namespace: c-team-x
+  uid: 4c1e5f47-0000-4000-8000-000000000001
+  resourceVersion: "53001"
+  creationTimestamp: "2026-07-01T12:00:00Z"
+  annotations:
+    sidecar.istio.io/status: '{"containers":["istio-proxy"]}'
+spec:
+  nodeName: worker-3
+  priority: 0
+  priorityClassName: standard
+  serviceAccount: debug-sa
+  serviceAccountName: debug-sa
+  containers:
+    - name: app
+      image: alpine:3.20
+      volumeMounts:
+        - name: kube-api-access-x7f2q
+          mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+          readOnly: true
+        - name: workdir
+          mountPath: /work
+    - name: istio-proxy
+      image: docker.io/istio/proxyv2:1.24.0
+      volumeMounts:
+        - name: kube-api-access-x7f2q
+          mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+          readOnly: true
+  volumes:
+    - name: workdir
+      emptyDir: {}
+    - name: kube-api-access-x7f2q
+      projected:
+        defaultMode: 420
+        sources:
+          - serviceAccountToken:
+              expirationSeconds: 3607
+              path: token
+status:
+  phase: Running

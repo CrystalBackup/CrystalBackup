@@ -1,0 +1,19 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: nightly-report-29001234
+  namespace: c-team-x
+  uid: cc000001-0000-4000-8000-000000000001
+  ownerReferences:
+    - apiVersion: batch/v1
+      kind: CronJob
+      name: nightly-report
+      uid: dd000001-0000-4000-8000-000000000001
+      controller: true
+spec:
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: report
+          image: reporter:1.0

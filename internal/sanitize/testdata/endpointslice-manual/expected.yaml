@@ -1,0 +1,16 @@
+addressType: IPv4
+apiVersion: discovery.k8s.io/v1
+endpoints:
+- addresses:
+  - 198.51.100.20
+  conditions:
+    ready: true
+kind: EndpointSlice
+metadata:
+  labels:
+    kubernetes.io/service-name: external-api
+  name: external-api-manual
+ports:
+- name: https
+  port: 443
+  protocol: TCP

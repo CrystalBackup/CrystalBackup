@@ -1,0 +1,26 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-np
+  namespace: c-team-x
+  uid: 1f8b2c14-0000-4000-8000-000000000002
+  resourceVersion: "48299"
+  creationTimestamp: "2026-07-01T10:01:00Z"
+spec:
+  type: NodePort
+  clusterIP: 10.43.12.8
+  clusterIPs:
+    - 10.43.12.8
+  ipFamilies:
+    - IPv4
+  externalTrafficPolicy: Cluster
+  selector:
+    app: web
+  ports:
+    - name: http
+      port: 80
+      protocol: TCP
+      targetPort: 8080
+      nodePort: 30080
+status:
+  loadBalancer: {}

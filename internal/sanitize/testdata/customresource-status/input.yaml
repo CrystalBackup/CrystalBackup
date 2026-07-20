@@ -1,0 +1,18 @@
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: db
+  namespace: c-team-x
+  uid: 7f4b8c70-0000-4000-8000-000000000001
+  resourceVersion: "56000"
+  generation: 2
+  creationTimestamp: "2026-07-01T15:00:00Z"
+spec:
+  instances: 3
+  storage:
+    size: 20Gi
+    storageClass: ceph-block
+status:
+  instances: 3
+  readyInstances: 3
+  phase: "Cluster in healthy state"

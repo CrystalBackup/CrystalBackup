@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kube-root-ca.crt
+  namespace: c-team-x
+  uid: 66000001-0000-4000-8000-000000000001
+data:
+  ca.crt: |
+    -----BEGIN CERTIFICATE-----
+    ZmFrZQ==
+    -----END CERTIFICATE-----

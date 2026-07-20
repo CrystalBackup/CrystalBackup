@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: web-lb
+spec:
+  externalTrafficPolicy: Local
+  healthCheckNodePort: 32100
+  loadBalancerIP: 203.0.113.10
+  ports:
+  - name: https
+    nodePort: 31443
+    port: 443
+    protocol: TCP
+    targetPort: 8443
+  selector:
+    app: web
+  type: LoadBalancer
