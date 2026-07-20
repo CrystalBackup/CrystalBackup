@@ -260,7 +260,7 @@ func TestApplyPhaseOrdering(t *testing.T) {
 	crd := applyPhase(groupAPIExtensions, kindCRD, true)
 	sc := applyPhase(groupStorage, kindStorageClass, true)
 	ns := applyPhase(coreGroup, kindNamespace, true)
-	if !(crd < sc && sc < ns) {
+	if crd >= sc || sc >= ns {
 		t.Errorf("cluster order: CRD(%d) must precede StorageClass(%d) must precede Namespace(%d)", crd, sc, ns)
 	}
 	// A custom cluster-scoped kind is a middle object, never before a CRD.
