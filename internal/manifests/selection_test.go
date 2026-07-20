@@ -241,8 +241,8 @@ func TestApplyPhaseOrdering(t *testing.T) {
 		{resource{group: groupApps, kind: "Deployment"}, resource{group: "", kind: "Service"}},
 	}
 	for _, rel := range mustPrecede {
-		b := applyPhase(rel.before.group, rel.before.kind)
-		a := applyPhase(rel.after.group, rel.after.kind)
+		b := applyPhase(rel.before.group, rel.before.kind, false)
+		a := applyPhase(rel.after.group, rel.after.kind, false)
 		if b >= a {
 			t.Errorf("%s/%s (phase %d) must precede %s/%s (phase %d)",
 				rel.before.group, rel.before.kind, b, rel.after.group, rel.after.kind, a)
@@ -251,7 +251,20 @@ func TestApplyPhaseOrdering(t *testing.T) {
 
 	// A custom Kind that happens to share a built-in's name belongs with its own CRD's kinds,
 	// not among the workloads — which is why the table is keyed on group AND kind.
-	if got := applyPhase("acme.example.com", "Job"); got != phaseEverythingElse {
+	if got := applyPhase("acme.example.com", "Job", false); got != phaseEverythingElse {
 		t.Errorf("applyPhase(acme.example.com, Job) = %d, want the generic phase %d", got, phaseEverythingElse)
+	}
+
+	// Cluster-scoped ordering (adr/0011 §2): CRDs strictly before every other cluster-scoped
+	// kind, Namespaces strictly after — so a namespaced object (a later Job) has its namespace.
+	crd := applyPhase(groupAPIExtensions, kindCRD, true)
+	sc := applyPhase(groupStorage, kindStorageClass, true)
+	ns := applyPhase(coreGroup, kindNamespace, true)
+	if !(crd < sc && sc < ns) {
+		t.Errorf("cluster order: CRD(%d) must precede StorageClass(%d) must precede Namespace(%d)", crd, sc, ns)
+	}
+	// A custom cluster-scoped kind is a middle object, never before a CRD.
+	if got := applyPhase("example.com", "ClusterWidget", true); got != phaseClusterOther {
+		t.Errorf("applyPhase(cluster custom) = %d, want the middle cluster phase %d", got, phaseClusterOther)
 	}
 }

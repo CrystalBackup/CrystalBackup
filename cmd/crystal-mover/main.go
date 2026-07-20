@@ -167,15 +167,26 @@ func main() {
 		result.IncompleteManifests = len(manifestIndex.Warnings) > 0
 	}
 
-	// A manifest restore has its step AFTER restic: the tree has to exist before anything can
-	// be applied. Gated on result.OK because applying a half-restored tree would create a
-	// partial namespace and report it as a restore.
-	if mover.Operation(*operation) == mover.OpManifestsRestore && result.OK {
-		applied, err := applyManifests(context.Background())
+	// A manifest restore — namespaced or cluster-scoped — has its step AFTER restic: the tree
+	// has to exist before anything can be applied. Gated on result.OK because applying a
+	// half-restored tree would leave a partial namespace (or a partial cluster) and report it as
+	// a restore. The two differ only in scope: the cluster path stamps no namespace and takes
+	// the cluster-scoped ordering (applyClusterManifests → Applier{ClusterScoped:true}).
+	if result.OK {
+		var applied *manifests.Report
+		var err error
+		switch mover.Operation(*operation) {
+		case mover.OpManifestsRestore:
+			applied, err = applyManifests(context.Background())
+		case mover.OpClusterManifestsRestore:
+			applied, err = applyClusterManifests(context.Background())
+		}
 		if err != nil {
 			fail(*terminationLog, *operation, err)
 		}
-		result = reportToResult(result, applied)
+		if applied != nil {
+			result = reportToResult(result, applied)
+		}
 	}
 	report(*terminationLog, result)
 }

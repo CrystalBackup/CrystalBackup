@@ -102,6 +102,13 @@ type ApplyOptions struct {
 	// StorageClassMapping rewrites PVC spec.storageClassName (§5.3). A value of "" REMOVES the
 	// field so the target's default class applies; an unmapped class passes through untouched.
 	StorageClassMapping map[string]string
+	// ClusterScoped marks a whole tree of CLUSTER-scoped objects — the kind=cluster-manifests
+	// snapshot, which by construction holds nothing namespaced (cluster_dump keeps only
+	// namespaced == false). It flips off the two namespace behaviours that would be wrong for
+	// such objects: metadata.namespace is NOT stamped (a cluster-scoped object has none, and the
+	// API server rejects one that does), and no TargetNamespace is required. The per-object apply
+	// still resolves scope from the RESTMapper, so a stray mis-scoped object cannot slip through.
+	ClusterScoped bool
 }
 
 // Report is the accounting one restore pass produces.
@@ -144,7 +151,7 @@ type plannedResource struct {
 // the first bad object leaves the namespace in a state nobody asked for and no one can reason
 // about (adr/0007).
 func (a *Applier) Apply(ctx context.Context, opts ApplyOptions) (*Report, error) {
-	if opts.TargetNamespace == "" {
+	if opts.TargetNamespace == "" && !opts.ClusterScoped {
 		return nil, errors.New("apply: no target namespace")
 	}
 
@@ -193,15 +200,18 @@ func (a *Applier) plan(idx *Index, opts ApplyOptions) ([]plannedResource, *Repor
 			continue
 		}
 
-		// The two — and only two — restore-time transformations (04-manifest-backup.md §5.3
-		// and S6). Anything else the stored manifest needed was already done at backup.
-		obj.SetNamespace(opts.TargetNamespace)
+		// The restore-time transformations (04-manifest-backup.md §5.3 and S6). Anything else the
+		// stored manifest needed was already done at backup. A cluster-scoped object gets NO
+		// namespace stamped — it has none, and the API server rejects one that does.
+		if !opts.ClusterScoped {
+			obj.SetNamespace(opts.TargetNamespace)
+		}
 		if isPVC(entry.Group, entry.Kind) {
 			applyStorageClassMapping(obj, opts.StorageClassMapping)
 		}
 
 		planned = append(planned, plannedResource{
-			entry: entry, obj: obj, phase: applyPhase(entry.Group, entry.Kind),
+			entry: entry, obj: obj, phase: applyPhase(entry.Group, entry.Kind, opts.ClusterScoped),
 		})
 	}
 
@@ -270,7 +280,15 @@ func (a *Applier) applyOne(ctx context.Context, p *plannedResource, opts ApplyOp
 		report.fail(p.entry, err.Error())
 		return
 	}
-	ri := a.Dynamic.Resource(mapping.Resource).Namespace(opts.TargetNamespace)
+	// Root-scoped resources take the un-namespaced dynamic interface; a namespaced one takes the
+	// target namespace. Keyed on the RESTMapper's own scope, not on opts.ClusterScoped, so the
+	// resolution is correct per object even if a tree ever carries a kind of the other scope.
+	var ri dynamic.ResourceInterface
+	if mapping.Scope.Name() == meta.RESTScopeNameRoot {
+		ri = a.Dynamic.Resource(mapping.Resource)
+	} else {
+		ri = a.Dynamic.Resource(mapping.Resource).Namespace(opts.TargetNamespace)
+	}
 
 	live, err := ri.Get(ctx, p.entry.Name, metav1.GetOptions{})
 	switch {

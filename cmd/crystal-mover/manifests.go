@@ -248,6 +248,72 @@ func applyManifests(ctx context.Context) (*manifests.Report, error) {
 	return report, nil
 }
 
+// applyClusterManifests applies a restored CLUSTER-scoped manifest tree (adr/0011 §2). The
+// cluster-plane sibling of applyManifests, and it runs on the same side of restic (after). It
+// differs in exactly the way the objects differ: no target namespace is read or stamped
+// (ClusterScoped), and the source tree is the cluster-manifests restore dir. Per-resource
+// failures are counted and stepped over, same as the namespaced apply — a CRD that fails to
+// apply must not abandon the StorageClasses that would have followed it.
+func applyClusterManifests(ctx context.Context) (*manifests.Report, error) {
+	sourceDir := os.Getenv(mover.EnvManifestsRestoreDir)
+	if sourceDir == "" {
+		return nil, fmt.Errorf("%s is not set; the cluster apply cannot guess where restic put the tree",
+			mover.EnvManifestsRestoreDir)
+	}
+
+	selection, err := manifests.DecodeSelection(os.Getenv(mover.EnvManifestsSelection))
+	if err != nil {
+		return nil, err
+	}
+	compiled, err := selection.Compile()
+	if err != nil {
+		// A malformed selector must never degrade into "restore everything cluster-scoped":
+		// recreating CRDs and cluster RBAC is the most privileged thing this tool does.
+		return nil, fmt.Errorf("selection: %w", err)
+	}
+
+	cfg, err := rest.InClusterConfig()
+	if err != nil {
+		return nil, fmt.Errorf("in-cluster config (the cluster-manifest mover needs an automounted "+
+			"ServiceAccount token — see spec/03-security-and-tenancy.md I6): %w", err)
+	}
+	disco, err := discovery.NewDiscoveryClientForConfig(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("discovery client: %w", err)
+	}
+	dyn, err := dynamic.NewForConfig(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("dynamic client: %w", err)
+	}
+	mapper := restmapper.NewDeferredDiscoveryRESTMapper(memory.NewMemCacheClient(disco))
+
+	a := &manifests.Applier{Dynamic: dyn, Mapper: mapper}
+	opts := manifests.ApplyOptions{
+		SourceDir:     sourceDir,
+		Mode:          manifests.RestoreMode(os.Getenv(mover.EnvManifestsMode)),
+		DryRun:        os.Getenv(mover.EnvManifestsDryRun) == "true",
+		Selection:     compiled,
+		ClusterScoped: true,
+	}
+
+	report, err := a.Apply(ctx, opts)
+	if err != nil {
+		return nil, fmt.Errorf("apply cluster-scoped objects: %w", err)
+	}
+
+	dry := ""
+	if opts.DryRun {
+		dry = " (dry run, nothing persisted)"
+	}
+	fmt.Fprintf(os.Stderr, "crystal-mover: applied %d, failed %d, skipped %d cluster-scoped resource(s)%s\n",
+		report.Applied, report.Failed, report.Skipped, dry)
+	for _, e := range report.Entries {
+		fmt.Fprintf(os.Stderr, "crystal-mover: %s %s/%s/%s %s %s\n",
+			e.Outcome, e.Group, e.Kind, e.Name, e.Reason, strings.Join(e.Changed, ","))
+	}
+	return report, nil
+}
+
 // decodeStorageClassMapping reads the JSON map the operator passed. An empty value is the
 // namespaced Restore's normal case — it exposes no storageClassMapping at all (§5.3).
 func decodeStorageClassMapping(encoded string) (map[string]string, error) {

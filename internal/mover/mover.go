@@ -119,6 +119,14 @@ const (
 	// so its snapshot carries NEITHER tenant nor namespace tag (restic.ClusterManifestsIdentity),
 	// and its dump destination is the fixed ClusterManifestsRoot with no per-namespace suffix.
 	OpClusterManifestsBackup Operation = "cluster-manifests-backup"
+	// OpClusterManifestsRestore restores a kind=cluster-manifests snapshot and APPLIES its
+	// cluster-scoped objects (adr/0011 §2). The mirror of OpManifestsRestore on the cluster
+	// plane: same "restic restore then apply" shape (the API work runs AFTER restic), but the
+	// objects are cluster-scoped — no target namespace is stamped, and the transient grant is a
+	// cluster-scoped ClusterRoleBinding to crystal-cluster-manifest-writer, the second half of
+	// I6's exception on the restore side. Admin-only, opt-in, and confirmation-gated at the CR
+	// level; the mover only executes what the operator resolved.
+	OpClusterManifestsRestore Operation = "cluster-manifests-restore"
 )
 
 // Filesystem layout inside the mover container. These paths are a two-sided contract: the
@@ -183,6 +191,12 @@ const (
 	// (adr/0011). Writing the dump anywhere else would silently store the snapshot under the wrong
 	// path and break every retention group and ClusterRestore that keys on it.
 	ClusterManifestsRoot = "/cluster-manifests"
+
+	// ClusterManifestsRestoreDir is where the restic half of a cluster-manifests RESTORE lands the
+	// tree, and where the apply reads index.json from. A SUBDIRECTORY of ClusterManifestsRoot for
+	// the same reason ManifestsRestoreDir is one of ManifestsRoot: keep "tree written out" and
+	// "tree read in" as distinct paths so a reader can reason about each unambiguously.
+	ClusterManifestsRestoreDir = ClusterManifestsRoot + "/restore"
 )
 
 // Environment the manifest mover reads. The mover has no config file and no flags beyond

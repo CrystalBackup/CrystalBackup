@@ -51,7 +51,8 @@ func knownOperation(op string) bool {
 	switch mover.Operation(op) {
 	case mover.OpBackup, mover.OpRestore, mover.OpInit, mover.OpForget, mover.OpPrune,
 		mover.OpCheck, mover.OpSnapshots, mover.OpUnlock,
-		mover.OpManifestsBackup, mover.OpManifestsRestore, mover.OpClusterManifestsBackup:
+		mover.OpManifestsBackup, mover.OpManifestsRestore,
+		mover.OpClusterManifestsBackup, mover.OpClusterManifestsRestore:
 		return true
 	default:
 		return false
@@ -68,9 +69,11 @@ func parsesJSONSummary(op string) bool {
 	// cluster-manifests-backup is its cluster-plane sibling and ends in the same `restic backup`.
 	// manifests-restore likewise BEGINS with a `restic restore`, whose summary proves the tree
 	// actually landed before the apply reads a single file from it.
+	// cluster-manifests-restore, like manifests-restore, BEGINS with a `restic restore`, whose
+	// summary proves the tree landed before the apply reads a file from it.
 	return op == string(mover.OpBackup) || op == string(mover.OpRestore) ||
 		op == string(mover.OpManifestsBackup) || op == string(mover.OpManifestsRestore) ||
-		op == string(mover.OpClusterManifestsBackup)
+		op == string(mover.OpClusterManifestsBackup) || op == string(mover.OpClusterManifestsRestore)
 }
 
 // ensureSummaryJSON guarantees the summary-parsed operations (backup, restore — see
@@ -140,7 +143,7 @@ func buildResult(operation string, resticStdout []byte, resticErr error) mover.M
 			}
 		}
 		return mover.SummaryToResult(mover.Operation(operation), summary)
-	case string(mover.OpRestore), string(mover.OpManifestsRestore):
+	case string(mover.OpRestore), string(mover.OpManifestsRestore), string(mover.OpClusterManifestsRestore):
 		summary, err := mover.ParseRestoreSummary(resticStdout)
 		if err != nil {
 			// Same refusal as backup: a clean exit whose summary cannot be read is a truncated

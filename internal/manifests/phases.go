@@ -90,10 +90,60 @@ var phaseByKind = map[schema.GroupKind]int{
 	{Group: groupNetworking, Kind: kindNetworkPolicy}: phaseNetworking,
 }
 
-// applyPhase returns the phase a resource belongs to. Anything §5.1 does not name — custom
-// resources, PDBs, HPAs — lands in the generic phase, which sits AFTER storage and config and
-// BEFORE the workloads that tend to depend on it.
-func applyPhase(group, kind string) int {
+// The cluster-scoped apply order (adr/0011 §2): CRDs first, so a later kind that a CRD defines
+// is registered; then the other cluster-scoped kinds; then Namespaces last, so a namespaced
+// object (applied by the SEPARATE, later namespaced Job) has its namespace to bind into. A
+// kind=cluster-manifests snapshot holds ONLY cluster-scoped objects, so this is its whole order
+// — it does not interleave with the namespaced §5.1 phases, which run in a different Job.
+const (
+	phaseClusterCRDs = iota + 1
+	phaseClusterOther
+	phaseClusterNamespaces
+)
+
+// kindCRD, kindStorageClass, kindPersistentVolume, kindClusterRole and kindClusterRoleBinding
+// are declared in clusterscope.go (this package) and reused here.
+const (
+	kindNamespace           = "Namespace"
+	kindPriorityClass       = "PriorityClass"
+	kindIngressClass        = "IngressClass"
+	kindRuntimeClass        = "RuntimeClass"
+	kindVolumeSnapshotClass = "VolumeSnapshotClass"
+	groupScheduling         = "scheduling.k8s.io"
+	groupNode               = "node.k8s.io"
+	groupSnapshot           = "snapshot.storage.k8s.io"
+)
+
+// clusterPhaseByKind pins the cluster-scoped kinds to their phase. CRDs alone sit in the first
+// phase; Namespaces alone in the last. Everything else — StorageClass, the *Class kinds, cluster
+// RBAC, PVs — is in the middle, where relative order does not matter (none depends on another).
+// A cluster-scoped kind not listed here (a custom cluster-scoped CR) lands in the middle too.
+var clusterPhaseByKind = map[schema.GroupKind]int{
+	{Group: groupAPIExtensions, Kind: kindCRD}: phaseClusterCRDs,
+
+	{Group: groupStorage, Kind: kindStorageClass}:         phaseClusterOther,
+	{Group: groupScheduling, Kind: kindPriorityClass}:     phaseClusterOther,
+	{Group: groupNetworking, Kind: kindIngressClass}:      phaseClusterOther,
+	{Group: groupNode, Kind: kindRuntimeClass}:            phaseClusterOther,
+	{Group: groupSnapshot, Kind: kindVolumeSnapshotClass}: phaseClusterOther,
+	{Group: groupRBAC, Kind: kindClusterRole}:             phaseClusterOther,
+	{Group: groupRBAC, Kind: kindClusterRoleBinding}:      phaseClusterOther,
+	{Group: coreGroup, Kind: kindPersistentVolume}:        phaseClusterOther,
+
+	{Group: coreGroup, Kind: kindNamespace}: phaseClusterNamespaces,
+}
+
+// applyPhase returns the phase a resource belongs to. For a namespaced restore, anything §5.1
+// does not name lands in the generic phase (after storage/config, before workloads). For a
+// cluster-scoped restore it uses the adr/0011 §2 order, where an unlisted kind is a middle
+// cluster-scoped object.
+func applyPhase(group, kind string, clusterScoped bool) int {
+	if clusterScoped {
+		if p, ok := clusterPhaseByKind[schema.GroupKind{Group: group, Kind: kind}]; ok {
+			return p
+		}
+		return phaseClusterOther
+	}
 	if p, ok := phaseByKind[schema.GroupKind{Group: group, Kind: kind}]; ok {
 		return p
 	}
