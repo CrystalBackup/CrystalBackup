@@ -66,6 +66,12 @@ vet: ## Run go vet against code.
 # failures alone can spend most of this.
 TEST_TIMEOUT ?= 20m
 
+# E2E_TIMEOUT is the same guard for the e2e suite, which runs against a real Kind cluster and
+# so is far slower and far more variable than envtest. It had been sitting right at go test's
+# 10-minute default — one CI run finished in 7m57s and passed while its sibling hit 10m and
+# PANICKED — which reads as a flake and is not one: the suite simply outgrew the default.
+E2E_TIMEOUT ?= 30m
+
 .PHONY: test
 test: manifests generate fmt vet setup-envtest ## Run tests.
 	KUBEBUILDER_ASSETS="$(shell "$(ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(LOCALBIN)" -p path)" go test $$(go list ./... | grep -v /e2e) -timeout $(TEST_TIMEOUT) -coverprofile cover.out
@@ -122,7 +128,7 @@ test-e2e: install-test-e2e-infra manifests generate fmt vet ## Create the Kind c
 	$(MAKE) docker-build IMG=$(E2E_IMG)
 	$(KIND) load docker-image $(E2E_IMG) --name $(KIND_CLUSTER)
 	E2E_IMG=$(E2E_IMG) E2E_BUILD_IMAGE=false KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) \
-		go test -tags=e2e ./test/e2e/ -v -ginkgo.v
+		go test -tags=e2e ./test/e2e/ -timeout $(E2E_TIMEOUT) -v -ginkgo.v
 	$(MAKE) cleanup-test-e2e
 
 # Alias for the milestone exit-criteria wording in spec/90-roadmap.md ("make e2e").
