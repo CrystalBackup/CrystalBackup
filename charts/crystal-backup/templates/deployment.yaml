@@ -60,6 +60,9 @@ spec:
             # The restore-side grant. Separate from the reader on purpose: the operator hands
             # out whichever one the operation needs, and nothing binds both.
             - --manifest-writer-cluster-role={{ include "crystal-backup.fullname" . }}-manifest-writer
+            # The cluster-scoped capture grant (adr/0011 §1), bound as a transient
+            # ClusterRoleBinding for one ClusterBackup run. Enumerated, not "*".
+            - --cluster-manifest-reader-cluster-role={{ include "crystal-backup.fullname" . }}-cluster-manifest-reader
             {{- end }}
             {{- with .Values.extraArgs }}
             {{- toYaml . | nindent 12 }}

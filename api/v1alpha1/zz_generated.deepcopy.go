@@ -1013,6 +1013,11 @@ func (in *ClusterBackupStatus) DeepCopyInto(out *ClusterBackupStatus) {
 		in, out := &in.CompletionTime, &out.CompletionTime
 		*out = (*in).DeepCopy()
 	}
+	if in.ClusterManifests != nil {
+		in, out := &in.ClusterManifests, &out.ClusterManifests
+		*out = new(ManifestsStatus)
+		**out = **in
+	}
 	if in.Failures != nil {
 		in, out := &in.Failures, &out.Failures
 		*out = make([]FailureRecord, len(*in))

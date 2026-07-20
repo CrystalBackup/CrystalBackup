@@ -35,6 +35,7 @@ import (
 
 	cbv1 "github.com/CrystalBackup/CrystalBackup/api/v1alpha1"
 	"github.com/CrystalBackup/CrystalBackup/internal/apiconst"
+	"github.com/CrystalBackup/CrystalBackup/internal/client/secrets"
 	"github.com/CrystalBackup/CrystalBackup/internal/nsselector"
 	"github.com/CrystalBackup/CrystalBackup/internal/status"
 )
@@ -62,11 +63,19 @@ const clusterBackupMessageCap = 256
 type ClusterBackupReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
-	// OperatorNamespace is where the cluster-plane platform Secrets and mover Jobs live. The
-	// ClusterBackup controller does not touch them directly, but carries the value for parity with
-	// the sibling controllers and for future cluster-manifests capture (M3).
+	// OperatorNamespace is where the cluster-plane platform Secrets and mover Jobs live.
 	OperatorNamespace string
-	Recorder          events.EventRecorder
+	// Secrets, MoverImage, ManifestMoverServiceAccount and ClusterManifestReaderClusterRole drive
+	// the run-level cluster-manifests capture (adr/0011 §1): the mover image and identity, the
+	// DEK reader, and the enumerated ClusterRole the operator binds TRANSIENTLY for the capture.
+	// The names are configured rather than derived — the chart release-prefixes them. An empty
+	// reader role disables the capture, the same way the namespaced half handles an unconfigured
+	// operator.
+	Secrets                          *secrets.ByNameReader
+	MoverImage                       string
+	ManifestMoverServiceAccount      string
+	ClusterManifestReaderClusterRole string
+	Recorder                         events.EventRecorder
 }
 
 // NewClusterBackupReconciler builds a ClusterBackupReconciler. Callers (main.go, the envtest
@@ -76,13 +85,19 @@ func NewClusterBackupReconciler(
 	c client.Client,
 	scheme *runtime.Scheme,
 	operatorNamespace string,
+	secretsReader *secrets.ByNameReader,
+	moverImage, manifestMoverSA, clusterManifestReaderRole string,
 	recorder events.EventRecorder,
 ) *ClusterBackupReconciler {
 	return &ClusterBackupReconciler{
-		Client:            c,
-		Scheme:            scheme,
-		OperatorNamespace: operatorNamespace,
-		Recorder:          recorder,
+		Client:                           c,
+		Scheme:                           scheme,
+		OperatorNamespace:                operatorNamespace,
+		Secrets:                          secretsReader,
+		MoverImage:                       moverImage,
+		ManifestMoverServiceAccount:      manifestMoverSA,
+		ClusterManifestReaderClusterRole: clusterManifestReaderRole,
+		Recorder:                         recorder,
 	}
 }
 
@@ -90,6 +105,7 @@ func NewClusterBackupReconciler(
 // +kubebuilder:rbac:groups=crystalbackup.io,resources=clusterbackups/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=crystalbackup.io,resources=clusterbackuplocations,verbs=get;list;watch
 // +kubebuilder:rbac:groups=crystalbackup.io,resources=backups,verbs=get;list;watch;create;update;patch
+// +kubebuilder:rbac:groups=crystalbackup.io,resources=backuprepositories,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch
 
 // Reconcile drives one ClusterBackup run: fail-fast on a missing location, resolve the namespace
@@ -144,8 +160,81 @@ func (r *ClusterBackupReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		}
 	}
 
-	// (4) Aggregate the children into the run status and write it once.
-	return r.aggregateAndWrite(ctx, &cb, matched, fanoutFailures)
+	// (3.5) The run-level cluster-manifests capture (adr/0011 §1), driven INDEPENDENTLY of the
+	// children — the two halves fail for unrelated reasons. Gated on matched being non-empty:
+	// a misaimed selector terminates the run fast (below), and starting a capture Job we would
+	// then strand mid-flight is exactly the orphaned-snapshot loss the namespaced half taught us
+	// to avoid. Disabled, or its repository not yet ready, leaves captureDone at a safe value.
+	captureDone := true
+	teardownCluster := ""
+	if len(matched) > 0 && captureClusterManifests(&cb) && r.ClusterManifestReaderClusterRole != "" {
+		cc, ready, err := r.resolveClusterCaptureContext(ctx, &cb, &loc)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if !ready {
+			// The shared repository is not initialized yet, or its DEK is not resolvable. Hold
+			// the run non-terminal and retry; the children gate on the same repository anyway.
+			captureDone = false
+		} else {
+			done, teardownJob, err := r.advanceClusterManifests(ctx, &cb, cc)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+			captureDone, teardownCluster = done, teardownJob
+		}
+	}
+
+	// (4) Aggregate the children into the run status and write it once. captureDone gates the
+	// terminal phase: a run whose namespaces are all done but whose cluster capture is still
+	// running must NOT go terminal, or the already-terminal guard at the top of Reconcile would
+	// stop the pass that records the capture's snapshot.
+	res, err := r.aggregateAndWrite(ctx, &cb, matched, fanoutFailures, captureDone)
+	if err != nil {
+		return res, err
+	}
+	// The terminal result is durable: only now reclaim the capture's residue (its cluster-scoped
+	// grant is a live read until this runs), and keep polling while the capture is in flight.
+	if teardownCluster != "" {
+		r.teardownClusterManifests(ctx, teardownCluster)
+	}
+	if !captureDone && res.IsZero() {
+		res = ctrl.Result{RequeueAfter: clusterBackupPollInterval}
+	}
+	return res, nil
+}
+
+// resolveClusterCaptureContext resolves the repository coordinates the capture needs. ready is
+// false (with a nil error) when the shared repository is not initialized yet or its DEK cannot be
+// resolved — a transient not-ready, not a fault: the caller holds the run non-terminal and
+// retries, exactly as the children do.
+func (r *ClusterBackupReconciler) resolveClusterCaptureContext(
+	ctx context.Context, cb *cbv1.ClusterBackup, loc *cbv1.ClusterBackupLocation,
+) (*clusterCaptureContext, bool, error) {
+	var repo cbv1.BackupRepository
+	if err := r.Get(ctx, client.ObjectKey{Name: loc.Name}, &repo); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, false, nil
+		}
+		return nil, false, fmt.Errorf("get BackupRepository %s: %w", loc.Name, err)
+	}
+	if !repo.Status.Initialized {
+		return nil, false, nil
+	}
+	dek, _, _, ok := resolvePlatformDEKCommon(ctx, r.Client, r.Secrets, r.OperatorNamespace, loc)
+	if !ok {
+		return nil, false, nil
+	}
+	return &clusterCaptureContext{
+		clusterID:     loc.Spec.ClusterID,
+		scheduleRef:   cb.Spec.ScheduleRef,
+		run:           cb.Name,
+		repoURL:       repo.Status.RepositoryURL,
+		dek:           dek,
+		s3CredsSecret: loc.Spec.S3.CredentialsSecretRef.Name,
+		include:       cb.Spec.ClusterResources.Include,
+		exclude:       cb.Spec.ClusterResources.Exclude,
+	}, true, nil
 }
 
 // ensureChildBackup creates the run's child Backup in namespace ns if it does not already exist.
@@ -211,6 +300,7 @@ func childBackupLabels(cb *cbv1.ClusterBackup, ns string) map[string]string {
 // Running until every matched namespace has a reporting child.
 func (r *ClusterBackupReconciler) aggregateAndWrite(
 	ctx context.Context, cb *cbv1.ClusterBackup, matched []string, fanoutFailures []cbv1.FailureRecord,
+	captureDone bool,
 ) (ctrl.Result, error) {
 	var children cbv1.BackupList
 	if err := r.List(ctx, &children, client.MatchingLabels{apiconst.LabelClusterBackup: cb.Name}); err != nil {
@@ -231,7 +321,14 @@ func (r *ClusterBackupReconciler) aggregateAndWrite(
 	st.PVCsSucceeded = 0
 	st.PVCsFailed = 0
 	st.AddedBytes = 0
-	st.ClusterResourcesCaptured = 0 // the kind=cluster-manifests capture Job is M3.
+	// The cluster-scoped capture's headline count. Recomputed from the durable snapshot record
+	// each pass like every other tally, so it survives the from-scratch reset above; zero until
+	// the capture completes (or when the run opted out).
+	if cb.Status.ClusterManifests != nil {
+		st.ClusterResourcesCaptured = cb.Status.ClusterManifests.ResourceCount
+	} else {
+		st.ClusterResourcesCaptured = 0
+	}
 	st.Failures = nil
 	for _, f := range fanoutFailures {
 		st.Failures = status.AppendCappedFailure(st.Failures, f, status.DefaultFailureCap)
@@ -268,13 +365,23 @@ func (r *ClusterBackupReconciler) aggregateAndWrite(
 	}
 
 	phase := status.RollUpBackupPhases(childPhases)
-	if len(matched) == 0 {
+	switch {
+	case len(matched) == 0:
 		// A valid selector that matches no namespace has nothing to protect: terminate the run
 		// (vacuously Completed) rather than hot-loop in Pending, but surface it so a misaimed
 		// selector is diagnosable. The terminal guard then freezes it after this single event.
+		// No cluster capture runs for such a run (gated on matched in Reconcile), so nothing is
+		// stranded by terminating here.
 		phase = status.ClusterBackupPhaseCompleted
 		r.Recorder.Eventf(cb, nil, corev1.EventTypeWarning, "NoNamespacesMatched", "SelectNamespaces",
 			"namespace selector matched no namespaces; nothing to back up")
+	case !captureDone && isTerminalClusterBackupPhase(string(phase)):
+		// Both halves gate the run. Every namespace is done but the cluster-scoped capture is
+		// still in flight, so the run is not finished: hold it at Running. Letting it go terminal
+		// here would trip the already-terminal guard at the top of Reconcile and the capture in
+		// flight would never have its snapshot recorded — an orphaned kind=cluster-manifests
+		// snapshot that no ClusterBackup points at.
+		phase = status.ClusterBackupPhaseRunning
 	}
 	st.Phase = string(phase)
 

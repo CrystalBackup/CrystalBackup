@@ -176,6 +176,9 @@ func (r *OrphanReaper) sweepOnce(ctx context.Context) error {
 	// Transient manifest-mover RoleBindings, swept on their own (much shorter) clock — see
 	// reapManifestBindings.
 	r.reapManifestBindings(ctx)
+	// And their cluster-scoped counterparts from a cluster-manifests capture (adr/0011 §1),
+	// which live in no namespace and so need a separate list.
+	r.reapClusterManifestBindings(ctx)
 	return nil
 }
 
@@ -247,6 +250,61 @@ func (r *OrphanReaper) reapManifestBindings(ctx context.Context) {
 		// nominal teardown did not run — worth noticing, not routine housekeeping.
 		log.Info("reaped an orphaned manifest-mover RoleBinding; its nominal teardown did not run",
 			"namespace", rb.Namespace, "name", rb.Name, "job", jobName)
+	}
+}
+
+// reapClusterManifestBindings is reapManifestBindings for the cluster-scoped ClusterRoleBindings
+// a cluster-manifests capture creates. The logic is identical — spare a live grant, refuse to
+// guess without a Job label, ignore another operator's — but the objects are cluster-scoped, so
+// they carry no namespace and are listed as ClusterRoleBindings rather than RoleBindings. The
+// grant they hold is a bounded (enumerated) read of the whole cluster, so the same MinAge that
+// treats a leaked namespaced read as a security cost applies here.
+func (r *OrphanReaper) reapClusterManifestBindings(ctx context.Context) {
+	log := logf.FromContext(ctx).WithName("orphan-reaper")
+
+	var bindings rbacv1.ClusterRoleBindingList
+	if err := r.List(ctx, &bindings,
+		client.MatchingLabels{
+			apiconst.LabelManagedBy:  apiconst.ManagedByValue,
+			apiconst.LabelMoverRole:  apiconst.MoverRoleManifest,
+			apiconst.LabelOperatorNS: r.OperatorNamespace,
+		}); err != nil {
+		log.Error(err, "listing transient cluster-manifest ClusterRoleBindings")
+		return
+	}
+
+	cutoff := time.Now().Add(-manifestBindingMinAge)
+	for i := range bindings.Items {
+		crb := &bindings.Items[i]
+		if crb.CreationTimestamp.After(cutoff) {
+			continue
+		}
+		jobName := crb.Labels[apiconst.LabelMoverJob]
+		if jobName == "" {
+			log.Info("transient cluster-manifest ClusterRoleBinding has no job label; leaving it alone",
+				"name", crb.Name)
+			continue
+		}
+
+		var job batchv1.Job
+		err := r.Get(ctx, client.ObjectKey{Namespace: r.OperatorNamespace, Name: jobName}, &job)
+		switch {
+		case apierrors.IsNotFound(err):
+			// The Job is gone and the grant outlived it.
+		case err != nil:
+			log.Error(err, "checking the job behind a transient cluster-manifest ClusterRoleBinding",
+				"name", crb.Name, "job", jobName)
+			continue
+		case job.Status.Succeeded == 0 && job.Status.Failed == 0:
+			continue // still running
+		}
+
+		if err := r.Delete(ctx, crb); err != nil && !apierrors.IsNotFound(err) {
+			log.Error(err, "deleting orphaned transient cluster-manifest ClusterRoleBinding", "name", crb.Name)
+			continue
+		}
+		log.Info("reaped an orphaned cluster-manifest ClusterRoleBinding; its nominal teardown did not run",
+			"name", crb.Name, "job", jobName)
 	}
 }
 

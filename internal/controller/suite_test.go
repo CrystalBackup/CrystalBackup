@@ -98,9 +98,10 @@ const suiteMoverImage = "crystal-mover:test"
 // kubelet so no Job ever runs, but the RoleBinding IS really created against the API server,
 // which is what exercises the transient-grant path.
 const (
-	suiteManifestMoverSA    = "crystal-backup-manifest-mover"
-	suiteManifestWriterRole = "crystal-backup-manifest-writer"
-	suiteManifestReaderRole = "crystal-backup-manifest-reader"
+	suiteManifestMoverSA           = "crystal-backup-manifest-mover"
+	suiteManifestWriterRole        = "crystal-backup-manifest-writer"
+	suiteManifestReaderRole        = "crystal-backup-manifest-reader"
+	suiteClusterManifestReaderRole = "crystal-backup-cluster-manifest-reader"
 )
 
 var _ = BeforeSuite(func() {
@@ -201,6 +202,10 @@ var _ = BeforeSuite(func() {
 		mgr.GetClient(),
 		mgr.GetScheme(),
 		suiteOperatorNamespace,
+		secrets.NewByNameReader(mgr.GetAPIReader()),
+		suiteMoverImage,
+		suiteManifestMoverSA,
+		suiteClusterManifestReaderRole,
 		mgr.GetEventRecorder("clusterbackup"),
 	).SetupWithManager(mgr)).To(Succeed())
 

@@ -55,12 +55,19 @@ func createLabelledNamespace(name string, labels map[string]string) {
 // and writing to location. Registers a best-effort delete of the run and its label-linked children.
 func createClusterRun(name, location string, sel cbv1.NamespaceSelector) {
 	GinkgoHelper()
+	// Cluster-scoped capture OFF. These are the child fan-out and roll-up specs; the capture is
+	// the run's OTHER half and now gates the terminal phase (adr/0011 §1), so a run with it
+	// enabled would sit Running until the capture Job is simulated — which is the concern of
+	// cluster_manifests_phase_test.go, not of a child-rollup assertion. Same split as
+	// createVolumeOnlyParent uses for the namespaced manifest half.
+	off := false
 	cb := &cbv1.ClusterBackup{
 		ObjectMeta: metav1.ObjectMeta{Name: name},
 		Spec: cbv1.ClusterBackupSpec{
 			ClusterBackupRunSpec: cbv1.ClusterBackupRunSpec{
-				LocationRef: cbv1.LocalObjectReference{Name: location},
-				Namespaces:  sel,
+				LocationRef:      cbv1.LocalObjectReference{Name: location},
+				Namespaces:       sel,
+				ClusterResources: cbv1.ClusterResourceCaptureSpec{Enabled: &off},
 			},
 		},
 	}

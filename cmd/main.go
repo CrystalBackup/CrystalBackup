@@ -82,6 +82,7 @@ func main() {
 	var manifestMoverSA string
 	var manifestReaderRole string
 	var manifestWriterRole string
+	var clusterManifestReaderRole string
 	// defaultOperatorNamespace resolves the operator's own namespace before flags are parsed:
 	// $POD_NAMESPACE (set via the downward API in the Helm chart / manifest) if present, else
 	// the Helm chart's own default, apiconst.DefaultOperatorNamespace. This is where every
@@ -106,6 +107,11 @@ func main() {
 			"(create/update/delete on arbitrary namespaced kinds). This is the largest grant in the "+
 			"system (spec/03 §5): it is bound for one Job's lifetime in one namespace, never standing, "+
 			"and widening it requires an ADR. Empty disables the resources[] half of a restore.")
+	flag.StringVar(&clusterManifestReaderRole, "cluster-manifest-reader-cluster-role", "",
+		"ClusterRole the operator binds TRANSIENTLY (as a ClusterRoleBinding) for a CLUSTER-scoped "+
+			"capture (adr/0011 §1). Its rules are ENUMERATED, not \"*\": a ClusterRoleBinding has no "+
+			"namespace to confine it, so the allow-list IS the boundary, and widening it is an ADR "+
+			"change. Empty disables the cluster-manifests capture on every ClusterBackup.")
 	flag.StringVar(&moverImage, "mover-image", "",
 		"Container image for the mover Jobs (repository init and, later, backup/restore/maintenance). "+
 			"REQUIRED for real backups — the Helm chart and the crucible set it; an empty value is tolerated "+
@@ -324,6 +330,10 @@ func main() {
 		mgr.GetClient(),
 		mgr.GetScheme(),
 		operatorNamespace,
+		secrets.NewByNameReader(mgr.GetAPIReader()),
+		moverImage,
+		manifestMoverSA,
+		clusterManifestReaderRole,
 		mgr.GetEventRecorder("clusterbackup"),
 	).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Unable to create controller", "controller", "ClusterBackup")
