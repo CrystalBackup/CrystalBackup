@@ -41,14 +41,21 @@ admin-only, and confirmation-gated.**
 - Controlled by `ClusterBackupSchedule.template.spec.clusterResources` (mirrored on
   `ClusterBackup.spec`): `enabled` (**default `true`**), `include`, `exclude`, `labelSelector`
   ([02-api.md](../02-api.md)).
-- **Default allow-list** (when `include` is empty) — the DR-relevant kinds, curated to be useful
+- **Default allow-list** (when `include` is empty) — this list is **canonical**; every other
+  document quotes it rather than restating it. The DR-relevant kinds, curated to be useful
   without being noise: `CustomResourceDefinition`, `StorageClass`, `VolumeSnapshotClass`,
   `IngressClass`, `PriorityClass`, `RuntimeClass`, `ClusterRole`/`ClusterRoleBinding`, and
-  `PersistentVolume` (PV specs, for the PV↔PVC rebinding story). **Default excludes** the
+  `PersistentVolume` (PV specs, for the PV↔PVC rebinding story). `VolumeSnapshotClass` and
+  `RuntimeClass` are both in: a missing `VolumeSnapshotClass` breaks the snapshot path a
+  restored PVC depends on, and a missing `RuntimeClass` breaks scheduling of any workload
+  that names one. **Default excludes** the
   control-plane's own objects (names matching `system:*`, and objects owned by cluster add-ons)
   so a restore does not fight the API server or an add-on operator. Admins widen/narrow via
   `include`/`exclude`/`labelSelector`.
-- Capture runs as a dedicated Job bound to ClusterRole **`crystal-cluster-manifest-reader`**
+- Capture runs as a dedicated Job — same mover image, subcommand **`cluster-manifests-backup`**
+  (mirroring the namespaced `manifests-backup` of
+  [04-manifest-backup.md §2.3](../04-manifest-backup.md)) — bound to ClusterRole
+  **`crystal-cluster-manifest-reader`**
   (read on the allow-listed cluster-scoped kinds), transient per run
   ([03-security-and-tenancy.md §5](../03-security-and-tenancy.md)). Sanitization reuses the
   rules engine of [adr/0007](0007-manifest-sanitization.md) with cluster-scoped additions: strip
@@ -66,8 +73,12 @@ admin-only, and confirmation-gated.**
   → other cluster-scoped (StorageClasses, PriorityClasses, IngressClasses, ClusterRoles/Bindings,
   PVs) → **namespaces** → namespaced objects. `Recreate`/`Overwrite` mode and the R23 `confirmation`
   gate apply as for any restore.
-- Restore binds ClusterRole **`crystal-cluster-manifest-writer`** (create/update on the selected
-  cluster-scoped kinds), **admin-only** and transient per Job. Because recreating cluster RBAC
+- Restore runs under subcommand **`cluster-manifests-restore`** and binds ClusterRole
+  **`crystal-cluster-manifest-writer`** (create/update on the selected
+  cluster-scoped kinds), **admin-only** and transient per Job. The binding follows the
+  transient-lifecycle contract of
+  [03-security-and-tenancy.md §5](../03-security-and-tenancy.md) like every other
+  mover binding. Because recreating cluster RBAC
   (`ClusterRoleBinding`s) or CRDs is privileged, it is **never implicit** — opt-in + confirmation
   + admin RBAC are all required.
 

@@ -164,8 +164,9 @@ spec:
       clusterResources:                        # R22 — cluster-scoped capture for full DR (adr/0011)
         enabled: true                          # default true on the cluster plane
         include: []                            # empty ⇒ curated default allowlist (CRDs, StorageClasses,
-                                               #   IngressClasses, PriorityClasses, RuntimeClasses,
-                                               #   ClusterRoles/Bindings excl. system:*, PersistentVolumes)
+                                               #   VolumeSnapshotClasses, IngressClasses, PriorityClasses,
+                                               #   RuntimeClasses, ClusterRoles/Bindings excl. system:*,
+                                               #   PersistentVolumes) — canonical list: adr/0011 §1
         exclude: []                            # denylist applied after include (default: system:* names)
         labelSelector: {}                      # optional extra filter
       hooks: { honorAnnotations: true }        # crystalbackup.io/pre-backup-* on pods (R16)
@@ -560,6 +561,7 @@ Restore into a non-existent namespace (`target.createNamespace`) is non-destruct
 resources:                           # a resource is restored iff ANY item matches
   - selector: { matchLabels: { app: web } }        # AND: label match
     include: ["apps/Deployment"]                    #  AND: type/name (globs)
+    exclude: ["apps/Deployment/legacy-*"]           #  ... minus what exclude removes
   - include: ["apps/StatefulSet/postgres", "Secret/db-creds"]
 volumes:                             # a PVC is restored iff ANY item matches
   - names: ["data-postgres-0"]                       # whole PVC
@@ -570,7 +572,11 @@ volumes:                             # a PVC is restored iff ANY item matches
 ```
 
 Defaults: **both `resources` and `volumes` omitted ⇒ whole namespace**. A present field
-(even `[]`) restores only what it lists (`[]` ⇒ nothing of that kind). When several
+(even `[]`) restores only what it lists (`[]` ⇒ nothing of that kind). Within a
+`resources[]` item the `selector` **and** `include` select and `exclude` removes — an item
+reads "these kinds, minus these"; the backup-time default exclusions
+([04-manifest-backup.md §2.2](04-manifest-backup.md)) already applied at capture and
+cannot be re-included here. When several
 `volumes[]` items match the same PVC, the **first matching item wins** (its
 `include`/`exclude`/`targetPath` apply) — one PVC is restored by exactly one mover pass.
 On `Restore.spec.source` and `ClusterRestore.spec.source`, `backup` and `time` are
