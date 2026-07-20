@@ -24,6 +24,7 @@ import (
 	"os"
 	"os/exec"
 	"testing"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -68,7 +69,9 @@ var _ = BeforeSuite(func() {
 	if os.Getenv("E2E_BUILD_IMAGE") != "false" {
 		By("building the manager image")
 		cmd := exec.Command("make", "docker-build", fmt.Sprintf("IMG=%s", managerImage))
-		_, err := utils.Run(cmd)
+		// A cold image build can take several minutes; the default per-command budget is too
+		// tight, so give the build its own headroom.
+		_, err := utils.RunWithTimeout(cmd, 15*time.Minute)
 		ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to build the manager image")
 
 		// TODO(user): If you want to change the e2e test vendor from Kind,
