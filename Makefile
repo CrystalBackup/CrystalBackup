@@ -69,8 +69,11 @@ TEST_TIMEOUT ?= 20m
 # E2E_TIMEOUT is the same guard for the e2e suite, which runs against a real Kind cluster and
 # so is far slower and far more variable than envtest. It had been sitting right at go test's
 # 10-minute default — one CI run finished in 7m57s and passed while its sibling hit 10m and
-# PANICKED — which reads as a flake and is not one: the suite simply outgrew the default.
-E2E_TIMEOUT ?= 30m
+# PANICKED — which reads as a flake and is not one: the suite simply outgrew the default. Raised
+# again for M3: the manifest round-trip runs REAL mover Jobs (repository init, per-PVC CSI-snapshot
+# backup, namespaced + cluster-scoped manifest capture/restore), minutes each, on top of the M0/M2
+# deploy cycles — the whole suite now legitimately needs ~35m, so 45m leaves headroom.
+E2E_TIMEOUT ?= 45m
 
 .PHONY: test
 test: manifests generate fmt vet setup-envtest ## Run tests.
@@ -88,6 +91,11 @@ KIND_CLUSTER ?= bs-k8s-backup-test-e2e
 KIND_IMAGE ?=
 # Operator image built + loaded into Kind for the e2e run (M0 appVersion 0.0.0, adr/0014).
 E2E_IMG ?= example.com/crystalbackup-operator:v0.0.0-e2e
+# Mover image (crystal-mover + pinned restic) built + loaded into Kind for the M3 data-path
+# suite. The production mover is apko/Wolfi (build/apko/mover.yaml); Dockerfile.mover is the
+# plain-Docker equivalent the kind e2e uses so real mover Jobs can run without the melange/apko
+# toolchain. The M3 Helm install points --mover-image at this loaded tag.
+E2E_MOVER_IMG ?= example.com/crystalbackup-mover:v0.0.0-e2e
 # Pinned versions of the e2e data-path infrastructure, installed by
 # test/e2e/manifests/install-csi-snapshot.sh (external-snapshotter + csi-driver-host-path).
 EXTERNAL_SNAPSHOTTER_VERSION ?= v8.2.0
@@ -124,10 +132,12 @@ install-test-e2e-infra: setup-test-e2e ## Install external-snapshotter + csi-dri
 		bash test/e2e/manifests/install-csi-snapshot.sh
 
 .PHONY: test-e2e
-test-e2e: install-test-e2e-infra manifests generate fmt vet ## Create the Kind cluster (CSI snapshots + SeaweedFS), load the image, deploy, and run the Ginkgo e2e suite.
+test-e2e: install-test-e2e-infra manifests generate fmt vet ## Create the Kind cluster (CSI snapshots + SeaweedFS), load the images, deploy, and run the Ginkgo e2e suite.
 	$(MAKE) docker-build IMG=$(E2E_IMG)
 	$(KIND) load docker-image $(E2E_IMG) --name $(KIND_CLUSTER)
-	E2E_IMG=$(E2E_IMG) E2E_BUILD_IMAGE=false KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) \
+	$(MAKE) docker-build-mover E2E_MOVER_IMG=$(E2E_MOVER_IMG)
+	$(KIND) load docker-image $(E2E_MOVER_IMG) --name $(KIND_CLUSTER)
+	E2E_IMG=$(E2E_IMG) E2E_MOVER_IMG=$(E2E_MOVER_IMG) E2E_BUILD_IMAGE=false KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) \
 		go test -tags=e2e ./test/e2e/ -timeout $(E2E_TIMEOUT) -v -ginkgo.v
 	$(MAKE) cleanup-test-e2e
 
@@ -167,6 +177,10 @@ run: manifests generate fmt vet ## Run a controller from your host.
 .PHONY: docker-build
 docker-build: ## Build docker image with the manager.
 	$(CONTAINER_TOOL) build -t ${IMG} .
+
+.PHONY: docker-build-mover
+docker-build-mover: ## Build the mover image (crystal-mover + pinned restic) for the kind e2e data path.
+	$(CONTAINER_TOOL) build -f Dockerfile.mover -t ${E2E_MOVER_IMG} .
 
 .PHONY: docker-push
 docker-push: ## Push docker image with the manager.

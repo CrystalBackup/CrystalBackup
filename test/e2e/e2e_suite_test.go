@@ -38,6 +38,14 @@ import (
 // the Kind node); the tag encodes the M0 appVersion (0.0.0) per adr/0014.
 var managerImage = getenvDefault("E2E_IMG", "example.com/crystalbackup-operator:v0.0.0-e2e")
 
+// moverImage is the crystal-mover + restic image the M3 data-path suite loads into Kind and
+// wires into the operator via --mover-image (through the Helm chart). Built from
+// Dockerfile.mover — the plain-Docker equivalent of the apko/Wolfi production mover — so real
+// mover Jobs (repository init, per-PVC backup, manifest capture/restore) can run in Kind. The
+// tag is overridable via E2E_MOVER_IMG so `make test-e2e` and a standalone `go test -tags=e2e`
+// agree on the same image.
+var moverImage = getenvDefault("E2E_MOVER_IMG", "example.com/crystalbackup-mover:v0.0.0-e2e")
+
 // shouldCleanupCertManager tracks whether CertManager was installed by this suite.
 var shouldCleanupCertManager = false
 
@@ -79,9 +87,22 @@ var _ = BeforeSuite(func() {
 		By("loading the manager image on Kind")
 		err = utils.LoadImageToKindClusterWithName(managerImage)
 		ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to load the manager image into Kind")
+
+		// The M3 data-path suite needs the mover image (crystal-mover + restic) in Kind too. A
+		// bare `go test -tags=e2e ./test/e2e/` builds+loads it here; `make test-e2e` builds+loads
+		// it itself and sets E2E_BUILD_IMAGE=false to skip this block (as it does for the manager).
+		By("building the mover image")
+		cmd = exec.Command("docker", "build", "-f", "Dockerfile.mover", "-t", moverImage, ".")
+		_, err = utils.RunWithTimeout(cmd, 15*time.Minute)
+		ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to build the mover image")
+
+		By("loading the mover image on Kind")
+		err = utils.LoadImageToKindClusterWithName(moverImage)
+		ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to load the mover image into Kind")
 	} else {
 		_, _ = fmt.Fprintf(GinkgoWriter,
-			"Skipping in-suite image build/load (E2E_BUILD_IMAGE=false); using %s\n", managerImage)
+			"Skipping in-suite image build/load (E2E_BUILD_IMAGE=false); using operator=%s mover=%s\n",
+			managerImage, moverImage)
 	}
 
 	configureKubectlKubeRC()

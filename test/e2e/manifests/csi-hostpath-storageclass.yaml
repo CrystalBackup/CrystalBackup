@@ -1,0 +1,24 @@
+# StorageClass for the csi-driver-host-path driver used by the e2e data path.
+#
+# The upstream `deploy.sh` (kubernetes-latest) installs the driver, its sidecars and the
+# CSIDriver object, but NOT a StorageClass — that lives in the driver's examples/ and is not
+# applied by deploy.sh. The data-path e2e cases (from M1, and the M3 manifest round-trip) bind
+# PVCs against this class name, so the infra bootstrap applies it explicitly (symmetric with the
+# VolumeSnapshotClass it already applies).
+#
+# volumeBindingMode: Immediate — REQUIRED on the multi-node kind cluster. csi-driver-host-path is
+# a single-node driver: its plugin runs as a one-replica StatefulSet, so only that node's CSINode
+# carries the hostpath.csi.k8s.io topology key. Under WaitForFirstConsumer the scheduler may place
+# the consumer on any node, and provisioning then fails with "no topology key found on CSINode
+# <other-node>". Immediate provisions the volume against the (only) node that advertises the
+# driver's topology, and the PV's node affinity then pins the consuming pod there.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: csi-hostpath-sc
+  labels:
+    app.kubernetes.io/part-of: crystal-backup-e2e
+provisioner: hostpath.csi.k8s.io
+reclaimPolicy: Delete
+volumeBindingMode: Immediate
+allowVolumeExpansion: true
