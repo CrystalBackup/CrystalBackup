@@ -19,10 +19,11 @@ limitations under the License.
 package crucible
 
 import (
+	"cmp"
 	"fmt"
 	"os"
 	"regexp"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
@@ -126,13 +127,13 @@ var _ = ReportAfterSuite("crucible readable report", func(report Report) {
 	out := renderCrucibleReport(report)
 
 	// Surface it in the Ginkgo stream (visible with --ginkgo.v)...
-	fmt.Fprintln(GinkgoWriter, "\n"+out)
+	_, _ = fmt.Fprintln(GinkgoWriter, "\n"+out)
 
 	// ...and write the file the mise `test` task prints last (visible even when
 	// `go test` swallows a passing binary's stdout).
 	if path := os.Getenv("CRUCIBLE_REPORT_PATH"); path != "" {
 		if err := os.WriteFile(path, []byte(out), 0o644); err != nil {
-			fmt.Fprintf(GinkgoWriter, "warning: could not write %s: %v\n", path, err)
+			_, _ = fmt.Fprintf(GinkgoWriter, "warning: could not write %s: %v\n", path, err)
 		}
 	}
 })
@@ -218,7 +219,7 @@ func renderCrucibleReport(report types.Report) string {
 	for a := range byArea {
 		areas = append(areas, a)
 	}
-	sort.Slice(areas, func(i, j int) bool { return areaRank(areas[i]) < areaRank(areas[j]) })
+	slices.SortFunc(areas, func(a, b string) int { return cmp.Compare(areaRank(a), areaRank(b)) })
 
 	for _, area := range areas {
 		heading, question := areaTitle(area)

@@ -241,11 +241,6 @@ func m1UnwrapDEK(locationName string) string {
 	return string(dek)
 }
 
-// m1SeedSelector is the label selector matching the crucible's seeded tenant namespaces.
-func m1SeedSelector() metav1.LabelSelector {
-	return metav1.LabelSelector{MatchLabels: map[string]string{m1SeedLabel: m1SeedValue}}
-}
-
 // m1RunClusterBackup creates a MANUAL (no scheduleRef, deterministic name) ClusterBackup
 // whose inline run spec targets locationName and the given namespace selector.
 func m1RunClusterBackup(name, locationName string, nsSelector cbv1.NamespaceSelector) *cbv1.ClusterBackup {

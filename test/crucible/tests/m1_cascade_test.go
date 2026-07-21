@@ -272,7 +272,7 @@ var _ = Describe("M1 — cluster-DR backup cascade", Label("m1"), Ordered, func(
 		plain, ok := m1CascadeNodeByPath(nodes, base+"plain.txt")
 		Expect(ok).To(BeTrue(), "the hardlink target must be in the snapshot tree")
 		hard, ok := m1CascadeNodeByPath(nodes, base+"plain.hardlink")
-		Expect(ok).To(BeTrue(), "the hardlinked file must be in the snapshot tree")
+		Expect(ok).To(BeTrue(), "the hard-linked file must be in the snapshot tree")
 		Expect(plain.Inode).NotTo(BeZero(), "restic must record inode numbers to reconstruct hardlinks")
 		Expect(hard.Inode).To(Equal(plain.Inode),
 			"the hardlink must share its target's inode (link kept, not copied)")
