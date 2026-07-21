@@ -152,6 +152,13 @@ func m1ResticRestoreVerify(locationName string, snap restic.Snapshot) (bool, str
 			BackoffLimit:          &backoff,
 			ActiveDeadlineSeconds: &deadline,
 			Template: corev1.PodTemplateSpec{
+				// Reaches object storage like a data mover, so it needs the mover's egress. Under
+				// M3's default-deny NetworkPolicy a pod in the operator namespace reaches S3 ONLY if
+				// it matches the mover-egress policy (app.kubernetes.io/managed-by=crystal-backup);
+				// without this label the Job is default-denied and restic times out dialing S3.
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{"app.kubernetes.io/managed-by": "crystal-backup"},
+				},
 				Spec: corev1.PodSpec{
 					RestartPolicy: corev1.RestartPolicyNever,
 					Containers: []corev1.Container{{
