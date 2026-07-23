@@ -139,6 +139,16 @@ rules:
   - update
   - watch
 - apiGroups:
+  - rbac.authorization.k8s.io
+  resources:
+  - rolebindings
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - watch
+- apiGroups:
   - snapshot.storage.k8s.io
   resources:
   - volumesnapshotclasses

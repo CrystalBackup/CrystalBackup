@@ -1,0 +1,33 @@
+# A StatefulSet PVC under a persistentVolumeClaimRetentionPolicy: the StatefulSet owns it, but
+# unlike a controller-owned Pod or ReplicaSet it is NOT recreated from the workload spec — it
+# holds data. So it is kept (no exclusion rule matches a PVC) and its ownerReference must be
+# stripped: a dangling owner UID from the source cluster would make the target's garbage
+# collector delete the volume that was just restored. Cited in 04-manifest-backup.md §4.3.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: data-cache-0
+  namespace: c-team-x
+  uid: 99000001-0000-4000-8000-000000000001
+  resourceVersion: "60123"
+  creationTimestamp: "2026-07-01T09:30:00Z"
+  labels:
+    app: cache
+  ownerReferences:
+    - apiVersion: apps/v1
+      kind: StatefulSet
+      name: cache
+      uid: 99000002-0000-4000-8000-000000000002
+      controller: true
+      blockOwnerDeletion: true
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+  storageClassName: local-path
+  volumeMode: Filesystem
+  volumeName: pvc-99000001-1111-4000-8000-000000000001
+status:
+  phase: Bound

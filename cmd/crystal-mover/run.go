@@ -50,7 +50,9 @@ const jsonFlag = "--json"
 func knownOperation(op string) bool {
 	switch mover.Operation(op) {
 	case mover.OpBackup, mover.OpRestore, mover.OpInit, mover.OpForget, mover.OpPrune,
-		mover.OpCheck, mover.OpSnapshots, mover.OpUnlock:
+		mover.OpCheck, mover.OpSnapshots, mover.OpUnlock,
+		mover.OpManifestsBackup, mover.OpManifestsRestore,
+		mover.OpClusterManifestsBackup, mover.OpClusterManifestsRestore:
 		return true
 	default:
 		return false
@@ -62,7 +64,16 @@ func knownOperation(op string) bool {
 // bytes). These are the two operations whose stdout is captured instead of teed to the pod
 // log, and for which ensureSummaryJSON forces --json.
 func parsesJSONSummary(op string) bool {
-	return op == string(mover.OpBackup) || op == string(mover.OpRestore)
+	// manifests-backup ends in a `restic backup` of the dumped tree, so it produces and needs
+	// the same summary as any other backup — the snapshot id is what the controller records.
+	// cluster-manifests-backup is its cluster-plane sibling and ends in the same `restic backup`.
+	// manifests-restore likewise BEGINS with a `restic restore`, whose summary proves the tree
+	// actually landed before the apply reads a single file from it.
+	// cluster-manifests-restore, like manifests-restore, BEGINS with a `restic restore`, whose
+	// summary proves the tree landed before the apply reads a file from it.
+	return op == string(mover.OpBackup) || op == string(mover.OpRestore) ||
+		op == string(mover.OpManifestsBackup) || op == string(mover.OpManifestsRestore) ||
+		op == string(mover.OpClusterManifestsBackup) || op == string(mover.OpClusterManifestsRestore)
 }
 
 // ensureSummaryJSON guarantees the summary-parsed operations (backup, restore — see
@@ -120,7 +131,7 @@ func buildResult(operation string, resticStdout []byte, resticErr error) mover.M
 		}
 	}
 	switch operation {
-	case string(mover.OpBackup):
+	case string(mover.OpBackup), string(mover.OpManifestsBackup), string(mover.OpClusterManifestsBackup):
 		summary, err := mover.ParseBackupSummary(resticStdout)
 		if err != nil {
 			// restic returned success but we could not read a summary: refuse to fabricate a
@@ -131,8 +142,8 @@ func buildResult(operation string, resticStdout []byte, resticErr error) mover.M
 				Error:     clampError(err),
 			}
 		}
-		return mover.SummaryToResult(summary)
-	case string(mover.OpRestore):
+		return mover.SummaryToResult(mover.Operation(operation), summary)
+	case string(mover.OpRestore), string(mover.OpManifestsRestore), string(mover.OpClusterManifestsRestore):
 		summary, err := mover.ParseRestoreSummary(resticStdout)
 		if err != nil {
 			// Same refusal as backup: a clean exit whose summary cannot be read is a truncated
@@ -143,7 +154,12 @@ func buildResult(operation string, resticStdout []byte, resticErr error) mover.M
 				Error:     clampError(err),
 			}
 		}
-		return mover.RestoreSummaryToResult(summary)
+		result := mover.RestoreSummaryToResult(summary)
+		// RestoreSummaryToResult stamps OpRestore, which is right for the data path and wrong
+		// here: Operation exists so a controller can check it got the result it asked for, and
+		// a manifest restore reporting "restore" would defeat exactly that.
+		result.Operation = operation
+		return result
 	}
 	return mover.MoverResult{OK: true, Operation: operation}
 }

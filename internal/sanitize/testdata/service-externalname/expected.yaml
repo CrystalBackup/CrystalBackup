@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: external-db
+spec:
+  externalName: db.example.net
+  sessionAffinity: None
+  type: ExternalName

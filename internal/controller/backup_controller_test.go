@@ -180,6 +180,30 @@ func createParentClusterBackup(name, location string, sel cbv1.PVCSelector) {
 	DeferCleanup(func() { _ = k8sClient.Delete(context.Background(), cb) })
 }
 
+// createVolumeOnlyParent is createParentClusterBackup with the manifest half switched OFF.
+//
+// includeManifests defaults to true, so every run now has two halves and a Backup only reaches
+// a terminal phase when BOTH settle. A test that is about volume roll-up and never simulates a
+// manifest mover would otherwise sit at Uploading forever — failing on a timeout that says
+// nothing about what it meant to check. Opting out keeps those assertions about the thing they
+// name; the interaction between the two halves has its own test in manifests_phase_test.go.
+func createVolumeOnlyParent(name, location string, sel cbv1.PVCSelector) {
+	GinkgoHelper()
+	off := false
+	cb := &cbv1.ClusterBackup{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Spec: cbv1.ClusterBackupSpec{
+			ClusterBackupRunSpec: cbv1.ClusterBackupRunSpec{
+				LocationRef:      cbv1.LocalObjectReference{Name: location},
+				PVCSelector:      sel,
+				IncludeManifests: &off,
+			},
+		},
+	}
+	Expect(k8sClient.Create(ctx, cb)).To(Succeed())
+	DeferCleanup(func() { _ = k8sClient.Delete(context.Background(), cb) })
+}
+
 // createChildBackup creates a cluster-origin Backup in namespace, named after the run (== the
 // parent ClusterBackup name, per apiconst.LabelClusterBackup's contract) and linked by label.
 func createChildBackup(namespace, name, location string) *cbv1.Backup {
@@ -323,7 +347,7 @@ var _ = Describe("BackupReconciler", func() {
 		seedInitializedRepo(location, "kek-bk-happy", "s3-bk-happy")
 		createTenantNamespace(ns)
 		createSourcePVC(ns, pvcName, "ceph-block")
-		createParentClusterBackup(run, location, cbv1.PVCSelector{})
+		createVolumeOnlyParent(run, location, cbv1.PVCSelector{})
 		createChildBackup(ns, run, location)
 
 		By("the reconciler exposes the PVC and creates a mover Job that mounts the temp clone")
@@ -383,7 +407,7 @@ var _ = Describe("BackupReconciler", func() {
 		createTenantNamespace(ns)
 		createSourcePVC(ns, skipPVC, stubUnsupportedStorageClass)
 		createSourcePVC(ns, okPVC, "ceph-block")
-		createParentClusterBackup(run, location, cbv1.PVCSelector{})
+		createVolumeOnlyParent(run, location, cbv1.PVCSelector{})
 		createChildBackup(ns, run, location)
 
 		By("the unsupported volume becomes Skipped/CSISnapshotUnsupported without a mover Job")
@@ -418,7 +442,7 @@ var _ = Describe("BackupReconciler", func() {
 		)
 		seedInitializedRepo(location, "kek-bk-empty", "s3-bk-empty")
 		createTenantNamespace(ns)
-		createParentClusterBackup(run, location, cbv1.PVCSelector{})
+		createVolumeOnlyParent(run, location, cbv1.PVCSelector{})
 		createChildBackup(ns, run, location)
 
 		By("the Backup reaches Completed with an empty volume set")

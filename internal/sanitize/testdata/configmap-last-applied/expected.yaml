@@ -1,0 +1,7 @@
+apiVersion: v1
+data:
+  LOG_LEVEL: info
+  TIMEOUT: "30"
+kind: ConfigMap
+metadata:
+  name: app-config

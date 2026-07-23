@@ -53,12 +53,14 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"flag"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 
+	"github.com/CrystalBackup/CrystalBackup/internal/manifests"
 	"github.com/CrystalBackup/CrystalBackup/internal/mover"
 )
 
@@ -93,6 +95,28 @@ func main() {
 	// The restic subcommand and its args are mandatory; without them there is nothing to run.
 	if len(resticArgv) == 0 {
 		fail(*terminationLog, *operation, fmt.Errorf("no restic argv after the %q separator", "--"))
+	}
+
+	// A manifest backup — namespaced or cluster-scoped — has a step BEFORE restic: read the
+	// objects from the API server and write the sanitized tree that restic is about to snapshot.
+	// A failure here is fatal on purpose — backing up an empty or half-written directory would
+	// produce a snapshot that reports success and restores to nothing, which is the worst outcome
+	// a backup tool has. Both variants fold their ResourceCount + IncompleteManifests into the
+	// result identically below (the count/partial signal is the same shape for either plane).
+	var manifestIndex *manifests.Index
+	switch mover.Operation(*operation) {
+	case mover.OpManifestsBackup:
+		idx, err := dumpManifests(context.Background())
+		if err != nil {
+			fail(*terminationLog, *operation, err)
+		}
+		manifestIndex = idx
+	case mover.OpClusterManifestsBackup:
+		idx, err := dumpClusterManifests(context.Background())
+		if err != nil {
+			fail(*terminationLog, *operation, err)
+		}
+		manifestIndex = idx
 	}
 
 	// For a backup or restore, guarantee restic emits a machine-readable summary we can parse;
@@ -133,7 +157,38 @@ func main() {
 		}
 	}
 
-	report(*terminationLog, buildResult(*operation, stdout.Bytes(), runErr))
+	result := buildResult(*operation, stdout.Bytes(), runErr)
+	// Fold the dump's accounting into the result the controller reads. Only on success: a
+	// resource count attached to a failed snapshot would claim a capture the repository does
+	// not hold.
+	if manifestIndex != nil && result.OK {
+		// A namespace's object count fits an int32 by orders of magnitude.
+		result.ResourceCount = int32(manifestIndex.ResourceCount) //nolint:gosec // bounded above
+		result.IncompleteManifests = len(manifestIndex.Warnings) > 0
+	}
+
+	// A manifest restore — namespaced or cluster-scoped — has its step AFTER restic: the tree
+	// has to exist before anything can be applied. Gated on result.OK because applying a
+	// half-restored tree would leave a partial namespace (or a partial cluster) and report it as
+	// a restore. The two differ only in scope: the cluster path stamps no namespace and takes
+	// the cluster-scoped ordering (applyClusterManifests → Applier{ClusterScoped:true}).
+	if result.OK {
+		var applied *manifests.Report
+		var err error
+		switch mover.Operation(*operation) {
+		case mover.OpManifestsRestore:
+			applied, err = applyManifests(context.Background())
+		case mover.OpClusterManifestsRestore:
+			applied, err = applyClusterManifests(context.Background())
+		}
+		if err != nil {
+			fail(*terminationLog, *operation, err)
+		}
+		if applied != nil {
+			result = reportToResult(result, applied)
+		}
+	}
+	report(*terminationLog, result)
 }
 
 // report is the shim's single exit point once a MoverResult exists. It persists the result to

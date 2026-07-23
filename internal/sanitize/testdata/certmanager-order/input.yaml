@@ -1,0 +1,11 @@
+apiVersion: acme.cert-manager.io/v1
+kind: Order
+metadata:
+  name: web-tls-1-2748531
+  namespace: c-team-x
+  uid: 33000001-0000-4000-8000-000000000001
+spec:
+  commonName: web.example.net
+  issuerRef:
+    kind: ClusterIssuer
+    name: letsencrypt

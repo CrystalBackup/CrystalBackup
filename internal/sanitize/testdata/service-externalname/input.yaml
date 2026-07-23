@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: external-db
+  namespace: c-team-x
+  uid: 1f8b2c14-0000-4000-8000-000000000005
+  resourceVersion: "48450"
+  creationTimestamp: "2026-07-01T10:04:00Z"
+spec:
+  type: ExternalName
+  externalName: db.example.net
+  sessionAffinity: None
+status:
+  loadBalancer: {}

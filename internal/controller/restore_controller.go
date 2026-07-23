@@ -73,7 +73,15 @@ type RestoreReconciler struct {
 	Lister FilteredSnapshotLister
 	// OperatorNamespace is where every operator-side restore object lives.
 	OperatorNamespace string
-	Recorder          events.EventRecorder
+	// ManifestMoverServiceAccount and ManifestWriterClusterRole name the identity and grant of
+	// the manifest mover on the RESTORE side. Configured, not derived: the chart
+	// release-prefixes every cluster-scoped object so two installs cannot collide, so the
+	// operator must be told the resolved names. An empty writer role disables the resources[]
+	// half — the grant it hands out is the largest in the system, and an operator that was
+	// never told which ClusterRole to bind must not guess one.
+	ManifestMoverServiceAccount string
+	ManifestWriterClusterRole   string
+	Recorder                    events.EventRecorder
 }
 
 // NewRestoreReconciler wires the reconciler and its engine from the shared primitives.
@@ -84,16 +92,19 @@ func NewRestoreReconciler(
 	targets *rexposer.TargetExposer,
 	lister FilteredSnapshotLister,
 	operatorNamespace, moverImage string,
+	manifestMoverSA, manifestWriterRole string,
 	recorder events.EventRecorder,
 	q *queue.Manager,
 ) *RestoreReconciler {
 	return &RestoreReconciler{
-		Client:            c,
-		Scheme:            scheme,
-		Engine:            newRestoreEngine(c, secretsReader, targets, operatorNamespace, moverImage, q),
-		Lister:            lister,
-		OperatorNamespace: operatorNamespace,
-		Recorder:          recorder,
+		Client:                      c,
+		Scheme:                      scheme,
+		Engine:                      newRestoreEngine(c, secretsReader, targets, operatorNamespace, moverImage, q),
+		Lister:                      lister,
+		OperatorNamespace:           operatorNamespace,
+		ManifestMoverServiceAccount: manifestMoverSA,
+		ManifestWriterClusterRole:   manifestWriterRole,
+		Recorder:                    recorder,
 	}
 }
 
@@ -175,9 +186,16 @@ func (r *RestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	// (3) Resolve the repository behind the source Backup's location.
-	rc, plans, res, err := r.prepare(ctx, &restore, source)
+	rc, plans, resources, res, err := r.prepare(ctx, &restore, source)
 	if err != nil || plans == nil {
 		return res, err
+	}
+
+	// (3b) The manifest half, driven independently of the volumes — the two fail for unrelated
+	// reasons, and coupling them would lose one to the other's bad day.
+	resourcesDone, teardownResources, err := r.advanceResources(ctx, &restore, rc, resources)
+	if err != nil {
+		return ctrl.Result{}, err
 	}
 
 	// (4) Drive every planned volume one step; collect outcomes (shared engine loop with a
@@ -188,17 +206,39 @@ func (r *RestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	// (5) Single status write; terminal only when EVERY volume settled.
-	if drive.settled < len(plans) {
+	// A restore is not finished while EITHER half is running. Letting the volume roll-up go
+	// terminal here would trip the already-terminal short-circuit at the top of Reconcile, and
+	// the apply in flight would never have its report recorded — leaving a namespace that was
+	// written to and a Restore object that never says what happened to it.
+	if drive.settled < len(plans) || !resourcesDone {
 		restore.Status.Phase = string(status.RestorePhaseRunning)
 		status.SetCondition(&restore.Status.Conditions, ConditionReady, metav1.ConditionFalse, "InProgress",
-			fmt.Sprintf("restoring: %d/%d volumes settled", drive.settled, len(plans)), restore.Generation)
+			fmt.Sprintf("restoring: %d/%d volumes settled, manifests %s",
+				drive.settled, len(plans), doneWord(resourcesDone)), restore.Generation)
 		if err := r.Status().Update(ctx, &restore); err != nil {
 			return ctrl.Result{}, fmt.Errorf("update status for Restore %s/%s: %w", restore.Namespace, restore.Name, err)
+		}
+		if teardownResources != "" {
+			r.teardownResources(ctx, rc, teardownResources)
 		}
 		return ctrl.Result{RequeueAfter: restorePollInterval}, nil
 	}
 
-	phase := status.RollUpRestoreOutcomes(drive.completed, drive.failedCount)
+	// The roll-up is over UNITS OF WORK, and a resource is one just as a volume is. Both counts
+	// have to include both halves or the phase misreports: feeding in resource failures while
+	// `completed` still counted volumes alone turned a restore that applied 138 objects and
+	// failed 3 — with no volumes at all — into Failed rather than PartiallyFailed, because the
+	// roll-up saw "nothing succeeded".
+	//
+	// A resource that failed to apply degrades the restore exactly as a failed volume does: the
+	// user asked for a namespace back and part of it is not there. Reporting Completed over a
+	// non-zero failedCount would be the one lie this status must never tell.
+	completed, failed := drive.completed, drive.failedCount
+	if restore.Status.Resources != nil {
+		completed += int(restore.Status.RestoredResources)
+		failed += int(restore.Status.Resources.FailedCount)
+	}
+	phase := status.RollUpRestoreOutcomes(completed, failed)
 	restore.Status.Phase = string(phase)
 	restore.Status.RestoredVolumes = int32(drive.completed)
 	restore.Status.RestoredBytes = drive.restoredBytes
@@ -209,7 +249,11 @@ func (r *RestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, fmt.Errorf("update status for Restore %s/%s: %w", restore.Namespace, restore.Name, err)
 	}
 
-	// (6) The terminal result is durable: reclaim the operator-side residue.
+	// (6) The terminal result is durable: reclaim the operator-side residue. The manifest half
+	// goes first because part of its residue is a live write grant in a tenant namespace.
+	if teardownResources != "" {
+		r.teardownResources(ctx, rc, teardownResources)
+	}
 	r.Engine.teardownAll(ctx, rc, plans)
 	r.Engine.forgetResolution(restore.UID, rc.ownerID)
 	if phase == status.RestorePhaseCompleted {
@@ -224,14 +268,14 @@ func (r *RestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 // prepare resolves the repository coordinates and builds the volume plans. A nil plans
 // return with a nil error means a gate was written (res carries the requeue).
-func (r *RestoreReconciler) prepare(ctx context.Context, restore *cbv1.Restore, source *cbv1.Backup) (*restoreExecContext, []restoreVolumePlan, ctrl.Result, error) {
+func (r *RestoreReconciler) prepare(ctx context.Context, restore *cbv1.Restore, source *cbv1.Backup) (*restoreExecContext, []restoreVolumePlan, *resourcesPlan, ctrl.Result, error) {
 	if source.Spec.LocationRef.Kind != string(kindClusterBackupLocationRef) {
 		// The namespace plane's own repositories (BackupLocation + user key) land with M5;
 		// until then a user-plane Backup cannot be executed or restored.
 		res, err := r.gate(ctx, restore, "NamespacePlaneRestoreUnavailable",
 			"restoring from a namespace-plane BackupLocation lands with the namespace plane (M5); "+
 				"this Backup references location kind BackupLocation")
-		return nil, nil, res, err
+		return nil, nil, nil, res, err
 	}
 
 	var loc cbv1.ClusterBackupLocation
@@ -239,24 +283,24 @@ func (r *RestoreReconciler) prepare(ctx context.Context, restore *cbv1.Restore, 
 		if apierrors.IsNotFound(err) {
 			res, gerr := r.gate(ctx, restore, "LocationNotFound",
 				fmt.Sprintf("ClusterBackupLocation %q not found", source.Spec.LocationRef.Name))
-			return nil, nil, res, gerr
+			return nil, nil, nil, res, gerr
 		}
-		return nil, nil, ctrl.Result{}, fmt.Errorf("get ClusterBackupLocation %s: %w", source.Spec.LocationRef.Name, err)
+		return nil, nil, nil, ctrl.Result{}, fmt.Errorf("get ClusterBackupLocation %s: %w", source.Spec.LocationRef.Name, err)
 	}
 	var repo cbv1.BackupRepository
 	if err := r.Get(ctx, client.ObjectKey{Name: loc.Name}, &repo); err != nil || !repo.Status.Initialized {
 		if err != nil && !apierrors.IsNotFound(err) {
-			return nil, nil, ctrl.Result{}, fmt.Errorf("get BackupRepository %s: %w", loc.Name, err)
+			return nil, nil, nil, ctrl.Result{}, fmt.Errorf("get BackupRepository %s: %w", loc.Name, err)
 		}
 		res, gerr := r.gate(ctx, restore, "RepositoryNotReady",
 			fmt.Sprintf("BackupRepository %q is not initialized", loc.Name))
-		return nil, nil, res, gerr
+		return nil, nil, nil, res, gerr
 	}
 
 	dek, reason, message, ok := resolvePlatformDEKCommon(ctx, r.Client, r.Engine.Secrets, r.OperatorNamespace, &loc)
 	if !ok {
 		res, gerr := r.gate(ctx, restore, reason, message)
-		return nil, nil, res, gerr
+		return nil, nil, nil, res, gerr
 	}
 
 	rc := &restoreExecContext{
@@ -278,7 +322,7 @@ func (r *RestoreReconciler) prepare(ctx context.Context, restore *cbv1.Restore, 
 	// are deliberately not trusted for cluster-origin data — the projection is
 	// operator-authored and user-read-only (I7), but the execution boundary re-derives
 	// anyway (adr/0010 "controllers re-derive at execution").
-	byPVC, cached := r.Engine.cachedResolution(restore.UID, source.Name)
+	byPVC, manifestSnaps, cached := r.Engine.cachedResolution(restore.UID, source.Name)
 	if !cached {
 		snaps, err := r.Lister.ListFiltered(ctx, &repo, restoreResolveJobName(restoreOwnerID(restore.Namespace, restore.Name)),
 			restic.Tag(restic.TagKeyNamespace, restore.Namespace),
@@ -286,9 +330,12 @@ func (r *RestoreReconciler) prepare(ctx context.Context, restore *cbv1.Restore, 
 		if err != nil {
 			res, gerr := r.gate(ctx, restore, "SnapshotResolutionFailed",
 				fmt.Sprintf("mediated snapshot resolution failed: %v", err))
-			return nil, nil, res, gerr
+			return nil, nil, nil, res, gerr
 		}
 		byPVC = dataSnapshotsByPVC(snaps)
+		// The manifest half comes out of the SAME listing, and therefore under the same
+		// server-derived namespace= filter (I1). There is no second, wider query.
+		manifestSnaps = snaps
 	}
 
 	plans, missing := r.buildPlans(ctx, restore, source, byPVC)
@@ -301,10 +348,10 @@ func (r *RestoreReconciler) prepare(ctx context.Context, restore *cbv1.Restore, 
 		r.Engine.forgetListing(restore.UID)
 		res, gerr := r.gate(ctx, restore, "SnapshotNotFound",
 			fmt.Sprintf("no snapshot under the namespace filter for PVC(s): %s", clampMessage(joinFailures(missing))))
-		return nil, nil, res, gerr
+		return nil, nil, nil, res, gerr
 	}
 	if !cached {
-		r.Engine.storeResolution(restore.UID, source.Name, byPVC)
+		r.Engine.storeResolution(restore.UID, source.Name, byPVC, manifestSnaps)
 	}
 	if plans == nil {
 		// An empty selection is a VALID, immediately-terminal outcome (02-api: a present-but-
@@ -312,7 +359,21 @@ func (r *RestoreReconciler) prepare(ctx context.Context, restore *cbv1.Restore, 
 		// mistakes it for a blocker and strands the CR without a terminal status.
 		plans = []restoreVolumePlan{}
 	}
-	return rc, plans, ctrl.Result{}, nil
+
+	// The resources[] half. A namespaced Restore restores into its OWN namespace and exposes no
+	// storageClassMapping — same cluster, same classes (04-manifest-backup.md §5.3) — so the
+	// mapping is empty here and only a ClusterRestore fills it.
+	resources, _ := resolveResourcesPlan(restore.Spec.Resources, string(restore.Spec.Mode),
+		restore.Spec.DryRun, manifestSnaps, nil)
+	if resources != nil && r.ManifestWriterClusterRole == "" {
+		// The operator was never told which ClusterRole to bind. That grant is the largest in
+		// the system, so the answer is to say so and stop, not to guess a name.
+		res, gerr := r.gate(ctx, restore, "ManifestRestoreUnavailable",
+			"this operator was not configured with --manifest-writer-cluster-role, so the "+
+				"resources[] half of a restore cannot run; restore volumes only with resources: []")
+		return nil, nil, nil, res, gerr
+	}
+	return rc, plans, resources, ctrl.Result{}, nil
 }
 
 // buildPlans intersects the restore's selection with the source Backup's restorable volumes

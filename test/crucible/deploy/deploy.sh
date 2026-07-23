@@ -131,7 +131,13 @@ helm upgrade --install crystal-backup "${REPO_ROOT}/charts/crystal-backup" \
   --set image.digest="${OPERATOR_IMAGE_DIGEST}" \
   --set image.tag="${OPERATOR_IMAGE_TAG}" \
   --set mover.image.digest="${MOVER_IMAGE_DIGEST}" \
-  --set mover.image.tag="${MOVER_IMAGE_TAG}"
+  --set mover.image.tag="${MOVER_IMAGE_TAG}" \
+  --set networkPolicy.apiServerPort=6443
+  # apiServerPort=6443: RKE2's kube-apiserver Service (10.43.0.1:443) DNATs to the master
+  # nodes on 6443, and Canal (the crucible CNI) evaluates NetworkPolicy egress POST-DNAT, so
+  # the operator's and manifest-mover's API-server egress must name 6443, not the chart default
+  # 443 (which fits a cluster whose apiserver Endpoints are themselves on 443). Without this the
+  # operator crashes at startup with "dial tcp 10.43.0.1:443: i/o timeout".
 
 echo
 echo "Deployed. Storage classes:"

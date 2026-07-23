@@ -117,7 +117,10 @@ func ensureNamespace(name string) {
 		default:
 			return nil
 		}
-	}, 2*time.Minute, 3*time.Second).Should(Succeed())
+		// 5 min (was 2): on a reused cluster a same-named namespace from a prior run can still be
+		// draining finalizers (PVCs/VolumeSnapshots on Ceph) when the next run re-seeds it; give the
+		// termination headroom rather than fail the re-seed.
+	}, 5*time.Minute, 3*time.Second).Should(Succeed())
 }
 
 func deleteNamespace(name string) {

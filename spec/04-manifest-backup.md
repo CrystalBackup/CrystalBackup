@@ -133,10 +133,21 @@ implemented in-house: neat's behavior is a reference, not a dependency.
 
 | # | Kind | Rule |
 |---|---|---|
-| S10 | `Service` | Strip `spec.clusterIP`, `spec.clusterIPs`, `spec.ipFamilies`. **Preserve `spec.ports[].nodePort` and `spec.healthCheckNodePort`** (agreed decision; Velero only does this behind `--preserve-nodeports`). |
+| S10 | `Service` | Strip `spec.clusterIP`, `spec.clusterIPs`, `spec.ipFamilies` — **except the literal value `None`, which is kept** (see below). **Preserve `spec.ports[].nodePort` and `spec.healthCheckNodePort`** (agreed decision; Velero only does this behind `--preserve-nodeports`). |
 | S11 | `PersistentVolumeClaim` | Strip `spec.volumeName` (PV binding is cluster-local); strip `spec.dataSource` and `spec.dataSourceRef` (source objects excluded per E9; data comes back through the volume restore path); strip annotations `pv.kubernetes.io/bind-completed`, `pv.kubernetes.io/bound-by-controller`, `volume.beta.kubernetes.io/storage-provisioner`, `volume.kubernetes.io/storage-provisioner`, `volume.kubernetes.io/selected-node`; strip finalizer `kubernetes.io/pvc-protection` (re-added by the control plane). **Keep `spec.storageClassName`** — it is the input of storageClassMapping (§5.3). |
 | S12 | `Pod` (standalone) | Strip `spec.nodeName`, `spec.priority` (derived from kept `priorityClassName`), deprecated `spec.serviceAccount` alias; strip projected token volumes named `kube-api-access-*` and their volumeMounts. |
 | S13 | `Deployment` | Strip annotation `deployment.kubernetes.io/revision`. |
+
+**Headless Services (`clusterIP: None`) — corrected 2026-07-20.** The rule above originally
+stripped `spec.clusterIP` unconditionally. That is wrong for exactly one value: `None` is not
+an address the API server allocated, it is how a headless Service is *declared*. Stripping it
+restores the Service as an ordinary ClusterIP Service with a virtual IP, which silently
+removes the per-pod DNS records (`<pod>.<svc>.<ns>.svc.cluster.local`) that every StatefulSet
+governed by it depends on — so a clustered database comes back unable to resolve its own
+members, failing at the application layer long after the restore reported success. The
+sanitizer therefore keeps `clusterIP` and `clusterIPs` when their value is `None`, and strips
+them otherwise. Found by the golden corpus (§6) before the rule ever ran on real data, which
+is the corpus doing its job.
 
 NodePort / LoadBalancer notes: a preserved `nodePort` may collide in the target cluster;
 the apply then fails for that Service and is reported per-resource (§5.4) — it is never
@@ -210,10 +221,21 @@ e.g. `ClusterRestore` into a fresh namespace via `target.createNamespace` — is
 non-destructive and needs no confirmation.
 
 Caveats: a `Recreate` delete honors finalizers — an object stuck on a finalizer is
-reported `Failed` (reason surfaced), never force-deleted, and the restore continues.
+reported `Failed` (reason surfaced), never force-deleted, and the restore continues. It
+deletes with **background** propagation: `foreground` works by adding a
+`foregroundDeletion` finalizer only the garbage collector removes, which would make every
+`Recreate` wait on a healthy GC controller, and ownerReferences are stripped at backup
+anyway (§4.3) so the replaced objects have no dependents to wait for.
+
 Under `Overwrite`, server-side apply resolves field ownership per Kubernetes conflict
-rules; ownerReferences were stripped at backup (§4.3), so restored objects are unowned
-in either mode.
+rules — that is the *merge* semantics (list keys, atomic vs granular fields), not a refusal
+to take ownership. The apply is **forced** (`force: true`). Without it, an apply conflicts
+with whatever manager already owns each field — `kubectl`, Helm, a controller — which in a
+real namespace is nearly every pre-existing object, so `Overwrite` would fail on precisely
+what it exists to reconcile; the §6 e2e (a pre-created *drifted* ConfigMap that `Overwrite`
+must SSA-merge) is unsatisfiable otherwise. Force takes ownership; it does not prune, so
+"objects and fields present in the target but absent from the backup are kept" still holds.
+ownerReferences were stripped at backup, so restored objects are unowned in either mode.
 
 ### 5.3 storageClassMapping
 
@@ -226,6 +248,11 @@ target class). Application points:
 2. The **volume-data restore path** consults the *same* map when it must materialize a
    PVC (mode `Recreate`, fresh PVC), so a PVC's class is identical whether it arrives
    through its manifest or through the data path.
+
+The map touches **PVCs only**. A restored cluster-scoped `PersistentVolume` keeps its captured
+`spec.storageClassName` unchanged: a PV represents an already-provisioned volume, so rewriting
+its class would rename a label without re-provisioning anything (adr/0011 §2). An explicit v1
+non-goal, not an oversight.
 
 Both points share one implementation, so mapping semantics cannot diverge. The namespaced
 `Restore` restores into **its own namespace** and exposes no `storageClassMapping`
@@ -240,8 +267,12 @@ cross-namespace) concern.
   (labels) **and** `include` select, `exclude` removes. `include`/`exclude` entries are
   globs over the stored path `<group>/<Kind>[/<name>]` (§3; the core group may be written
   `core` or elided) — e.g. `apps/Deployment`, `apps/StatefulSet/postgres`, `Secret/db-creds`,
-  `postgresql.cnpg.io/Cluster/db`, `apps/*`. `resources` omitted **and** `volumes` omitted
-  ⇒ whole namespace; `resources: []` ⇒ no manifests. The default exclusions (§2.2) already
+  `postgresql.cnpg.io/Cluster/db`, `apps/*`. Each list defaults
+  **independently**: `resources` omitted ⇒ every manifest, whatever `volumes` says (so
+  "both omitted ⇒ whole namespace" is the common case of that rule, not a special one);
+  `resources: []` ⇒ no manifests. The CLI is the tie-breaker that fixes this reading —
+  `--data-only` writes `resources: []` explicitly, which it would not need to do if
+  omitting the field already meant none ([06-cli.md](06-cli.md)). The default exclusions (§2.2) already
   happened at **backup** time and cannot be re-included.
 - **Dry-run** (`spec.dryRun: true`, reserved — additive to the 02-api.md contract, lands
   at M3): runs the full pipeline (ordering, selection, mapping, mode resolution) with
@@ -288,9 +319,11 @@ Metrics carry the origin `namespace` label per R19; the catalogue lives in
 
 ## 7. Open questions
 
-1. `spec.dryRun` and `status.resources` are additive to the 02-api.md contract (already
-   listed in its *Reserved / pending fields*) — to be merged into 02-api.md when M3
-   development starts (same-PR rule of the DoD).
+1. ~~`spec.dryRun` and `status.resources` are additive to the 02-api.md contract~~ —
+   **resolved (M3)**: both are now in [02-api.md](02-api.md) as the contract, `dryRun`
+   top-level rather than nested under a `manifests` block (one selection model and one mode
+   serve both halves of a restore, so a per-half switch would be inventing a distinction
+   that does not exist).
 2. Should E9 (VolumeSnapshot exclusion) become opt-out for same-cluster restores where
    the VolumeSnapshotContents still exist? Deferred; default stays excluded.
 3. Helm release Secrets (`type: helm.sh/release.v1`) are currently **kept** so `helm`

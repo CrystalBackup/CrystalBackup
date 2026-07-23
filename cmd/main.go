@@ -79,6 +79,11 @@ func main() {
 	var tlsOpts []func(*tls.Config)
 	var operatorNamespace string
 	var moverImage string
+	var manifestMoverSA string
+	var manifestReaderRole string
+	var manifestWriterRole string
+	var clusterManifestReaderRole string
+	var clusterManifestWriterRole string
 	// defaultOperatorNamespace resolves the operator's own namespace before flags are parsed:
 	// $POD_NAMESPACE (set via the downward API in the Helm chart / manifest) if present, else
 	// the Helm chart's own default, apiconst.DefaultOperatorNamespace. This is where every
@@ -90,6 +95,30 @@ func main() {
 	flag.StringVar(&operatorNamespace, "operator-namespace", defaultOperatorNamespace,
 		"Namespace where cluster-plane platform Secrets (the cluster KEK, DR S3 credentials, wrapped DEKs) live. "+
 			"Defaults to $POD_NAMESPACE (downward API) or, if unset, "+apiconst.DefaultOperatorNamespace+".")
+	flag.StringVar(&manifestMoverSA, "manifest-mover-service-account", "",
+		"ServiceAccount the manifest mover Jobs run as — the ONE mover identity that reaches the "+
+			"API server (spec/03-security-and-tenancy.md I6). Configured rather than derived because "+
+			"the chart release-prefixes cluster-visible names so two installs cannot collide. Empty "+
+			"disables manifest capture.")
+	flag.StringVar(&manifestReaderRole, "manifest-reader-cluster-role", "",
+		"ClusterRole the operator binds TRANSIENTLY into a tenant namespace for a manifest backup "+
+			"(read on all namespaced kinds). Never bound standing; see spec/03 §5.")
+	flag.StringVar(&manifestWriterRole, "manifest-writer-cluster-role", "",
+		"ClusterRole the operator binds TRANSIENTLY into a target namespace for a manifest RESTORE "+
+			"(create/update/delete on arbitrary namespaced kinds). This is the largest grant in the "+
+			"system (spec/03 §5): it is bound for one Job's lifetime in one namespace, never standing, "+
+			"and widening it requires an ADR. Empty disables the resources[] half of a restore.")
+	flag.StringVar(&clusterManifestReaderRole, "cluster-manifest-reader-cluster-role", "",
+		"ClusterRole the operator binds TRANSIENTLY (as a ClusterRoleBinding) for a CLUSTER-scoped "+
+			"capture (adr/0011 §1). Its rules are ENUMERATED, not \"*\": a ClusterRoleBinding has no "+
+			"namespace to confine it, so the allow-list IS the boundary, and widening it is an ADR "+
+			"change. Empty disables the cluster-manifests capture on every ClusterBackup.")
+	flag.StringVar(&clusterManifestWriterRole, "cluster-manifest-writer-cluster-role", "",
+		"ClusterRole the operator binds TRANSIENTLY (as a ClusterRoleBinding) for a CLUSTER-scoped "+
+			"RESTORE (adr/0011 §2): create/update/delete on CRDs, StorageClasses, cluster RBAC and PVs. "+
+			"The most privileged grant in the system — bound for one Job's lifetime, never standing, "+
+			"and, like the reader, ENUMERATED because a ClusterRoleBinding has no namespace to confine "+
+			"it. Empty disables the cluster-scoped half of every ClusterRestore.")
 	flag.StringVar(&moverImage, "mover-image", "",
 		"Container image for the mover Jobs (repository init and, later, backup/restore/maintenance). "+
 			"REQUIRED for real backups — the Helm chart and the crucible set it; an empty value is tolerated "+
@@ -292,6 +321,8 @@ func main() {
 		exposer.NewRegistry(mgr.GetClient(), operatorNamespace),
 		operatorNamespace,
 		moverImage,
+		manifestMoverSA,
+		manifestReaderRole,
 		mgr.GetEventRecorder("backup"),
 		// The SAME per-repository exclusive queue the BackupRepository controller uses: the Backup
 		// controller enqueues retention-forget and stale-lock-unlock on it, serialised per repository
@@ -306,6 +337,10 @@ func main() {
 		mgr.GetClient(),
 		mgr.GetScheme(),
 		operatorNamespace,
+		secrets.NewByNameReader(mgr.GetAPIReader()),
+		moverImage,
+		manifestMoverSA,
+		clusterManifestReaderRole,
 		mgr.GetEventRecorder("clusterbackup"),
 	).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Unable to create controller", "controller", "ClusterBackup")
@@ -365,6 +400,8 @@ func main() {
 		snapshotLister,
 		operatorNamespace,
 		moverImage,
+		manifestMoverSA,
+		manifestWriterRole,
 		mgr.GetEventRecorder("restore"),
 		repoQueue,
 	).SetupWithManager(mgr); err != nil {
@@ -379,6 +416,8 @@ func main() {
 		snapshotLister,
 		operatorNamespace,
 		moverImage,
+		manifestMoverSA,
+		clusterManifestWriterRole,
 		mgr.GetEventRecorder("clusterrestore"),
 		repoQueue,
 	).SetupWithManager(mgr); err != nil {

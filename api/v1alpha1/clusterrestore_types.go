@@ -53,13 +53,21 @@ type ClusterRestoreSpec struct {
 	// match the volumes cap — an unbounded selector array is an etcd/object-size smell.
 	// +optional
 	// +kubebuilder:validation:MaxItems=128
-	Resources []ResourceSelectorItem `json:"resources,omitempty"`
+	// NOTE: no `omitempty`. A PRESENT-but-empty list means "restore nothing of this kind",
+	// while an omitted one means "everything" (spec/02-api.md § Restore selection model), and
+	// `omitempty` erases exactly that difference on the way OUT: a Go client sending an empty
+	// slice would emit no field at all, and the operator would read it back as omitted and
+	// restore the whole namespace. That is the failure mode this model must never have —
+	// crystalctl's `--data-only` writes `resources: []`, and it would widen to everything in
+	// Overwrite or Recreate mode against a live namespace.
+	Resources []ResourceSelectorItem `json:"resources"`
 
 	// volumes selects PVCs (and optionally files) to restore. Bounded so the per-item CEL
 	// cost stays within the apiserver's per-CRD budget.
 	// +optional
 	// +kubebuilder:validation:MaxItems=128
-	Volumes []VolumeSelectorItem `json:"volumes,omitempty"`
+	// No `omitempty`, for the same reason as resources above.
+	Volumes []VolumeSelectorItem `json:"volumes"`
 
 	// clusterResources selects cluster-scoped resources to restore (omitted ⇒ none; adr/0011).
 	// +optional
@@ -68,6 +76,14 @@ type ClusterRestoreSpec struct {
 	// confirmation must equal target.namespace when the operation modifies existing objects (R23).
 	// +optional
 	Confirmation string `json:"confirmation,omitempty"`
+
+	// dryRun runs the whole pipeline — ordering, selection, mapping, mode resolution — with
+	// server-side dry-run applies, persists nothing, and writes the plan to
+	// status.resources. On the cluster plane this matters most: a ClusterRestore can
+	// recreate CRDs and cluster RBAC, and seeing the plan first is the difference between a
+	// reviewed DR and a hopeful one (04-manifest-backup.md §5.4).
+	// +optional
+	DryRun bool `json:"dryRun,omitempty"`
 }
 
 // ClusterRestoreStatus is the observed state of a ClusterRestore.
@@ -79,6 +95,10 @@ type ClusterRestoreStatus struct {
 	// restoredResources count.
 	// +optional
 	RestoredResources int32 `json:"restoredResources,omitempty"`
+	// resources is the per-resource detail of the manifest half (04-manifest-backup.md §5.4).
+	// Under dryRun it holds the PLAN rather than an observed outcome.
+	// +optional
+	Resources *RestoreResourcesStatus `json:"resources,omitempty"`
 	// restoredVolumes count.
 	// +optional
 	RestoredVolumes int32 `json:"restoredVolumes,omitempty"`

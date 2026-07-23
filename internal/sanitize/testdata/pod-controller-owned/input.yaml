@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: web-7d4c9b8f6-x2k9p
+  namespace: c-team-x
+  uid: aa000001-0000-4000-8000-000000000001
+  ownerReferences:
+    - apiVersion: apps/v1
+      kind: ReplicaSet
+      name: web-7d4c9b8f6
+      uid: bb000001-0000-4000-8000-000000000001
+      controller: true
+      blockOwnerDeletion: true
+spec:
+  containers:
+    - name: web
+      image: nginx:1.27

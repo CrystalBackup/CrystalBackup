@@ -51,6 +51,23 @@ spec:
             # digest-pinned via the moverImage helper. The operator reads no default for this — a
             # cluster that never sets it can init/inspect CRs but cannot move data.
             - --mover-image={{ include "crystal-backup.moverImage" . }}
+            {{- if .Values.rbac.create }}
+            # The manifest mover's identity and the ClusterRole the operator binds transiently
+            # into a tenant namespace for a capture. Passed rather than derived: these names are
+            # release-prefixed, so the operator must be told what the chart actually created.
+            - --manifest-mover-service-account={{ include "crystal-backup.manifestMoverServiceAccountName" . }}
+            - --manifest-reader-cluster-role={{ include "crystal-backup.fullname" . }}-manifest-reader
+            # The restore-side grant. Separate from the reader on purpose: the operator hands
+            # out whichever one the operation needs, and nothing binds both.
+            - --manifest-writer-cluster-role={{ include "crystal-backup.fullname" . }}-manifest-writer
+            # The cluster-scoped capture grant (adr/0011 §1), bound as a transient
+            # ClusterRoleBinding for one ClusterBackup run. Enumerated, not "*".
+            - --cluster-manifest-reader-cluster-role={{ include "crystal-backup.fullname" . }}-cluster-manifest-reader
+            # The cluster-scoped RESTORE grant (adr/0011 §2) — the writer twin, bound as a
+            # transient ClusterRoleBinding for one ClusterRestore. The most privileged grant in
+            # the system; recreates CRDs and cluster RBAC. Enumerated, never standing.
+            - --cluster-manifest-writer-cluster-role={{ include "crystal-backup.fullname" . }}-cluster-manifest-writer
+            {{- end }}
             {{- with .Values.extraArgs }}
             {{- toYaml . | nindent 12 }}
             {{- end }}

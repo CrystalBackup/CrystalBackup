@@ -241,11 +241,6 @@ func m1UnwrapDEK(locationName string) string {
 	return string(dek)
 }
 
-// m1SeedSelector is the label selector matching the crucible's seeded tenant namespaces.
-func m1SeedSelector() metav1.LabelSelector {
-	return metav1.LabelSelector{MatchLabels: map[string]string{m1SeedLabel: m1SeedValue}}
-}
-
 // m1RunClusterBackup creates a MANUAL (no scheduleRef, deterministic name) ClusterBackup
 // whose inline run spec targets locationName and the given namespace selector.
 func m1RunClusterBackup(name, locationName string, nsSelector cbv1.NamespaceSelector) *cbv1.ClusterBackup {
@@ -355,7 +350,11 @@ func m1AssertNoResidualSnapshotObjects(namespaces ...string) {
 					"residual temporary clone PVC %s/%s (labels %v)", ns, p.Name, p.Labels)
 			}
 		}
-	}, 2*time.Minute, 5*time.Second).Should(Succeed())
+		// 5 min (was 2): finalizer teardown of VolumeSnapshots/VSContents/clone PVCs on Ceph is
+		// slow under full-suite load, and M3's default manifest capture adds a manifest-mover Job to
+		// every backup's teardown. The objects DO drain (the m3-only run clears them well under 2m);
+		// this only needs headroom for the loaded case, so it stays a real leak-check, not a sleep.
+	}, 5*time.Minute, 5*time.Second).Should(Succeed())
 }
 
 // m1DeleteOperatorPod deletes the operator pod(s) (app.kubernetes.io/name=crystal-backup) to

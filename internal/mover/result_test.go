@@ -190,7 +190,7 @@ func TestParseBackupSummaryUnterminatedFinalLine(t *testing.T) {
 // total_bytes_processed -> SizeBytes, data_added -> AddedBytes, snapshot id carried
 // through, Operation forced to "backup", OK true.
 func TestSummaryToResult(t *testing.T) {
-	got := SummaryToResult(ResticBackupSummary{
+	got := SummaryToResult(OpBackup, ResticBackupSummary{
 		MessageType:         "summary",
 		SnapshotID:          "abc123def456",
 		TotalBytesProcessed: 2048,
@@ -203,7 +203,9 @@ func TestSummaryToResult(t *testing.T) {
 		SizeBytes:  2048,
 		AddedBytes: 1536,
 	}
-	if got != want {
+	// DeepEqual rather than ==: MoverResult now carries the per-resource restore report, and a
+	// struct with a slice field is not comparable.
+	if !reflect.DeepEqual(got, want) {
 		t.Errorf("SummaryToResult = %+v, want %+v", got, want)
 	}
 	if got.Operation != string(OpBackup) {

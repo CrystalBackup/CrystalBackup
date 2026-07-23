@@ -71,6 +71,14 @@ spec:
                 description: confirmation must equal target.namespace when the operation
                   modifies existing objects (R23).
                 type: string
+              dryRun:
+                description: |-
+                  dryRun runs the whole pipeline — ordering, selection, mapping, mode resolution — with
+                  server-side dry-run applies, persists nothing, and writes the plan to
+                  status.resources. On the cluster plane this matters most: a ClusterRestore can
+                  recreate CRDs and cluster RBAC, and seeing the plan first is the difference between a
+                  reviewed DR and a hopeful one (04-manifest-backup.md §5.4).
+                type: boolean
               mode:
                 default: Overwrite
                 description: mode selects Recreate or Overwrite (default Overwrite).
@@ -82,10 +90,26 @@ spec:
                 description: |-
                   resources selects manifests to restore (omitted with volumes ⇒ whole namespace). Bounded to
                   match the volumes cap — an unbounded selector array is an etcd/object-size smell.
+                  NOTE: no `omitempty`. A PRESENT-but-empty list means "restore nothing of this kind",
+                  while an omitted one means "everything" (spec/02-api.md § Restore selection model), and
+                  `omitempty` erases exactly that difference on the way OUT: a Go client sending an empty
+                  slice would emit no field at all, and the operator would read it back as omitted and
+                  restore the whole namespace. That is the failure mode this model must never have —
+                  crystalctl's `--data-only` writes `resources: []`, and it would widen to everything in
+                  Overwrite or Recreate mode against a live namespace.
                 items:
                   description: ResourceSelectorItem selects manifests to restore (AND
                     within an item, OR between items).
                   properties:
+                    exclude:
+                      description: |-
+                        exclude removes from what selector and include selected, so an item reads
+                        "these kinds, minus these". Applied after both (04-manifest-backup.md §5.4).
+                        The backup-time default exclusions already applied at capture and cannot be
+                        re-included here.
+                      items:
+                        type: string
+                      type: array
                     include:
                       description: include is a list of <group>/<Kind>[/<name>] globs.
                       items:
@@ -203,6 +227,7 @@ spec:
                 description: |-
                   volumes selects PVCs (and optionally files) to restore. Bounded so the per-item CEL
                   cost stays within the apiserver's per-CRD budget.
+                  No `omitempty`, for the same reason as resources above.
                 items:
                   description: |-
                     VolumeSelectorItem selects PVCs (and optionally files within them) to restore.
@@ -321,6 +346,65 @@ spec:
                 - PartiallyFailed
                 - Failed
                 type: string
+              resources:
+                description: |-
+                  resources is the per-resource detail of the manifest half (04-manifest-backup.md §5.4).
+                  Under dryRun it holds the PLAN rather than an observed outcome.
+                properties:
+                  entries:
+                    description: |-
+                      entries records non-trivial outcomes only — a plain Created is the expected case and
+                      would drown the interesting ones. Capped at MaxRestoreResourceEntries.
+                    items:
+                      description: RestoreResourceEntry is one resource's outcome
+                        in a manifest restore.
+                      properties:
+                        changed:
+                          description: |-
+                            changed lists the field paths a server-side apply modified (Overwrite). Capped at
+                            MaxRestoreChangedPaths per entry.
+                          items:
+                            type: string
+                          maxItems: 20
+                          type: array
+                        group:
+                          description: group is the API group ("" for the core group).
+                          type: string
+                        kind:
+                          description: kind is the PascalCase kind.
+                          type: string
+                        name:
+                          description: name of the object.
+                          type: string
+                        outcome:
+                          description: outcome of the apply. In a dry run this is
+                            the PLANNED action, not an observed one.
+                          enum:
+                          - Created
+                          - Configured
+                          - Recreated
+                          - Failed
+                          type: string
+                        reason:
+                          description: |-
+                            reason carries the server's error when outcome is Failed (a nodePort collision, a
+                            finalizer holding a Recreate delete, a CRD absent in the target cluster).
+                          type: string
+                      type: object
+                    maxItems: 100
+                    type: array
+                  failedCount:
+                    description: |-
+                      failedCount is how many resources failed to apply. A restore reports per-resource
+                      failures and continues; it does not abort on the first one.
+                    format: int32
+                    type: integer
+                  truncated:
+                    description: |-
+                      truncated is true when entries were dropped to stay within the caps, so a reader can
+                      tell an empty tail from a complete report.
+                    type: boolean
+                type: object
               restoredBytes:
                 description: restoredBytes total.
                 format: int64

@@ -93,6 +93,40 @@ const (
 	// OpUnlock removes stale repository locks (`restic unlock`) so an OOM-killed mover's lock
 	// cannot wedge the next run. Maintenance shape (no PVC).
 	OpUnlock Operation = "unlock"
+	// OpManifestsBackup dumps a namespace's Kubernetes resources and backs the tree up (R15,
+	// spec/04-manifest-backup.md §2.3). It is the ONLY operation that talks to the API server:
+	// the dump must not go through exec/stdout (delta 8), so the mover reads the objects and
+	// writes them to the repository itself. That makes it the sole exception to the zero-API
+	// mover invariant (I6) — it runs under crystal-manifest-mover with an automounted token
+	// and a transient RoleBinding, never under the zero-RBAC crystal-mover.
+	OpManifestsBackup Operation = "manifests-backup"
+	// OpManifestsRestore restores a manifest snapshot and APPLIES the tree to a target
+	// namespace (spec/04-manifest-backup.md §5). The mirror of OpManifestsBackup, and the
+	// second half of I6's sole exception: it runs under crystal-manifest-mover with a
+	// transient RoleBinding to crystal-manifest-writer — create/update/delete on arbitrary
+	// kinds in ONE namespace for ONE Job's lifetime, the largest grant in the system.
+	//
+	// It is the mirror in a second way that matters to the shim: the API work runs AFTER
+	// restic here, not before. restic writes the tree, then the shim applies it.
+	OpManifestsRestore Operation = "manifests-restore"
+	// OpClusterManifestsBackup captures the cluster's CLUSTER-SCOPED objects (CRDs,
+	// StorageClasses, PersistentVolumes, ClusterRoles/Bindings, IngressClasses, …) and backs the
+	// tree up as ONE kind=cluster-manifests snapshot (adr/0011 §1). It is the cluster-plane
+	// sibling of OpManifestsBackup: the same "dump then restic backup" shape, and the same sole
+	// exception to the zero-API mover invariant (I6) — it runs under a privileged-read
+	// ServiceAccount transiently bound to ClusterRole crystal-cluster-manifest-reader, never
+	// under the zero-RBAC crystal-mover. Unlike the namespaced dump it belongs to no namespace,
+	// so its snapshot carries NEITHER tenant nor namespace tag (restic.ClusterManifestsIdentity),
+	// and its dump destination is the fixed ClusterManifestsRoot with no per-namespace suffix.
+	OpClusterManifestsBackup Operation = "cluster-manifests-backup"
+	// OpClusterManifestsRestore restores a kind=cluster-manifests snapshot and APPLIES its
+	// cluster-scoped objects (adr/0011 §2). The mirror of OpManifestsRestore on the cluster
+	// plane: same "restic restore then apply" shape (the API work runs AFTER restic), but the
+	// objects are cluster-scoped — no target namespace is stamped, and the transient grant is a
+	// cluster-scoped ClusterRoleBinding to crystal-cluster-manifest-writer, the second half of
+	// I6's exception on the restore side. Admin-only, opt-in, and confirmation-gated at the CR
+	// level; the mover only executes what the operator resolved.
+	OpClusterManifestsRestore Operation = "cluster-manifests-restore"
 )
 
 // Filesystem layout inside the mover container. These paths are a two-sided contract: the
@@ -131,6 +165,93 @@ const (
 	// the kubelet reads the container's termination message from. Exported so the shim and
 	// the Job spec name the exact same path (BuildJob pins it on the container).
 	TerminationMessagePath = "/dev/termination-log"
+
+	// ManifestsRoot is where the manifest emptyDir is mounted, and it is chosen to EQUAL the
+	// restic path prefix of restic.ManifestsIdentity ("/manifests/<namespace>"). restic
+	// records the absolute path it was given, so the dump destination and the snapshot's
+	// stored path are the same string by construction — exactly as a data job mounts its PVC
+	// at /data/<ns>/<pvc> rather than somewhere neutral. Writing the dump anywhere else would
+	// silently store the snapshot under the wrong path and break every retention group and
+	// restore that keys on it.
+	ManifestsRoot = "/manifests"
+
+	// ManifestsRestoreDir is where the restic half of a manifest restore lands the tree, and
+	// therefore where the apply reads index.json from. A SUBDIRECTORY of ManifestsRoot rather
+	// than the root itself: on backup that root is the dump's parent, and reusing it here would
+	// make one path mean "tree being written out" in one operation and "tree being read in" in
+	// the other. They never run in the same pod, so nothing would break — but a future reader
+	// deciding whether it is safe to clear the directory deserves an unambiguous answer.
+	ManifestsRestoreDir = ManifestsRoot + "/restore"
+
+	// ClusterManifestsRoot is where the cluster-manifests emptyDir is mounted, and it is chosen
+	// to EQUAL the restic path of restic.ClusterManifestsIdentity ("/cluster-manifests"). As with
+	// ManifestsRoot, restic records the absolute path it is given, so the dump destination and the
+	// snapshot's stored path are the same string by construction. Unlike ManifestsRoot there is NO
+	// per-namespace suffix: one run writes one cluster-manifests snapshot at this fixed path
+	// (adr/0011). Writing the dump anywhere else would silently store the snapshot under the wrong
+	// path and break every retention group and ClusterRestore that keys on it.
+	ClusterManifestsRoot = "/cluster-manifests"
+
+	// ClusterManifestsRestoreDir is where the restic half of a cluster-manifests RESTORE lands the
+	// tree, and where the apply reads index.json from. A SUBDIRECTORY of ClusterManifestsRoot for
+	// the same reason ManifestsRestoreDir is one of ManifestsRoot: keep "tree written out" and
+	// "tree read in" as distinct paths so a reader can reason about each unambiguously.
+	ClusterManifestsRestoreDir = ClusterManifestsRoot + "/restore"
+)
+
+// Environment the manifest mover reads. The mover has no config file and no flags beyond
+// --operation; everything else arrives as env, so these are the contract between the Job
+// builder and the shim.
+const (
+	// EnvManifestsNamespace is the namespace to dump. The destination directory is
+	// ManifestsRoot + "/" + this, which is what makes it agree with the restic identity.
+	EnvManifestsNamespace = "CRYSTAL_MANIFESTS_NAMESPACE"
+	// EnvManifestsClusterID is recorded in index.json.
+	EnvManifestsClusterID = "CRYSTAL_MANIFESTS_CLUSTER_ID"
+	// EnvManifestsBackupName is the run name (the `run` tag), recorded in index.json.
+	EnvManifestsBackupName = "CRYSTAL_MANIFESTS_BACKUP_NAME"
+	// EnvManifestsExcludeSecretData is "true" when manifestOptions.excludeSecretData is set.
+	EnvManifestsExcludeSecretData = "CRYSTAL_MANIFESTS_EXCLUDE_SECRET_DATA"
+
+	// EnvManifestsRestoreDir is where restic restored the manifest tree, and therefore where
+	// the apply reads index.json from. Passed explicitly rather than re-derived: the RESTORE
+	// target has no reason to equal the captured path — a ClusterRestore may send another
+	// cluster's namespace into a differently-named one — so the one thing the shim must not do
+	// is guess it.
+	EnvManifestsRestoreDir = "CRYSTAL_MANIFESTS_RESTORE_DIR"
+	// EnvManifestsMode is the Restore's spec.mode ("Overwrite" or "Recreate").
+	EnvManifestsMode = "CRYSTAL_MANIFESTS_MODE"
+	// EnvManifestsDryRun is "true" for a spec.dryRun restore: the full pipeline runs against
+	// the API server with dryRun=All and nothing is persisted.
+	EnvManifestsDryRun = "CRYSTAL_MANIFESTS_DRY_RUN"
+	// EnvManifestsSelection is the JSON-encoded manifests.Selection resolved from the
+	// Restore's resources[]. It travels as env rather than argv because everything after the
+	// shim's "--" separator belongs to restic verbatim. An UNSET variable means "restore
+	// everything", which is what an operator with no concept of narrowing meant.
+	EnvManifestsSelection = "CRYSTAL_MANIFESTS_SELECTION"
+	// EnvManifestsStorageClassMapping is the JSON-encoded map[string]string of
+	// ClusterRestore.spec.target.storageClassMapping, applied to PVC manifests (§5.3).
+	EnvManifestsStorageClassMapping = "CRYSTAL_MANIFESTS_STORAGE_CLASS_MAPPING"
+)
+
+// Environment the CLUSTER-scoped manifest mover reads (OpClusterManifestsBackup). The
+// cluster-plane sibling of the EnvManifests* block: it carries NO namespace (the capture belongs
+// to no namespace) and NO excludeSecretData (cluster-scoped kinds hold no Secret data), but the
+// same clusterID + run name, plus the JSON-encoded cluster selection.
+const (
+	// EnvClusterManifestsClusterID is the resolved clusterID, recorded in index.json — the same
+	// value the snapshot's restic --host carries.
+	EnvClusterManifestsClusterID = "CRYSTAL_CLUSTER_MANIFESTS_CLUSTER_ID"
+	// EnvClusterManifestsBackupName is the run name (the `run` tag), recorded in index.json.
+	EnvClusterManifestsBackupName = "CRYSTAL_CLUSTER_MANIFESTS_BACKUP_NAME"
+	// EnvClusterManifestsSelection is the JSON-encoded manifests.ClusterCaptureOptions
+	// (include/exclude) resolved from ClusterBackup.spec.clusterResources
+	// (manifests.EncodeClusterCaptureOptions). It travels as env rather than argv because
+	// everything after the shim's "--" separator belongs to restic verbatim. An UNSET or empty
+	// value means the curated default allow-list (adr/0011 §1) — an empty include is NOT "capture
+	// everything cluster-scoped", it is "capture the DR-relevant defaults", which is what capture
+	// being ON by default means.
+	EnvClusterManifestsSelection = "CRYSTAL_CLUSTER_MANIFESTS_SELECTION"
 )
 
 // Secret data keys the per-Job Secret must carry. The restic password is consumed as a

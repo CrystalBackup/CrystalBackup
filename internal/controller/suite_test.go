@@ -94,6 +94,17 @@ var (
 // SIMULATE the Job's outcome by patching its status.
 const suiteMoverImage = "crystal-mover:test"
 
+// The manifest mover identity and grant, as the chart would resolve them. envtest has no
+// kubelet so no Job ever runs, but the RoleBinding IS really created against the API server,
+// which is what exercises the transient-grant path.
+const (
+	suiteManifestMoverSA           = "crystal-backup-manifest-mover"
+	suiteManifestWriterRole        = "crystal-backup-manifest-writer"
+	suiteManifestReaderRole        = "crystal-backup-manifest-reader"
+	suiteClusterManifestReaderRole = "crystal-backup-cluster-manifest-reader"
+	suiteClusterManifestWriterRole = "crystal-backup-cluster-manifest-writer"
+)
+
 var _ = BeforeSuite(func() {
 	logf.SetLogger(zap.New(zap.WriteTo(GinkgoWriter), zap.UseDevMode(true)))
 
@@ -176,6 +187,8 @@ var _ = BeforeSuite(func() {
 		&stubExposerRegistry{client: mgr.GetClient(), operatorNamespace: suiteOperatorNamespace},
 		suiteOperatorNamespace,
 		suiteMoverImage,
+		suiteManifestMoverSA,
+		suiteManifestReaderRole,
 		mgr.GetEventRecorder("backup"),
 		// The same shared exclusive queue as the BackupRepository controller. In envtest no backup
 		// sets a retention policy and no mover is simulated as hard-killed, so the forget/unlock
@@ -190,6 +203,10 @@ var _ = BeforeSuite(func() {
 		mgr.GetClient(),
 		mgr.GetScheme(),
 		suiteOperatorNamespace,
+		secrets.NewByNameReader(mgr.GetAPIReader()),
+		suiteMoverImage,
+		suiteManifestMoverSA,
+		suiteClusterManifestReaderRole,
 		mgr.GetEventRecorder("clusterbackup"),
 	).SetupWithManager(mgr)).To(Succeed())
 
@@ -229,6 +246,8 @@ var _ = BeforeSuite(func() {
 		restoreLister,
 		suiteOperatorNamespace,
 		suiteMoverImage,
+		suiteManifestMoverSA,
+		suiteManifestWriterRole,
 		mgr.GetEventRecorder("restore"),
 		repoQueue,
 	).SetupWithManager(mgr)).To(Succeed())
@@ -240,6 +259,8 @@ var _ = BeforeSuite(func() {
 		restoreLister,
 		suiteOperatorNamespace,
 		suiteMoverImage,
+		suiteManifestMoverSA,
+		suiteClusterManifestWriterRole,
 		mgr.GetEventRecorder("clusterrestore"),
 		repoQueue,
 	).SetupWithManager(mgr)).To(Succeed())

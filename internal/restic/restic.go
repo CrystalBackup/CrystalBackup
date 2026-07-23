@@ -317,7 +317,7 @@ func ForgetArgs(r v1alpha1.RetentionSpec) []string {
 	// waits behind the lock instead. Appended only when a real keep policy was emitted (the caller
 	// must not run an all-zero forget anyway); on the degenerate all-zero result len(args) is still 4.
 	if len(args) > 4 {
-		args = append(args, "--retry-lock", "5m")
+		args = append(args, flagRetryLock, retryLockFor)
 	}
 	return args
 }

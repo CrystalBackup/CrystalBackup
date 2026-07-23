@@ -1,0 +1,44 @@
+# Mover image for the kind e2e data path: the crystal-mover shim + a pinned restic engine.
+#
+# The AUTHORITATIVE, production mover image is apko/Wolfi/SLSA (build/apko/mover.yaml +
+# build/melange/{mover,restic}.yaml, adr/0012). This Dockerfile is the throwaway, plain-Docker
+# equivalent used ONLY by the kind e2e so real mover Jobs can run without the melange/apko
+# toolchain. It honours the exact contract the operator relies on (internal/mover):
+#   * entrypoint /usr/bin/crystal-mover   (mover.MoverBinaryPath)
+#   * `restic` on PATH                    (the shim execs `restic` — cmd/crystal-mover/main.go)
+#   * restic pinned to 0.19.1             (build/melange/restic.yaml)
+#   * glibc base, runs as root (uid 0)    (the mover POD's securityContext governs privilege)
+FROM golang:1.26 AS builder
+ARG TARGETOS
+ARG TARGETARCH
+
+WORKDIR /workspace
+# Cache module downloads before copying the source (mirrors the operator Dockerfile).
+COPY go.mod go.mod
+COPY go.sum go.sum
+RUN go mod download
+COPY . .
+
+# The crystal-mover shim — the container entrypoint the operator execs for every mover Job.
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
+    go build -trimpath -ldflags="-s -w" -o /out/crystal-mover ./cmd/crystal-mover
+
+# restic, built from the upstream source release — same version + tarball hash the production
+# melange recipe pins (build/melange/restic.yaml). restic bakes its version into a compile-time
+# const, so `restic version` reports 0.19.1 with no -X needed.
+ARG RESTIC_VERSION=0.19.1
+ARG RESTIC_SHA256=bb9b1a19040744d26d8a79be029d4e6b189c45ccc9d8831d7fe367d3c33df725
+ADD https://github.com/restic/restic/releases/download/v${RESTIC_VERSION}/restic-${RESTIC_VERSION}.tar.gz /tmp/restic.tar.gz
+RUN echo "${RESTIC_SHA256}  /tmp/restic.tar.gz" | sha256sum -c - \
+    && mkdir -p /tmp/restic \
+    && tar -xzf /tmp/restic.tar.gz -C /tmp/restic --strip-components=1 \
+    && cd /tmp/restic \
+    && CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
+       go build -trimpath -ldflags="-s -w" -o /out/restic ./cmd/restic
+
+# Minimal glibc base with a CA bundle (adr/0012 wants glibc, not musl). No shell/package
+# manager: the shim execs restic directly, restic talks to S3 on its own — nothing needs a shell.
+FROM gcr.io/distroless/base-debian12:latest
+COPY --from=builder /out/crystal-mover /usr/bin/crystal-mover
+COPY --from=builder /out/restic /usr/bin/restic
+ENTRYPOINT ["/usr/bin/crystal-mover"]

@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: default-token-x7f2q
+  namespace: c-team-x
+  uid: 22000001-0000-4000-8000-000000000001
+  annotations:
+    kubernetes.io/service-account.name: default
+type: kubernetes.io/service-account-token
+# No data block on purpose: E7 excludes this Secret by its TYPE, so a token value would add
+# nothing to the fixture except a secret-scanner false positive.

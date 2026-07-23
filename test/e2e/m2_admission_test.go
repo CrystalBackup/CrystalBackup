@@ -79,8 +79,12 @@ var _ = Describe("Crystal Backup admission (M2)", Ordered, func() {
 	})
 
 	AfterAll(func() {
-		_, _ = kubectl("delete", "namespace", tenantNS, "--ignore-not-found")
-		_, _ = kubectl("delete", "clusterbackuplocation", "--all", "--ignore-not-found")
+		// --wait=false on the resource deletes: a parked Restore holds a teardown finalizer and
+		// a ClusterBackupLocation holds FinalizerLocation, so a default delete (and a namespace
+		// delete, which waits for every contained object) would block on the controller. Best-
+		// effort teardown must not hang the suite.
+		_, _ = kubectl("delete", "namespace", tenantNS, "--ignore-not-found", "--wait=false")
+		_, _ = kubectl("delete", "clusterbackuplocation", "--all", "--ignore-not-found", "--wait=false")
 		_, _ = kubectl("delete", "validatingadmissionpolicybinding", "-l", "app.kubernetes.io/name=crystal-backup", "--ignore-not-found")
 		_, _ = kubectl("delete", "validatingadmissionpolicy", "-l", "app.kubernetes.io/name=crystal-backup", "--ignore-not-found")
 	})
@@ -104,7 +108,13 @@ spec:
 			out, err := applyStdin(restoreManifest("m2-wrong-confirmation", "Recreate", "not-the-namespace"), "create")
 			if err == nil {
 				// The policy may still be compiling right after apply: remove and retry.
-				_, _ = kubectl("delete", "restore", "-n", tenantNS, "m2-wrong-confirmation", "--ignore-not-found")
+				// --wait=false is REQUIRED here: the Restore controller adds a teardown
+				// finalizer on its first reconcile (internal apiconst.FinalizerRestore), so a
+				// default `kubectl delete` blocks until that finalizer clears — an unbounded
+				// wait that previously wedged the whole suite. Fire-and-forget: admission
+				// (VAP) runs before storage, so the retried create is still denied even while
+				// a prior object lingers in Terminating.
+				_, _ = kubectl("delete", "restore", "-n", tenantNS, "m2-wrong-confirmation", "--ignore-not-found", "--wait=false")
 			}
 			g.Expect(err).To(HaveOccurred(), "a wrong confirmation must be denied, got: %s", out)
 			g.Expect(err.Error()).To(ContainSubstring("confirmation"))
@@ -134,7 +144,8 @@ spec:
 		Eventually(func(g Gomega) {
 			out, err := applyStdin(manifest, "create")
 			if err == nil {
-				_, _ = kubectl("delete", "clusterbackup", "m2-shapeless", "--ignore-not-found")
+				// --wait=false: don't block on the controller's finalizer teardown (see rule 1).
+				_, _ = kubectl("delete", "clusterbackup", "m2-shapeless", "--ignore-not-found", "--wait=false")
 			}
 			g.Expect(err).To(HaveOccurred(), "a selector-less ClusterBackup must be denied, got: %s", out)
 			g.Expect(err.Error()).To(ContainSubstring("positive"))
@@ -161,7 +172,8 @@ spec:
 		Eventually(func(g Gomega) {
 			out, err := applyStdin(manifest, "create")
 			if err == nil {
-				_, _ = kubectl("delete", "clusterbackuplocation", "m2-immutable-prune", "--ignore-not-found")
+				// --wait=false: don't block on the controller's finalizer teardown (see rule 1).
+				_, _ = kubectl("delete", "clusterbackuplocation", "m2-immutable-prune", "--ignore-not-found", "--wait=false")
 			}
 			g.Expect(err).To(HaveOccurred(), "Immutable+prune must be denied, got: %s", out)
 			g.Expect(err.Error()).To(ContainSubstring("prune"))
@@ -197,7 +209,8 @@ spec:
 		Eventually(func(g Gomega) {
 			out, err := applyStdin(locationManifest("m2-default-b", true), "create")
 			if err == nil {
-				_, _ = kubectl("delete", "clusterbackuplocation", "m2-default-b", "--ignore-not-found")
+				// --wait=false: don't block on the controller's finalizer teardown (see rule 1).
+				_, _ = kubectl("delete", "clusterbackuplocation", "m2-default-b", "--ignore-not-found", "--wait=false")
 			}
 			g.Expect(err).To(HaveOccurred(), "the second default must be denied once the webhook serves, got: %s", out)
 			g.Expect(err.Error()).To(ContainSubstring("m2-default-a"))

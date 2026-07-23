@@ -1,0 +1,206 @@
+{{- if .Values.rbac.create }}
+################################################################################
+# Manifest mover identity and grants (R15, R22 — spec/03-security-and-tenancy.md §5,
+# spec/04-manifest-backup.md §2.3, spec/adr/0011).
+#
+# These are the LARGEST GRANTS IN THE SYSTEM. They exist because a manifest backup has to
+# read a namespace's objects and a manifest restore has to write them, and no narrower
+# formulation of "back up whatever this tenant has" is possible — the whole point is to
+# capture kinds this operator does not know about.
+#
+# Four things keep that bounded, and all four are load-bearing:
+#   1. NONE of these ClusterRoles is bound standing. The namespaced ones are bound by a
+#      TRANSIENT RoleBinding the operator creates in the target namespace immediately before
+#      the Job and deletes when it finishes (§5 "Transient binding lifecycle"). A RoleBinding
+#      to a ClusterRole grants only within its namespace, whatever the rule says.
+#   2. The subject is crystal-manifest-mover, never the zero-RBAC crystal-mover that carries
+#      the repository credentials.
+#   3. The reader and writer are separate roles bound for separate operations, so a backup
+#      never holds write.
+#   4. Widening any of them requires an ADR (roadmap DoD), and CODEOWNERS routes this file.
+################################################################################
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "crystal-backup.manifestMoverServiceAccountName" . }}
+  namespace: {{ include "crystal-backup.namespace" . }}
+  labels:
+    {{- include "crystal-backup.labels" . | nindent 4 }}
+# The one mover identity whose token IS mounted (invariant I6's sole exception). The pod spec
+# still sets automountServiceAccountToken explicitly, so this is belt and braces rather than
+# the actual control.
+automountServiceAccountToken: true
+---
+################################################################################
+# Namespaced manifest capture — bound TRANSIENTLY into one tenant namespace.
+#
+# apiGroups/resources "*" is deliberate and is not a shortcut: a namespace's contents are
+# whatever CRDs the tenant installed, so an enumerable list would silently miss exactly the
+# custom resources a restore most needs. The confinement comes from the binding being a
+# namespaced RoleBinding, not from the rule.
+#
+# This includes Secrets (spec/03 §10). That is stated plainly rather than worked around: a
+# full namespace recovery needs them, and the control on them is the repository key.
+################################################################################
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "crystal-backup.fullname" . }}-manifest-reader
+  labels:
+    {{- include "crystal-backup.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["*"]
+    resources: ["*"]
+    verbs: ["get", "list"]
+---
+################################################################################
+# Namespaced manifest restore — bound TRANSIENTLY into one target namespace.
+#
+# Velero-equivalent, and the single largest grant here: create/update on arbitrary kinds.
+# `delete` is included because Recreate mode is delete-then-create (04-manifest-backup.md
+# §5.2); without it that mode fails halfway, having already deleted nothing but able to
+# create nothing either.
+################################################################################
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "crystal-backup.fullname" . }}-manifest-writer
+  labels:
+    {{- include "crystal-backup.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["*"]
+    resources: ["*"]
+    verbs: ["get", "list", "create", "update", "patch", "delete"]
+---
+################################################################################
+# Cluster-scoped capture (adr/0011 §1) — bound TRANSIENTLY per ClusterBackup run.
+#
+# Unlike the namespaced roles above, this one is ENUMERATED. A ClusterRoleBinding is not
+# confined by a namespace, so "*" here would be a standing read of every object in the
+# cluster rather than a bounded one — the enumeration IS the boundary. The list is the
+# canonical allow-list of adr/0011 §1; adding to it is an ADR change, not a config tweak.
+################################################################################
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "crystal-backup.fullname" . }}-cluster-manifest-reader
+  labels:
+    {{- include "crystal-backup.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources: ["customresourcedefinitions"]
+    verbs: ["get", "list"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses", "csidrivers"]
+    verbs: ["get", "list"]
+  - apiGroups: ["snapshot.storage.k8s.io"]
+    resources: ["volumesnapshotclasses"]
+    verbs: ["get", "list"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingressclasses"]
+    verbs: ["get", "list"]
+  - apiGroups: ["scheduling.k8s.io"]
+    resources: ["priorityclasses"]
+    verbs: ["get", "list"]
+  - apiGroups: ["node.k8s.io"]
+    resources: ["runtimeclasses"]
+    verbs: ["get", "list"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["clusterroles", "clusterrolebindings"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["persistentvolumes", "namespaces"]
+    verbs: ["get", "list"]
+---
+################################################################################
+# Cluster-scoped restore (adr/0011 §2) — admin-only, opt-in, transient per Job.
+#
+# Recreating ClusterRoleBindings or CRDs is privileged, so this is never implicit: opt-in
+# selection, R23 confirmation and admin RBAC are all required before it is ever bound.
+################################################################################
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "crystal-backup.fullname" . }}-cluster-manifest-writer
+  labels:
+    {{- include "crystal-backup.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources: ["customresourcedefinitions"]
+    verbs: ["get", "list", "create", "update", "patch", "delete"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses", "csidrivers"]
+    verbs: ["get", "list", "create", "update", "patch", "delete"]
+  - apiGroups: ["snapshot.storage.k8s.io"]
+    resources: ["volumesnapshotclasses"]
+    verbs: ["get", "list", "create", "update", "patch", "delete"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingressclasses"]
+    verbs: ["get", "list", "create", "update", "patch", "delete"]
+  - apiGroups: ["scheduling.k8s.io"]
+    resources: ["priorityclasses"]
+    verbs: ["get", "list", "create", "update", "patch", "delete"]
+  - apiGroups: ["node.k8s.io"]
+    resources: ["runtimeclasses"]
+    verbs: ["get", "list", "create", "update", "patch", "delete"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["clusterroles", "clusterrolebindings"]
+    verbs: ["get", "list", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["persistentvolumes", "namespaces"]
+    verbs: ["get", "list", "create", "update", "patch", "delete"]
+---
+################################################################################
+# What the OPERATOR needs to run the above.
+#
+# Two grants, and the second one is the subtle one.
+#
+# (a) RoleBindings in any namespace. Tenant namespaces are arbitrary, so this cannot be
+#     namespace-scoped. It is deliberately ONLY rolebindings — not roles — so the operator
+#     can bind existing ClusterRoles but cannot author new permission sets.
+#
+# (b) `bind` on these four ClusterRoles BY NAME. Kubernetes refuses to let a subject create a
+#     RoleBinding granting permissions it does not itself hold, unless it has `bind` on the
+#     referenced role (privilege-escalation prevention). The alternative would be to grant the
+#     operator read-on-all-Secrets cluster-wide so it "already holds" what it hands out — a
+#     permanent, standing version of the very grant this design keeps transient. `bind` with
+#     resourceNames is the least-privilege form: the operator can hand out exactly these four
+#     roles and nothing else, while holding none of them.
+################################################################################
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "crystal-backup.fullname" . }}-manifest-binder
+  labels:
+    {{- include "crystal-backup.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["rolebindings"]
+    verbs: ["create", "delete", "get", "list", "watch"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["clusterrolebindings"]
+    verbs: ["create", "delete", "get", "list", "watch"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["clusterroles"]
+    verbs: ["bind"]
+    resourceNames:
+      - {{ include "crystal-backup.fullname" . }}-manifest-reader
+      - {{ include "crystal-backup.fullname" . }}-manifest-writer
+      - {{ include "crystal-backup.fullname" . }}-cluster-manifest-reader
+      - {{ include "crystal-backup.fullname" . }}-cluster-manifest-writer
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "crystal-backup.fullname" . }}-manifest-binder
+  labels:
+    {{- include "crystal-backup.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "crystal-backup.fullname" . }}-manifest-binder
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "crystal-backup.serviceAccountName" . }}
+    namespace: {{ include "crystal-backup.namespace" . }}
+{{- end }}

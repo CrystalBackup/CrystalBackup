@@ -63,9 +63,17 @@ type ClusterBackupStatus struct {
 	// pvcsFailed across all namespaces.
 	// +optional
 	PVCsFailed int32 `json:"pvcsFailed,omitempty"`
-	// clusterResourcesCaptured in the kind=cluster-manifests snapshot (adr/0011).
+	// clusterResourcesCaptured in the kind=cluster-manifests snapshot (adr/0011). A flat mirror
+	// of clusterManifests.resourceCount, kept because it is the field the run's headline count
+	// has always exposed.
 	// +optional
 	ClusterResourcesCaptured int32 `json:"clusterResourcesCaptured,omitempty"`
+	// clusterManifests records the run's one kind=cluster-manifests snapshot (adr/0011 §1). Its
+	// presence is also the "capture is terminal" marker the reconcile keys on — set once, it
+	// stops a second capture of the same run, exactly as backup.status.manifests does for a
+	// namespace. Absent means either the capture is still in flight or the run opted out.
+	// +optional
+	ClusterManifests *ManifestsStatus `json:"clusterManifests,omitempty"`
 	// addedBytes is the deduplicated bytes added by this run.
 	// +optional
 	AddedBytes int64 `json:"addedBytes,omitempty"`

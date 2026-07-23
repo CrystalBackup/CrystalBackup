@@ -71,8 +71,8 @@ var _ = Describe("M1 — convergence and no orphans", Label("m1"), Ordered, func
 	seedSelector := cbv1.NamespaceSelector{MatchLabels: map[string]string{m1SeedLabel: m1SeedValue}}
 
 	// listActiveMoverJobs returns the mover Jobs — a crystalbackup.io/* label, in the operator
-	// namespace — that still have an active pod. The operator pod itself carries only
-	// app.kubernetes.io/* labels and the restic-oracle Jobs carry none, so this predicate
+	// namespace — that still have an active pod. The operator pod and the restic-oracle Jobs
+	// carry only app.kubernetes.io/* labels (never crystalbackup.io/*), so this predicate
 	// selects exactly the run's data/manifests movers.
 	listActiveMoverJobs := func() []batchv1.Job {
 		var jobs batchv1.JobList

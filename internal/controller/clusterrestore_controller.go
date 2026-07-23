@@ -63,7 +63,15 @@ type ClusterRestoreReconciler struct {
 	Lister FilteredSnapshotLister
 	// OperatorNamespace is where every operator-side restore object lives.
 	OperatorNamespace string
-	Recorder          events.EventRecorder
+	// ManifestMoverServiceAccount and ClusterManifestWriterClusterRole name the identity and grant
+	// of the CLUSTER-scoped restore mover — the same manifest mover SA as the namespaced half, but
+	// bound to the cluster-manifest WRITER ClusterRole (create/update/delete on CRDs and cluster
+	// RBAC). Configured, not derived: the chart release-prefixes every cluster-scoped object. An
+	// empty writer role disables the cluster-scoped half — that grant has no namespace to confine
+	// it, so an operator that was never told which ClusterRole to bind must not guess one.
+	ManifestMoverServiceAccount      string
+	ClusterManifestWriterClusterRole string
+	Recorder                         events.EventRecorder
 }
 
 // NewClusterRestoreReconciler wires the reconciler and its engine.
@@ -74,16 +82,19 @@ func NewClusterRestoreReconciler(
 	targets *rexposer.TargetExposer,
 	lister FilteredSnapshotLister,
 	operatorNamespace, moverImage string,
+	manifestMoverSA, clusterManifestWriterRole string,
 	recorder events.EventRecorder,
 	q *queue.Manager,
 ) *ClusterRestoreReconciler {
 	return &ClusterRestoreReconciler{
-		Client:            c,
-		Scheme:            scheme,
-		Engine:            newRestoreEngine(c, secretsReader, targets, operatorNamespace, moverImage, q),
-		Lister:            lister,
-		OperatorNamespace: operatorNamespace,
-		Recorder:          recorder,
+		Client:                           c,
+		Scheme:                           scheme,
+		Engine:                           newRestoreEngine(c, secretsReader, targets, operatorNamespace, moverImage, q),
+		Lister:                           lister,
+		OperatorNamespace:                operatorNamespace,
+		ManifestMoverServiceAccount:      manifestMoverSA,
+		ClusterManifestWriterClusterRole: clusterManifestWriterRole,
+		Recorder:                         recorder,
 	}
 }
 
@@ -147,10 +158,34 @@ func (r *ClusterRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return res, err
 	}
 
-	// (3) Resolve location, repository, DEK, and the repo coordinate.
-	rc, plans, res, err := r.prepare(ctx, &cr)
+	// (3) Resolve location, repository, DEK, the repo coordinate, and the cluster-scoped plan.
+	rc, plans, clusterPlan, res, err := r.prepare(ctx, &cr)
 	if err != nil || plans == nil {
 		return res, err
+	}
+
+	// (3b) The CLUSTER-scoped half runs BEFORE the volumes: a namespace's PVCs reference
+	// StorageClasses (and its objects reference CRDs) this half brings back, so they must exist
+	// first. teardownCluster is the Job name to reclaim once the cluster status write is durable —
+	// its grant is a live cluster-wide write until then.
+	clusterDone, teardownCluster, err := r.advanceClusterRestore(ctx, &cr, rc, clusterPlan)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if !clusterDone {
+		// Hold the volumes back — and hold the run non-terminal — until the cluster-scoped restore
+		// settles. Driving volumes now could provision PVCs against StorageClasses that are still
+		// being applied. Teardown-after-write still applies if the cluster half settled this pass.
+		cr.Status.Phase = string(status.RestorePhaseRunning)
+		status.SetCondition(&cr.Status.Conditions, ConditionReady, metav1.ConditionFalse, "InProgress",
+			"restoring cluster-scoped resources before volumes", cr.Generation)
+		if err := r.Status().Update(ctx, &cr); err != nil {
+			return ctrl.Result{}, fmt.Errorf("update status for ClusterRestore %s: %w", cr.Name, err)
+		}
+		if teardownCluster != "" {
+			r.teardownClusterRestore(ctx, teardownCluster)
+		}
+		return ctrl.Result{RequeueAfter: restorePollInterval}, nil
 	}
 
 	// (4) Drive the volumes; (5) single status write; (6) teardown after terminal. The
@@ -167,10 +202,23 @@ func (r *ClusterRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		if err := r.Status().Update(ctx, &cr); err != nil {
 			return ctrl.Result{}, fmt.Errorf("update status for ClusterRestore %s: %w", cr.Name, err)
 		}
+		// The cluster-scoped result was persisted in this write (advanceClusterRestore stamped it on
+		// cr.Status): reclaim its Job and cluster-wide grant now, after the write.
+		if teardownCluster != "" {
+			r.teardownClusterRestore(ctx, teardownCluster)
+		}
 		return ctrl.Result{RequeueAfter: restorePollInterval}, nil
 	}
 
-	phase := status.RollUpRestoreOutcomes(drive.completed, drive.failedCount)
+	// The roll-up is over UNITS OF WORK, and a cluster-scoped resource is one just as a volume is:
+	// fold both halves into both counts or the phase misreports (a restore that applied 40
+	// cluster objects and failed 2, with no volumes, must not read Failed for "nothing succeeded").
+	completed, failed := drive.completed, drive.failedCount
+	if cr.Status.Resources != nil {
+		completed += int(cr.Status.RestoredResources)
+		failed += int(cr.Status.Resources.FailedCount)
+	}
+	phase := status.RollUpRestoreOutcomes(completed, failed)
 	cr.Status.Phase = string(phase)
 	cr.Status.RestoredVolumes = int32(drive.completed)
 	cr.Status.RestoredBytes = drive.restoredBytes
@@ -179,6 +227,12 @@ func (r *ClusterRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, fmt.Errorf("update status for ClusterRestore %s: %w", cr.Name, err)
 	}
 
+	// (6) The terminal result is durable: reclaim the operator-side residue. The cluster-scoped
+	// half goes first because part of its residue is a live create/update/delete grant on CRDs and
+	// cluster RBAC across the whole cluster.
+	if teardownCluster != "" {
+		r.teardownClusterRestore(ctx, teardownCluster)
+	}
 	r.Engine.teardownAll(ctx, rc, plans)
 	r.Engine.forgetResolution(cr.UID, rc.ownerID)
 	if phase == status.RestorePhaseCompleted {
@@ -216,33 +270,35 @@ func (r *ClusterRestoreReconciler) ensureTargetNamespace(ctx context.Context, cr
 	return ctrl.Result{}, false, nil
 }
 
-// prepare resolves the repository and the repo coordinate into volume plans. One filtered
-// listing (namespace=<source.namespace>) serves BOTH the run selection (named run, latest,
-// or time cutoff) and the per-PVC snapshot mapping — the repository, not any in-cluster
-// object, is the source of truth (R26).
-func (r *ClusterRestoreReconciler) prepare(ctx context.Context, cr *cbv1.ClusterRestore) (*restoreExecContext, []restoreVolumePlan, ctrl.Result, error) {
+// prepare resolves the repository and the repo coordinate into volume plans and — when the
+// restore opts in — the cluster-scoped half's plan. One namespace-filtered listing serves the
+// run selection AND the per-PVC snapshot mapping; a SECOND, separate listing resolves the run's
+// cluster-manifests snapshot, because that snapshot carries no namespace tag and so can never
+// come back through the namespace filter. The repository, not any in-cluster object, is the
+// source of truth (R26). A nil plans return with a nil error means a gate was written.
+func (r *ClusterRestoreReconciler) prepare(ctx context.Context, cr *cbv1.ClusterRestore) (*restoreExecContext, []restoreVolumePlan, *clusterRestoreResourcesPlan, ctrl.Result, error) {
 	var loc cbv1.ClusterBackupLocation
 	if err := r.Get(ctx, client.ObjectKey{Name: cr.Spec.Source.LocationRef.Name}, &loc); err != nil {
 		if apierrors.IsNotFound(err) {
 			res, gerr := r.gate(ctx, cr, "LocationNotFound",
 				fmt.Sprintf("ClusterBackupLocation %q not found", cr.Spec.Source.LocationRef.Name))
-			return nil, nil, res, gerr
+			return nil, nil, nil, res, gerr
 		}
-		return nil, nil, ctrl.Result{}, fmt.Errorf("get ClusterBackupLocation %s: %w", cr.Spec.Source.LocationRef.Name, err)
+		return nil, nil, nil, ctrl.Result{}, fmt.Errorf("get ClusterBackupLocation %s: %w", cr.Spec.Source.LocationRef.Name, err)
 	}
 	var repo cbv1.BackupRepository
 	if err := r.Get(ctx, client.ObjectKey{Name: loc.Name}, &repo); err != nil || !repo.Status.Initialized {
 		if err != nil && !apierrors.IsNotFound(err) {
-			return nil, nil, ctrl.Result{}, fmt.Errorf("get BackupRepository %s: %w", loc.Name, err)
+			return nil, nil, nil, ctrl.Result{}, fmt.Errorf("get BackupRepository %s: %w", loc.Name, err)
 		}
 		res, gerr := r.gate(ctx, cr, "RepositoryNotReady",
 			fmt.Sprintf("BackupRepository %q is not initialized", loc.Name))
-		return nil, nil, res, gerr
+		return nil, nil, nil, res, gerr
 	}
 	dek, reason, message, ok := resolvePlatformDEKCommon(ctx, r.Client, r.Engine.Secrets, r.OperatorNamespace, &loc)
 	if !ok {
 		res, gerr := r.gate(ctx, cr, reason, message)
-		return nil, nil, res, gerr
+		return nil, nil, nil, res, gerr
 	}
 
 	// One filtered listing for the whole source namespace, cached per (owner, coordinate).
@@ -250,14 +306,14 @@ func (r *ClusterRestoreReconciler) prepare(ctx context.Context, cr *cbv1.Cluster
 	// pinned for the restore's lifetime by the cache itself (cleared on terminal): a newer
 	// run uploading mid-restore can never flip the remaining volumes onto a different run.
 	coordinate := cr.Spec.Source.Namespace + "/" + cr.Spec.Source.Backup + "/" + cr.Spec.Source.Time
-	byPVC, cached := r.Engine.cachedResolution(cr.UID, coordinate)
+	byPVC, clusterManifestSnaps, cached := r.Engine.cachedClusterResolution(cr.UID, coordinate)
 	if !cached {
 		snaps, err := r.Lister.ListFiltered(ctx, &repo, restoreResolveJobName(clusterRestoreOwnerID(cr.Name)),
 			restic.Tag(restic.TagKeyNamespace, cr.Spec.Source.Namespace))
 		if err != nil {
 			res, gerr := r.gate(ctx, cr, "SnapshotResolutionFailed",
 				fmt.Sprintf("repository listing for namespace %q failed: %v", cr.Spec.Source.Namespace, err))
-			return nil, nil, res, gerr
+			return nil, nil, nil, res, gerr
 		}
 		run, runSnaps, found := selectRun(snaps, cr.Spec.Source.Backup, cr.Spec.Source.Time)
 		if !found {
@@ -267,7 +323,7 @@ func (r *ClusterRestoreReconciler) prepare(ctx context.Context, cr *cbv1.Cluster
 			res, gerr := r.gateAt(ctx, cr, "RunNotFound",
 				fmt.Sprintf("no run matching spec.source in the repository for namespace %q", cr.Spec.Source.Namespace),
 				periodicRequeueInterval)
-			return nil, nil, res, gerr
+			return nil, nil, nil, res, gerr
 		}
 		byPVC = dataSnapshotsByPVC(runSnaps)
 		if len(byPVC) == 0 {
@@ -276,11 +332,27 @@ func (r *ClusterRestoreReconciler) prepare(ctx context.Context, cr *cbv1.Cluster
 			res, gerr := r.gateAt(ctx, cr, "RunNotFound",
 				fmt.Sprintf("run %q holds no data snapshots for namespace %q", run, cr.Spec.Source.Namespace),
 				periodicRequeueInterval)
-			return nil, nil, res, gerr
+			return nil, nil, nil, res, gerr
 		}
 		r.Recorder.Eventf(cr, nil, corev1.EventTypeNormal, "RunResolved", "ResolveRun",
 			"restoring run %q of namespace %s", run, cr.Spec.Source.Namespace)
-		r.Engine.storeResolution(cr.UID, coordinate, byPVC)
+
+		// The cluster-scoped half's snapshot needs a SECOND listing, filtered kind=cluster-manifests
+		// AND run=<run>: the namespace-filtered listing above cannot return it (a cluster-manifests
+		// snapshot carries no namespace tag). Only listed when the restore opts in — otherwise the
+		// separate listing Job against S3 would be pure waste.
+		if cr.Spec.ClusterResources != nil {
+			clusterManifestSnaps, err = r.Lister.ListFiltered(ctx, &repo,
+				clusterManifestsResolveJobName(clusterRestoreOwnerID(cr.Name)),
+				restic.Tag(restic.TagKeyKind, restic.KindClusterManifests),
+				restic.Tag(restic.TagKeyRun, run))
+			if err != nil {
+				res, gerr := r.gate(ctx, cr, "ClusterManifestResolutionFailed",
+					fmt.Sprintf("repository listing for cluster-scoped resources of run %q failed: %v", run, err))
+				return nil, nil, nil, res, gerr
+			}
+		}
+		r.Engine.storeClusterResolution(cr.UID, coordinate, byPVC, clusterManifestSnaps)
 	}
 
 	run := runOf(byPVC)
@@ -302,7 +374,28 @@ func (r *ClusterRestoreReconciler) prepare(ctx context.Context, cr *cbv1.Cluster
 		// comment): non-nil so nil keeps meaning "a gate was written".
 		plans = []restoreVolumePlan{}
 	}
-	return rc, plans, ctrl.Result{}, nil
+
+	// The cluster-scoped half. Resolved every pass from the cached listing (never re-listed), so
+	// advanceClusterRestore has its plan in hand. A nil plan is either the opt-out (the default) or
+	// a run with no cluster-manifests snapshot — both leave the volumes to run exactly as before.
+	clusterPlan, _ := resolveClusterRestorePlan(cr, clusterManifestSnaps)
+	if clusterPlan != nil && r.ClusterManifestWriterClusterRole == "" {
+		// The operator was never told which ClusterRole to bind. That grant recreates CRDs and
+		// cluster RBAC and has no namespace to confine it, so the answer is to say so and stop, not
+		// to guess a name.
+		res, gerr := r.gate(ctx, cr, "ClusterManifestRestoreUnavailable",
+			"this operator was not configured with --cluster-manifest-writer-cluster-role, so the "+
+				"cluster-scoped half of a ClusterRestore cannot run; omit spec.clusterResources to restore volumes only")
+		return nil, nil, nil, res, gerr
+	}
+	return rc, plans, clusterPlan, ctrl.Result{}, nil
+}
+
+// clusterManifestsResolveJobName names the SECOND, cluster-manifests listing Job for one
+// ClusterRestore — distinct from the volume listing's restoreResolveJobName so the two filtered
+// listings never share a Job name, and deterministic per owner so a restarted resolution re-adopts.
+func clusterManifestsResolveJobName(ownerID string) string {
+	return sanitizeDNSName(ownerID+"-cluster-manifests", restoreNamePrefixMax) + "-resolve"
 }
 
 // buildPlans intersects the selection with the resolved snapshots and sizes each plan

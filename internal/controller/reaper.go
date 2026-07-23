@@ -23,6 +23,7 @@ import (
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -73,6 +74,7 @@ type OrphanReaper struct {
 // +kubebuilder:rbac:groups="",resources=persistentvolumes,verbs=get;list;watch;patch;delete
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;delete
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;delete
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=rolebindings,verbs=get;list;watch;create;delete
 // +kubebuilder:rbac:groups=crystalbackup.io,resources=backups;restores;clusterrestores,verbs=get;list;watch
 
 // Start runs the sweep loop until ctx is cancelled. It satisfies manager.Runnable. It applies the
@@ -171,7 +173,139 @@ func (r *OrphanReaper) sweepOnce(ctx context.Context) error {
 	for i := range pvs.Items {
 		r.reapRestorePV(ctx, &pvs.Items[i], cutoff)
 	}
+	// Transient manifest-mover RoleBindings, swept on their own (much shorter) clock — see
+	// reapManifestBindings.
+	r.reapManifestBindings(ctx)
+	// And their cluster-scoped counterparts from a cluster-manifests capture (adr/0011 §1),
+	// which live in no namespace and so need a separate list.
+	r.reapClusterManifestBindings(ctx)
 	return nil
+}
+
+// reapManifestBindings sweeps tenant namespaces for transient manifest-mover RoleBindings whose
+// Job is gone or already finished.
+//
+// This is the ONLY automatic cleanup for those bindings. Everything else the reaper handles has
+// an ownerReference somewhere as a first line of defence; a RoleBinding in a tenant namespace
+// cannot have one, because its Job lives in the operator namespace and Kubernetes rejects
+// cross-namespace ownerReferences (spec/03-security-and-tenancy.md §5). If the operator dies
+// between "Job completed" and "delete RoleBinding", this sweep is what stops a
+// read-on-all-Secrets grant standing in someone's namespace indefinitely.
+//
+// It uses manifestBindingMinAge rather than the reaper's general MinAge. The general default is
+// calibrated for a temp clone PVC, where the cost of waiting is storage; here it is a live
+// privilege.
+func (r *OrphanReaper) reapManifestBindings(ctx context.Context) {
+	log := logf.FromContext(ctx).WithName("orphan-reaper")
+
+	var bindings rbacv1.RoleBindingList
+	// Cluster-wide on purpose: the bindings live in arbitrary tenant namespaces. The label
+	// selector keeps that from being a sweep of every RoleBinding in the cluster, and the
+	// operator-namespace label keeps one operator from reaping another's in-flight grant.
+	if err := r.List(ctx, &bindings,
+		client.MatchingLabels{
+			apiconst.LabelManagedBy:  apiconst.ManagedByValue,
+			apiconst.LabelMoverRole:  apiconst.MoverRoleManifest,
+			apiconst.LabelOperatorNS: r.OperatorNamespace,
+		}); err != nil {
+		log.Error(err, "listing transient manifest RoleBindings")
+		return
+	}
+
+	cutoff := time.Now().Add(-manifestBindingMinAge)
+	for i := range bindings.Items {
+		rb := &bindings.Items[i]
+		if rb.CreationTimestamp.After(cutoff) {
+			continue
+		}
+		jobName := rb.Labels[apiconst.LabelMoverJob]
+		if jobName == "" {
+			// No Job label: this predates the label or was hand-made. Refuse to guess — an
+			// erroneous delete here breaks an in-flight backup, and the operator can see it.
+			log.Info("transient manifest RoleBinding has no job label; leaving it alone",
+				"namespace", rb.Namespace, "name", rb.Name)
+			continue
+		}
+
+		var job batchv1.Job
+		err := r.Get(ctx, client.ObjectKey{Namespace: r.OperatorNamespace, Name: jobName}, &job)
+		switch {
+		case apierrors.IsNotFound(err):
+			// The Job is gone (TTL-collected or deleted) and the grant outlived it.
+		case err != nil:
+			log.Error(err, "checking the job behind a transient manifest RoleBinding",
+				"namespace", rb.Namespace, "name", rb.Name, "job", jobName)
+			continue
+		case job.Status.Succeeded == 0 && job.Status.Failed == 0:
+			// Still running: this grant is doing its job.
+			continue
+		}
+
+		if err := r.Delete(ctx, rb); err != nil && !apierrors.IsNotFound(err) {
+			log.Error(err, "deleting orphaned transient manifest RoleBinding",
+				"namespace", rb.Namespace, "name", rb.Name)
+			continue
+		}
+		// Logged at a level an operator will see. A binding reaching this path means the
+		// nominal teardown did not run — worth noticing, not routine housekeeping.
+		log.Info("reaped an orphaned manifest-mover RoleBinding; its nominal teardown did not run",
+			"namespace", rb.Namespace, "name", rb.Name, "job", jobName)
+	}
+}
+
+// reapClusterManifestBindings is reapManifestBindings for the cluster-scoped ClusterRoleBindings
+// a cluster-manifests capture creates. The logic is identical — spare a live grant, refuse to
+// guess without a Job label, ignore another operator's — but the objects are cluster-scoped, so
+// they carry no namespace and are listed as ClusterRoleBindings rather than RoleBindings. The
+// grant they hold is a bounded (enumerated) read of the whole cluster, so the same MinAge that
+// treats a leaked namespaced read as a security cost applies here.
+func (r *OrphanReaper) reapClusterManifestBindings(ctx context.Context) {
+	log := logf.FromContext(ctx).WithName("orphan-reaper")
+
+	var bindings rbacv1.ClusterRoleBindingList
+	if err := r.List(ctx, &bindings,
+		client.MatchingLabels{
+			apiconst.LabelManagedBy:  apiconst.ManagedByValue,
+			apiconst.LabelMoverRole:  apiconst.MoverRoleManifest,
+			apiconst.LabelOperatorNS: r.OperatorNamespace,
+		}); err != nil {
+		log.Error(err, "listing transient cluster-manifest ClusterRoleBindings")
+		return
+	}
+
+	cutoff := time.Now().Add(-manifestBindingMinAge)
+	for i := range bindings.Items {
+		crb := &bindings.Items[i]
+		if crb.CreationTimestamp.After(cutoff) {
+			continue
+		}
+		jobName := crb.Labels[apiconst.LabelMoverJob]
+		if jobName == "" {
+			log.Info("transient cluster-manifest ClusterRoleBinding has no job label; leaving it alone",
+				"name", crb.Name)
+			continue
+		}
+
+		var job batchv1.Job
+		err := r.Get(ctx, client.ObjectKey{Namespace: r.OperatorNamespace, Name: jobName}, &job)
+		switch {
+		case apierrors.IsNotFound(err):
+			// The Job is gone and the grant outlived it.
+		case err != nil:
+			log.Error(err, "checking the job behind a transient cluster-manifest ClusterRoleBinding",
+				"name", crb.Name, "job", jobName)
+			continue
+		case job.Status.Succeeded == 0 && job.Status.Failed == 0:
+			continue // still running
+		}
+
+		if err := r.Delete(ctx, crb); err != nil && !apierrors.IsNotFound(err) {
+			log.Error(err, "deleting orphaned transient cluster-manifest ClusterRoleBinding", "name", crb.Name)
+			continue
+		}
+		log.Info("reaped an orphaned cluster-manifest ClusterRoleBinding; its nominal teardown did not run",
+			"name", crb.Name, "job", jobName)
+	}
 }
 
 // reapRestorePV handles one labeled restore PV. A twin is deleted like any residue (the PV

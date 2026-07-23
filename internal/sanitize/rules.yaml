@@ -1,0 +1,159 @@
+# Sanitization ruleset — spec/04-manifest-backup.md §4, spec/adr/0007.
+#
+# THE RULESET IS DATA, NOT CODE. It is embedded in the binary with go:embed and its version
+# is recorded in the /manifests snapshot metadata, so a restore can always tell which rules
+# produced its input. Adding a rule here without a golden corpus case fails the build
+# (TestRuleCoverage) — a rule nobody exercises is a rule nobody has checked.
+#
+# ORDER MATTERS. Generic rules (match kind "*") run first, per-kind rules after. A later
+# rule's `keep` re-protects a path an earlier `remove` would have taken; this is the
+# mechanism that lets Service nodePorts survive (spec/adr/0007 "Ordered rule pipeline").
+#
+# The asymmetry this ruleset exists to express: strip what the SERVER owns, keep what the
+# USER meant. A clusterIP is an allocation the target cluster will redo; a nodePort is a
+# number someone's firewall rule depends on. They look identical to a generic "remove
+# server-populated fields" pass, which is exactly why kubectl-neat is the wrong tool here.
+version: "1"
+
+rules:
+  # --- Generic: all kinds -----------------------------------------------------------------
+  - id: S1
+    description: Server-owned identity and bookkeeping. Meaningless in another cluster, and
+      a stale resourceVersion makes an apply fail outright.
+    match: { kind: "*" }
+    ops:
+      - { op: remove, path: metadata.uid }
+      - { op: remove, path: metadata.resourceVersion }
+      - { op: remove, path: metadata.creationTimestamp }
+      - { op: remove, path: metadata.generation }
+      - { op: remove, path: metadata.selfLink }
+
+  - id: S2
+    description: Field-management bookkeeping. Large, churny, and it defeats dedup — an
+      otherwise unchanged object serialises differently on every backup.
+    match: { kind: "*" }
+    ops:
+      - { op: remove, path: metadata.managedFields }
+
+  - id: S3
+    description: Observed state. It is the controller's to rebuild, and restoring a stale
+      status would describe a world that no longer exists.
+    match: { kind: "*" }
+    ops:
+      - { op: remove, path: status }
+
+  - id: S4
+    description: kubectl's client-side-apply bookkeeping — a full copy of a previous
+      revision, so it doubles the object and churns constantly.
+    match: { kind: "*" }
+    ops:
+      - { op: removeAnnotation, path: kubectl.kubernetes.io/last-applied-configuration }
+
+  - id: S5
+    description: ownerReferences carry source-cluster UIDs. Restored objects are unowned by
+      design — a dangling ownerReference does not merely fail, it makes the garbage collector
+      delete what was just restored (spec/04-manifest-backup.md §4.3).
+    match: { kind: "*" }
+    ops:
+      - { op: remove, path: metadata.ownerReferences }
+
+  - id: S6
+    description: The namespace is reinjected at apply time from the restore target. Stripping
+      it is what makes a cross-namespace ClusterRestore possible at all.
+    match: { kind: "*" }
+    ops:
+      - { op: remove, path: metadata.namespace }
+
+  - id: S7
+    description: Drop annotation/label maps left empty by the rules above, so an object that
+      only ever had server annotations does not carry an empty map forever.
+    match: { kind: "*" }
+    ops:
+      - { op: pruneEmptyMap, path: metadata.annotations }
+      - { op: pruneEmptyMap, path: metadata.labels }
+
+  # --- Kind-specific ----------------------------------------------------------------------
+  - id: S10
+    description: Service. clusterIP/clusterIPs/ipFamilies are allocations from THIS cluster's
+      service CIDR and will not exist in another one. nodePort and healthCheckNodePort are
+      kept deliberately — they are user-visible contract (firewall rules, external LBs point
+      at them). Velero hides this behind --preserve-nodeports; here it is always on. A kept
+      nodePort may collide in the target, which surfaces as a per-resource apply failure
+      rather than a silent renumbering. The clusterIP "None" carve-out is not a special case
+      for its own sake — see the keepIfValue ops below.
+    match: { group: "", kind: Service }
+    ops:
+      # `clusterIP: None` is NOT an allocation, it is how a headless Service is declared, and
+      # stripping it restores the Service as a normal ClusterIP one with a virtual IP. That
+      # breaks per-pod DNS, so every StatefulSet governed by it comes back unable to resolve
+      # its own members — a clustered database restored into silent breakage, failing at the
+      # application layer long after the restore reported success. Same intent, both shapes:
+      # clusterIP: None and clusterIPs: ["None"].
+      - { op: keepIfValue, path: spec.clusterIP, value: "None" }
+      - { op: keepIfValue, path: spec.clusterIPs, value: "None" }
+      - { op: remove, path: spec.clusterIP }
+      - { op: remove, path: spec.clusterIPs }
+      - { op: remove, path: spec.ipFamilies }
+      - { op: keep, path: spec.healthCheckNodePort }
+      # Quoted: an unquoted [ opens a flow sequence in YAML.
+      - { op: keep, path: "spec.ports[].nodePort" }
+
+  - id: S11
+    description: PersistentVolumeClaim. The PV binding is cluster-local, so volumeName and the
+      binding annotations go. dataSource/dataSourceRef point at VolumeSnapshots excluded by
+      E9 — the data comes back through the volume restore path, not through the manifest.
+      storageClassName is KEPT because it is the input of storageClassMapping at restore.
+    match: { group: "", kind: PersistentVolumeClaim }
+    ops:
+      - { op: remove, path: spec.volumeName }
+      - { op: remove, path: spec.dataSource }
+      - { op: remove, path: spec.dataSourceRef }
+      - { op: removeAnnotation, path: pv.kubernetes.io/bind-completed }
+      - { op: removeAnnotation, path: pv.kubernetes.io/bound-by-controller }
+      - { op: removeAnnotation, path: volume.beta.kubernetes.io/storage-provisioner }
+      - { op: removeAnnotation, path: volume.kubernetes.io/storage-provisioner }
+      - { op: removeAnnotation, path: volume.kubernetes.io/selected-node }
+      - { op: removeFinalizer, path: kubernetes.io/pvc-protection }
+      - { op: keep, path: spec.storageClassName }
+      - { op: pruneEmptyMap, path: metadata.annotations }
+
+  - id: S12
+    description: Standalone Pod. nodeName pins it to a node that will not exist; priority is
+      derived by the API server from the kept priorityClassName; serviceAccount is the
+      deprecated alias of serviceAccountName. The kube-api-access-* projected volumes are
+      injected by the API server and carry a bound token — restoring them would fail on a
+      volume the target cluster wants to inject itself.
+    match: { group: "", kind: Pod }
+    ops:
+      - { op: remove, path: spec.nodeName }
+      - { op: remove, path: spec.priority }
+      - { op: remove, path: spec.serviceAccount }
+      - { op: removeProjectedTokenVolumes, path: kube-api-access-* }
+
+  - id: S13
+    description: Deployment revision bookkeeping, rewritten by the controller on every
+      rollout — pure churn against dedup.
+    match: { group: apps, kind: Deployment }
+    ops:
+      - { op: removeAnnotation, path: deployment.kubernetes.io/revision }
+      - { op: pruneEmptyMap, path: metadata.annotations }
+
+  # --- Cluster-scoped (spec/adr/0011 §1) --------------------------------------------------
+  - id: S20
+    description: PersistentVolume. claimRef binds to a PVC UID from the source cluster; the
+      UID and resourceVersion must go or the PV binds to nothing and stays Released. The rest
+      of claimRef (namespace/name) is kept so the PV can rebind to the restored PVC.
+    match: { group: "", kind: PersistentVolume }
+    ops:
+      - { op: remove, path: spec.claimRef.uid }
+      - { op: remove, path: spec.claimRef.resourceVersion }
+
+  - id: S21
+    description: ClusterRoleBinding subjects are kept verbatim. They ARE the point of a DR —
+      a binding without its subjects restores an empty grant, which looks successful and
+      grants nobody anything. Pinned as an explicit keep so no future generic rule can take
+      them.
+    match: { group: rbac.authorization.k8s.io, kind: ClusterRoleBinding }
+    ops:
+      - { op: keep, path: subjects }
+      - { op: keep, path: roleRef }

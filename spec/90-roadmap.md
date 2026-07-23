@@ -165,6 +165,41 @@ reconstitutes a deleted namespace from the shared repo.
 - [ ] e2e: full namespace backup, restore into a fresh namespace and into kind (different
       CIDR, different storage class) — workloads come back Ready.
 
+## M3.1 — Operator throughput & discovery scalability audit (post-M3 hardening)
+
+**Root-cause audit, NOT speculative fixes.** Surfaced by the M3 **full-suite** crucible run (all of
+m0–m3 driving the ONE shared "dr" repository): under sustained multi-namespace load the operator's
+reconcile throughput becomes the bottleneck — several specs time out **differently on every run**
+(m1 OOM crash-detection convergence `m1_reliability`, m1 discovery GC of a forgotten projection
+`m1_discovery`, m1 `restic check` `m1_repository`, m2 Recreate restore), and the whole `go test`
+overran its **60-min** budget (panic). This is **NOT an M3 regression and NOT a correctness bug** —
+M3 is functionally validated (unit + envtest, `make e2e` kind 25/25 with real mover Jobs, crucible
+**m3-only 11/11**, every M3 `It` green even inside the full suite). It is operator scalability under
+load, largely **pre-existing** (M1 discovery was already O(snapshots)) and orthogonal to M3; M3 only
+accelerates repo growth (a `kind=manifests` snapshot per backup ≈ doubles the snapshot count).
+
+- [ ] **Measure the real bottleneck FIRST** (the whole point — no fix on a guess): instrument
+      per-controller reconcile-queue depth, Job-spawn latency, `restic snapshots` wall-time vs repo
+      snapshot count, controller-runtime `MaxConcurrentReconciles`, operator CPU/mem, and discovery
+      cycle time on a large shared repo. Reproduce on the crucible with all specs → one repo.
+- [ ] From the data (do NOT pre-commit a design): evaluate throughput models — worker-count /
+      `MaxConcurrentReconciles` tuning, a pub/sub or fan-out-with-ack model for the mover Jobs,
+      backpressure, batching. Owner's steer: prefer a real audit over guessed fixes.
+- [ ] **Discovery scalability**: today `internal/restic.SnapshotsArgs()` runs
+      `snapshots --json --tag crystalbackup` — a FULL repo re-scan every cycle (O(snapshots), and M3
+      ~doubles the count). Evaluate an **incremental / cached inventory** instead of a full re-scan.
+      NOTE — `--no-lock` for discovery is deliberately deferred to **M4** (it lands WITH `prune`, the
+      first exclusive lock; until then discovery's non-exclusive `restic` lock contends with nobody,
+      so `--no-lock` buys nothing yet and is best done alongside the maintenance controller).
+- [ ] **Harden the crucible full suite to be reproducibly green**: the suite piles every spec's
+      snapshots into one repo with **no pruning between specs** (worse than steady-state prod, which
+      prunes via retention). Isolate/prune the repo between specs, tune the discovery interval
+      (crucible runs 1m), and raise the `go test` budget (60m was overrun). Already fixed THIS
+      session (committed on the M3 branch): `m3RunID` per-run-unique backup names, the
+      `m1ResticRestoreVerify` mover-egress label, `networkPolicy.apiServerPort=6443` for RKE2/Canal,
+      and the residual-object / namespace-terminating cleanup-timeout bumps (2m→5m).
+- [ ] Ship as a patch (0.3.z) once the audit lands a real fix or documents the scaling limits.
+
 ## M4 — Consistency hooks, verification & maintenance (R16, R17)
 
 - [ ] Pre/post exec hooks (pod selector, container, timeout, onError), freeze window =

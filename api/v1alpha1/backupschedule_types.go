@@ -59,6 +59,10 @@ type BackupScheduleSpec struct {
 	// +kubebuilder:default=true
 	IncludeManifests *bool `json:"includeManifests,omitempty"`
 
+	// manifestOptions tunes what the manifest dump captures (03-security-and-tenancy.md §10).
+	// +optional
+	ManifestOptions ManifestOptions `json:"manifestOptions,omitempty"`
+
 	// hooks are exec hooks around snapshotting (R16).
 	// +optional
 	Hooks HooksSpec `json:"hooks,omitempty"`

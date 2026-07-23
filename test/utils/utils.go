@@ -19,10 +19,12 @@ package utils
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2" // nolint:revive,staticcheck
 )
@@ -33,25 +35,61 @@ const (
 
 	defaultKindBinary  = "kind"
 	defaultKindCluster = "kind"
+
+	// defaultCommandTimeout bounds any single subprocess the e2e helpers spawn. It is the
+	// safety net for the "orphan kubectl" hang: a wedged child — e.g. a `kubectl delete`
+	// blocked on an operator finalizer, or any call stuck on an unresponsive API server — is
+	// SIGKILLed at the deadline and fails its own step with a diagnosable error, instead of
+	// silently eating the whole suite budget (a 30-minute `go test -timeout` panic). It sits
+	// comfortably above the longest in-band wait the suite issues through Run
+	// (`kubectl rollout status --timeout=3m`); genuinely longer operations (image build/load,
+	// cert-manager rollout) pass their own larger budget to RunWithTimeout.
+	defaultCommandTimeout = 5 * time.Minute
+
+	// longCommandTimeout covers the heavy setup operations that legitimately outrun the
+	// default: building the manager image and loading it into Kind.
+	longCommandTimeout = 15 * time.Minute
 )
 
 func warnError(err error) {
 	_, _ = fmt.Fprintf(GinkgoWriter, "warning: %v\n", err)
 }
 
-// Run executes the provided command within this context
+// Run executes the provided command bounded by defaultCommandTimeout.
 func Run(cmd *exec.Cmd) (string, error) {
-	dir, _ := GetProjectDir()
-	cmd.Dir = dir
+	return RunWithTimeout(cmd, defaultCommandTimeout)
+}
 
-	if err := os.Chdir(cmd.Dir); err != nil {
+// RunWithTimeout executes cmd from the project root with a hard per-command deadline. The
+// caller's command is rebound to a context.WithTimeout via exec.CommandContext, so a wedged
+// child is SIGKILLed at the deadline (turning an "orphan kubectl" hang into a diagnosable
+// step failure) rather than blocking the suite forever. Callers only ever set Args and Stdin,
+// both of which are preserved. Use a timeout larger than defaultCommandTimeout for operations
+// that legitimately run long (image build/load, cert-manager rollout).
+func RunWithTimeout(cmd *exec.Cmd, timeout time.Duration) (string, error) {
+	dir, _ := GetProjectDir()
+
+	if err := os.Chdir(dir); err != nil {
 		_, _ = fmt.Fprintf(GinkgoWriter, "chdir dir: %q\n", err)
 	}
 
-	cmd.Env = append(os.Environ(), "GO111MODULE=on")
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	// Rebind to the deadline context. exec.CommandContext resolves the binary from Args[0]
+	// exactly as the original exec.Command did, and SIGKILLs the child when ctx expires.
+	run := exec.CommandContext(ctx, cmd.Args[0], cmd.Args[1:]...)
+	run.Dir = dir
+	run.Stdin = cmd.Stdin
+	run.Env = append(os.Environ(), "GO111MODULE=on")
+
 	command := strings.Join(cmd.Args, " ")
 	_, _ = fmt.Fprintf(GinkgoWriter, "running: %q\n", command)
-	output, err := cmd.CombinedOutput()
+	output, err := run.CombinedOutput()
+	if ctx.Err() == context.DeadlineExceeded {
+		return string(output), fmt.Errorf("%q timed out after %s and was killed (output: %q): %w",
+			command, timeout, string(output), ctx.Err())
+	}
 	if err != nil {
 		return string(output), fmt.Errorf("%q failed with error %q: %w", command, string(output), err)
 	}
@@ -89,14 +127,15 @@ func InstallCertManager() error {
 		return err
 	}
 	// Wait for cert-manager-webhook to be ready, which can take time if cert-manager
-	// was re-installed after uninstalling on a cluster.
+	// was re-installed after uninstalling on a cluster. The command's own --timeout is 5m, so
+	// give the surrounding deadline headroom past it rather than racing the default.
 	cmd = exec.Command("kubectl", "wait", "deployment.apps/cert-manager-webhook",
 		"--for", "condition=Available",
 		"--namespace", "cert-manager",
 		"--timeout", "5m",
 	)
 
-	_, err := Run(cmd)
+	_, err := RunWithTimeout(cmd, 6*time.Minute)
 	return err
 }
 
@@ -145,7 +184,8 @@ func LoadImageToKindClusterWithName(name string) error {
 		kindBinary = v
 	}
 	cmd := exec.Command(kindBinary, kindOptions...)
-	_, err := Run(cmd)
+	// Loading a freshly built image into Kind can take several minutes; give it headroom.
+	_, err := RunWithTimeout(cmd, longCommandTimeout)
 	return err
 }
 

@@ -20,6 +20,7 @@ limitations under the License.
 package e2e
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -359,7 +360,12 @@ func serviceAccountToken(ns, serviceAccount string) (string, error) {
 
 	var out string
 	verifyTokenCreation := func(g Gomega) {
-		cmd := exec.Command("kubectl", "create", "--raw", fmt.Sprintf(
+		// Bound this call: it does not go through utils.Run, so without a deadline a wedged
+		// kubectl would block the enclosing Eventually (which cannot preempt a stuck syscall)
+		// and stall the whole suite.
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, "kubectl", "create", "--raw", fmt.Sprintf(
 			"/api/v1/namespaces/%s/serviceaccounts/%s/token", ns, serviceAccount,
 		), "-f", tokenRequestFile)
 		output, err := cmd.CombinedOutput()

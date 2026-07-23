@@ -57,6 +57,9 @@ ${KUBECTL} -n default rollout status statefulset/csi-hostpathplugin --timeout=24
 echo "==> VolumeSnapshotClass for hostpath.csi.k8s.io"
 ${KUBECTL} apply -f "${SCRIPT_DIR}/csi-hostpath-snapshotclass.yaml"
 
+echo "==> StorageClass csi-hostpath-sc (deploy.sh does not create it; data-path PVCs need it)"
+${KUBECTL} apply -f "${SCRIPT_DIR}/csi-hostpath-storageclass.yaml"
+
 echo "==> SeaweedFS S3 backend"
 ${KUBECTL} apply -f "${SCRIPT_DIR}/seaweedfs.yaml"
 ${KUBECTL} -n crystalbackup-e2e rollout status deploy/seaweedfs --timeout=240s

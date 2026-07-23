@@ -420,6 +420,7 @@ spec:
   volumes:
     - names: ["uploads"]
       include: ["images/2026/**"]      # a single folder of a single PVC
+  dryRun: false                        # true ⇒ plan only, nothing persisted (§ below)
   confirmation: "c-team-x"             # required iff the op modifies existing objects
   # source and mode are IMMUTABLE after creation (CEL); confirmation and the selection
   # lists stay mutable. `time` accepts "latest" or an RFC3339 instant (a zone-less
@@ -429,8 +430,25 @@ status:
   restoredResources: 0
   restoredVolumes: 1
   restoredBytes: 734003200
+  resources:                           # per-resource detail; shape + caps in 04 §5.4
+    failedCount: 0
+    truncated: false
+    entries: []                        # non-trivial outcomes only
   conditions: [...]
 ```
+
+### Dry run (`spec.dryRun`)
+
+`dryRun: true` runs the full manifest pipeline — ordering, selection, storageClass mapping,
+mode resolution — with **server-side dry-run applies**, persists nothing, and writes the
+plan to `status.resources` using the same outcome vocabulary as a real run (the *planned*
+action). It is a **top-level** field on `Restore`/`ClusterRestore`, not nested under a
+`manifests` block: there is one selection model and one mode for both halves of a restore,
+and nesting the flag would imply a per-half switch that does not exist. The volume half has
+no dry run in v1 and ignores it.
+
+Detail — outcome vocabulary, the 20-paths/100-entries caps and `truncated` — lives in
+[04-manifest-backup.md §5.4](04-manifest-backup.md).
 
 ### BackupExternalSync (namespaced, user) — secondary-location replication (R28)
 
@@ -571,12 +589,13 @@ volumes:                             # a PVC is restored iff ANY item matches
     targetPath: "/"
 ```
 
-Defaults: **both `resources` and `volumes` omitted ⇒ whole namespace**. A present field
-(even `[]`) restores only what it lists (`[]` ⇒ nothing of that kind). Within a
-`resources[]` item the `selector` **and** `include` select and `exclude` removes — an item
-reads "these kinds, minus these"; the backup-time default exclusions
-([04-manifest-backup.md §2.2](04-manifest-backup.md)) already applied at capture and
-cannot be re-included here. When several
+Defaults: each list defaults **independently** — an omitted field selects everything of
+its kind, so **both omitted ⇒ whole namespace** is the common case of that rule rather
+than a special one. A present field (even `[]`) restores only what it lists (`[]` ⇒
+nothing of that kind). Within a `resources[]` item the `selector` **and** `include`
+select and `exclude` removes — an item reads "these kinds, minus these"; the backup-time
+default exclusions ([04-manifest-backup.md §2.2](04-manifest-backup.md)) already applied
+at capture and cannot be re-included here. When several
 `volumes[]` items match the same PVC, the **first matching item wins** (its
 `include`/`exclude`/`targetPath` apply) — one PVC is restored by exactly one mover pass.
 On `Restore.spec.source` and `ClusterRestore.spec.source`, `backup` and `time` are
@@ -641,11 +660,7 @@ path; not safety-critical, so `failurePolicy: Ignore` there is acceptable too.
 
 ## Reserved / pending fields
 
-- `Restore`/`ClusterRestore` `manifests`-level `dryRun` + `status` diff report (owned by
-  [04-manifest-backup.md §5](04-manifest-backup.md), M3).
 - Per-item `mode` override on `resources[]`/`volumes[]` (deferred).
-- `BackupSchedule`/`ClusterBackupSchedule` `manifestOptions.excludeSecretData`
-  ([03-security-and-tenancy.md §10](03-security-and-tenancy.md), M3).
 - **Mover placement on `[Cluster]BackupLocation`** (`spec.jobAffinity` = core `nodeAffinity` +
   `tolerations`, reused verbatim from `corev1`) to steer mover Jobs near the S3 endpoint —
   bandwidth, S3 IO cost, or network segmentation where S3 is reachable only from some nodes.

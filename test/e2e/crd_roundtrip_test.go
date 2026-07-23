@@ -259,7 +259,9 @@ var _ = Describe("CRD installation & round-trip (M0)", Ordered, func() {
 			if c.namespaced {
 				continue
 			}
-			_, _ = kubectl("delete", c.resource+".crystalbackup.io", c.name, "--ignore-not-found")
+			// --wait=false: if an operator from another (randomized-order) container is still
+			// deployed, these CRs carry teardown finalizers; a default delete would block.
+			_, _ = kubectl("delete", c.resource+".crystalbackup.io", c.name, "--ignore-not-found", "--wait=false")
 		}
 	})
 
@@ -286,7 +288,10 @@ var _ = Describe("CRD installation & round-trip (M0)", Ordered, func() {
 		Expect(strings.TrimSpace(uid)).NotTo(BeEmpty(), "%s has no UID after apply", c.kind)
 
 		By("deleting the " + c.kind)
-		delArgs := []string{"delete", c.resource + ".crystalbackup.io", c.name, "--ignore-not-found"}
+		// --wait=false: an operator may be running (Ginkgo randomizes container order), in
+		// which case these CRs carry teardown finalizers and a default delete would block on
+		// the controller. The round-trip only asserts the delete is accepted, not drained.
+		delArgs := []string{"delete", c.resource + ".crystalbackup.io", c.name, "--ignore-not-found", "--wait=false"}
 		if c.namespaced {
 			delArgs = append(delArgs, "-n", crdTestNamespace)
 		}

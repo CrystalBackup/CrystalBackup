@@ -67,6 +67,16 @@ func m1ResticExec(locationName string, args ...string) string {
 			BackoffLimit:          &backoff,
 			ActiveDeadlineSeconds: &deadline,
 			Template: corev1.PodTemplateSpec{
+				// The oracle talks to object storage exactly like a data mover, so it needs the
+				// mover's egress. Under M3's default-deny NetworkPolicy (03-security §7), a pod in
+				// the operator namespace reaches S3 ONLY if it matches the mover-egress policy,
+				// which selects app.kubernetes.io/managed-by=crystal-backup (chart
+				// networkPolicy.moverManagedByValue). Without this label the Job is default-denied
+				// and restic times out dialing the S3 endpoint. This is NOT a crystalbackup.io/*
+				// label, so m1HasCrystalLabel still excludes the oracle from the mover-Job predicates.
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{"app.kubernetes.io/managed-by": "crystal-backup"},
+				},
 				Spec: corev1.PodSpec{
 					RestartPolicy: corev1.RestartPolicyNever,
 					Containers: []corev1.Container{{

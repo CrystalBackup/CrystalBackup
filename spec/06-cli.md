@@ -178,7 +178,7 @@ crystalctl restore create
     [--mode Recreate|Overwrite]
     [--resources <glob>]... | --data-only
     [--volume <name>]... [--volume-include <name>=<glob>]... [--volume-exclude <name>=<glob>]... [--target-path <name>=<path>]... | --manifests-only
-    [--confirm <namespace>] [--wait] [--dry-run]
+    [--confirm <namespace>] [--wait] [--dry-run] [--plan]
 crystalctl restore status [<restoreName>]
 ```
 
@@ -204,8 +204,16 @@ fresh namespace (non-destructive).
   namespace (own namespace for `Restore`, `--target-namespace` for `ClusterRestore`) and
   refuses to create the CR otherwise (exit 5), printing the expected value; the admission
   policy remains the authoritative gate (VAP, [adr/0010](adr/0010-admission-vap-first.md); the
-  `AwaitingConfirmation` phase exists for CRs created via kubectl/GitOps). `--dry-run` prints the CR YAML; the server-side manifest
-  dry-run diff (`spec.…manifests.dryRun` + `status`) is a reserved M3 capability
+  `AwaitingConfirmation` phase exists for CRs created via kubectl/GitOps).
+
+  **Two different dry runs, deliberately kept apart.** `--dry-run` is the global CLI
+  convention of §1: print the CR YAML instead of applying it — a *client-side* affordance
+  that never reaches the cluster. The *server-side* plan is the CR's own field, set with
+  `--plan`, which creates a real `Restore` with `spec.dryRun: true`; it runs the full
+  pipeline with server-side dry-run applies, persists nothing, and reports the plan in
+  `status.resources` ([04-manifest-backup.md §5.4](04-manifest-backup.md), landed M3).
+  Overloading one flag with both would be a trap: `--dry-run` promises "nothing happens",
+  and the server-side plan does create an object
   ([02-api.md](02-api.md), [04-manifest-backup.md](04-manifest-backup.md)).
 
 ### 4.3 `crystalctl admin erase` and `admin decommission` (CLI in M7; wraps the `ClusterErasure` CR delivered in M5, R21)
