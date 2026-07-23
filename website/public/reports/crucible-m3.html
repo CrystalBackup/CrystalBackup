@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Crystal Backup — Crucible M3 Acceptance Report</title>
+<style>
+  :root {
+    --paper: #f6f8f9;
+    --panel: #ffffff;
+    --ink: #0f1620;
+    --muted: #59636e;
+    --faint: #8b96a1;
+    --line: #e2e7ec;
+    --line-strong: #d0d8de;
+    --steel: #35607a;        /* structural accent: infra / k8s / links */
+    --steel-soft: #eaf1f5;
+    --pass: #0f9d63;         /* the one bold place: success / verdict */
+    --pass-soft: #e6f5ed;
+    --skip: #8a97a3;         /* label-gated, not a failure */
+    --skip-soft: #eef1f4;
+    --amber: #b6791f;
+    --tag-product: #2a5db0;
+    --tag-product-soft: #e9eff9;
+    --tag-test: #5f6b78;
+    --tag-test-soft: #edf0f3;
+    --shadow: 0 1px 2px rgba(15,22,32,.04), 0 8px 24px rgba(15,22,32,.05);
+
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper: #0c1116;
+      --panel: #121a22;
+      --ink: #e8eef3;
+      --muted: #97a3ae;
+      --faint: #6c7883;
+      --line: #212c35;
+      --line-strong: #2c3a45;
+      --steel: #74a7c8;
+      --steel-soft: #16242e;
+      --pass: #37d18b;
+      --pass-soft: #10241b;
+      --skip: #6c7883;
+      --skip-soft: #171f27;
+      --amber: #d6a24e;
+      --tag-product: #7aa5e8;
+      --tag-product-soft: #16202f;
+      --tag-test: #97a3ae;
+      --tag-test-soft: #1a222a;
+      --shadow: 0 1px 2px rgba(0,0,0,.3), 0 10px 30px rgba(0,0,0,.35);
+    }
+  }
+  :root[data-theme="light"] {
+    --paper: #f6f8f9; --panel: #ffffff; --ink: #0f1620; --muted: #59636e; --faint: #8b96a1;
+    --line: #e2e7ec; --line-strong: #d0d8de; --steel: #35607a; --steel-soft: #eaf1f5;
+    --pass: #0f9d63; --pass-soft: #e6f5ed; --skip: #8a97a3; --skip-soft: #eef1f4;
+    --tag-product: #2a5db0; --tag-product-soft: #e9eff9; --tag-test: #5f6b78; --tag-test-soft: #edf0f3;
+    --shadow: 0 1px 2px rgba(15,22,32,.04), 0 8px 24px rgba(15,22,32,.05);
+  }
+  :root[data-theme="dark"] {
+    --paper: #0c1116; --panel: #121a22; --ink: #e8eef3; --muted: #97a3ae; --faint: #6c7883;
+    --line: #212c35; --line-strong: #2c3a45; --steel: #74a7c8; --steel-soft: #16242e;
+    --pass: #37d18b; --pass-soft: #10241b; --skip: #6c7883; --skip-soft: #171f27;
+    --tag-product: #7aa5e8; --tag-product-soft: #16202f; --tag-test: #97a3ae; --tag-test-soft: #1a222a;
+    --shadow: 0 1px 2px rgba(0,0,0,.3), 0 10px 30px rgba(0,0,0,.35);
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: var(--sans);
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+  .wrap { max-width: 860px; margin: 0 auto; padding: clamp(28px, 5vw, 64px) clamp(18px, 4vw, 40px) 80px; }
+
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 12px;
+    letter-spacing: .14em;
+    text-transform: uppercase;
+    color: var(--steel);
+    margin: 0;
+  }
+
+  /* ── Masthead ─────────────────────────────────────────── */
+  .masthead { border-bottom: 1px solid var(--line); padding-bottom: 26px; }
+  h1 {
+    font-size: clamp(28px, 4.6vw, 40px);
+    line-height: 1.08;
+    letter-spacing: -.02em;
+    text-wrap: balance;
+    margin: 12px 0 8px;
+    font-weight: 680;
+  }
+  .lede { color: var(--muted); font-size: 17px; margin: 0; max-width: 60ch; }
+  .meta {
+    font-family: var(--mono);
+    font-size: 12.5px;
+    color: var(--faint);
+    margin-top: 18px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 18px;
+  }
+  .meta b { color: var(--muted); font-weight: 500; }
+
+  /* ── Verdict ──────────────────────────────────────────── */
+  .verdict {
+    margin: 30px 0;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-left: 3px solid var(--pass);
+    border-radius: 12px;
+    box-shadow: var(--shadow);
+    padding: 22px clamp(18px, 3vw, 28px);
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 20px 26px;
+    align-items: center;
+  }
+  .verdict-badge {
+    display: inline-flex; align-items: center; gap: 9px;
+    font-family: var(--mono); font-weight: 600; font-size: 15px;
+    color: var(--pass);
+    background: var(--pass-soft);
+    border: 1px solid color-mix(in srgb, var(--pass) 28%, transparent);
+    padding: 8px 14px; border-radius: 999px; white-space: nowrap;
+  }
+  .verdict-badge .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--pass); box-shadow: 0 0 0 4px color-mix(in srgb, var(--pass) 18%, transparent); }
+  .metrics { display: flex; flex-wrap: wrap; gap: 10px 30px; align-items: baseline; }
+  .metric { display: flex; flex-direction: column; }
+  .metric .n { font-family: var(--mono); font-size: 26px; font-weight: 620; letter-spacing: -.02em; font-variant-numeric: tabular-nums; line-height: 1; }
+  .metric .n.pass { color: var(--pass); }
+  .metric .n.zero { color: var(--ink); }
+  .metric .n.skip { color: var(--skip); }
+  .metric .k { font-family: var(--mono); font-size: 11px; text-transform: uppercase; letter-spacing: .1em; color: var(--faint); margin-top: 5px; }
+
+  /* ── Prose ────────────────────────────────────────────── */
+  .context { color: var(--muted); font-size: 15.5px; max-width: 66ch; }
+  .context b { color: var(--ink); font-weight: 600; }
+  code { font-family: var(--mono); font-size: .89em; background: var(--steel-soft); color: var(--ink); padding: .1em .38em; border-radius: 5px; }
+
+  h2 {
+    font-size: 13px; font-family: var(--mono); text-transform: uppercase; letter-spacing: .12em;
+    color: var(--steel); font-weight: 600;
+    margin: 0 0 2px;
+  }
+  .group { margin-top: 40px; }
+  .group-head { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; border-bottom: 1px solid var(--line); padding-bottom: 10px; }
+  .group-head .count { font-family: var(--mono); font-size: 12px; color: var(--faint); }
+  .group-note { color: var(--muted); font-size: 13.5px; margin: 8px 0 4px; }
+
+  /* ── Spec rows ────────────────────────────────────────── */
+  ul.specs { list-style: none; margin: 6px 0 0; padding: 0; }
+  ul.specs > li { display: grid; grid-template-columns: 20px 1fr auto; gap: 3px 14px; padding: 14px 0; border-bottom: 1px solid var(--line); }
+  ul.specs > li:last-child { border-bottom: 0; }
+  .check { grid-row: span 2; margin-top: 3px; color: var(--pass); }
+  .check svg { display: block; }
+  .spec-name { font-weight: 560; font-size: 15px; color: var(--ink); }
+  .spec-time { font-family: var(--mono); font-size: 12.5px; color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; grid-row: span 2; align-self: start; margin-top: 2px; }
+  .spec-proves { grid-column: 2 / 3; color: var(--muted); font-size: 13.5px; margin: 0; max-width: 62ch; }
+  .fixflag {
+    display: inline-block; font-family: var(--mono); font-size: 10.5px; letter-spacing: .04em;
+    color: var(--steel); background: var(--steel-soft);
+    border: 1px solid color-mix(in srgb, var(--steel) 22%, transparent);
+    padding: 1px 7px; border-radius: 999px; margin-left: 8px; vertical-align: 1.5px; white-space: nowrap;
+  }
+
+  /* ── Terse preflight rows (infra / m0): self-evident names, no "proves" subtext ─ */
+  ul.specs.terse > li { grid-template-columns: 20px 1fr auto; align-items: baseline; padding: 11px 0; }
+  ul.specs.terse .check, ul.specs.terse .spec-time, ul.specs.terse .skip-mark { grid-row: auto; margin-top: 0; }
+  ul.specs.terse .spec-name { font-weight: 520; }
+  .skip-mark { color: var(--skip); display: inline-flex; }
+  .skip-mark svg { display: block; }
+  li.skipped .spec-name { color: var(--muted); }
+  .spec-time.skip { color: var(--skip); }
+
+  /* ── Caught / fixes ───────────────────────────────────── */
+  .caught { margin-top: 48px; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: clamp(20px, 3vw, 30px); box-shadow: var(--shadow); }
+  .wave { font-family: var(--mono); font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: var(--faint); margin: 22px 0 2px; }
+  .fixes { display: grid; gap: 12px; margin-top: 12px; }
+  @media (min-width: 620px) { .fixes { grid-template-columns: 1fr 1fr 1fr; } }
+  .fix { border: 1px solid var(--line); border-radius: 10px; padding: 15px 16px; background: var(--paper); }
+  .fix .tag { display: inline-block; font-family: var(--mono); font-size: 10.5px; letter-spacing: .04em; text-transform: uppercase; padding: 2px 8px; border-radius: 999px; margin-bottom: 9px; }
+  .fix.product .tag { color: var(--tag-product); background: var(--tag-product-soft); }
+  .fix.test .tag { color: var(--tag-test); background: var(--tag-test-soft); }
+  .fix h3 { font-size: 14px; margin: 0 0 5px; font-weight: 620; }
+  .fix p { margin: 0; font-size: 13px; color: var(--muted); }
+  .fix .sha { font-family: var(--mono); font-size: 11.5px; color: var(--faint); margin-top: 9px; }
+
+  .foot { margin-top: 40px; padding-top: 20px; border-top: 1px solid var(--line); color: var(--faint); font-size: 13px; }
+  .foot code { background: var(--skip-soft); }
+</style>
+
+</head>
+<body>
+<div class="wrap">
+  <header class="masthead">
+    <p class="eyebrow">Crystal Backup · Crucible acceptance</p>
+    <h1>Milestone&nbsp;M3 — Manifests &amp; cluster-scoped DR</h1>
+    <p class="lede">Real-conditions, end-to-end validation of namespace-manifest backup/restore and cluster-scoped disaster recovery against a live RKE2 / Ceph cluster — the sanitization engine, selective restore, the opt-in cluster-resource boundary and the R23 confirmation gate, on real infrastructure.</p>
+    <div class="meta">
+      <span><b>Run</b> acceptance gate · label <code>m3</code></span>
+      <span><b>Date</b> 2026-07-21</span>
+      <span><b>Suite</b> ginkgo · m3</span>
+      <span><b>Duration</b> 4m50s</span>
+    </div>
+  </header>
+
+  <section class="verdict" aria-label="Verdict">
+    <span class="verdict-badge"><span class="dot"></span>PASS · gate met</span>
+    <div class="metrics">
+      <div class="metric"><span class="n pass">11</span><span class="k">Passed</span></div>
+      <div class="metric"><span class="n zero">0</span><span class="k">Failed</span></div>
+      <div class="metric"><span class="n skip">32</span><span class="k">Skipped</span></div>
+      <div class="metric"><span class="n zero" style="font-size:20px">4m50s</span><span class="k">Wall clock</span></div>
+    </div>
+  </section>
+
+  <p class="context">
+    This is the <b>M3 acceptance gate</b> — the eleven new criteria run under the <code>m3</code> label against a live cluster. As with every crucible run, it uses an <b>independent restic oracle</b> (a throwaway Job running the plain <code>restic</code> CLI against the same S3 repository, wrapped-DEK password and credentials the operator uses), so a controller that both <b>writes and reports the same wrong thing</b> cannot make a check pass. M3 landed two new capabilities: <b>namespace-manifest backup &amp; restore</b> (the discovery-driven dump, the sanitization engine, and mode-aware apply — Recreate vs SSA-Overwrite) and <b>cluster-scoped DR</b> (cluster-manifest capture with opt-in, selective restore, and the unconditional R23 gate). The <b>32 skipped</b> lines are the platform / M0 / M1 / M2 checks that belong to other labels and did not run under this filter — a skip is not a failure; those milestones keep their own green reports and non-regression coverage.
+  </p>
+
+  <section class="group">
+    <div class="group-head"><h2>M3 · Namespace manifests &amp; DR bootstrap</h2><span class="count">6 / 6</span></div>
+    <p class="group-note">The first half of M3: capture a namespace&rsquo;s Kubernetes objects (sanitized) alongside its PVC data, and restore them — reconstituting a namespace, healing config drift under both modes, and honouring the R23 confirmation gate.</p>
+    <ul class="specs">
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">Bootstraps DR into a created namespace, remaps the storage class, and a workload runs on the restored volume</span>
+        <span class="spec-time">1m43.4s</span>
+        <p class="spec-proves">The namespace-DR exit criterion: an absent namespace is reconstituted from the repository alone — manifests <b>and</b> PVC data — into a freshly created target; the source <code>storageClassName</code> is remapped to the target cluster&rsquo;s class, and a Deployment mounting the restored PVC reaches Running.</p>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">Captures the namespace manifests: run Completes, child Backup + clusterResourcesCaptured set, kind=manifests snapshot present</span>
+        <span class="spec-time">53.7s</span>
+        <p class="spec-proves">The manifests phase dumps the namespace&rsquo;s discovered resources through the sanitization engine into a <code>kind=manifests</code> restic snapshot; the run reaches Completed and the child Backup&rsquo;s status records the capture — the oracle confirms the tagged snapshot exists in the repository.</p>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">Overwrite-restores the drifted ConfigMap via SSA, keeping target-only extras (R23 parks without a confirmation)</span>
+        <span class="spec-time">15.6s</span>
+        <p class="spec-proves">Without <code>spec.confirmation</code> the restore parks (R23); once confirmed, Overwrite applies the backed-up manifests with <b>server-side apply</b> — the drifted ConfigMap is healed to the backup, and a key present only in the target but absent from the backup is <b>kept</b>.</p>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">Recreate-restores the ConfigMap to an EXACT match (target-only extra removed)</span>
+        <span class="spec-time">15.4s</span>
+        <p class="spec-proves">Recreate deletes the selected resource and re-creates it from the backup — the ConfigMap matches the snapshot exactly and the target-only key is gone, the manifest analogue of <code>restic restore --delete</code>.</p>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">Restores the workload manifests: Deployment reaches Ready, nodePort preserved, clusterIP freshly allocated</span>
+        <span class="spec-time">15.5s</span>
+        <p class="spec-proves">A restored Deployment rolls out to Ready; the sanitization engine preserves a stable field (the Service <code>nodePort</code>) while dropping a cluster-assigned one (<code>clusterIP</code>), which the apiserver re-allocates — restore-portability without carrying stale cluster state.</p>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">Rejects a WRONG confirmation at admission (R23 gate)</span>
+        <span class="spec-time">600ms</span>
+        <p class="spec-proves">A destructive restore whose <code>spec.confirmation</code> does not equal the target namespace is refused at admission — the R23 gate is unconditional, not a controller-time afterthought.</p>
+      </li>
+    </ul>
+  </section>
+
+  <section class="group">
+    <div class="group-head"><h2>M3 · Cluster-scoped capture &amp; selective restore</h2><span class="count">5 / 5</span></div>
+    <p class="group-note">The second half: capture cluster-scoped objects (CRDs, StorageClasses, ClusterRoles…) as their own snapshot, and restore them <b>selectively and opt-in</b> — nothing cluster-wide moves unless explicitly asked, gated by R23 and admin-only RBAC.</p>
+    <ul class="specs">
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">Captures a kind=cluster-manifests snapshot; clusterResourcesCaptured is set</span>
+        <span class="spec-time">53.6s</span>
+        <p class="spec-proves">A cluster-scoped backup dumps the allow-listed cluster resources into a distinct <code>kind=cluster-manifests</code> restic snapshot and stamps <code>clusterResourcesCaptured</code> on status — the oracle confirms the tagged snapshot in the repository.</p>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">Selectively restores ONLY the included CRD + StorageClass, leaving the un-included ClusterRole absent</span>
+        <span class="spec-time">20.7s</span>
+        <p class="spec-proves">A cluster-scoped restore with an explicit selection applies exactly the included CRD and StorageClass; a ClusterRole present in the snapshot but outside the selection is <b>never</b> created — selection is a strict allow-list, not a best-effort filter.</p>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">Restores NOTHING cluster-scoped when clusterResources is omitted (opt-in default)</span>
+        <span class="spec-time">10.4s</span>
+        <p class="spec-proves">Omitting the cluster-resource selection restores <b>nothing</b> cluster-wide — the blast radius of cluster-scoped objects is opt-in by construction, so a namespace restore can never silently mutate shared cluster state.</p>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">Denies a destructive cluster-scoped restore with a WRONG confirmation (R23 gate)</span>
+        <span class="spec-time">0s</span>
+        <p class="spec-proves">The R23 confirmation gate applies to the cluster-scoped path too — a destructive ClusterRestore with a mismatched confirmation is refused, closing the gate on the highest-blast-radius operation in the system.</p>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">Denies a cluster-scoped restore to a NON-admin identity (RBAC)</span>
+        <span class="spec-time">700ms</span>
+        <p class="spec-proves">Cluster-scoped restore is admin-only: a non-admin identity attempting a ClusterRestore is denied by RBAC — the tenancy boundary holds even for a caller who authors a valid spec.</p>
+      </li>
+    </ul>
+  </section>
+
+  <section class="caught">
+    <p class="eyebrow">What real RKE2 / Canal surfaced</p>
+    <h2 style="color:var(--ink); text-transform:none; font-family:var(--sans); font-size:19px; letter-spacing:-.01em; margin:8px 0 2px;">Three findings from live infrastructure that kind couldn&rsquo;t — harness &amp; ops, not product defects</h2>
+    <p class="context" style="margin-top:6px;">M3&rsquo;s functional code passed envtest and the <code>make e2e</code> kind suite (25/25) before it ever reached the cluster. What only a real RKE2 / Canal / Ceph cluster surfaced was operational: the interaction of M3&rsquo;s new default-deny NetworkPolicies with a CNI that enforces egress <b>after</b> Service DNAT, and shared-repository hermeticity under a re-used cluster. None were correctness defects in the product — each is a harness or deployment-configuration adjustment, captured here so an RKE2 operator hits none of them.</p>
+
+    <div class="fixes">
+      <div class="fix test">
+        <span class="tag">ops · CNI</span>
+        <h3>Canal evaluates egress post-DNAT</h3>
+        <p>The manifest-mover&rsquo;s NetworkPolicy must reach the API server. On RKE2, the <code>kubernetes</code> Service (<code>10.43.0.1:443</code>) DNATs to the masters on <code>:6443</code>, and Canal evaluates the egress rule <b>after</b> DNAT — so the allow must name the post-DNAT port. Deploy with <code>networkPolicy.apiServerPort=6443</code> on RKE2-class clusters.</p>
+      </div>
+      <div class="fix test">
+        <span class="tag">test harness</span>
+        <h3>Default-deny caught the restic oracle</h3>
+        <p>M3&rsquo;s default-deny (correctly) blocks all egress by default. The crucible&rsquo;s independent restic oracle is a Job <b>outside</b> the mover&rsquo;s path, so it too was denied its S3 egress. Fixed in the harness by tagging the oracle Jobs with the mover-egress label the policy allows.</p>
+      </div>
+      <div class="fix test">
+        <span class="tag">test harness</span>
+        <h3>Shared-repo hermeticity</h3>
+        <p>On a restic repository re-used across runs, discovery projects the <b>first</b> snapshot for a given backup name and short-circuits duplicates — so a re-used backup name silently skipped a manifest capture. Fixed by deriving per-run-unique backup names in the suite.</p>
+      </div>
+    </div>
+  </section>
+
+  <p class="foot">
+    <b>Label-scoped gate —</b> this run exercises the eleven M3 criteria under the <code>m3</code> filter; the skipped platform / M0 / M1 / M2 lines are covered by their own reports and by non-regression runs. M3 also passed <code>make e2e</code> on kind (25/25, real mover Jobs) plus the full unit + envtest suite and the custom linter. · Report generated from <code>test/crucible/artifacts/crucible-report.md</code>.
+  </p>
+
+</div>
+</body>
+</html>

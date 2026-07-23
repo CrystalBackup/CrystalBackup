@@ -4,6 +4,48 @@ All notable changes to Crystal Backup. Versioning follows
 [adr/0014](spec/adr/0014-versioning-and-release.md): milestone `Mn` → minor `0.n.z` on
 major 0; `1.0.0` is a deliberate post-M9 API-stability decision.
 
+## 0.3.0 — M3 "Manifests & cluster-scoped DR" (2026-07-23)
+
+Milestone M3 adds **Kubernetes-manifest backup & restore** alongside the existing PVC-data
+engine, plus a **cluster-scoped disaster-recovery** path. A namespace backup can now capture its
+API objects — sanitized for restore portability — into their own restic snapshots, and a restore
+re-applies them mode-aware (Recreate, or server-side-apply Overwrite). Cluster-scoped objects
+(CRDs, StorageClasses, ClusterRoles…) get their own capture and a **selective, opt-in** restore,
+all behind the unconditional R23 confirmation gate. This release also lands the supply-chain
+OpenVEX attestation work.
+
+Validated on real infrastructure: envtest + `make e2e` on kind (25/25, real mover Jobs) and the
+crucible **M3 acceptance gate (11/11)** on a live RKE2 / Ceph cluster.
+
+### Added
+
+- **Namespace-manifest backup.** A discovery-driven dump engine enumerates a namespace's
+  resources and writes them, through the sanitization engine, into a `kind=manifests` restic
+  snapshot. The mover gains a `manifests-backup` operation; the Backup controller wires the
+  manifests phase alongside the data phase (adr/0007, spec/04).
+- **Sanitization engine + golden corpus.** A rules engine strips cluster-assigned and
+  non-portable fields (`resourceVersion`, `uid`, `clusterIP`, …) while preserving stable ones
+  (e.g. a Service `nodePort`), covered by a golden-corpus test (R15, adr/0007).
+- **Manifest restore.** `resources[]` selection (a `selector` **and** `include` select, `exclude`
+  removes) with mode-aware apply: Recreate (delete-then-create, exact match) and Overwrite
+  (server-side apply, keeping target-only extras). The R23 confirmation gate is unconditional for
+  every destructive restore (spec/04 §5).
+- **Cluster-scoped capture (`ClusterBackup`, R22).** An allow-listed capture of cluster-scoped
+  resources into a distinct `kind=cluster-manifests` snapshot; `status.clusterResourcesCaptured`
+  records it (adr/0011 §1).
+- **Cluster-scoped restore (`ClusterRestore`).** Selective, **opt-in** restore of cluster
+  resources — nothing cluster-wide moves unless explicitly selected — with scope-aware apply
+  ordering, gated by R23 and admin-only RBAC (adr/0011 §2).
+- **RBAC & network isolation for the manifest mover.** Least-privilege manifest-mover grants with
+  a transient RoleBinding lifecycle, and M3 NetworkPolicies (default-deny + mover-egress + a
+  manifest-mover API-server allow). The API-server allow honours a configurable
+  `networkPolicy.apiServerPort` for CNIs that evaluate egress post-DNAT (e.g. RKE2 / Canal).
+- **API surface.** The reserved M3 fields land: `spec.dryRun`, `status.resources`, and the
+  manifest / cluster-resource selection fields (spec/02).
+- **Supply-chain: OpenVEX attestation.** `images.yml` produces an OpenVEX attestation, a
+  scheduled day-N workflow re-attests without a rebuild, and the release actions are pinned by
+  SHA (adr/0012).
+
 ## 0.2.1 — M2 hardening (2026-07-19)
 
 A security- and resilience-hardening patch from a full read-only audit of the M0–M2 code

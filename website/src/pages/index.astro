@@ -66,8 +66,8 @@ const milestones = [
   ['M1', 'Core engine & cluster disaster recovery', 'done', `${base}/reports/crucible-m1.html`],
   ['M2', 'Restore — self-service & admin', 'done', `${base}/reports/crucible-m2.html`],
   ['0.2.1', 'Hardening — full M0–M2 audit & fixes', 'patch', [['Check report', `${base}/reports/audit-m2.1.html`], ['Crucible M2.1', `${base}/reports/crucible-m2.1.html`]]],
-  ['M3', 'Manifests & cluster-scoped DR', 'here'],
-  ['M4', 'Consistency hooks, verification & maintenance', ''],
+  ['M3', 'Manifests & cluster-scoped DR', 'done', `${base}/reports/crucible-m3.html`],
+  ['M4', 'Consistency hooks, verification & maintenance', 'here'],
   ['M5', 'Namespace plane, external sync & right-to-erasure', ''],
   ['M6', 'Observability hardening & production beta', ''],
   ['M7', 'CLI & browse UI', ''],
@@ -122,7 +122,7 @@ const description =
       <section class="hero">
         <div class="hero-copy">
           <span class="pill">
-            <span class="dot"></span> Building M3 · M2 shipped (v0.2.1)
+            <span class="dot"></span> Building M4 · M3 shipped (v0.3.0)
           </span>
           <h1>
             Every namespace gets <span class="grad">its own backups.</span>
@@ -298,9 +298,10 @@ const description =
         <p class="eyebrow">Roadmap</p>
         <h2>Releasable, core-first, in the open</h2>
         <p class="section-lead">
-          Each milestone ships something usable. <strong>M0, M1 and M2 have shipped</strong> — CRDs,
-          CI, the core engine, cluster disaster recovery and self-service &amp; admin restore are
-          live (v0.2.1); we’re now building <strong>M3 — Manifests &amp; cluster-scoped DR</strong>.
+          Each milestone ships something usable. <strong>M0 through M3 have shipped</strong> — CRDs,
+          CI, the core engine, cluster disaster recovery, self-service &amp; admin restore and
+          manifest &amp; cluster-scoped DR are live (v0.3.0); we’re now building
+          <strong>M4 — Consistency hooks, verification &amp; maintenance</strong>.
         </p>
         <ol class="timeline">
           {
@@ -343,7 +344,7 @@ const description =
           <aside class="note">
             <h3>You’re early — and that’s the point</h3>
             <p>
-              M0, M1 and M2 have shipped (v0.2.1) — real, tested code — but it’s still early: most
+              M0 through M3 have shipped (v0.3.0) — real, tested code — but it’s still early: most
               milestones are ahead and it isn’t production-ready yet, so try it in a sandbox, keep
               your existing backups, and use it at your own risk. It’s
               provided <strong>as-is under Apache-2.0</strong>, without warranty. If the direction
