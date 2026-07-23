@@ -90,7 +90,8 @@ logic checks against this list (cf. roadmap DoD).
   (SA `crystal-manifest-mover`) automounts its token and receives a **transient**
   namespace-scoped RoleBinding — ClusterRole `crystal-manifest-reader` on backup,
   `crystal-manifest-writer` on restore — created by the operator in the target namespace
-  and deleted when the Job completes.
+  and deleted when the Job completes. The create/delete/backstop contract, and why an
+  `ownerReference` cannot carry it, are normative in §5 *Transient binding lifecycle*.
 - **I7 — Cluster-origin `Backup`s are read-only; the namespace plane cannot reference the
   cluster plane.** Admission: `Backup` objects labelled `crystalbackup.io/origin: cluster`
   are get/list/watch-only for users; a user-created `Backup`/`BackupSchedule` must
@@ -239,10 +240,44 @@ namespace-scoped RoleBinding created and deleted by the operator (I6), binding:
   system; it is Velero-equivalent, scoped to one namespace for one Job's lifetime, and any
   widening beyond it requires an ADR (roadmap DoD).
 
+### Transient binding lifecycle
+
+Because these are the largest grants in the system, *when the binding disappears* is as
+normative as what it grants. The contract:
+
+1. **Create** — the operator creates the RoleBinding in the **target namespace**
+   immediately before creating the mover Job, stamped with the run-identity labels
+   (`crystalbackup.io/managed-by`, plus the owning `Backup`/`Restore` identity).
+2. **Delete** — the operator deletes it when the Job reaches a terminal state
+   (`Complete` or `Failed`), in the same reconcile as the Job teardown. This is the
+   nominal path and it is the one that must be fast: the binding's lifetime is intended
+   to be the Job's lifetime, not the run's.
+3. **Backstop** — the `OrphanReaper` sweeps target namespaces for manifest-mover
+   RoleBindings and deletes any whose Job no longer exists or has already terminated.
+
+**An `ownerReference` cannot be used here, and that is a structural fact, not an
+oversight.** The mover Job lives in `crystal-backup-system` (I5) while the RoleBinding
+must live in the tenant namespace; Kubernetes does not permit cross-namespace
+ownerReferences, and the GC controller treats such a dependent as orphaned and deletes
+it. The creds-Secret precedent in I4 works only because that Secret is co-located with
+its owner. So the backstop above is not belt-and-braces — it is the *only* automatic
+cleanup, and its sweep parameters are a security control, not a housekeeping tunable.
+
+In particular the reaper's general 30-minute minimum age is calibrated for a temp clone
+PVC, where reaping early would corrupt an in-flight backup. It is **not** an acceptable
+window for a standing read-on-all-Secrets (or create/update-on-arbitrary-kinds) grant in
+a tenant namespace: manifest-mover RoleBindings get their own, materially shorter minimum
+age, and a leaked binding is a reportable security event, not a tidy-up.
+
+Failure mode this closes: an operator crash between "Job completed" and "delete
+RoleBinding" would otherwise leave that grant standing in a tenant namespace
+indefinitely.
+
 **Cluster-scoped capture/restore** (R22, [adr/0011](adr/0011-cluster-scoped-dr.md)) is
 **cluster-plane only** — there is no namespace-user path to it. A `ClusterBackup`'s capture Job
 binds ClusterRole `crystal-cluster-manifest-reader` (read on the allow-listed cluster-scoped
-kinds — CRDs, StorageClasses, IngressClasses, PriorityClasses, ClusterRoles/Bindings, PVs);
+kinds — the canonical allow-list is [adr/0011 §1](adr/0011-cluster-scoped-dr.md), quoted
+nowhere else so it cannot drift);
 `ClusterRestore` of cluster-scoped objects binds `crystal-cluster-manifest-writer`
 (create/update on them). Both are **admin-only** and transient per Job; cluster-scoped restore is
 **opt-in** with R23 confirmation, because recreating cluster RBAC (`ClusterRoleBinding`s) is
