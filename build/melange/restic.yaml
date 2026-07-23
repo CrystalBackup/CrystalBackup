@@ -34,6 +34,7 @@ environment:
       # ca-certificates-bundle are added automatically by the go/build pipeline's
       # `needs.packages`; only the extras go here.
       - git # module-resolution fallback for any non-proxy dependency
+      - go-1.25 # needed BEFORE go/build too, for the x/text override step below
   environment:
     CGO_ENABLED: "0"
     GOFLAGS: "-trimpath -mod=readonly"
@@ -48,6 +49,16 @@ pipeline:
       uri: https://github.com/restic/restic/releases/download/v${{package.version}}/restic-${{package.version}}.tar.gz
       expected-sha256: bb9b1a19040744d26d8a79be029d4e6b189c45ccc9d8831d7fe367d3c33df725
       strip-components: 1
+
+  - name: Override x/text past GO-2026-5970 (restic pins the vulnerable v0.37.0)
+    runs: |
+      # GO-2026-5970 / CVE-2026-56852 — infinite loop in x/text/unicode/norm, fixed in
+      # 0.39.0 — is reachable through restic, and no restic release bumps past it yet
+      # (0.19.1 is the latest and still pins 0.37.0). Override the module so the shipped
+      # binary is clean. Kept in LOCKSTEP with build/vex/generate-vex.sh, which analyses the
+      # same override so the VEX describes this binary, not the vanilla tarball.
+      # The go/build step below runs with -mod=readonly; the module edit needs -mod=mod.
+      GOFLAGS=-mod=mod go get golang.org/x/text@v0.40.0
 
   - name: Build restic (CLI)
     uses: go/build
