@@ -1,0 +1,57 @@
+# Code owners — two-person review on the security-load-bearing surface.
+#
+# spec/08-testing-and-dod.md (DoD 4) requires two approvals on anything touching
+# credentials, keys, or cross-namespace logic. This file names the reviewers; it does
+# NOT by itself enforce the count.
+#
+#   >>> CODEOWNERS is only half the control. The other half is a branch-protection
+#   >>> rule on `main`: "Require a pull request before merging" + "Require review from
+#   >>> Code Owners" + "Required approving reviews: 2". Without it, GitHub treats the
+#   >>> entries below as suggestions. Configure it in the repository settings.
+#
+# Owners are named as a user rather than a team on purpose: GitHub silently ignores
+# rules naming an unknown user or team, which fails OPEN — exactly the outcome this
+# file exists to prevent — and a team that does not exist yet would do that quietly.
+# Swap in a team once one exists. Verify either way with:
+#   gh api repos/CrystalBackup/CrystalBackup/codeowners/errors
+#
+#   >>> Honest caveat: with a single maintainer, "two approvals" is structurally
+#   >>> unsatisfiable — you cannot approve your own pull request. Until there is a
+#   >>> second reviewer, this file routes review and the PR checklist carries the
+#   >>> security questions, but the DoD's two-person gate is aspirational, not
+#   >>> enforced. That is a staffing question, not a configuration one, and it should
+#   >>> be stated rather than papered over.
+
+* @AlexisDucastel
+
+# --- Key management and escrow (adr/0004) -----------------------------------------
+/internal/keys/                     @AlexisDucastel
+/internal/escrow/                   @AlexisDucastel
+
+# --- Tenancy derivation: repo path + the non-forgeable namespace= tag filter -------
+# Invariant I1 (03-security-and-tenancy.md). internal/restic holds the tag constants
+# marked SECURITY-LOAD-BEARING; restore_controller.go derives the filter server-side.
+/internal/restic/                   @AlexisDucastel
+/internal/nsselector/               @AlexisDucastel
+/internal/controller/restore_controller.go        @AlexisDucastel
+/internal/controller/clusterrestore_controller.go @AlexisDucastel
+
+# --- Admission (VAP + webhook), adr/0010 ------------------------------------------
+/internal/webhook/                  @AlexisDucastel
+/charts/crystal-backup/templates/admission.yaml   @AlexisDucastel
+
+# --- RBAC and network posture -----------------------------------------------------
+# The manifest-mover ClusterRoles are the largest grants in the system
+# (03-security-and-tenancy.md §5); adr/0011 requires two-person review on the
+# cluster-scoped capture role specifically. Widening any of them requires an ADR.
+/charts/crystal-backup/templates/rbac.yaml        @AlexisDucastel
+/charts/crystal-backup/templates/networkpolicy.yaml @AlexisDucastel
+/charts/crystal-backup/templates/serviceaccount.yaml @AlexisDucastel
+
+# --- Supply chain -----------------------------------------------------------------
+# Signing, SBOM, VEX and provenance: a bad change here is silently trust-destroying.
+/.github/workflows/images.yml       @AlexisDucastel
+/build/                             @AlexisDucastel
+
+# --- The specs are the contract ---------------------------------------------------
+/spec/                              @AlexisDucastel

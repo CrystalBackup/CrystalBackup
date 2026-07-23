@@ -151,10 +151,14 @@ reconstitutes a deleted namespace from the shared repo.
       `Restore`/`ClusterRestore` **mode × selection** model: `Recreate` = delete-then-create,
       `Overwrite` = server-side apply keeping extras; apply ordering; storageClass mapping.
 - [ ] **Cluster-scoped resource capture & restore** (R22, [adr/0011](adr/0011-cluster-scoped-dr.md)):
-      `ClusterBackup` captures selected cluster-scoped objects (curated default allowlist — CRDs,
-      StorageClasses, IngressClasses, PriorityClasses, ClusterRoles/Bindings excl. `system:*`,
-      PersistentVolumes; admin-tunable include/exclude) as a `kind=cluster-manifests` snapshot at
-      `<prefix>/<clusterID>/cluster-manifests/`, via a privileged-read capture Job; capture **ON**
+      `ClusterBackup` captures selected cluster-scoped objects (curated default allowlist —
+      canonical in [adr/0011 §1](adr/0011-cluster-scoped-dr.md): CRDs, StorageClasses,
+      VolumeSnapshotClasses, IngressClasses, PriorityClasses, RuntimeClasses,
+      ClusterRoles/Bindings excl. `system:*`, PersistentVolumes; admin-tunable
+      include/exclude) as a `kind=cluster-manifests` snapshot at restic path
+      `/cluster-manifests` — inside the shared repo that already lives at
+      `s3://<bucket>/<prefix>/<clusterID>/`, per the layout table of
+      [02-api.md](02-api.md) — via a privileged-read capture Job; capture **ON**
       by default. `ClusterRestore` restores them **selectively** (opt-in, admin-only, apply-ordered
       CRDs→cluster-scoped→namespaces→namespaced), with sanitization + confirmation.
 - [ ] Never dump via exec/stdout — the manifest mover writes to the repo directly (delta 8).

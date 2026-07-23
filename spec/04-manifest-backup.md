@@ -1,7 +1,8 @@
 # Manifest backup & restore (R15)
 
-Status: draft v2 (aligned with the two-plane cascade + Restore selection model,
-2026-07-12). Implements R15; milestone [M3](90-roadmap.md). Naming & field contract:
+Status: draft v3 (v2 aligned the two-plane cascade + Restore selection model, 2026-07-12;
+v3 corrects §1 for [adr/0011](adr/0011-cluster-scoped-dr.md) and names the cluster-scoped
+subcommands, 2026-07-20). Implements R15; milestone [M3](90-roadmap.md). Naming & field contract:
 [02-api.md](02-api.md). Prior art: `kubectl-neat` (itaysk/kubectl-neat) for field
 stripping, Velero `restorePriorities` for apply ordering, Velero `--preserve-nodeports`
 for the NodePort decision (here: always preserve).
@@ -16,9 +17,16 @@ tags and `host=<clusterID>`
 ([02-api.md § Repository layout](02-api.md#repository-layout--snapshot-identity)).
 The same capture serves both planes: a namespace-plane `BackupSchedule` and a
 cluster-plane `ClusterBackup` both converge on a per-namespace `Backup`, the single unit
-of execution. Cluster-scoped resources (CRDs, ClusterRoles, PVs, VolumeSnapshotContents,
-…) are **out of scope** here; they belong to platform DR (`ClusterBackupSchedule`, M9,
-R22).
+of execution. Cluster-scoped resources (CRDs, ClusterRoles, StorageClasses, PVs, …) are out
+of scope **for this document**, which owns the namespaced dump: they are captured and
+restored by the cluster plane, designed in
+[adr/0011](adr/0011-cluster-scoped-dr.md) and delivered in the **same milestone (M3)**.
+They reuse the sanitization engine of §4 and the mover pattern of §2.3 with their own
+subcommands and ClusterRoles.
+
+> Superseded note: earlier drafts of this section deferred cluster-scoped capture to M9
+> with no design. [adr/0011](adr/0011-cluster-scoped-dr.md) (2026-07-15) pulled it into
+> v1 and into M3; the roadmap follows. This paragraph is the correction.
 
 ## 2. Dump pipeline
 

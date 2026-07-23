@@ -8,7 +8,10 @@
 #   * generate an SPDX SBOM, run a trivy 0-known-CVE release gate (scan BEFORE push);
 #   * cosign keyless-sign the index (Fulcio/Rekor) + attest the SBOM;
 #   * attach SLSA build provenance (GitHub OIDC identity → SLSA L3);
-#   * push to ghcr.io/crystalbackup/{operator,mover} by digest.
+#   * push to ghcr.io/crystalbackup/{operator,mover} by digest;
+#   * generate an OpenVEX document from govulncheck and attest it AFTER publish — the
+#     day-N answer for advisories that land on an already-immutable image. Kept refreshed
+#     without rebuilding by .github/workflows/vex-refresh.yml (adr/0012).
 #
 # `image-dry-run` runs the whole build + CVE scan on PRs but never signs or pushes.
 # Action versions are pinned; each job requests the minimum permissions it needs.
@@ -26,6 +29,7 @@ on:
     paths:
       - "build/apko/**"
       - "build/melange/**"
+      - "build/vex/**"
       - ".github/workflows/images.yml"
       - "cmd/**"
       - "api/**"
@@ -44,6 +48,12 @@ env:
   GO_VERSION: "1.26.5" # matches mise.toml
   APKO_VERSION: "v1.2.25"
   MELANGE_VERSION: "v0.56.2"
+  # VEX (adr/0012): govulncheck produces the statements, cosign attests them. No vexctl —
+  # generation is govulncheck's job and re-keying is a jq transform, so a third tool would
+  # only add a pin to track. Trivy CLI is pinned separately from trivy-action because the
+  # action exposes no `--vex` input.
+  GOVULNCHECK_VERSION: "v1.6.0"
+  TRIVY_VERSION: "0.70.0"
 
 jobs:
   # ===========================================================================
@@ -73,7 +83,7 @@ jobs:
             melange: build/melange/mover.yaml
             with_restic: "true"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Gate — skip components whose binary is not in the tree yet
         id: gate
@@ -86,7 +96,7 @@ jobs:
             echo "::notice title=Skipping mover::cmd/crystal-mover lands in M1 (spec/90-roadmap.md); mover image build deferred."
           fi
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         if: steps.gate.outputs.proceed == 'true'
         with:
           go-version: ${{ env.GO_VERSION }}
@@ -94,7 +104,7 @@ jobs:
 
       - name: Set up QEMU (aarch64 melange build sandbox)
         if: steps.gate.outputs.proceed == 'true'
-        uses: docker/setup-qemu-action@v4
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
 
       - name: Install apko + melange (pinned)
         if: steps.gate.outputs.proceed == 'true'
@@ -166,7 +176,7 @@ jobs:
 
       - name: trivy — 0-known-CVE gate (amd64)
         if: steps.gate.outputs.proceed == 'true'
-        uses: aquasecurity/trivy-action@v0.36.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           scan-type: image
           input: image-x86_64.tar
@@ -177,7 +187,7 @@ jobs:
 
       - name: trivy — 0-known-CVE gate (arm64)
         if: steps.gate.outputs.proceed == 'true'
-        uses: aquasecurity/trivy-action@v0.36.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           scan-type: image
           input: image-aarch64.tar
@@ -216,7 +226,7 @@ jobs:
             melange: build/melange/mover.yaml
             with_restic: "true"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Gate — skip components whose binary is not in the tree yet
         id: gate
@@ -233,7 +243,7 @@ jobs:
         if: steps.gate.outputs.proceed == 'true'
         run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         if: steps.gate.outputs.proceed == 'true'
         with:
           go-version: ${{ env.GO_VERSION }}
@@ -241,7 +251,7 @@ jobs:
 
       - name: Set up QEMU (aarch64 melange build sandbox)
         if: steps.gate.outputs.proceed == 'true'
-        uses: docker/setup-qemu-action@v4
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
 
       - name: Install apko + melange (pinned)
         if: steps.gate.outputs.proceed == 'true'
@@ -251,12 +261,12 @@ jobs:
           go install "chainguard.dev/melange@${MELANGE_VERSION}"
           echo "${HOME}/go/bin" >> "$GITHUB_PATH"
 
-      - uses: sigstore/cosign-installer@v3.10.1
+      - uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
         if: steps.gate.outputs.proceed == 'true'
 
       - name: Log in to GHCR
         if: steps.gate.outputs.proceed == 'true'
-        uses: docker/login-action@v4
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -339,7 +349,7 @@ jobs:
 
       - name: trivy — 0-known-CVE release gate (amd64)
         if: steps.gate.outputs.proceed == 'true'
-        uses: aquasecurity/trivy-action@v0.36.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           scan-type: image
           input: image-x86_64.tar
@@ -350,7 +360,7 @@ jobs:
 
       - name: trivy — 0-known-CVE release gate (arm64)
         if: steps.gate.outputs.proceed == 'true'
-        uses: aquasecurity/trivy-action@v0.36.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           scan-type: image
           input: image-aarch64.tar
@@ -391,9 +401,78 @@ jobs:
           [ -n "$PRED" ] || PRED="$(ls ./sbom/*.spdx.json | head -n1)"
           cosign attest --yes --type spdxjson --predicate "$PRED" "${IMAGE_REF}"
 
+      # --- VEX (adr/0012) ------------------------------------------------------------------
+      # Deliberately AFTER publish, never before. The CVE gate above scans a local tarball
+      # that has no OCI purl, so no VEX statement could be keyed to it even in principle —
+      # and more importantly, a CVE found before push must be FIXED, not asserted away. VEX
+      # answers the day-N question instead: an advisory landing against an image that is
+      # already immutable, where rebuilding is no longer the available move.
+      - name: Install govulncheck (pinned)
+        if: steps.gate.outputs.proceed == 'true'
+        run: |
+          set -euo pipefail
+          go install "golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}"
+          echo "${HOME}/go/bin" >> "$GITHUB_PATH"
+
+      - name: Install trivy CLI (pinned)
+        if: steps.gate.outputs.proceed == 'true'
+        uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567 # v0.3.1
+        with:
+          version: v${{ env.TRIVY_VERSION }}
+
+      - name: govulncheck — generate the OpenVEX document for the published digest
+        if: steps.gate.outputs.proceed == 'true'
+        run: |
+          set -euo pipefail
+          # Ask the scanner for the product identifiers rather than hand-building purl
+          # strings: the purl shape (including its arch= qualifier) is the scanner's
+          # business, and a guessed identifier silently matches nothing.
+          REFS=()
+          for platform in linux/amd64 linux/arm64; do
+            purl="$(trivy image "${IMAGE_REF}" --platform "$platform" \
+                      --scanners vuln --format cyclonedx --quiet 2>/dev/null \
+                    | jq -r '.metadata.component.purl // empty')"
+            if [ -n "$purl" ]; then
+              REFS+=(--image-ref "$purl")
+              echo "product (${platform}): ${purl}"
+            else
+              echo "::warning title=No purl for ${platform}::the VEX document will not cover ${platform}"
+            fi
+          done
+          [ "${#REFS[@]}" -gt 0 ] || { echo "no product identifier resolved; refusing to attest an unusable VEX" >&2; exit 1; }
+
+          ./build/vex/generate-vex.sh \
+            --component "${{ matrix.component }}" \
+            --output "vex-${{ matrix.component }}.openvex.json" \
+            "${REFS[@]}"
+
+      - name: Refuse to release with a reachable vulnerability
+        if: steps.gate.outputs.proceed == 'true'
+        run: |
+          set -euo pipefail
+          DOC="vex-${{ matrix.component }}.openvex.json"
+          AFFECTED="$(jq -r '[.statements[] | select(.status == "affected")] | length' "$DOC")"
+          if [ "$AFFECTED" != "0" ]; then
+            echo "::error title=Reachable vulnerability::${AFFECTED} advisory/advisories are reachable in ${{ matrix.component }}."
+            jq -r '.statements[] | select(.status == "affected")
+                   | "  \(.vulnerability.name)  \(.vulnerability.aliases // [] | join(", "))  \(.vulnerability.description)"' "$DOC"
+            echo "A reachable advisory is a bug to fix, not a statement to publish. Bump the dependency."
+            exit 1
+          fi
+          echo "no reachable advisory; $(jq -r '.statements | length' "$DOC") statement(s) to attest"
+
+      - name: cosign — attest the OpenVEX document (keyless)
+        if: steps.gate.outputs.proceed == 'true'
+        env:
+          COSIGN_YES: "true"
+        run: |
+          set -euo pipefail
+          cosign attest --yes --type openvex \
+            --predicate "vex-${{ matrix.component }}.openvex.json" "${IMAGE_REF}"
+
       - name: SLSA build provenance (SLSA L3, keyless) → GHCR
         if: steps.gate.outputs.proceed == 'true'
-        uses: actions/attest-build-provenance@v4
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4
         with:
           subject-name: ${{ env.IMAGE_NAME }}
           subject-digest: ${{ env.IMAGE_DIGEST }}
@@ -416,16 +495,16 @@ jobs:
       packages: write # helm push the chart to GHCR (OCI)
       id-token: write # cosign keyless-sign the chart (Fulcio/Rekor OIDC)
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Resolve release version from tag (adr/0014)
         run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
 
-      - uses: azure/setup-helm@v4
+      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
         with:
           version: v3.17.0
 
-      - uses: sigstore/cosign-installer@v3.10.1
+      - uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
 
       - name: Log in to GHCR (docker for digest lookup, helm for the OCI push)
         run: |
