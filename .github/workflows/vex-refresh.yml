@@ -1,0 +1,259 @@
+# Day-N VEX refresh — re-scan supported published images and re-attest, WITHOUT rebuilding.
+#
+# The problem this solves (spec/adr/0012): the release gate guarantees 0 known CVEs at push
+# time, so the VEX document attested at release is essentially empty. The interesting case
+# arrives later — an advisory published against a dependency of an image that already shipped
+# and can no longer change. At that moment a consumer scanning our digest sees findings, and
+# the only honest way to tell them which ones actually matter is a fresh reachability
+# analysis over the exact source that produced that digest.
+#
+# So this workflow does NOT rebuild. It checks out the tag a digest was built from, re-runs
+# govulncheck against it, regenerates the OpenVEX document, PROVES the document still applies
+# to the published image, and re-attests. The image bytes never change; only what we can say
+# about them does.
+#
+# Every statement remains tool-generated. A newly *reachable* advisory is deliberately a
+# build failure rather than a statement we publish: it means the shipped image is genuinely
+# vulnerable, which calls for a patch release, not for a note explaining it away.
+name: vex-refresh
+
+on:
+  schedule:
+    # 04:17 UTC daily. Off the hour on purpose — scheduled runs cluster on :00 across GitHub
+    # and get queued; an odd minute starts sooner. Daily because the Go vulnerability
+    # database publishes on business-day cadence and a day is the useful resolution for a
+    # "should I worry about this digest" answer.
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+    inputs:
+      releases:
+        description: "How many recent releases to refresh (default: the support window)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAMESPACE: crystalbackup
+  GO_VERSION: "1.26.5"
+  GOVULNCHECK_VERSION: "v1.6.0"
+  TRIVY_VERSION: "0.70.0"
+  # Support window (adr/0012): the N most recent releases keep a refreshed VEX. Older digests
+  # stay signed and SBOM'd, but their VEX is a point-in-time statement that is no longer
+  # maintained — stated plainly rather than implied by silence.
+  SUPPORT_WINDOW: "3"
+
+jobs:
+  # Resolve which (release, component) pairs are in the support window and still published.
+  discover:
+    name: resolve supported digests
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.resolve.outputs.matrix }}
+      count: ${{ steps.resolve.outputs.count }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0 # tags carry the support window
+
+      - name: Log in to GHCR (digest lookup)
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve tags → index digests
+        id: resolve
+        run: |
+          set -euo pipefail
+          WINDOW="${{ github.event.inputs.releases }}"
+          [ -n "$WINDOW" ] || WINDOW="${SUPPORT_WINDOW}"
+
+          TAGS="$(git tag --list 'v*' --sort=-v:refname | head -n "$WINDOW")"
+          [ -n "$TAGS" ] || { echo "no release tags found"; echo 'matrix={"include":[]}' >> "$GITHUB_OUTPUT"; echo "count=0" >> "$GITHUB_OUTPUT"; exit 0; }
+
+          ENTRIES=""
+          for tag in $TAGS; do
+            version="${tag#v}"
+            for component in operator mover; do
+              ref="${REGISTRY}/${IMAGE_NAMESPACE}/${component}:${version}"
+              # The INDEX digest, read from the human-readable output. Not
+              # --format '{{.Manifest.Digest}}' (unreliable across buildx versions) and not
+              # the first line of an image-refs file (can be a per-arch digest): VEX must
+              # land on the same multi-arch index that carries the signature and SBOM.
+              digest="$(docker buildx imagetools inspect "$ref" 2>/dev/null | awk '/^Digest:/{print $2; exit}')" || true
+              if [ -z "$digest" ]; then
+                echo "::notice title=Skipping ${component} ${version}::not published (or not readable)"
+                continue
+              fi
+              echo "  ${component} ${version} -> ${digest}"
+              ENTRIES="${ENTRIES}{\"tag\":\"${tag}\",\"version\":\"${version}\",\"component\":\"${component}\",\"digest\":\"${digest}\"},"
+            done
+          done
+
+          ENTRIES="${ENTRIES%,}"
+          MATRIX="{\"include\":[${ENTRIES}]}"
+          # Count via jq, not string arithmetic: an empty include list must report 0, and a
+          # miscount here would either skip a supported digest or start a job with no matrix.
+          COUNT="$(printf '%s' "$MATRIX" | jq -r '.include | length')"
+          echo "matrix=${MATRIX}" >> "$GITHUB_OUTPUT"
+          echo "count=${COUNT}" >> "$GITHUB_OUTPUT"
+          echo "resolved ${COUNT} (release, component) pair(s) in the support window"
+
+  refresh:
+    name: ${{ matrix.component }} ${{ matrix.version }}
+    needs: discover
+    if: needs.discover.outputs.count != '0'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write # push the refreshed attestation to GHCR
+      id-token: write # cosign keyless (Fulcio/Rekor OIDC)
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.discover.outputs.matrix) }}
+    steps:
+      # The SOURCE at the tag that produced this digest — not main. A reachability analysis
+      # is only meaningful against the code that actually shipped.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ matrix.tag }}
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
+
+      - uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567 # v0.3.1
+        with:
+          version: v${{ env.TRIVY_VERSION }}
+
+      - name: Log in to GHCR
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install govulncheck (pinned)
+        run: |
+          set -euo pipefail
+          go install "golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}"
+          echo "${HOME}/go/bin" >> "$GITHUB_PATH"
+
+      - name: Guard — this tag must carry the VEX generator
+        id: guard
+        run: |
+          set -euo pipefail
+          if [ -x ./build/vex/generate-vex.sh ]; then
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Skipping ${{ matrix.tag }}::predates build/vex/generate-vex.sh; nothing to refresh"
+          fi
+
+      - name: Scan the published image (baseline, no VEX)
+        if: steps.guard.outputs.proceed == 'true'
+        run: |
+          set -euo pipefail
+          IMAGE_REF="${REGISTRY}/${IMAGE_NAMESPACE}/${{ matrix.component }}@${{ matrix.digest }}"
+          echo "IMAGE_REF=${IMAGE_REF}" >> "$GITHUB_ENV"
+          trivy image "$IMAGE_REF" --scanners vuln --severity CRITICAL,HIGH \
+            --format json --quiet > baseline.json
+          BASE="$(jq -r '[.Results[]?.Vulnerabilities[]?.VulnerabilityID] | unique | length' baseline.json)"
+          echo "BASELINE_COUNT=${BASE}" >> "$GITHUB_ENV"
+          echo "baseline findings (CRITICAL,HIGH): ${BASE}"
+          jq -r '[.Results[]?.Vulnerabilities[]? | "  \(.VulnerabilityID)  \(.PkgName)@\(.InstalledVersion)"] | unique | .[]' baseline.json
+
+      - name: govulncheck — regenerate the OpenVEX document
+        if: steps.guard.outputs.proceed == 'true'
+        run: |
+          set -euo pipefail
+          REFS=()
+          for platform in linux/amd64 linux/arm64; do
+            purl="$(trivy image "${IMAGE_REF}" --platform "$platform" \
+                      --scanners vuln --format cyclonedx --quiet 2>/dev/null \
+                    | jq -r '.metadata.component.purl // empty')"
+            if [ -n "$purl" ]; then REFS+=(--image-ref "$purl"); echo "product (${platform}): ${purl}"; fi
+          done
+          [ "${#REFS[@]}" -gt 0 ] || { echo "no product identifier resolved" >&2; exit 1; }
+
+          ./build/vex/generate-vex.sh \
+            --component "${{ matrix.component }}" \
+            --output vex.json \
+            "${REFS[@]}"
+
+      # The document must be shown to WORK before it is signed. Trivy accepts a VEX file that
+      # matches nothing and silently reports every finding — a malformed or mis-keyed document
+      # is indistinguishable from an honest one unless the effect is measured. Signing an
+      # inert document would be worse than shipping none: it looks like a reassurance.
+      - name: Prove the VEX document actually applies
+        if: steps.guard.outputs.proceed == 'true'
+        run: |
+          set -euo pipefail
+          trivy image "${IMAGE_REF}" --scanners vuln --severity CRITICAL,HIGH \
+            --vex vex.json --format json --quiet > filtered.json
+          FILTERED="$(jq -r '[.Results[]?.Vulnerabilities[]?.VulnerabilityID] | unique | length' filtered.json)"
+          STATEMENTS="$(jq -r '.statements | length' vex.json)"
+          echo "baseline=${BASELINE_COUNT} filtered=${FILTERED} statements=${STATEMENTS}"
+
+          if [ "${BASELINE_COUNT}" = "0" ]; then
+            echo "nothing to suppress — the image is still clean against today's database"
+            exit 0
+          fi
+
+          if [ "${FILTERED}" = "${BASELINE_COUNT}" ] && [ "${STATEMENTS}" != "0" ]; then
+            echo "::error title=VEX has no effect::${STATEMENTS} statement(s) suppressed nothing on ${IMAGE_REF}."
+            echo "The document is almost certainly mis-keyed: a scanner matches statements by product"
+            echo "purl, and an identifier that does not match is ignored WITHOUT error."
+            echo "--- product identifiers in the document ---"
+            jq -r '[.statements[].products[]."@id"] | unique | .[]' vex.json
+            echo "--- what the scanner expects ---"
+            trivy image "${IMAGE_REF}" --scanners vuln --format cyclonedx --quiet \
+              | jq -r '.metadata.component.purl'
+            exit 1
+          fi
+          echo "VEX suppressed $(( BASELINE_COUNT - FILTERED )) of ${BASELINE_COUNT} finding(s)"
+
+      # A reachable advisory is not a VEX problem. It means this published image is genuinely
+      # exploitable on a path that runs, and the answer is a patch release.
+      - name: Fail if an advisory is now reachable
+        if: steps.guard.outputs.proceed == 'true'
+        run: |
+          set -euo pipefail
+          AFFECTED="$(jq -r '[.statements[] | select(.status == "affected")] | length' vex.json)"
+          [ "$AFFECTED" = "0" ] || {
+            echo "::error title=Reachable vulnerability in a published image::${{ matrix.component }} ${{ matrix.version }} (${{ matrix.digest }})"
+            jq -r '.statements[] | select(.status == "affected")
+                   | "  \(.vulnerability.name)  \(.vulnerability.aliases // [] | join(", "))  \(.vulnerability.description)"' vex.json
+            echo "This needs a patch release, not a VEX statement."
+            exit 1; }
+          echo "no reachable advisory in ${{ matrix.component }} ${{ matrix.version }}"
+
+      - name: cosign — re-attest the refreshed OpenVEX document
+        if: steps.guard.outputs.proceed == 'true'
+        env:
+          COSIGN_YES: "true"
+        run: |
+          set -euo pipefail
+          # A new attestation is added alongside the previous one rather than replacing it;
+          # the transparency log keeps both, so the history of what we claimed and when
+          # stays auditable. Consumers verify and read the most recent.
+          cosign attest --yes --type openvex --predicate vex.json "${IMAGE_REF}"
+
+      - name: Summary
+        if: steps.guard.outputs.proceed == 'true'
+        run: |
+          {
+            echo "### ${{ matrix.component }} ${{ matrix.version }}"
+            echo ""
+            echo "- digest: \`${{ matrix.digest }}\`"
+            echo "- findings before VEX: ${BASELINE_COUNT}"
+            echo "- statements: $(jq -r '.statements | length' vex.json)"
+            echo "- reachable: 0"
+          } >> "$GITHUB_STEP_SUMMARY"
