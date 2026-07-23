@@ -103,7 +103,14 @@ if [ "$COMPONENT" = "mover" ]; then
 
   mkdir -p "${WORK}/restic-src"
   tar xzf "$TARBALL" -C "${WORK}/restic-src" --strip-components=1
-  ( cd "${WORK}/restic-src" && govulncheck -format openvex ./cmd/restic ) > "${WORK}/restic.json"
+  # restic ${RESTIC_VERSION} pins golang.org/x/text v0.37.0, reachable for GO-2026-5970
+  # (CVE-2026-56852: infinite loop in x/text/unicode/norm, fixed in 0.39.0). The mover image
+  # builds restic with that module overridden past the fix (build/melange/restic.yaml); analyse
+  # the SAME override here so the VEX describes the restic that actually ships, not the vanilla
+  # tarball. Keep the x/text version in lockstep with the melange recipe.
+  ( cd "${WORK}/restic-src" \
+      && GOFLAGS=-mod=mod go get golang.org/x/text@v0.40.0 \
+      && govulncheck -format openvex ./cmd/restic ) > "${WORK}/restic.json"
   DOCS+=("${WORK}/restic.json")
 fi
 
