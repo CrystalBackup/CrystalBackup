@@ -123,10 +123,26 @@ create/update/delete events (a fresh Job every ~6 s) wake the `backuprepository`
 Note: discovery's `--no-lock` stays deferred to M4 (it lands with `prune`, the first exclusive
 lock — it buys nothing before that).
 
-## Minor
-- Every discovery cycle logs `would violate PodSecurity "restricted:latest"` for the mover pod
-  (DAC_OVERRIDE, runAsUser=0). Namespace enforces `baseline` (admitted); `warn=restricted`
-  fires each cycle → log spam. Separate small hardening item.
+## Minor — PodSecurity warn spam (analysed, deliberately not "fixed" here)
+Every discovery cycle logged `would violate PodSecurity "restricted:latest"` for the mover pod.
+The namespace enforces `baseline`, which admits it; only the `warn=restricted` label fires.
+
+It is not cheaply silenceable, and the obvious tweak does not work: the warning is driven by
+`runAsUser=0` / `runAsNonRoot != true` (internal/mover/job.go), not by the capability list, so
+dropping `DAC_OVERRIDE` would not quiet it. Root + `DAC_OVERRIDE` is a deliberate, documented
+choice for the data path (a mover reads files it does not own —
+spec/03-security-and-tenancy.md §6). Silencing the warning properly means giving the mover image
+a non-root user model, which is its own lot with its own restore-fidelity risk (CHOWN/FOWNER/
+MKNOD on restore).
+
+Worth noting separately: `OpSnapshots` — discovery's listing Job — mounts **no** data volume
+(`PVC: nil`) and still receives `DAC_OVERRIDE` from the catch-all branch of `moverCapabilities`.
+Narrowing that one operation to no added capabilities is a genuine least-privilege improvement
+(independent of the warning). Left out of this patch because it wants crucible validation of the
+restic cache path under a reduced capability set.
+
+Meanwhile the **volume** of the spam is down ~10x on its own: the self-trigger fix means discovery
+builds one Job per `discovery.interval` instead of one every ~6 s.
 
 ## Artifacts (this session, scratchpad)
 - `m31-findings.md` — raw running findings.
