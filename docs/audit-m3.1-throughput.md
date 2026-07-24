@@ -98,7 +98,35 @@ discovery Job is owner-referenced to the BackupRepository (B above), every disco
 create/update/delete events (a fresh Job every ~6 s) wake the `backuprepository` reconciler →
 ~2700 no-op reconciles in 33 min. Cheap each (15 ms) but pure API/cache waste.
 
-## Candidate fixes (ranked; measurement-driven, NOT yet chosen)
+## What shipped in 0.3.1 (all four, in this order)
+
+1. **Self-trigger killed** — `inventoryChurnPredicate` on discovery's `For` watch drops an update
+   only when the change is confined to the three inventory fields discovery itself writes.
+   Everything else still wakes it (the `Initialized` flip, another controller's status write, any
+   metadata change — which matters because `BackupRepositorySpec` is empty, so generation never
+   moves for this kind). Discovery now honours `RequeueAfter: interval` instead of spinning.
+   **~10x duty-cycle reduction** on its own.
+2. **Job-event storm killed** — the inventory Job carries a plain owner reference instead of a
+   controller reference, so `backuprepository`'s `Owns(&batchv1.Job{})` (which matches only the
+   controller owner) stops waking on every listing Job event. Removes ~2700 no-op reconciles / 33 min.
+   GC still cascades on repository delete.
+3. **Inventory moved off the reconcile worker** — `inventoryTracker` runs each `SnapshotLister`
+   pass on a background goroutine, single-flight per repository, and re-enqueues the repository
+   through a `source.Channel` when it lands (plus a 30 s watchdog requeue in case a wake is ever
+   lost). Reconcile consumes a finished result and does only the fast in-memory work (project, GC,
+   status). Deliberately does NOT change the `SnapshotLister` contract, so the production lister
+   stays a simple blocking call and the envtest stub is untouched. A panicking pass is recovered
+   and surfaced as a normal inventory error, so a repository can never wedge as in-flight.
+   This is what makes MULTIPLE repositories stop queueing behind one another — the single-repo case
+   was already fine after fix 1.
+4. **Harness** — the crucible suite budget moved 60 m → 90 m and became `CRUCIBLE_TIMEOUT`.
+
+Still open, deliberately: the cold O(N) cost per pass is unchanged (a pass still re-scans the whole
+repository from a cold cache). It is now paid off the worker and once per interval, so it no longer
+starves anything; a warm/incremental inventory (cold O(N) → warm O(Δ)) remains the next lever if a
+repository grows into the thousands of snapshots. `--no-lock` still belongs to M4, with `prune`.
+
+## Candidate fixes as ranked at audit time (kept for the record)
 
 1. **Kill the self-trigger (B).** Add a status/generation predicate to discovery's `For`
    watch (drop self status-only updates) and/or only bump `LastDiscoveryTime` when the
@@ -122,6 +150,40 @@ create/update/delete events (a fresh Job every ~6 s) wake the `backuprepository`
 
 Note: discovery's `--no-lock` stays deferred to M4 (it lands with `prune`, the first exclusive
 lock — it buys nothing before that).
+
+## Open — the m2-Recreate RBD flake (investigated, NOT fixed: needs reproduction)
+
+**Not a throughput problem, and the more worrying of the two findings.** During the audit run the
+m2 Recreate restore hung ~20 min in `ContainerCreating`:
+
+```
+MountVolume.MountDevice failed for volume "rst-m2-restore-m2-recreate-data-twin":
+  rpc error: code = Internal desc = error generating volume
+  0001-0009-rook-ceph-0000000000000001-d5fc4ceb-…:
+  Failed as image not found (internal RBD image not found: rbd: ret=-2, No such file or directory)
+```
+
+The PVC was `Bound`, `AttachVolume.Attach` **succeeded**, and the mount then failed because the
+RBD image behind the volume handle did not exist. Ceph itself was healthy (81/81 PGs
+`active+clean`, 3/3 OSDs up); the only warning was `BLUESTORE_SLOW_OP_ALERT` on osd.1.
+
+What makes it worth a real investigation rather than a "flaky infra" shrug: **the m2 overwrite and
+partial restores completed successfully on the same target volume just before**, and only the third
+one found the image gone. The restore twin PV (`internal/rexposer/expose.go`) deliberately copies
+the bound PV's `PersistentVolumeSource` verbatim — same CSI `volumeHandle` — and pins
+`PersistentVolumeReclaimPolicy: Retain` precisely so that deleting a twin can never destroy the
+user's volume. So either that guarantee held and the image vanished for an unrelated (Ceph-side)
+reason, or something in the earlier restores' teardown released a PV bound to that same handle
+under a Delete policy — which would be a data-destruction bug, not a flake.
+
+Reproduction plan (the audit rule applies — do not fix on this hypothesis):
+1. Run `mise run test 'm2'` alone on a fresh crucible, so no other spec's churn is in play.
+2. Between each of the three restores, record `rbd ls -p <pool>` from the toolbox plus
+   `kubectl get pv -o custom-columns=NAME:.metadata.name,HANDLE:.spec.csi.volumeHandle,POLICY:.spec.persistentVolumeReclaimPolicy,PHASE:.status.phase`.
+3. The question to answer: does the image disappear at a specific teardown step, or only under the
+   concurrent Job churn of the full suite (pointing at Ceph/osd.1 slow-ops instead)?
+
+Until that is answered, this is tracked, not diagnosed.
 
 ## Minor — PodSecurity warn spam (analysed, deliberately not "fixed" here)
 Every discovery cycle logged `would violate PodSecurity "restricted:latest"` for the mover pod.

@@ -37,6 +37,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	cbv1 "github.com/CrystalBackup/CrystalBackup/api/v1alpha1"
 	"github.com/CrystalBackup/CrystalBackup/internal/apiconst"
@@ -84,11 +85,19 @@ type DiscoveryReconciler struct {
 	Scheme   *runtime.Scheme
 	Lister   SnapshotLister
 	Recorder events.EventRecorder
+	// Inventory runs Lister passes off the reconcile worker, single-flight per repository.
+	Inventory *inventoryTracker
 }
 
 // NewDiscoveryReconciler builds the reconciler. Callers wire the production or stub lister here.
 func NewDiscoveryReconciler(c client.Client, scheme *runtime.Scheme, lister SnapshotLister, recorder events.EventRecorder) *DiscoveryReconciler {
-	return &DiscoveryReconciler{Client: c, Scheme: scheme, Lister: lister, Recorder: recorder}
+	return &DiscoveryReconciler{
+		Client:    c,
+		Scheme:    scheme,
+		Lister:    lister,
+		Recorder:  recorder,
+		Inventory: newInventoryTracker(),
+	}
 }
 
 // +kubebuilder:rbac:groups=crystalbackup.io,resources=backuprepositories,verbs=get;list;watch;update;patch
@@ -127,13 +136,29 @@ func (r *DiscoveryReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		return ctrl.Result{}, nil
 	}
 
-	snaps, err := r.Lister.List(ctx, &repo)
-	if err != nil {
-		log.Error(err, "discovery: inventory failed; will retry", "repository", repo.Name)
+	// The inventory runs OFF this worker (inventoryTracker): a pass creates a `restic snapshots`
+	// Job and waits on it — seconds, cold every time — and holding the controller's single worker
+	// for that made every other repository queue behind it. Consume a finished pass if one is
+	// waiting, otherwise start one and return immediately; the tracker re-enqueues us when it
+	// lands, with a watchdog requeue in case that wake is ever lost.
+	res, state := r.Inventory.take(repo.Name)
+	switch state {
+	case inventoryPending:
+		return ctrl.Result{RequeueAfter: inventoryWatchdogInterval}, nil
+	case inventoryIdle:
+		r.Inventory.start(&repo, r.Lister)
+		return ctrl.Result{RequeueAfter: inventoryWatchdogInterval}, nil
+	case inventoryReady:
+		// fall through to consume res
+	}
+
+	if res.err != nil {
+		log.Error(res.err, "discovery: inventory failed; will retry", "repository", repo.Name)
 		r.Recorder.Eventf(&repo, nil, corev1.EventTypeWarning, "InventoryFailed", "InventoryRepository",
-			"repository inventory failed: %v", err)
+			"repository inventory failed: %v", res.err)
 		return ctrl.Result{RequeueAfter: discoveryRetryInterval}, nil
 	}
+	snaps := res.snaps
 
 	groups := restic.GroupByNamespaceRun(snaps)
 
@@ -367,6 +392,9 @@ func (r *DiscoveryReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&cbv1.BackupRepository{}, builder.WithPredicates(inventoryChurnPredicate())).
 		Watches(&cbv1.ClusterBackup{}, handler.EnqueueRequestsFromMapFunc(r.mapRunToRepository)).
+		// A background inventory pass re-enqueues its repository through this channel when it
+		// finishes, so the result is consumed as soon as it exists rather than at the next tick.
+		WatchesRawSource(source.Channel(r.Inventory.wake, &handler.EnqueueRequestForObject{})).
 		Named("discovery").
 		Complete(r)
 }
