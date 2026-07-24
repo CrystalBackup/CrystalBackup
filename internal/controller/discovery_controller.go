@@ -22,6 +22,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -29,9 +30,12 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	cbv1 "github.com/CrystalBackup/CrystalBackup/api/v1alpha1"
@@ -314,12 +318,54 @@ func (r *DiscoveryReconciler) discoverySettings(ctx context.Context, repo *cbv1.
 	return loc.Spec.Discovery.Enabled, interval, nil
 }
 
+// inventoryChurnPredicate filters the BackupRepository stream feeding discovery. Discovery WRITES
+// this same object's inventory status (snapshotCount, namespacesPresent, lastDiscoveryTime) at the
+// end of every successful pass; unfiltered, that write returns as an Update event and re-enqueues
+// discovery immediately, so it never rests at `discovery.interval` — it spins back-to-back, each
+// pass blocking its single worker on a fresh `restic snapshots` Job. Measured on the crucible:
+// ~5.7 s per pass, one worker ~100 % saturated for a whole run, at THREE snapshots
+// (docs/audit-m3.1-throughput.md). Cadence is meant to come from `RequeueAfter: interval` plus the
+// ClusterBackup post-run nudge.
+//
+// The filter is deliberately narrow: it drops an update ONLY when the change is confined to the
+// three fields discovery itself writes. Anything else still wakes it — the `Initialized` flip that
+// makes the repository inventoriable, another controller's status write (lastMaintenanceTime after
+// a prune, keySlots, conditions), and any metadata change (the envtest specs nudge discovery with
+// an annotation, and BackupRepositorySpec is empty so generation never moves). Create/Delete/
+// Generic stay unfiltered (predicate.Funcs defaults them to true).
+func inventoryChurnPredicate() predicate.Predicate {
+	return predicate.Funcs{
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			oldRepo, okOld := e.ObjectOld.(*cbv1.BackupRepository)
+			newRepo, okNew := e.ObjectNew.(*cbv1.BackupRepository)
+			if !okOld || !okNew {
+				return true // not a BackupRepository — not ours to filter
+			}
+			if oldRepo.GetGeneration() != newRepo.GetGeneration() ||
+				!equality.Semantic.DeepEqual(oldRepo.GetLabels(), newRepo.GetLabels()) ||
+				!equality.Semantic.DeepEqual(oldRepo.GetAnnotations(), newRepo.GetAnnotations()) {
+				return true
+			}
+			// Mask discovery's own inventory fields: if the two statuses match once they are
+			// zeroed, this event IS discovery's write coming back — swallow it.
+			oldStatus, newStatus := oldRepo.Status.DeepCopy(), newRepo.Status.DeepCopy()
+			for _, s := range []*cbv1.BackupRepositoryStatus{oldStatus, newStatus} {
+				s.SnapshotCount = 0
+				s.NamespacesPresent = 0
+				s.LastDiscoveryTime = nil
+			}
+			return !equality.Semantic.DeepEqual(oldStatus, newStatus)
+		},
+	}
+}
+
 // SetupWithManager registers this reconciler. It reconciles BackupRepositories and, via a mapping
 // from a ClusterBackup to its location's repository, re-inventories promptly right after a run
-// completes (rather than waiting for the next interval tick).
+// completes (rather than waiting for the next interval tick). The For watch is filtered so
+// discovery's own inventory status writes do not re-trigger it (inventoryChurnPredicate).
 func (r *DiscoveryReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&cbv1.BackupRepository{}).
+		For(&cbv1.BackupRepository{}, builder.WithPredicates(inventoryChurnPredicate())).
 		Watches(&cbv1.ClusterBackup{}, handler.EnqueueRequestsFromMapFunc(r.mapRunToRepository)).
 		Named("discovery").
 		Complete(r)

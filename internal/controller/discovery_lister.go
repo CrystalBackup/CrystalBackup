@@ -276,6 +276,13 @@ func (l *JobSnapshotLister) ensureCredsSecret(ctx context.Context, repo *cbv1.Ba
 // a mediated restore resolution. Owned by the repository (GC on repository delete);
 // tolerates AlreadyExists so a restart mid-inventory re-adopts the running Job rather than
 // leaking a second.
+//
+// The owner reference is deliberately a PLAIN one, not a controller reference: the
+// BackupRepository reconciler watches `Owns(&batchv1.Job{})` for its init Job, and Owns matches
+// only the CONTROLLER owner. A controller ref here made every listing Job's create/run/delete
+// events wake that reconciler too — ~2700 no-op reconciles in a 33-minute crucible run
+// (docs/audit-m3.1-throughput.md). A plain owner ref still cascades the GC on repository delete,
+// which is all this Job needs.
 func (l *JobSnapshotLister) ensureSnapshotsJob(ctx context.Context, repo *cbv1.BackupRepository, name, repoURL string, resticArgs []string) error {
 	job := mover.BuildJob(mover.JobRequest{
 		Name:         name,
@@ -290,8 +297,8 @@ func (l *JobSnapshotLister) ensureSnapshotsJob(ctx context.Context, repo *cbv1.B
 		TTLSeconds:   discoveryJobTTLSeconds,
 		Labels:       discoveryJobLabels(),
 	})
-	if err := controllerutil.SetControllerReference(repo, job, l.Scheme); err != nil {
-		return fmt.Errorf("set controller reference on discovery job %s: %w", name, err)
+	if err := controllerutil.SetOwnerReference(repo, job, l.Scheme); err != nil {
+		return fmt.Errorf("set owner reference on discovery job %s: %w", name, err)
 	}
 	if err := l.Create(ctx, job); err != nil {
 		if !apierrors.IsAlreadyExists(err) {
