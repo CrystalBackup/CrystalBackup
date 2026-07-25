@@ -194,9 +194,18 @@ const (
 	OriginNamespace = "namespace"
 )
 
-// AnnotationPreBackupPrefix is the prefix for pod annotations honoured as pre-backup
-// hooks when HooksSpec.HonorAnnotations is true (e.g. "crystalbackup.io/pre-backup-command").
-const AnnotationPreBackupPrefix = Domain + "/pre-backup-"
+// AnnotationPreBackupPrefix / AnnotationPostBackupPrefix are the prefixes for pod annotations
+// honoured as consistency hooks when HooksSpec.HonorAnnotations is true — e.g.
+// "crystalbackup.io/pre-backup-command", "-container", "-on-error", "-timeout", and the same four
+// under the post- prefix.
+//
+// Both phases exist because a hook that quiesces without a matching hook to release is an outage:
+// a pre-backup `FLUSH TABLES WITH READ LOCK` needs its `UNLOCK TABLES`, and the pod owner who
+// wrote the first must be able to write the second in the same place.
+const (
+	AnnotationPreBackupPrefix  = Domain + "/pre-backup-"
+	AnnotationPostBackupPrefix = Domain + "/post-backup-"
+)
 
 // AnnotationSecretDataExcluded marks a Secret manifest captured with its data/stringData
 // stripped, under manifestOptions.excludeSecretData (03-security-and-tenancy.md §10). It is

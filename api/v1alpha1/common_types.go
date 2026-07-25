@@ -280,6 +280,18 @@ type NamespaceSelector struct {
 // +kubebuilder:validation:Enum=Fail;Continue
 type HookErrorPolicy string
 
+// Hook failure policies. The zero value is empty, which callers must treat as Fail — matching the
+// CRD default — so a hook whose policy was never set fails closed rather than silently continuing.
+const (
+	// HookErrorPolicyFail aborts the backup when the hook fails. The default, because a
+	// pre-snapshot hook exists precisely to make the snapshot trustworthy: if the quiesce did not
+	// happen, a snapshot taken anyway is a backup that LOOKS application-consistent and is not.
+	HookErrorPolicyFail HookErrorPolicy = "Fail"
+	// HookErrorPolicyContinue records the failure and proceeds — for best-effort hooks whose
+	// absence degrades consistency without invalidating the backup.
+	HookErrorPolicyContinue HookErrorPolicy = "Continue"
+)
+
 // Hook is an exec hook run in a selected pod around snapshotting (R16).
 type Hook struct {
 	// podSelector selects the pod(s) to exec into.
