@@ -13,7 +13,7 @@ if [[ "${CONFIRM:-}" != "yes" ]]; then
   exit 1
 fi
 
-tofu -chdir="${CRUCIBLE_DIR}/terraform" destroy -auto-approve
+"${CRUCIBLE_DIR}/scripts/tofu-lane.sh" destroy -auto-approve
 rm -f "${CRUCIBLE_DIR}/artifacts/kubeconfig" "${CRUCIBLE_DIR}/artifacts/crucible.env"
 echo
 echo "Crucible destroyed. If the S3 bucket held backups, terraform emptied and removed it too;"

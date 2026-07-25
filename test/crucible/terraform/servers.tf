@@ -12,14 +12,14 @@ locals {
 resource "hcloud_server" "master" {
   count = var.master_count
 
-  name               = "${var.name_prefix}-master-${count.index + 1}"
+  name               = "${local.name_prefix}-master-${count.index + 1}"
   server_type        = var.master_type
   image              = var.image
   location           = var.location
   ssh_keys           = [data.hcloud_ssh_key.crucible.id]
   firewall_ids       = [hcloud_firewall.crucible.id]
   placement_group_id = hcloud_placement_group.crucible.id
-  labels             = merge(var.labels, { role = "master" })
+  labels             = merge(local.lane_labels, { role = "master" })
 
   public_net {
     ipv4_enabled = true
@@ -41,14 +41,14 @@ resource "hcloud_server" "master" {
 resource "hcloud_server" "worker" {
   count = var.worker_count
 
-  name               = "${var.name_prefix}-worker-${count.index + 1}"
+  name               = "${local.name_prefix}-worker-${count.index + 1}"
   server_type        = var.worker_type
   image              = var.image
   location           = var.location
   ssh_keys           = [data.hcloud_ssh_key.crucible.id]
   firewall_ids       = [hcloud_firewall.crucible.id]
   placement_group_id = hcloud_placement_group.crucible.id
-  labels             = merge(var.labels, { role = "worker" })
+  labels             = merge(local.lane_labels, { role = "worker" })
 
   public_net {
     ipv4_enabled = true
@@ -72,10 +72,10 @@ resource "hcloud_server" "worker" {
 resource "hcloud_volume" "ceph" {
   count = var.worker_count
 
-  name      = "${var.name_prefix}-ceph-${count.index + 1}"
+  name      = "${local.name_prefix}-ceph-${count.index + 1}"
   size      = var.ceph_volume_size
   location  = var.location
-  labels    = merge(var.labels, { role = "ceph-osd" })
+  labels    = merge(local.lane_labels, { role = "ceph-osd" })
   format    = null # raw on purpose — rook formats it
   automount = false
 }

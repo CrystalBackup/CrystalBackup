@@ -20,15 +20,17 @@ REPO_ROOT="$(cd "${CRUCIBLE_DIR}/../.." && pwd)"
 source "${CRUCIBLE_DIR}/scripts/load-env.sh"
 
 LABELS="${1:-${CRUCIBLE_LABELS:-}}"
-export KUBECONFIG="${KUBECONFIG:-${CRUCIBLE_DIR}/artifacts/kubeconfig}"
+export KUBECONFIG="${KUBECONFIG:-${CRUCIBLE_ARTIFACTS:-${CRUCIBLE_DIR}/artifacts}/kubeconfig}"
 
 if [[ ! -f "${KUBECONFIG}" ]]; then
   echo "FATAL: no kubeconfig at ${KUBECONFIG} — run 'mise run up' (or 'mise run cluster') first." >&2
   exit 1
 fi
 
-mkdir -p "${CRUCIBLE_DIR}/artifacts"
-export CRUCIBLE_REPORT_PATH="${CRUCIBLE_DIR}/artifacts/crucible-report.md"
+# Per-lane, so parallel lanes do not delete each other's report at startup.
+_artifacts="${CRUCIBLE_ARTIFACTS:-${CRUCIBLE_DIR}/artifacts}"
+mkdir -p "${_artifacts}"
+export CRUCIBLE_REPORT_PATH="${_artifacts}/crucible-report.md"
 rm -f "${CRUCIBLE_REPORT_PATH}"
 
 ginkgo_args=(--ginkgo.label-filter="${LABELS}")

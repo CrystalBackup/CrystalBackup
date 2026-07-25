@@ -84,21 +84,24 @@
       until: nodes_ready.rc == 0
       changed_when: false
 
+    # The destination is lane-aware: with no lane it is artifacts/kubeconfig exactly as before,
+    # and a lane writes under artifacts/lanes/<lane>/ instead. Two lanes sharing one kubeconfig
+    # path would silently aim every kubectl in the session at whichever cluster finished last.
     - name: Fetch kubeconfig
       ansible.builtin.fetch:
         src: /etc/rancher/rke2/rke2.yaml
-        dest: ../artifacts/kubeconfig
+        dest: "{{ crucible_artifacts_dir | default('../artifacts') }}/kubeconfig"
         flat: true
 
     - name: Point the kubeconfig at the first master's public IP
       delegate_to: localhost
       ansible.builtin.replace:
-        path: ../artifacts/kubeconfig
+        path: "{{ crucible_artifacts_dir | default('../artifacts') }}/kubeconfig"
         regexp: "https://127\\.0\\.0\\.1:6443"
         replace: "https://{{ first_master_public_ip }}:6443"
 
     - name: Restrict kubeconfig permissions
       delegate_to: localhost
       ansible.builtin.file:
-        path: ../artifacts/kubeconfig
+        path: "{{ crucible_artifacts_dir | default('../artifacts') }}/kubeconfig"
         mode: "0600"

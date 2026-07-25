@@ -4,7 +4,7 @@
 # ---------------------------------------------------------------------------
 
 resource "local_file" "ansible_inventory" {
-  filename        = "${path.module}/../ansible/inventory/hosts.ini"
+  filename        = local.inventory_file
   file_permission = "0600"
 
   content = templatefile("${path.module}/templates/hosts.ini.tftpl", {
@@ -32,7 +32,7 @@ resource "local_file" "ansible_inventory" {
 
 # Non-secret facts consumed by `make test` / the Ginkgo suite.
 resource "local_file" "crucible_env" {
-  filename        = "${path.module}/../artifacts/crucible.env"
+  filename        = "${local.artifacts_dir}/crucible.env"
   file_permission = "0644"
 
   content = <<-EOT
