@@ -28,6 +28,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	kerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -171,27 +172,66 @@ func (r *DiscoveryReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	}
 
 	// (1) Project one Backup per (namespace, run) group whose namespace exists.
+	//
+	// A per-group failure is ACCUMULATED, never returned early. Returning here discarded the whole
+	// inventory the pass had just paid for: step (3) never ran, so lastDiscoveryTime froze and the
+	// retry re-listed the entire repository from S3 to learn exactly the same thing. One namespace
+	// refusing a projection must cost that namespace — not the other groups, and not the inventory
+	// (docs/audit-m3.1-throughput.md, the flakiness chain).
+	var failures []error
 	for key, groupSnaps := range groups {
 		if key.Namespace == "" {
 			continue // a cluster-manifests group has no namespace to project into (admin ClusterRestore only).
 		}
 		if err := r.projectGroup(ctx, &repo, key, groupSnaps); err != nil {
-			return ctrl.Result{}, err
+			failures = append(failures, err)
 		}
 	}
 
 	// (2) GC projections whose snapshots are gone (post-forget); never touch execution Backups.
 	// Scoped to THIS repository's location so multiple locations never GC each other's projections.
+	// Accumulated for the same reason: a stale projection surviving one extra pass is a far smaller
+	// problem than a frozen inventory.
 	if err := r.gcProjections(ctx, repo.Name, repoKeys); err != nil {
+		failures = append(failures, err)
+	}
+
+	// (3) Record the inventory on the repository status — ALWAYS, partial pass included. What the
+	// repository holds is what the listing measured, independently of whether every projection
+	// landed, and it is stamped with the time the pass actually ran (res.at) rather than now, so a
+	// reused inventory never claims to be fresher than it is. A failure to PERSIST it is the one
+	// error worth returning: nothing downstream can trust a pass whose result was never written.
+	if err := r.updateInventoryStatus(ctx, &repo, snaps, res.at); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	// (3) Record the inventory on the repository status.
-	if err := r.updateInventoryStatus(ctx, &repo, snaps); err != nil {
-		return ctrl.Result{}, err
+	if len(failures) > 0 {
+		return r.reportPartialPass(ctx, &repo, res, failures, interval), nil
 	}
 
 	return ctrl.Result{RequeueAfter: interval}, nil
+}
+
+// reportPartialPass handles a pass that inventoried the repository but could not project (or GC)
+// every group: it reports the failures and schedules a prompt retry that reuses the inventory
+// already in hand.
+//
+// Retention is what makes the retry cheap. Without it the next reconcile finds the tracker idle and
+// starts a full `restic snapshots` Job — the O(snapshots) S3 round trip — every retry interval, for
+// as long as one namespace stays unhappy. With it, the retry re-attempts only the projection, and a
+// fresh listing is paid at most once per discovery interval (inventoryTracker.retain bounds the
+// reuse by exactly that age).
+func (r *DiscoveryReconciler) reportPartialPass(ctx context.Context, repo *cbv1.BackupRepository,
+	res *inventoryResult, failures []error, interval time.Duration,
+) ctrl.Result {
+	err := kerrors.NewAggregate(failures)
+	logf.FromContext(ctx).Error(err, "discovery: inventory recorded, but some groups could not be reconciled",
+		"repository", repo.Name, "failures", len(failures))
+	r.Recorder.Eventf(repo, nil, corev1.EventTypeWarning, "ProjectionIncomplete", "ProjectRepository",
+		"repository inventory recorded, but %d group(s) could not be reconciled: %v", len(failures), err)
+
+	r.Inventory.retain(repo.Name, res, interval)
+	return ctrl.Result{RequeueAfter: discoveryRetryInterval}
 }
 
 // projectGroup ensures the read-only projected Backup for one (namespace, run) group, unless the
@@ -322,11 +362,18 @@ func (r *DiscoveryReconciler) gcProjections(ctx context.Context, locationName st
 // the repository. It read-modify-writes (the BackupRepository controller owns other status fields
 // and its Get-modify-Update preserves these, as this one preserves its), so a concurrent write only
 // costs a conflict retry.
-func (r *DiscoveryReconciler) updateInventoryStatus(ctx context.Context, repo *cbv1.BackupRepository, snaps []restic.Snapshot) error {
-	now := metav1.Now()
+//
+// at is when the listing itself ran, not when it is being recorded: a partial pass whose inventory
+// is reused by the retry (inventoryTracker.retain) must not keep stamping a fresher time onto data
+// it did not re-measure — and re-writing the identical timestamp makes that retry's status update a
+// server-side no-op instead of pointless churn.
+func (r *DiscoveryReconciler) updateInventoryStatus(ctx context.Context, repo *cbv1.BackupRepository,
+	snaps []restic.Snapshot, at time.Time,
+) error {
+	discovered := metav1.NewTime(at)
 	repo.Status.SnapshotCount = int32(len(snaps))
 	repo.Status.NamespacesPresent = int32(discovery.DistinctNamespaces(snaps))
-	repo.Status.LastDiscoveryTime = &now
+	repo.Status.LastDiscoveryTime = &discovered
 	if err := r.Status().Update(ctx, repo); err != nil {
 		return fmt.Errorf("update repository inventory status %s: %w", repo.Name, err)
 	}

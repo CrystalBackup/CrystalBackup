@@ -130,6 +130,62 @@ func TestInventoryTrackerRunsOffTheWorker(t *testing.T) {
 	}
 }
 
+// TestInventoryTrackerRetain pins the partial-pass optimisation: a consumed result can be handed
+// back so the retry re-attempts only the projection, instead of paying for a whole fresh
+// `restic snapshots` listing to learn the same thing (docs/audit-m3.1-throughput.md). The reuse is
+// bounded by the caller's discovery interval, and never displaces newer data.
+func TestInventoryTrackerRetain(t *testing.T) {
+	repo := trackerTestRepo()
+	fresh := func() *inventoryResult {
+		return &inventoryResult{snaps: []restic.Snapshot{{ID: "id-1"}}, at: time.Now()}
+	}
+
+	t.Run("a fresh result is handed back and consumed once", func(t *testing.T) {
+		tr := newInventoryTracker()
+		if !tr.retain(repo.Name, fresh(), time.Minute) {
+			t.Fatal("retain() = false, want true for a result well inside maxAge")
+		}
+		res, state := tr.take(repo.Name)
+		if state != inventoryReady || len(res.snaps) != 1 {
+			t.Fatalf("take() = (%+v, %v), want the retained result as inventoryReady", res, state)
+		}
+		if _, state := tr.take(repo.Name); state != inventoryIdle {
+			t.Errorf("after consuming a retained result: state = %v, want inventoryIdle", state)
+		}
+	})
+
+	t.Run("a result older than maxAge is refused so the next pass lists afresh", func(t *testing.T) {
+		tr := newInventoryTracker()
+		stale := &inventoryResult{snaps: []restic.Snapshot{{ID: "id-1"}}, at: time.Now().Add(-2 * time.Minute)}
+		if tr.retain(repo.Name, stale, time.Minute) {
+			t.Error("retain() = true for a result past maxAge, want false (the inventory must not go stale)")
+		}
+		if _, state := tr.take(repo.Name); state != inventoryIdle {
+			t.Errorf("state = %v, want inventoryIdle so the caller starts a real pass", state)
+		}
+	})
+
+	t.Run("newer data always wins", func(t *testing.T) {
+		tr := newInventoryTracker()
+		lister := &blockingLister{release: make(chan struct{})}
+		tr.start(repo, lister)
+		waitFor(t, "the pass to be in flight", func() bool { return lister.calls.Load() == 1 })
+		if tr.retain(repo.Name, fresh(), time.Minute) {
+			t.Error("retain() = true while a pass is in flight, want false")
+		}
+		close(lister.release)
+
+		waitFor(t, "the pass to land", func() bool {
+			tr.mu.Lock()
+			defer tr.mu.Unlock()
+			return tr.results[repo.Name] != nil
+		})
+		if tr.retain(repo.Name, fresh(), time.Minute) {
+			t.Error("retain() = true over an unconsumed result, want false")
+		}
+	})
+}
+
 // TestInventoryTrackerSurfacesErrors checks a failed pass is handed back as a consumable error
 // (discovery turns it into an InventoryFailed event + retry) and does not strand the repository.
 func TestInventoryTrackerSurfacesErrors(t *testing.T) {

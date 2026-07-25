@@ -42,10 +42,13 @@ const (
 	inventoryReady
 )
 
-// inventoryResult is one completed inventory pass.
+// inventoryResult is one completed inventory pass. at stamps when the pass landed, so a consumer
+// can report the repository's inventory with the time it was actually measured (rather than the
+// time it was consumed) and decide whether the result is still fresh enough to reuse (retain).
 type inventoryResult struct {
 	snaps []restic.Snapshot
 	err   error
+	at    time.Time
 }
 
 // inventoryTracker runs SnapshotLister passes OFF the reconcile worker.
@@ -96,6 +99,32 @@ func (t *inventoryTracker) take(repoName string) (*inventoryResult, inventorySta
 	return nil, inventoryIdle
 }
 
+// retain hands a CONSUMED result back to the tracker so the next reconcile of that repository can
+// reuse it instead of paying for a whole fresh listing. It exists for the partial-pass path: when a
+// pass inventoried the repository fine but could not project every group, the retry only needs to
+// re-attempt the projection — re-listing the repository from S3 would cost the full O(snapshots)
+// round trip to learn nothing new (docs/audit-m3.1-throughput.md).
+//
+// Reuse is bounded by maxAge (the location's discovery interval): a retained inventory is never
+// older than the freshness discovery already promises, so a group that keeps failing costs one
+// listing per interval — not one per retry, and not a frozen inventory. Returns whether the result
+// was put back; false means the caller's next pass will list afresh.
+//
+// A pass that is somehow in flight, or a result that landed meanwhile, always wins: retention is an
+// optimisation and must never displace newer data.
+func (t *inventoryTracker) retain(repoName string, res *inventoryResult, maxAge time.Duration) bool {
+	if res == nil || time.Since(res.at) >= maxAge {
+		return false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.inFlight[repoName] || t.results[repoName] != nil {
+		return false
+	}
+	t.results[repoName] = res
+	return true
+}
+
 // start launches one inventory pass on a background goroutine, unless one is already in flight.
 // It returns immediately; the reconcile that called it must return without blocking.
 //
@@ -134,6 +163,8 @@ func (t *inventoryTracker) start(repo *cbv1.BackupRepository, lister SnapshotLis
 
 // finish records a completed pass and wakes the controller for that repository.
 func (t *inventoryTracker) finish(repo *cbv1.BackupRepository, res *inventoryResult) {
+	res.at = time.Now()
+
 	t.mu.Lock()
 	delete(t.inFlight, repo.Name)
 	t.results[repo.Name] = res

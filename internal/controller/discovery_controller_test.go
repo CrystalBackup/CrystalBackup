@@ -333,4 +333,39 @@ var _ = Describe("DiscoveryReconciler", func() {
 			g.Expect(err).To(HaveOccurred())
 		}, 2*time.Second, 500*time.Millisecond).Should(Succeed())
 	})
+
+	// A projection can fail for reasons no guard can pre-empt, and the repository is FOREIGN data:
+	// its run tags come from whatever wrote to the bucket, so a group can carry a run name the API
+	// server will not accept as an object name. That used to abort the whole reconcile before the
+	// inventory was recorded, so lastDiscoveryTime froze and every retry re-listed the entire
+	// repository — the amplifier documented in docs/audit-m3.1-throughput.md. A bad group must cost
+	// its own group only.
+	It("records the inventory even when a group cannot be projected at all", func() {
+		const loc = "disc-loc-partial"
+		const goodRun = "disc-run-good"
+		const badRun = "Invalid_Run" // not an RFC 1123 name: the API server rejects the apply
+		seedInitializedRepo(loc, "kek-disc-pf", "s3-disc-pf")
+		createTenantNamespace("disc-partial-ns")
+
+		discoveryLister.set(
+			discDataSnap("id-good", "disc-partial-ns", "pvc-a", goodRun),
+			discDataSnap("id-bad", "disc-partial-ns", "pvc-b", badRun),
+		)
+		pokeRepository(loc)
+
+		By("the healthy group is still projected")
+		Eventually(func(g Gomega) {
+			var b cbv1.Backup
+			g.Expect(k8sClient.Get(ctx, client.ObjectKey{Namespace: "disc-partial-ns", Name: goodRun}, &b)).To(Succeed())
+			g.Expect(b.Status.Volumes).To(HaveLen(1))
+		}, eventuallyTimeout, eventuallyPoll).Should(Succeed())
+
+		By("and the inventory the pass already paid for is recorded, not discarded")
+		Eventually(func(g Gomega) {
+			var repo cbv1.BackupRepository
+			g.Expect(k8sClient.Get(ctx, client.ObjectKey{Name: loc}, &repo)).To(Succeed())
+			g.Expect(repo.Status.SnapshotCount).To(Equal(int32(2)))
+			g.Expect(repo.Status.LastDiscoveryTime).NotTo(BeNil())
+		}, eventuallyTimeout, eventuallyPoll).Should(Succeed())
+	})
 })
