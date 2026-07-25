@@ -9,6 +9,7 @@
 # Env toggles:
 #   CRUCIBLE_VERBOSE=1               stream full Ginkgo output (debugging)
 #   CRUCIBLE_EXPECT_OPERATOR_READY=1 require the operator Deployment to be Available
+#   CRUCIBLE_TIMEOUT=3h              whole-suite go-test budget (default 90m)
 #
 # Exits non-zero when any spec fails (so automation and the skill can detect it).
 set -uo pipefail
@@ -33,9 +34,15 @@ rm -f "${CRUCIBLE_REPORT_PATH}"
 ginkgo_args=(--ginkgo.label-filter="${LABELS}")
 [[ "${CRUCIBLE_VERBOSE:-}" == "1" ]] && ginkgo_args+=(--ginkgo.v)
 
-echo "==> running crucible suite  (labels: '${LABELS:-<all>}')"
+# Whole-suite wall-clock budget. 60m was overrun by the M3 full-suite run (go test panicked
+# mid-flight, losing the report), so the default is 90m — the suite's own Eventually deadlines,
+# not this, are what should fail a spec. Override for a long debugging run:
+#   CRUCIBLE_TIMEOUT=3h mise run test
+CRUCIBLE_TIMEOUT="${CRUCIBLE_TIMEOUT:-90m}"
+
+echo "==> running crucible suite  (labels: '${LABELS:-<all>}', timeout ${CRUCIBLE_TIMEOUT})"
 cd "${REPO_ROOT}"
-go test -tags crucible ./test/crucible/tests -timeout 60m -args "${ginkgo_args[@]}"
+go test -tags crucible ./test/crucible/tests -timeout "${CRUCIBLE_TIMEOUT}" -args "${ginkgo_args[@]}"
 rc=$?
 
 # The readable report is the last thing the operator sees — `go test` hides a

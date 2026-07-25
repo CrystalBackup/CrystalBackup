@@ -165,40 +165,72 @@ reconstitutes a deleted namespace from the shared repo.
 - [ ] e2e: full namespace backup, restore into a fresh namespace and into kind (different
       CIDR, different storage class) — workloads come back Ready.
 
-## M3.1 — Operator throughput & discovery scalability audit (post-M3 hardening)
+## M3.1 — Operator throughput & discovery scalability audit (post-M3 hardening) — DONE (0.3.1)
 
 **Root-cause audit, NOT speculative fixes.** Surfaced by the M3 **full-suite** crucible run (all of
-m0–m3 driving the ONE shared "dr" repository): under sustained multi-namespace load the operator's
-reconcile throughput becomes the bottleneck — several specs time out **differently on every run**
-(m1 OOM crash-detection convergence `m1_reliability`, m1 discovery GC of a forgotten projection
-`m1_discovery`, m1 `restic check` `m1_repository`, m2 Recreate restore), and the whole `go test`
-overran its **60-min** budget (panic). This is **NOT an M3 regression and NOT a correctness bug** —
-M3 is functionally validated (unit + envtest, `make e2e` kind 25/25 with real mover Jobs, crucible
-**m3-only 11/11**, every M3 `It` green even inside the full suite). It is operator scalability under
-load, largely **pre-existing** (M1 discovery was already O(snapshots)) and orthogonal to M3; M3 only
-accelerates repo growth (a `kind=manifests` snapshot per backup ≈ doubles the snapshot count).
+m0–m3 driving the ONE shared "dr" repository): under sustained multi-namespace load several specs
+timed out **differently on every run** (m1 OOM crash-detection convergence `m1_reliability`, m1
+discovery GC of a forgotten projection `m1_discovery`, m1 `restic check` `m1_repository`, m2
+Recreate restore), and the whole `go test` overran its **60-min** budget (panic). This was **NOT an
+M3 regression and NOT a correctness bug** — M3 was functionally validated (unit + envtest, `make
+e2e` kind 25/25 with real mover Jobs, crucible **m3-only 11/11**, every M3 `It` green even inside
+the full suite), and the cause was pre-existing and orthogonal to M3.
 
-- [ ] **Measure the real bottleneck FIRST** (the whole point — no fix on a guess): instrument
-      per-controller reconcile-queue depth, Job-spawn latency, `restic snapshots` wall-time vs repo
-      snapshot count, controller-runtime `MaxConcurrentReconciles`, operator CPU/mem, and discovery
-      cycle time on a large shared repo. Reproduce on the crucible with all specs → one repo.
-- [ ] From the data (do NOT pre-commit a design): evaluate throughput models — worker-count /
-      `MaxConcurrentReconciles` tuning, a pub/sub or fan-out-with-ack model for the mover Jobs,
-      backpressure, batching. Owner's steer: prefer a real audit over guessed fixes.
-- [ ] **Discovery scalability**: today `internal/restic.SnapshotsArgs()` runs
-      `snapshots --json --tag crystalbackup` — a FULL repo re-scan every cycle (O(snapshots), and M3
-      ~doubles the count). Evaluate an **incremental / cached inventory** instead of a full re-scan.
+**What the measurement actually found** (the working hypothesis below was wrong, which is why the
+milestone was chartered as measure-first): the bottleneck was **not** an O(snapshots) re-scan and
+**not** operator resources. Discovery re-triggered itself — it wrote its own inventory status onto
+the object it watches, with no predicate on that watch — so it never rested at `discovery.interval`
+and spun back-to-back, each pass blocking its single worker on a cold `restic snapshots` Job.
+The O(snapshots) term is real but secondary, and is pure S3 per-object latency rather than restic
+compute. Details and numbers: [docs/audit-m3.1-throughput.md](../docs/audit-m3.1-throughput.md).
+
+**Shipped as `0.3.1`** (audit: [docs/audit-m3.1-throughput.md](../docs/audit-m3.1-throughput.md)).
+
+- [x] **Measured the real bottleneck FIRST.** The released 0.3.0 operator was deployed unmodified
+      on a live crucible and scraped over a whole full-suite run. The hypothesis below (O(snapshots)
+      re-scan) was **not** the dominant cost: discovery's single reconcile worker was **~100 %
+      saturated for an entire run at THREE snapshots** — `reconcile_time_seconds{discovery}` summed
+      to 1991 s inside a 1980 s window, every other controller combined under 100 s, operator CPU
+      ~0.01 core / RSS ~290 MB. The cost was wall-time on blocking reconciles; the multiplier was a
+      **self-trigger loop** (discovery wrote its own inventory status onto the object it watches,
+      with no predicate on the watch).
+- [x] **Fixes, driven by that data**: the self-trigger predicate; a plain (non-controller) owner
+      reference on the inventory Job so `backuprepository`'s `Owns(Job)` stops waking on every
+      listing Job (~2700 → 56 reconciles); the inventory moved **off the reconcile worker**
+      (single-flight per repository, re-enqueued via `source.Channel`); and a terminating namespace
+      skipped like an absent one. Re-measured: **discovery 1991 s → 9.9 s across a run 1.8× longer**,
+      worker never blocked.
+- [x] **Discovery scalability, quantified**: restic's own listing compute is flat (~0.8 s from N=10
+      to N=2000 on a local repo) — the O(N) is entirely **S3 per-object latency on a cold cache**
+      (~27 ms/snapshot; N=350 → 10 s). It is now paid off the worker and once per interval, so it
+      starves nothing. A warm/incremental inventory (cold O(N) → warm O(Δ)) stays available as the
+      next lever if a repository grows into the thousands of snapshots.
       NOTE — `--no-lock` for discovery is deliberately deferred to **M4** (it lands WITH `prune`, the
       first exclusive lock; until then discovery's non-exclusive `restic` lock contends with nobody,
       so `--no-lock` buys nothing yet and is best done alongside the maintenance controller).
-- [ ] **Harden the crucible full suite to be reproducibly green**: the suite piles every spec's
-      snapshots into one repo with **no pruning between specs** (worse than steady-state prod, which
-      prunes via retention). Isolate/prune the repo between specs, tune the discovery interval
-      (crucible runs 1m), and raise the `go test` budget (60m was overrun). Already fixed THIS
-      session (committed on the M3 branch): `m3RunID` per-run-unique backup names, the
-      `m1ResticRestoreVerify` mover-egress label, `networkPolicy.apiServerPort=6443` for RKE2/Canal,
-      and the residual-object / namespace-terminating cleanup-timeout bumps (2m→5m).
-- [ ] Ship as a patch (0.3.z) once the audit lands a real fix or documents the scaling limits.
+- [x] **Crucible budget** raised 60m → 90m (`CRUCIBLE_TIMEOUT`); the M3 run had overrun it and the
+      panic took the report with it. Full-suite result on 0.3.1: **37 passed / 2 failed / 4 skipped
+      in 58.6 min**, with `m1_discovery` and `m1_repository` now passing.
+
+### Deferred to `0.3.2`
+
+- [ ] **The leak behind the flakiness chain.** The validation traced why the suite "fails differently
+      every run": an orphaned `pvc-as-source-protection` finalizer (with **zero** VolumeSnapshots
+      left) wedges a PVC → wedges its namespace in `Terminating` → froze discovery entirely → the
+      next spec needing a fresh inventory failed. The namespace half is fixed; the leak that creates
+      it is not. Related and probably the same incident from the other end: a restore twin PV failing
+      to mount with `internal RBD image not found` after two earlier restores on the same volume
+      succeeded — the twin copies the volume handle verbatim under `Retain` precisely so it can never
+      destroy the user's volume, so this is either a Ceph-side vanish or a teardown releasing a PV
+      under a Delete policy. **Two explanations calling for opposite fixes** → shipped as a
+      reproduction plan, not a patch (audit § "the m2-Recreate RBD flake").
+- [ ] **A projection failure still discards the whole inventory**, forcing a full re-listing on the
+      retry. Make a pass survive a per-group failure (accumulate, record the inventory, report).
+- [ ] **Pre-existing OOM-detection flake**: a SIGKILLed mover's volume was reported `Completed`
+      instead of `Failed` (`m1_reliability`). On the backup/mover result path, untouched by 0.3.1.
+- [ ] Least-privilege trim: `OpSnapshots` mounts no data volume yet still receives `DAC_OVERRIDE`.
+      (The PodSecurity `restricted` **warning** is driven by `runAsUser=0`, not by capabilities, so
+      quieting it means a non-root mover image — its own lot, with restore-fidelity risk.)
 
 ## M4 — Consistency hooks, verification & maintenance (R16, R17)
 

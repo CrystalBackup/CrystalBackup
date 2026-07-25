@@ -22,6 +22,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -29,10 +30,14 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	cbv1 "github.com/CrystalBackup/CrystalBackup/api/v1alpha1"
 	"github.com/CrystalBackup/CrystalBackup/internal/apiconst"
@@ -80,11 +85,19 @@ type DiscoveryReconciler struct {
 	Scheme   *runtime.Scheme
 	Lister   SnapshotLister
 	Recorder events.EventRecorder
+	// Inventory runs Lister passes off the reconcile worker, single-flight per repository.
+	Inventory *inventoryTracker
 }
 
 // NewDiscoveryReconciler builds the reconciler. Callers wire the production or stub lister here.
 func NewDiscoveryReconciler(c client.Client, scheme *runtime.Scheme, lister SnapshotLister, recorder events.EventRecorder) *DiscoveryReconciler {
-	return &DiscoveryReconciler{Client: c, Scheme: scheme, Lister: lister, Recorder: recorder}
+	return &DiscoveryReconciler{
+		Client:    c,
+		Scheme:    scheme,
+		Lister:    lister,
+		Recorder:  recorder,
+		Inventory: newInventoryTracker(),
+	}
 }
 
 // +kubebuilder:rbac:groups=crystalbackup.io,resources=backuprepositories,verbs=get;list;watch;update;patch
@@ -123,13 +136,29 @@ func (r *DiscoveryReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		return ctrl.Result{}, nil
 	}
 
-	snaps, err := r.Lister.List(ctx, &repo)
-	if err != nil {
-		log.Error(err, "discovery: inventory failed; will retry", "repository", repo.Name)
+	// The inventory runs OFF this worker (inventoryTracker): a pass creates a `restic snapshots`
+	// Job and waits on it — seconds, cold every time — and holding the controller's single worker
+	// for that made every other repository queue behind it. Consume a finished pass if one is
+	// waiting, otherwise start one and return immediately; the tracker re-enqueues us when it
+	// lands, with a watchdog requeue in case that wake is ever lost.
+	res, state := r.Inventory.take(repo.Name)
+	switch state {
+	case inventoryPending:
+		return ctrl.Result{RequeueAfter: inventoryWatchdogInterval}, nil
+	case inventoryIdle:
+		r.Inventory.start(&repo, r.Lister)
+		return ctrl.Result{RequeueAfter: inventoryWatchdogInterval}, nil
+	case inventoryReady:
+		// fall through to consume res
+	}
+
+	if res.err != nil {
+		log.Error(res.err, "discovery: inventory failed; will retry", "repository", repo.Name)
 		r.Recorder.Eventf(&repo, nil, corev1.EventTypeWarning, "InventoryFailed", "InventoryRepository",
-			"repository inventory failed: %v", err)
+			"repository inventory failed: %v", res.err)
 		return ctrl.Result{RequeueAfter: discoveryRetryInterval}, nil
 	}
+	snaps := res.snaps
 
 	groups := restic.GroupByNamespaceRun(snaps)
 
@@ -178,6 +207,17 @@ func (r *DiscoveryReconciler) projectGroup(ctx context.Context, repo *cbv1.Backu
 			return nil // namespace gone: do not fabricate a Backup for it.
 		}
 		return fmt.Errorf("get namespace %s: %w", key.Namespace, err)
+	}
+	// A TERMINATING namespace still resolves through the Get above, but the API server rejects
+	// every create in it ("unable to create new content in namespace X because it is being
+	// terminated"). Treated as a hard error that aborts the whole reconcile, that transient and
+	// entirely expected state stopped the pass before it could record the inventory, so the retry
+	// re-ran a FULL re-inventory — a fresh `restic snapshots` Job every few seconds for as long as
+	// the namespace took to disappear, with lastDiscoveryTime frozen throughout. It is the same
+	// situation as a namespace that is already gone: skip it, and let the next pass (or the GC)
+	// settle it once the deletion completes.
+	if ns.Status.Phase == corev1.NamespaceTerminating || ns.DeletionTimestamp != nil {
+		return nil
 	}
 
 	var existing cbv1.Backup
@@ -314,13 +354,58 @@ func (r *DiscoveryReconciler) discoverySettings(ctx context.Context, repo *cbv1.
 	return loc.Spec.Discovery.Enabled, interval, nil
 }
 
+// inventoryChurnPredicate filters the BackupRepository stream feeding discovery. Discovery WRITES
+// this same object's inventory status (snapshotCount, namespacesPresent, lastDiscoveryTime) at the
+// end of every successful pass; unfiltered, that write returns as an Update event and re-enqueues
+// discovery immediately, so it never rests at `discovery.interval` — it spins back-to-back, each
+// pass blocking its single worker on a fresh `restic snapshots` Job. Measured on the crucible:
+// ~5.7 s per pass, one worker ~100 % saturated for a whole run, at THREE snapshots
+// (docs/audit-m3.1-throughput.md). Cadence is meant to come from `RequeueAfter: interval` plus the
+// ClusterBackup post-run nudge.
+//
+// The filter is deliberately narrow: it drops an update ONLY when the change is confined to the
+// three fields discovery itself writes. Anything else still wakes it — the `Initialized` flip that
+// makes the repository inventoriable, another controller's status write (lastMaintenanceTime after
+// a prune, keySlots, conditions), and any metadata change (the envtest specs nudge discovery with
+// an annotation, and BackupRepositorySpec is empty so generation never moves). Create/Delete/
+// Generic stay unfiltered (predicate.Funcs defaults them to true).
+func inventoryChurnPredicate() predicate.Predicate {
+	return predicate.Funcs{
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			oldRepo, okOld := e.ObjectOld.(*cbv1.BackupRepository)
+			newRepo, okNew := e.ObjectNew.(*cbv1.BackupRepository)
+			if !okOld || !okNew {
+				return true // not a BackupRepository — not ours to filter
+			}
+			if oldRepo.GetGeneration() != newRepo.GetGeneration() ||
+				!equality.Semantic.DeepEqual(oldRepo.GetLabels(), newRepo.GetLabels()) ||
+				!equality.Semantic.DeepEqual(oldRepo.GetAnnotations(), newRepo.GetAnnotations()) {
+				return true
+			}
+			// Mask discovery's own inventory fields: if the two statuses match once they are
+			// zeroed, this event IS discovery's write coming back — swallow it.
+			oldStatus, newStatus := oldRepo.Status.DeepCopy(), newRepo.Status.DeepCopy()
+			for _, s := range []*cbv1.BackupRepositoryStatus{oldStatus, newStatus} {
+				s.SnapshotCount = 0
+				s.NamespacesPresent = 0
+				s.LastDiscoveryTime = nil
+			}
+			return !equality.Semantic.DeepEqual(oldStatus, newStatus)
+		},
+	}
+}
+
 // SetupWithManager registers this reconciler. It reconciles BackupRepositories and, via a mapping
 // from a ClusterBackup to its location's repository, re-inventories promptly right after a run
-// completes (rather than waiting for the next interval tick).
+// completes (rather than waiting for the next interval tick). The For watch is filtered so
+// discovery's own inventory status writes do not re-trigger it (inventoryChurnPredicate).
 func (r *DiscoveryReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&cbv1.BackupRepository{}).
+		For(&cbv1.BackupRepository{}, builder.WithPredicates(inventoryChurnPredicate())).
 		Watches(&cbv1.ClusterBackup{}, handler.EnqueueRequestsFromMapFunc(r.mapRunToRepository)).
+		// A background inventory pass re-enqueues its repository through this channel when it
+		// finishes, so the result is consumed as soon as it exists rather than at the next tick.
+		WatchesRawSource(source.Channel(r.Inventory.wake, &handler.EnqueueRequestForObject{})).
 		Named("discovery").
 		Complete(r)
 }

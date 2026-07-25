@@ -25,6 +25,7 @@ import (
 	. "github.com/onsi/ginkgo/v2" //nolint:revive,staticcheck
 	. "github.com/onsi/gomega"    //nolint:revive,staticcheck
 
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -283,5 +284,53 @@ var _ = Describe("DiscoveryReconciler", func() {
 			g.Expect(k8sClient.Get(ctx, client.ObjectKey{Namespace: "disc-recreate-ns", Name: run}, &re)).To(Succeed())
 			g.Expect(re.UID).NotTo(Equal(first.UID))
 		}, initTimeout, initPoll).Should(Succeed())
+	})
+
+	// Regression guard from the 0.3.1 crucible validation run: a namespace being deleted still
+	// resolves through the Get, but the API server rejects every create in it. Treated as a hard
+	// error it aborted the pass BEFORE the inventory was recorded, so the retry re-ran a full
+	// re-inventory — a fresh `restic snapshots` Job every few seconds, lastDiscoveryTime frozen,
+	// for as long as the namespace lingered. envtest has no namespace controller, so a deleted
+	// namespace stays Terminating forever here: exactly the stuck state to pin.
+	It("skips a terminating namespace and still records the inventory", func() {
+		const loc = "disc-loc-term"
+		const run = "disc-run-term"
+		seedInitializedRepo(loc, "kek-disc-t", "s3-disc-t")
+		createTenantNamespace("disc-live-ns")
+
+		termNS := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "disc-term-ns"}}
+		Expect(k8sClient.Create(ctx, termNS)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, termNS)).To(Succeed())
+		Eventually(func(g Gomega) {
+			var ns corev1.Namespace
+			g.Expect(k8sClient.Get(ctx, client.ObjectKey{Name: "disc-term-ns"}, &ns)).To(Succeed())
+			g.Expect(ns.Status.Phase).To(Equal(corev1.NamespaceTerminating))
+		}, eventuallyTimeout, eventuallyPoll).Should(Succeed())
+
+		discoveryLister.set(
+			discDataSnap("id-live", "disc-live-ns", "pvc-a", run),
+			discDataSnap("id-term", "disc-term-ns", "pvc-b", run), // namespace is terminating
+		)
+		pokeRepository(loc)
+
+		By("the live namespace is still projected — one bad group does not sink the pass")
+		Eventually(func(g Gomega) {
+			var b cbv1.Backup
+			g.Expect(k8sClient.Get(ctx, client.ObjectKey{Namespace: "disc-live-ns", Name: run}, &b)).To(Succeed())
+		}, eventuallyTimeout, eventuallyPoll).Should(Succeed())
+
+		By("the inventory is recorded rather than lost to an aborted reconcile")
+		Eventually(func(g Gomega) {
+			var repo cbv1.BackupRepository
+			g.Expect(k8sClient.Get(ctx, client.ObjectKey{Name: loc}, &repo)).To(Succeed())
+			g.Expect(repo.Status.SnapshotCount).To(Equal(int32(2)))
+			g.Expect(repo.Status.LastDiscoveryTime).NotTo(BeNil())
+		}, eventuallyTimeout, eventuallyPoll).Should(Succeed())
+
+		By("no projection is fabricated in the terminating namespace")
+		Consistently(func(g Gomega) {
+			err := k8sClient.Get(ctx, client.ObjectKey{Namespace: "disc-term-ns", Name: run}, &cbv1.Backup{})
+			g.Expect(err).To(HaveOccurred())
+		}, 2*time.Second, 500*time.Millisecond).Should(Succeed())
 	})
 })
