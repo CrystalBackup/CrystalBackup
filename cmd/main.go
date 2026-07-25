@@ -310,6 +310,22 @@ func main() {
 		setupLog.Error(err, "Unable to create controller", "controller", "BackupRepository")
 		os.Exit(1)
 	}
+	if err := controller.NewMaintenanceReconciler(
+		mgr.GetClient(),
+		mgr.GetScheme(),
+		// Same uncached Secret reader (the cluster KEK + DR S3 credentials); never GetClient().
+		secrets.NewByNameReader(mgr.GetAPIReader()),
+		// The SAME queue instance as init/forget/unlock: prune and check must share one
+		// serialisation lane per repository, or they would race the ops they exist to coexist with.
+		repoQueue,
+		operatorNamespace,
+		moverImage,
+		mgr.GetEventRecorder("maintenance"),
+		clock.RealClock{},
+	).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Unable to create controller", "controller", "Maintenance")
+		os.Exit(1)
+	}
 	if err := controller.NewBackupReconciler(
 		mgr.GetClient(),
 		mgr.GetScheme(),

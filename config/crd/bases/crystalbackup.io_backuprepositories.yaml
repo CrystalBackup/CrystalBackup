@@ -223,8 +223,9 @@ spec:
                       type: string
                     startTime:
                       description: |-
-                        startTime is when the operation began (when its queue turn started, not when it was
-                        enqueued — the wait for the lane is not part of the operation's own duration).
+                        startTime is when the operation was enqueued on the repository's exclusive lane. It
+                        deliberately INCLUDES the wait for its turn: "the prune took three hours" is the number an
+                        operator needs, and the lane is exactly where contention shows up.
                       format: date-time
                       type: string
                   required:

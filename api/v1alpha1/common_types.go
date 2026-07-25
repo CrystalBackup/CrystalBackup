@@ -153,6 +153,12 @@ type MaintenanceSpec struct {
 	// +optional
 	// +kubebuilder:validation:MinLength=1
 	CheckSchedule string `json:"checkSchedule,omitempty"`
+	// timezone (IANA name) both cron expressions are interpreted in. Empty means UTC. It matters
+	// more here than it looks: the whole point of pruneSchedule is to put a cluster-wide exclusive
+	// window somewhere off-peak, and "off-peak" is a local-time notion — "0 3 * * *" read as UTC
+	// lands in the middle of the working day for half the world.
+	// +optional
+	Timezone string `json:"timezone,omitempty"`
 	// checkReadDataSubset is how much pack data each check actually READS (R17). Empty means a
 	// structural check only, which catches a missing or truncated object but never a silently
 	// corrupted one — its bytes rotted while its name and length stayed right. Accepts "n/t" for
@@ -183,8 +189,9 @@ type MaintenanceRecord struct {
 	// operation that ran, e.g. "prune" or "check".
 	// +required
 	Operation string `json:"operation"`
-	// startTime is when the operation began (when its queue turn started, not when it was
-	// enqueued — the wait for the lane is not part of the operation's own duration).
+	// startTime is when the operation was enqueued on the repository's exclusive lane. It
+	// deliberately INCLUDES the wait for its turn: "the prune took three hours" is the number an
+	// operator needs, and the lane is exactly where contention shows up.
 	// +required
 	StartTime metav1.Time `json:"startTime"`
 	// completionTime is when it finished. Absent while it is still running.

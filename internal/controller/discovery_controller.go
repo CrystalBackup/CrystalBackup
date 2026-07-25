@@ -410,11 +410,16 @@ func (r *DiscoveryReconciler) discoverySettings(ctx context.Context, repo *cbv1.
 // (docs/audit-m3.1-throughput.md). Cadence is meant to come from `RequeueAfter: interval` plus the
 // ClusterBackup post-run nudge.
 //
-// The filter is deliberately narrow: it drops an update ONLY when the change is confined to the
-// three fields discovery itself writes. Anything else still wakes it — the `Initialized` flip that
-// makes the repository inventoriable, another controller's status write (lastMaintenanceTime after
-// a prune, keySlots, conditions), and any metadata change (the envtest specs nudge discovery with
-// an annotation, and BackupRepositorySpec is empty so generation never moves). Create/Delete/
+// The filter drops an update when the change is confined to fields discovery has no interest in:
+// the three it writes itself, plus the maintenance controller's (M4). Discovery's own writes are
+// the self-trigger loop above. The maintenance fields are here for the same reason one milestone
+// later — that controller refreshes the repository's physical size and stale-lock count on a
+// cadence of its own, and every one of those writes would otherwise cost a full `restic snapshots`
+// Job for an inventory nobody asked to refresh.
+//
+// Everything else still wakes discovery: the `Initialized` flip that makes the repository
+// inventoriable, keySlots, conditions, and any metadata change (the envtest specs nudge discovery
+// with an annotation, and BackupRepositorySpec is empty so generation never moves). Create/Delete/
 // Generic stay unfiltered (predicate.Funcs defaults them to true).
 func inventoryChurnPredicate() predicate.Predicate {
 	return predicate.Funcs{
@@ -429,13 +434,21 @@ func inventoryChurnPredicate() predicate.Predicate {
 				!equality.Semantic.DeepEqual(oldRepo.GetAnnotations(), newRepo.GetAnnotations()) {
 				return true
 			}
-			// Mask discovery's own inventory fields: if the two statuses match once they are
-			// zeroed, this event IS discovery's write coming back — swallow it.
+			// Mask the fields discovery does not act on — its own inventory fields, and the
+			// maintenance controller's. If the two statuses match once those are zeroed, this event
+			// carries nothing discovery would do anything about; swallow it.
 			oldStatus, newStatus := oldRepo.Status.DeepCopy(), newRepo.Status.DeepCopy()
 			for _, s := range []*cbv1.BackupRepositoryStatus{oldStatus, newStatus} {
 				s.SnapshotCount = 0
 				s.NamespacesPresent = 0
 				s.LastDiscoveryTime = nil
+
+				s.LastMaintenanceTime = nil
+				s.LastCheckTime = nil
+				s.LastCheckResult = ""
+				s.ApproximateSizeBytes = 0
+				s.StaleLocks = 0
+				s.RecentMaintenance = nil
 			}
 			return !equality.Semantic.DeepEqual(oldStatus, newStatus)
 		},

@@ -79,6 +79,10 @@ var (
 	// schedule specs drive cron activations deterministically. A BeforeEach in the schedule Describe
 	// resets it to real-time-ish before each spec (it is shared process-wide).
 	scheduleClock *clocktesting.FakeClock
+	// maintenanceClock is the fake clock the MaintenanceReconciler reads "now" from, so a spec can
+	// make a daily prune window fire without waiting a day. Separate from scheduleClock: the two
+	// controllers are advanced independently, and sharing one would couple unrelated specs.
+	maintenanceClock *clocktesting.FakeClock
 	// discoveryLister is the stub inventory the DiscoveryReconciler reads; the discovery specs feed
 	// it canned snapshots (mutex-guarded, since the manager reconciles on another goroutine).
 	discoveryLister *stubSnapshotLister
@@ -173,6 +177,22 @@ var _ = BeforeSuite(func() {
 		suiteOperatorNamespace,
 		suiteMoverImage,
 		mgr.GetEventRecorder("backuprepository"),
+	).SetupWithManager(mgr)).To(Succeed())
+
+	// The maintenance reconciler (M4), on the SAME exclusive queue so prune/check serialise against
+	// init/forget/unlock exactly as in production. It reads "now" from its own fake clock: the specs
+	// advance it to make a daily cron fire without waiting a day. It stays inert unless a spec sets
+	// maintenance on a location — no schedule, nothing due, nothing submitted.
+	maintenanceClock = clocktesting.NewFakeClock(time.Now())
+	Expect(NewMaintenanceReconciler(
+		mgr.GetClient(),
+		mgr.GetScheme(),
+		secrets.NewByNameReader(mgr.GetAPIReader()),
+		repoQueue,
+		suiteOperatorNamespace,
+		suiteMoverImage,
+		mgr.GetEventRecorder("maintenance"),
+		maintenanceClock,
 	).SetupWithManager(mgr)).To(Succeed())
 
 	// The Backup reconciler under test. Its exposer seam is a STUB (stubExposerRegistry, defined

@@ -152,6 +152,13 @@ spec:
                       start a backup — schedule it off-peak.
                     minLength: 1
                     type: string
+                  timezone:
+                    description: |-
+                      timezone (IANA name) both cron expressions are interpreted in. Empty means UTC. It matters
+                      more here than it looks: the whole point of pruneSchedule is to put a cluster-wide exclusive
+                      window somewhere off-peak, and "off-peak" is a local-time notion — "0 3 * * *" read as UTC
+                      lands in the middle of the working day for half the world.
+                    type: string
                 type: object
               mode:
                 default: Standard
