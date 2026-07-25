@@ -49,6 +49,20 @@ read `pruneSchedule` or `checkSchedule`) and the hook types (nothing ever exec'd
 - **Repository reads pass `--no-lock`** (deferred from M3.1 to land with `prune`). Both read
   paths: discovery *and* the restore's mediated source listing. Without it a restore resolving
   its source during a maintenance window would block on the prune's lock.
+- **A `ClusterBackupLocation` reports `Ready` only once its repository is initialized.** It used
+  to flip `Ready`/`Phase: Ready` the moment the `BackupRepository` **object** was created, while
+  the `restic init` mover Job behind it was still to run — so the documented sequence (create a
+  location, wait for `Ready`, create a `Backup`) parked the `Backup` in `Pending` with
+  `BackupRepository "<name>" is not initialized yet`, which reads as a `Backup` fault rather than
+  as setup that was not finished. It cost an e2e run five minutes of timeout **inside the feature
+  under test** before pointing anywhere near the actual cause. `Ready` now means **usable**. No
+  controller behaviour changes — `Backup`, `ClusterBackup`, `Restore`, `ClusterRestore`, discovery
+  and maintenance all gated on the repository's own `initialized` already, which is exactly the
+  evidence that the location's verdict was not trusted.
+- **New location phase `Initializing`**, for the window between the two, with `Ready=False` and
+  reason `RepositoryInitializing`. Deliberately **not** `Degraded`: nothing is wrong and there is
+  nothing for an admin to fix. `Degraded` stays reserved for faults that need action, so
+  `kubectl get clusterbackuplocation` tells *wait* from *act*.
 - **A stale repository lock is now acted on, not merely counted.** The pre-existing reaper fires
   when a *data mover* is hard-killed, and a prune is not a data mover. Note what this does and
   does not do: the count is age-based on restic's own 30-minute horizon, so it never touches a

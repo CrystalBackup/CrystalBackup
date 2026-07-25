@@ -151,7 +151,23 @@ var _ = Describe("M1 — shared cluster-DR repository lifecycle", Label("m1"), O
 				To(BeTrue(), "location %q: condition Reachable is not true", m1LocationName)
 			g.Expect(apimeta.IsStatusConditionTrue(l.Status.Conditions, "Ready")).
 				To(BeTrue(), "location %q: condition Ready is not true", m1LocationName)
+			g.Expect(l.Status.Phase).To(Equal("Ready"),
+				"location %q: phase must agree with the Ready condition (it is the printer column)", m1LocationName)
 		}, 5*time.Minute, 5*time.Second).Should(Succeed())
+
+		By("And Ready=true means usable: the repository behind it is Initialized")
+		// The contract, asserted against a real repository: whenever a location reads Ready, its
+		// BackupRepository is initialized — so an admin who waits for Ready can create a Backup
+		// that runs. Checked as an implication (not a race on ordering), which is what an
+		// operator actually relies on.
+		var l cbv1.ClusterBackupLocation
+		Expect(k8s.Get(ctx, client.ObjectKey{Name: m1LocationName}, &l)).To(Succeed())
+		Expect(l.Status.RepositoryRef).NotTo(BeEmpty(), "a Ready location must name its repository")
+		var backing cbv1.BackupRepository
+		Expect(k8s.Get(ctx, client.ObjectKey{Name: l.Status.RepositoryRef}, &backing)).To(Succeed())
+		Expect(backing.Status.Initialized).To(BeTrue(),
+			"location %q reports Ready while BackupRepository %q is not Initialized — Ready must mean usable",
+			m1LocationName, l.Status.RepositoryRef)
 	})
 
 	It("The shared repository is initialized exactly once, even under concurrent reconciles", func() {

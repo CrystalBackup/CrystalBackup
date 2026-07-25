@@ -145,11 +145,37 @@ spec:
     objectLockMode: Governance       # Governance | Compliance | AppendOnlyProxy
     rotationPeriod: 720h
 status:
-  conditions: [...]                  # Ready, Reachable
+  phase: Ready                       # Initializing | Ready | Degraded[: reason]
+  conditions: [...]                  # Ready, Reachable, EncryptionValid, MultipleDefaults,
+                                     #   RetentionIgnored, DEKEscrowed
   repositoryRef: dr-primary
   namespacesProtected: 42
   lastDiscoveryTime: "2026-07-12T02:55:00Z"
 ```
+
+**`Ready` means usable, not merely configured.** It is `True` only when the location is
+reachable, its encryption is valid, it does not conflict with another default, **and** the
+`BackupRepository` it provisioned reports `initialized: true`. Provisioning that repository is
+two steps that are seconds-to-minutes apart: the operator stamps out the `BackupRepository`
+object immediately, then a mover Job runs `restic init` behind it. `Ready` waits for the second.
+This is deliberate — the whole point of a single top-level verdict is that
+`create location → wait for Ready → create a Backup` works. Gating `Ready` on the object alone
+would let that sequence park the `Backup` in `Pending` with
+`BackupRepository "<name>" is not initialized yet`, which reads as a `Backup` fault when in
+fact the setup was simply not finished.
+
+The window between the two steps has its own phase, **`Initializing`** (`Ready=False`, reason
+`RepositoryInitializing`) — deliberately *not* `Degraded`. Nothing is wrong and there is
+nothing for an admin to fix; the init Job has not completed. `Degraded` is reserved for faults
+that need action: an unreachable endpoint, an invalid or missing KEK, a pending DEK recovery, a
+second default location. An operator must be able to tell **wait** from **act** at a glance in
+`kubectl get clusterbackuplocation`, which surfaces `phase`.
+
+Consumers (`Backup`, `ClusterBackup`, `Restore`, `ClusterRestore`, discovery, maintenance) still
+gate on the `BackupRepository`'s own `initialized` rather than on this condition: they need the
+repository object anyway, and a location-level rollup would be a second source of truth that can
+lag. `Ready` is the **human**-facing verdict; `initialized` is the machine-facing one. They are
+now consistent, where before they were not.
 
 ### ClusterBackupSchedule (cluster-scoped, admin) — ≈ CronJob
 

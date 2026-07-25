@@ -91,6 +91,20 @@ func patchInitJobStatus(repoName string, mutate func(*batchv1.Job)) {
 	}, initTimeout, initPoll).Should(Succeed())
 }
 
+// simulateRepositoryInitialized drives an ALREADY-CREATED location's repository through a
+// successful init: it waits for the init Job, marks it Succeeded (envtest has no kubelet, so
+// nothing else ever will) and waits for the reconciler to record Initialized=true. Specs that
+// need a usable repository — including every spec asserting the location's Ready condition,
+// which folds Initialized in — call this rather than open-coding the three steps.
+func simulateRepositoryInitialized(repoName string) {
+	GinkgoHelper()
+	waitForInitJobCreated(repoName)
+	patchInitJobStatus(repoName, func(j *batchv1.Job) { j.Status.Succeeded = 1 })
+	Eventually(func(g Gomega) {
+		g.Expect(getRepositoryG(g, repoName).Status.Initialized).To(BeTrue())
+	}, initTimeout, initPoll).Should(Succeed())
+}
+
 // nudgeRepository forces a reconcile of the BackupRepository by writing an annotation, retrying
 // on conflict. Used to prove repeated reconciles do not enqueue a second init.
 func nudgeRepository(repoName string, i int) {

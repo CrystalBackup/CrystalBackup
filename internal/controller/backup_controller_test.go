@@ -155,11 +155,7 @@ func seedInitializedRepo(location, kekSecret, s3Secret string) {
 	registerRepoCleanup(location)
 	createTestLocation(newTestLocation(location, kekSecret, s3Secret, false))
 
-	waitForInitJobCreated(location)
-	patchInitJobStatus(location, func(j *batchv1.Job) { j.Status.Succeeded = 1 })
-	Eventually(func(g Gomega) {
-		g.Expect(getRepositoryG(g, location).Status.Initialized).To(BeTrue())
-	}, initTimeout, initPoll).Should(Succeed())
+	simulateRepositoryInitialized(location)
 }
 
 // createParentClusterBackup creates the (cluster-scoped) ClusterBackup the child Backups link to.

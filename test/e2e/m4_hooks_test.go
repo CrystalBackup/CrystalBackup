@@ -516,20 +516,28 @@ spec:
 	Expect(err).NotTo(HaveOccurred(), "apply ClusterBackupLocation")
 
 	By("waiting for the location to become Ready")
+	// Ready on a location means USABLE — reachable, keys resolved, AND its BackupRepository
+	// initialized — so this one wait covers the whole setup and a Backup created after it will
+	// run. Budgeted for the restic-init mover Job (image pull + schedule + init), not for a
+	// status write; the operator's hard cap on one init is 10 minutes.
 	Eventually(func(g Gomega) {
 		out, err := kubectl("get", "clusterbackuplocation", m4Location,
 			"-o", "jsonpath={.status.conditions[?(@.type=='Ready')].status}")
 		g.Expect(err).NotTo(HaveOccurred())
-		g.Expect(strings.TrimSpace(out)).To(Equal("True"),
-			"location not Ready yet (credentials or KEK unresolved, or S3 unreachable)")
-	}, 6*time.Minute, 5*time.Second).Should(Succeed())
+		if strings.TrimSpace(out) != "True" {
+			phase, _ := kubectl("get", "clusterbackuplocation", m4Location, "-o", "jsonpath={.status.phase}")
+			msg, _ := kubectl("get", "clusterbackuplocation", m4Location,
+				"-o", "jsonpath={.status.conditions[?(@.type=='Ready')].message}")
+			g.Expect(strings.TrimSpace(out)).To(Equal("True"),
+				"location not Ready yet — phase=%q message=%q", strings.TrimSpace(phase), strings.TrimSpace(msg))
+		}
+	}, 10*time.Minute, 5*time.Second).Should(Succeed())
 
-	By("waiting for its BackupRepository to report initialized")
-	// A Ready LOCATION does not mean an initialised REPOSITORY: they are two objects, and the
-	// location goes Ready on its credentials and key resolving, well before the restic-init mover
-	// Job has run. A Backup gates on the repository, so waiting on the location alone pushed the
-	// wait into the first spec, where it surfaced as "no hooks after 5 minutes" — a sentence that
-	// points at the feature under test rather than at the setup that was not finished.
+	By("confirming its BackupRepository reports initialized")
+	// Redundant with the Ready wait above by construction — kept because it fails with the Job
+	// and condition dump below, so a broken init reads as "the repository never initialized"
+	// instead of surfacing five minutes later inside the feature under test as "no hooks".
+	// If this ever times out while the location reads Ready, the Ready rollup itself is wrong.
 	Eventually(func(g Gomega) {
 		repo, err := kubectl("get", "clusterbackuplocation", m4Location,
 			"-o", "jsonpath={.status.repositoryRef}")

@@ -258,13 +258,22 @@ spec:
 	Expect(err).NotTo(HaveOccurred(), "apply ClusterBackupLocation")
 
 	By("waiting for the location to become Ready (repository initialised by a mover Job)")
+	// Ready on a location now means USABLE: it folds in the BackupRepository's Initialized flip,
+	// so this single wait covers the restic-init mover Job (image pull + schedule + init) and the
+	// caller may create a ClusterBackup straight after it. The budget is sized for that Job, not
+	// for a status write — the operator's own hard cap on one init is 10 minutes.
 	Eventually(func(g Gomega) {
 		out, err := kubectl("get", "clusterbackuplocation", m3Location,
 			"-o", "jsonpath={.status.conditions[?(@.type=='Ready')].status}")
 		g.Expect(err).NotTo(HaveOccurred())
-		g.Expect(strings.TrimSpace(out)).To(Equal("True"),
-			"location not Ready yet (repo init mover still running or S3 unreachable)")
-	}, 6*time.Minute, 5*time.Second).Should(Succeed())
+		if strings.TrimSpace(out) != "True" {
+			phase, _ := kubectl("get", "clusterbackuplocation", m3Location, "-o", "jsonpath={.status.phase}")
+			msg, _ := kubectl("get", "clusterbackuplocation", m3Location,
+				"-o", "jsonpath={.status.conditions[?(@.type=='Ready')].message}")
+			g.Expect(strings.TrimSpace(out)).To(Equal("True"),
+				"location not Ready yet — phase=%q message=%q", strings.TrimSpace(phase), strings.TrimSpace(msg))
+		}
+	}, 10*time.Minute, 5*time.Second).Should(Succeed())
 }
 
 // m3SeedDemoNamespace seeds the demo namespace with the four kinds §6 exercises: a Deployment
