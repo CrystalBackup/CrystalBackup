@@ -41,6 +41,7 @@ import (
 
 	cbv1 "github.com/CrystalBackup/CrystalBackup/api/v1alpha1"
 	"github.com/CrystalBackup/CrystalBackup/internal/client/secrets"
+	"github.com/CrystalBackup/CrystalBackup/internal/metrics"
 	"github.com/CrystalBackup/CrystalBackup/internal/mover"
 	"github.com/CrystalBackup/CrystalBackup/internal/repo/queue"
 	"github.com/CrystalBackup/CrystalBackup/internal/repo/s3stat"
@@ -218,6 +219,20 @@ func (r *MaintenanceReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		// watch wakes us if that changes.
 		return ctrl.Result{}, nil
 	}
+	// A stale lock is reaped BEFORE any schedule is consulted, and regardless of whether the
+	// location has schedules at all (R17, delta 3). It is the one maintenance decision that does
+	// not wait for a window: a lock left by a hard-killed maintenance Job blocks the NEXT exclusive
+	// op for restic's full staleness horizon, and the backup path's own reaper does not cover it —
+	// that one fires on a hard-killed data mover, and a prune is not a data mover.
+	if repo.Status.StaleLocks > 0 {
+		due := maintenanceDue{op: mover.OpUnlock, kind: queue.OpUnlock, tick: r.Clock.Now()}
+		if err := r.submit(ctx, &repo, loc, due); err != nil {
+			log.Info("stale-lock unlock not submitted; will retry", "repository", repo.Name, "err", err.Error())
+			return ctrl.Result{RequeueAfter: maintenanceMinRequeue}, nil
+		}
+		return ctrl.Result{RequeueAfter: maintenanceWatchdogInterval}, nil
+	}
+
 	if loc.Spec.Maintenance == nil {
 		// No schedules, but the footprint gauges still want refreshing, so keep a slow heartbeat
 		// rather than going silent.
@@ -415,6 +430,8 @@ func (r *MaintenanceReconciler) submit(ctx context.Context, repo *cbv1.BackupRep
 		argv, err = restic.PruneCommand(loc.Spec.Maintenance.PruneMaxRepackSize)
 	case mover.OpCheck:
 		argv, err = restic.CheckCommand(loc.Spec.Maintenance.CheckReadDataSubset)
+	case mover.OpUnlock:
+		argv = restic.UnlockArgs()
 	default:
 		return fmt.Errorf("unsupported maintenance operation %q", due.op)
 	}
@@ -436,6 +453,15 @@ func (r *MaintenanceReconciler) submit(ctx context.Context, repo *cbv1.BackupRep
 		RepoURL:       repo.Status.RepositoryURL,
 		DEK:           dek,
 		S3CredsSecret: loc.Spec.S3.CredentialsSecretRef.Name,
+	}
+	if due.op == mover.OpUnlock {
+		// The reap is an EVENT, not a state: nothing in status can reconstruct how many locks were
+		// removed over time, so it needs a real counter rather than a derived gauge.
+		req.OnDone = func(err error) {
+			if err == nil {
+				metrics.RecordLockReaped(repo.Name, loc.Spec.ClusterID)
+			}
+		}
 	}
 	deps := repoMaintenanceDeps{
 		Client:            r.Client,
@@ -462,7 +488,19 @@ func (r *MaintenanceReconciler) submit(ctx context.Context, repo *cbv1.BackupRep
 // timestamp fields, the check condition, and an event. It read-modify-writes so a concurrent
 // discovery or BackupRepository write costs a conflict retry rather than a lost update.
 func (r *MaintenanceReconciler) recordOutcome(ctx context.Context, repo *cbv1.BackupRepository, out *maintenanceOutcome) error {
-	completion := metav1.NewTime(out.endedAt)
+	r.applyOutcomeToStatus(repo, out, metav1.NewTime(out.endedAt))
+
+	if err := r.Status().Update(ctx, repo); err != nil {
+		return fmt.Errorf("record %s outcome on repository %s: %w", out.op, repo.Name, err)
+	}
+	r.emitOutcomeEvent(repo, out)
+	return nil
+}
+
+// applyOutcomeToStatus is recordOutcome's pure half: it mutates the status object and writes
+// nothing. Split out so the per-operation rules below — which of them move which timestamp, and on
+// success only or on every attempt — are testable without a client.
+func (r *MaintenanceReconciler) applyOutcomeToStatus(repo *cbv1.BackupRepository, out *maintenanceOutcome, completion metav1.Time) {
 	record := cbv1.MaintenanceRecord{
 		Operation:      string(out.op),
 		StartTime:      metav1.NewTime(out.startedAt),
@@ -497,13 +535,14 @@ func (r *MaintenanceReconciler) recordOutcome(ctx context.Context, repo *cbv1.Ba
 			repo.Status.LastCheckResult = checkResultFailed
 		}
 		r.setCheckCondition(repo, out.err)
+	case mover.OpUnlock:
+		// The count is now believed to be zero, and saying so is what stops the reap from
+		// resubmitting on every reconcile until the next probe fifteen minutes later. The probe
+		// re-measures regardless; if locks reappear they are new ones, which is the honest reading.
+		if out.err == nil {
+			repo.Status.StaleLocks = 0
+		}
 	}
-
-	if err := r.Status().Update(ctx, repo); err != nil {
-		return fmt.Errorf("record %s outcome on repository %s: %w", out.op, repo.Name, err)
-	}
-	r.emitOutcomeEvent(repo, out)
-	return nil
 }
 
 // Values of BackupRepositoryStatus.LastCheckResult (CRD enum Passed;Failed).
