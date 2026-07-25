@@ -187,7 +187,9 @@ var _ = Describe("M3 — manifest backup & restore round-trip", Label("m3"), Ord
 
 	AfterAll(func() {
 		_ = k8s.Delete(ctx, &cbv1.ClusterBackup{ObjectMeta: metav1.ObjectMeta{Name: runName}})
-		deleteNamespace(nsName)
+		// GONE, not merely deleted — this feature restores manifests into the namespace, so a
+		// finalizer transplanted by the restore would wedge it here (M3.2, rule S8).
+		deleteNamespaceAndWaitGone(nsName, 5*time.Minute)
 		m1AssertNoResidualSnapshotObjects(nsName)
 		m2AssertNoResidualRestoreObjects()
 	})

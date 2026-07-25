@@ -76,7 +76,10 @@ var _ = Describe("M2 — self-service restore (modes × selection × mediation)"
 
 	AfterAll(func() {
 		_ = k8s.Delete(ctx, &cbv1.ClusterBackup{ObjectMeta: metav1.ObjectMeta{Name: runName}})
-		deleteNamespace(nsName)
+		// Wait for the namespace to be GONE, not merely deleted: three restores wrote manifests
+		// into it, and a restored finalizer nothing will release is precisely what would leave it
+		// Terminating forever (M3.2, sanitization rule S8 + the applier's own strip).
+		deleteNamespaceAndWaitGone(nsName, 5*time.Minute)
 		m1AssertNoResidualSnapshotObjects(nsName)
 		m2AssertNoResidualRestoreObjects()
 	})

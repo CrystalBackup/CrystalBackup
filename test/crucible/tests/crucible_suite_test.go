@@ -22,6 +22,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -125,6 +126,38 @@ func ensureNamespace(name string) {
 
 func deleteNamespace(name string) {
 	_ = k8s.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: name}})
+}
+
+// deleteNamespaceAndWaitGone deletes a namespace and FAILS if it does not actually disappear.
+//
+// "Deleted" and "gone" are not the same thing, and the gap between them is where M3.2's worst bug
+// lived: a restore transplanted a CSI finalizer onto a PVC, so the claim could never be deleted and
+// the namespace sat in Terminating for the rest of the cluster's life — invisible to every spec,
+// because deleteNamespace is fire-and-forget. Any spec that RESTORES into a namespace should tear
+// it down through here, so the next such leak fails the run that caused it instead of the run after.
+//
+// The diagnostic is the point of the failure message: the namespace status names both the resource
+// kinds still present and the finalizers holding them, which is exactly what a reader needs.
+func deleteNamespaceAndWaitGone(name string, timeout time.Duration) {
+	GinkgoHelper()
+	_ = k8s.Delete(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: name}})
+	Eventually(func(g Gomega) {
+		var ns corev1.Namespace
+		err := k8s.Get(ctx, client.ObjectKey{Name: name}, &ns)
+		if apierrors.IsNotFound(err) {
+			return
+		}
+		g.Expect(err).NotTo(HaveOccurred())
+		var stuck []string
+		for _, c := range ns.Status.Conditions {
+			if c.Status == corev1.ConditionTrue {
+				stuck = append(stuck, fmt.Sprintf("%s: %s", c.Type, c.Message))
+			}
+		}
+		g.Expect(ns.Status.Phase).NotTo(Equal(corev1.NamespaceTerminating),
+			"namespace %s never finished deleting — something holds a finalizer nothing will release: %s",
+			name, strings.Join(stuck, " | "))
+	}, timeout, 5*time.Second).Should(Succeed())
 }
 
 // startPVCConsumer creates a PVC on the given StorageClass plus a pod that
