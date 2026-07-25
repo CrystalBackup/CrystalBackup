@@ -312,6 +312,7 @@ func (r *RestoreReconciler) prepare(ctx context.Context, restore *cbv1.Restore, 
 		restoredFromRun: source.Name,
 		repoName:        loc.Name,
 		repoURL:         repo.Status.RepositoryURL,
+		clusterID:       loc.Spec.ClusterID,
 		dek:             dek,
 		s3CredsSecret:   loc.Spec.S3.CredentialsSecretRef.Name,
 	}

@@ -677,6 +677,33 @@ func TestSnapshotsArgs(t *testing.T) {
 	}
 }
 
+// TestRepoObjectPrefix pins the trailing slash, which is the whole point. Two clusters sharing a
+// bucket can legitimately be "prod-eu-1" and "prod-eu-10"; a prefix without the separator would
+// make a LIST scoped to the first also return the second's objects, so the smaller cluster would
+// report the larger one's size and lock backlog as its own.
+func TestRepoObjectPrefix(t *testing.T) {
+	cases := []struct {
+		prefix, clusterID, want string
+	}{
+		{"prod", "eu-1", "prod/eu-1/"},
+		{"", "eu-1", "eu-1/"},
+		{"/prod/", "/eu-1/", "prod/eu-1/"},
+		{"a/b", "eu-1", "a/b/eu-1/"},
+		{"", "", ""},
+	}
+	for _, tc := range cases {
+		if got := RepoObjectPrefix(tc.prefix, tc.clusterID); got != tc.want {
+			t.Errorf("RepoObjectPrefix(%q, %q) = %q, want %q", tc.prefix, tc.clusterID, got, tc.want)
+		}
+	}
+	// It must agree with what RepoURL puts after the bucket, or the probe would measure a path
+	// restic never writes to.
+	url := RepoURL("https://s3.example.net", "dr", "prod", "eu-1")
+	if !strings.HasSuffix(url, "/"+strings.TrimSuffix(RepoObjectPrefix("prod", "eu-1"), "/")) {
+		t.Errorf("RepoURL %q does not end with the object prefix %q", url, RepoObjectPrefix("prod", "eu-1"))
+	}
+}
+
 func TestUnlockArgs(t *testing.T) {
 	// A hard-killed mover's lock is fresh and on a since-gone host, so it is not stale to restic;
 	// only --remove-all clears it. Safety against removing a concurrent backup's live lock is the

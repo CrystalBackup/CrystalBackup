@@ -136,6 +136,12 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- restoreLastSuccessDesc
 	ch <- restoreLastBytesDesc
 	ch <- restoreFailuresDesc
+	ch <- repositorySizeDesc
+	ch <- repositorySnapshotCountDesc
+	ch <- repositoryLastCheckDesc
+	ch <- repositoryLastCheckSuccessDesc
+	ch <- repositoryLastMaintenanceDesc
+	ch <- repositoryStaleLocksDesc
 }
 
 // Collect implements prometheus.Collector. It reads the live objects once and emits
@@ -184,6 +190,13 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 	clusterRestoresListed := c.reader.List(ctx, &clusterRestores) == nil
 	if restoresListed || clusterRestoresListed {
 		collectRestores(ch, restores.Items, clusterRestores.Items, resolveSource, clusterByLocation)
+	}
+
+	// The repository family (M4, 05-observability §2.4). Per-repository, not per-namespace: a
+	// check or prune result on the shared cluster repository is a platform-wide signal.
+	var repos cbv1.BackupRepositoryList
+	if err := c.reader.List(ctx, &repos); err == nil {
+		collectRepositories(ch, repos.Items, clusterByLocation)
 	}
 }
 

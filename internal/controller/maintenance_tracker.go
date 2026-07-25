@@ -17,6 +17,8 @@ limitations under the License.
 package controller
 
 import (
+	"context"
+	"errors"
 	"sync"
 	"time"
 
@@ -26,6 +28,7 @@ import (
 	cbv1 "github.com/CrystalBackup/CrystalBackup/api/v1alpha1"
 	"github.com/CrystalBackup/CrystalBackup/internal/mover"
 	"github.com/CrystalBackup/CrystalBackup/internal/repo/queue"
+	"github.com/CrystalBackup/CrystalBackup/internal/repo/s3stat"
 )
 
 // maintenanceOutcome is one finished maintenance op waiting to be written into status.
@@ -58,18 +61,111 @@ type maintenanceTracker struct {
 	inFlight map[string]mover.Operation
 	results  map[string]*maintenanceOutcome
 
-	// wake carries a GenericEvent per finished op so the controller re-enqueues that repository.
-	// Buffered: a completing op must never block on a busy controller.
+	// The footprint probe (physical size + stale locks) is tracked the same way and for the same
+	// reason, but SEPARATELY from ops: it takes no queue turn, blocks no mover, and must keep
+	// running on its own cadence while a multi-hour prune holds the lane. Conflating the two would
+	// mean a repository under maintenance stops reporting its size for the duration.
+	probeInFlight map[string]bool
+	probeResults  map[string]*probeOutcome
+	probedAt      map[string]time.Time
+
+	// wake carries a GenericEvent per finished op or probe so the controller re-enqueues that
+	// repository. Buffered: a completing op must never block on a busy controller.
 	wake chan event.GenericEvent
 }
 
 func newMaintenanceTracker() *maintenanceTracker {
 	return &maintenanceTracker{
-		inFlight: make(map[string]mover.Operation),
-		results:  make(map[string]*maintenanceOutcome),
-		wake:     make(chan event.GenericEvent, 32),
+		inFlight:      make(map[string]mover.Operation),
+		results:       make(map[string]*maintenanceOutcome),
+		probeInFlight: make(map[string]bool),
+		probeResults:  make(map[string]*probeOutcome),
+		probedAt:      make(map[string]time.Time),
+		wake:          make(chan event.GenericEvent, 32),
 	}
 }
+
+// probeOutcome is one finished footprint measurement.
+type probeOutcome struct {
+	stats s3stat.Stats
+	err   error
+}
+
+// takeProbe consumes a finished probe result, if any, and reports whether one is still running.
+func (t *maintenanceTracker) takeProbe(repoName string) (*probeOutcome, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	res := t.probeResults[repoName]
+	if res != nil {
+		delete(t.probeResults, repoName)
+	}
+	return res, t.probeInFlight[repoName]
+}
+
+// probeDue reports whether it is time to measure this repository again. The interval is generous
+// on purpose: this is a gauge nobody alerts on to the second, and the measurement is a full
+// recursive LIST of the repository's prefix — hundreds of thousands of objects on a large one.
+func (t *maintenanceTracker) probeDue(repoName string, now time.Time, every time.Duration) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.probeInFlight[repoName] {
+		return false
+	}
+	last, seen := t.probedAt[repoName]
+	return !seen || now.Sub(last) >= every
+}
+
+// startProbe runs one footprint measurement on a background goroutine. Like an op, it must never
+// run on the reconcile worker: a LIST over a multi-terabyte repository is a minutes-long walk, and
+// blocking a worker on it would starve every other repository for a metric.
+func (t *maintenanceTracker) startProbe(repo *cbv1.BackupRepository, now time.Time, measure func(context.Context) (s3stat.Stats, error)) {
+	t.mu.Lock()
+	if t.probeInFlight[repo.Name] {
+		t.mu.Unlock()
+		return
+	}
+	t.probeInFlight[repo.Name] = true
+	t.probedAt[repo.Name] = now
+	t.mu.Unlock()
+
+	repoCopy := repo.DeepCopy()
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), repositoryProbeDeadline)
+		defer cancel()
+
+		defer func() {
+			// A panic in the S3 client must not wedge this repository as permanently probing.
+			if rec := recover(); rec != nil {
+				logf.Log.WithName("maintenance").Error(nil, "repository probe panicked",
+					"repository", repoCopy.Name, "panic", rec)
+				t.finishProbe(repoCopy, &probeOutcome{err: errProbePanicked})
+			}
+		}()
+
+		stats, err := measure(ctx)
+		t.finishProbe(repoCopy, &probeOutcome{stats: stats, err: err})
+	}()
+}
+
+// finishProbe records a completed measurement and wakes the controller for that repository.
+func (t *maintenanceTracker) finishProbe(repo *cbv1.BackupRepository, res *probeOutcome) {
+	t.mu.Lock()
+	delete(t.probeInFlight, repo.Name)
+	t.probeResults[repo.Name] = res
+	t.mu.Unlock()
+
+	select {
+	case t.wake <- event.GenericEvent{Object: repo}:
+	default:
+		logf.Log.WithName("maintenance").V(1).Info("maintenance wake channel full; relying on the watchdog requeue",
+			"repository", repo.Name)
+	}
+}
+
+// errProbePanicked releases a repository whose probe panicked, so the failure surfaces as a normal
+// probe error (retried at the next interval) rather than a permanently stuck measurement.
+var errProbePanicked = errors.New("repository probe panicked")
 
 // take consumes a finished outcome for a repository, if one is waiting, and reports whether an op
 // is still in flight. A returned outcome hands ownership to the caller: it must be written to

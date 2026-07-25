@@ -43,6 +43,7 @@ import (
 	"github.com/CrystalBackup/CrystalBackup/internal/client/secrets"
 	"github.com/CrystalBackup/CrystalBackup/internal/mover"
 	"github.com/CrystalBackup/CrystalBackup/internal/repo/queue"
+	"github.com/CrystalBackup/CrystalBackup/internal/repo/s3stat"
 	"github.com/CrystalBackup/CrystalBackup/internal/restic"
 	"github.com/CrystalBackup/CrystalBackup/internal/schedule"
 	"github.com/CrystalBackup/CrystalBackup/internal/status"
@@ -81,6 +82,16 @@ const (
 
 	// maintenanceMessageLimit truncates a failure message to the CRD's MaxLength.
 	maintenanceMessageLimit = 512
+
+	// repositoryProbeInterval is how often the physical footprint (size + stale locks) is
+	// re-measured. Fifteen minutes is deliberately slow: a recursive LIST over a multi-terabyte
+	// repository walks hundreds of thousands of objects, and nothing alerts on these gauges to the
+	// second — CrystalbackupStaleLocks fires only after thirty minutes of them persisting.
+	repositoryProbeInterval = 15 * time.Minute
+
+	// repositoryProbeDeadline bounds one measurement, so a black-holed endpoint cannot leave a
+	// repository permanently "probing" and therefore never re-measured.
+	repositoryProbeDeadline = 10 * time.Minute
 )
 
 // MaintenanceReconciler runs a repository's SCHEDULED maintenance: `restic prune` to reclaim space
@@ -120,6 +131,9 @@ type MaintenanceReconciler struct {
 	// Clock is the only source of "now": clock.RealClock in production, a fake clock in envtest so
 	// a test can step a daily cron without waiting a day.
 	Clock clock.PassiveClock
+	// NewProber builds the footprint prober for one location's endpoint and credentials. A seam:
+	// envtest has no object storage, so the suite leaves it nil and the probe is simply skipped.
+	NewProber func(s3 cbv1.S3Spec, accessKey, secretKey string) (s3stat.Prober, error)
 
 	tracker *maintenanceTracker
 }
@@ -191,10 +205,23 @@ func (r *MaintenanceReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if loc == nil || loc.Spec.Maintenance == nil {
-		// No location yet, or no maintenance configured. Both are steady states, not errors: the
-		// ClusterBackupLocation watch wakes us if that changes, so requeueing would be pure churn.
+	if loc != nil {
+		// The footprint probe is independent of the schedules: it runs even on a location with no
+		// maintenance configured (the size and stale-lock gauges are useful regardless), and it
+		// keeps its own cadence while a multi-hour prune holds the lane.
+		if err := r.reconcileProbe(ctx, &repo, loc); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+	if loc == nil {
+		// Not linked yet, or mid-teardown. A steady state, not an error: the ClusterBackupLocation
+		// watch wakes us if that changes.
 		return ctrl.Result{}, nil
+	}
+	if loc.Spec.Maintenance == nil {
+		// No schedules, but the footprint gauges still want refreshing, so keep a slow heartbeat
+		// rather than going silent.
+		return ctrl.Result{RequeueAfter: maintenanceMaxRequeue}, nil
 	}
 
 	due, nextAt := r.nextDue(&repo, loc)
@@ -212,6 +239,67 @@ func (r *MaintenanceReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{RequeueAfter: maintenanceMinRequeue}, nil
 	}
 	return ctrl.Result{RequeueAfter: maintenanceWatchdogInterval}, nil
+}
+
+// reconcileProbe records a finished footprint measurement and starts the next one when due.
+//
+// It writes status only when a number actually MOVED. That matters more than it looks: this runs
+// every fifteen minutes forever, and an unconditional write would be a permanent trickle of
+// updates against an object two other controllers watch — the exact churn discovery's predicate
+// was built to stop, re-created from a different direction.
+func (r *MaintenanceReconciler) reconcileProbe(ctx context.Context, repo *cbv1.BackupRepository, loc *cbv1.ClusterBackupLocation) error {
+	if r.NewProber == nil {
+		return nil // no prober wired (envtest): the gauges simply stay unset.
+	}
+
+	if out, _ := r.tracker.takeProbe(repo.Name); out != nil {
+		if out.err != nil {
+			// A failed measurement leaves the previous numbers in place rather than zeroing them:
+			// a repository reporting 0 bytes because S3 was briefly unreachable reads as data loss.
+			logf.FromContext(ctx).Info("repository footprint probe failed; keeping the last measurement",
+				"repository", repo.Name, "err", out.err.Error())
+		} else if repo.Status.ApproximateSizeBytes != out.stats.SizeBytes ||
+			repo.Status.StaleLocks != int32(out.stats.StaleLocks) {
+			repo.Status.ApproximateSizeBytes = out.stats.SizeBytes
+			repo.Status.StaleLocks = int32(out.stats.StaleLocks)
+			if err := r.Status().Update(ctx, repo); err != nil {
+				return fmt.Errorf("record repository footprint on %s: %w", repo.Name, err)
+			}
+		}
+	}
+
+	now := r.Clock.Now()
+	if !r.tracker.probeDue(repo.Name, now, repositoryProbeInterval) {
+		return nil
+	}
+	prober, prefix, err := r.buildProber(ctx, loc)
+	if err != nil {
+		logf.FromContext(ctx).Info("repository footprint probe not started", "repository", repo.Name, "err", err.Error())
+		return nil // credentials or endpoint trouble: a gauge is never worth failing a reconcile
+	}
+	r.tracker.startProbe(repo, now, func(probeCtx context.Context) (s3stat.Stats, error) {
+		return prober.Stat(probeCtx, prefix, time.Now())
+	})
+	return nil
+}
+
+// buildProber resolves the location's S3 credentials and returns a prober plus the object-key
+// prefix this repository occupies inside the bucket.
+func (r *MaintenanceReconciler) buildProber(ctx context.Context, loc *cbv1.ClusterBackupLocation) (s3stat.Prober, string, error) {
+	credsName := loc.Spec.S3.CredentialsSecretRef.Name
+	accessKey, err := r.Secrets.GetValue(ctx, r.OperatorNamespace, credsName, mover.SecretKeyAWSAccessKeyID)
+	if err != nil {
+		return nil, "", fmt.Errorf("read S3 access key from secret %s/%s: %w", r.OperatorNamespace, credsName, err)
+	}
+	secretKey, err := r.Secrets.GetValue(ctx, r.OperatorNamespace, credsName, mover.SecretKeyAWSSecretAccessKey)
+	if err != nil {
+		return nil, "", fmt.Errorf("read S3 secret key from secret %s/%s: %w", r.OperatorNamespace, credsName, err)
+	}
+	prober, err := r.NewProber(loc.Spec.S3, string(accessKey), string(secretKey))
+	if err != nil {
+		return nil, "", err
+	}
+	return prober, restic.RepoObjectPrefix(loc.Spec.S3.Prefix, loc.Spec.ClusterID), nil
 }
 
 // maintenanceDue is one operation whose cron said "now", carried with the tick it fired for so the

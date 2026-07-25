@@ -256,6 +256,27 @@ var schemes = []string{"https://", "http://"}
 //
 // This exact string is published in BackupRepository.status.repositoryURL and is what
 // `restic -r <url>` opens, so it must be byte-stable across releases.
+// RepoObjectPrefix is the OBJECT-KEY prefix, inside the bucket, that one repository occupies:
+// "<prefix>/<clusterID>/", or "<clusterID>/" when the location sets no prefix. It always ends in a
+// slash, so a LIST on it can never match a sibling repository whose clusterID merely starts with
+// the same characters ("prod-eu-1" vs "prod-eu-10" — a real collision on a fleet).
+//
+// It is the bucket-relative half of what RepoURL builds, kept beside it so the two cannot drift:
+// anything that measures a repository by listing its objects (the physical-size and stale-lock
+// probe, 05-observability §2.4) must scope itself to exactly the keys restic writes there.
+func RepoObjectPrefix(prefix, clusterID string) string {
+	segments := make([]string, 0, 2)
+	for _, s := range []string{prefix, clusterID} {
+		if s = strings.Trim(s, "/"); s != "" {
+			segments = append(segments, s)
+		}
+	}
+	if len(segments) == 0 {
+		return ""
+	}
+	return strings.Join(segments, "/") + "/"
+}
+
 func RepoURL(endpoint, bucket, prefix, clusterID string) string {
 	// Detach a leading scheme so its "//" survives the double-slash collapse below.
 	scheme, host := "", endpoint

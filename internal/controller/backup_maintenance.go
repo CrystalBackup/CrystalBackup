@@ -30,6 +30,7 @@ import (
 
 	cbv1 "github.com/CrystalBackup/CrystalBackup/api/v1alpha1"
 	"github.com/CrystalBackup/CrystalBackup/internal/client/secrets"
+	"github.com/CrystalBackup/CrystalBackup/internal/metrics"
 	"github.com/CrystalBackup/CrystalBackup/internal/mover"
 	"github.com/CrystalBackup/CrystalBackup/internal/repo/queue"
 	"github.com/CrystalBackup/CrystalBackup/internal/restic"
@@ -181,6 +182,11 @@ func (r *BackupReconciler) enqueueStaleLockUnlock(ctx context.Context, backup *c
 		RepoURL:       rc.repoURL,
 		DEK:           rc.dek,
 		S3CredsSecret: rc.s3CredsSecret,
+		OnDone: func(err error) {
+			if err == nil {
+				metrics.RecordLockReaped(rc.repoName, rc.clusterID)
+			}
+		},
 	})
 	r.Recorder.Eventf(backup, nil, corev1.EventTypeWarning, "StaleLockUnlockEnqueued", "EnqueueUnlock",
 		"a mover was hard-killed; stale-lock unlock enqueued on repository %s", rc.repoName)
@@ -274,6 +280,12 @@ type repoMaintenanceRequest struct {
 	RepoURL       string
 	DEK           string
 	S3CredsSecret string
+	// OnDone, when set, is called with the op's result from the QUEUE WORKER goroutine, just after
+	// the op body returns. It exists for the fire-and-forget paths, which drop the Handle and would
+	// otherwise have no way to know an op succeeded — the stale-lock counter must count locks
+	// actually removed, not unlock attempts submitted. It must not block: it is holding the
+	// repository's exclusive lane while it runs.
+	OnDone func(error)
 }
 
 // submitRepoMaintenance schedules a maintenance mover op on the repository's exclusive queue and
@@ -288,7 +300,11 @@ type repoMaintenanceRequest struct {
 // M3.1 spent a milestone removing from discovery.
 func submitRepoMaintenance(q *queue.Manager, deps repoMaintenanceDeps, req repoMaintenanceRequest) (*queue.Handle, error) {
 	return q.Enqueue(req.RepoName, req.Kind, func(opCtx context.Context) error {
-		return runRepoMaintenance(opCtx, deps, req.Name, req.Op, req.ResticArgs, req.RepoURL, req.DEK, req.S3CredsSecret)
+		err := runRepoMaintenance(opCtx, deps, req.Name, req.Op, req.ResticArgs, req.RepoURL, req.DEK, req.S3CredsSecret)
+		if req.OnDone != nil {
+			req.OnDone(err)
+		}
+		return err
 	})
 }
 

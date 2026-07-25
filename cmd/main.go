@@ -50,6 +50,7 @@ import (
 	"github.com/CrystalBackup/CrystalBackup/internal/exposer"
 	"github.com/CrystalBackup/CrystalBackup/internal/metrics"
 	"github.com/CrystalBackup/CrystalBackup/internal/repo/queue"
+	"github.com/CrystalBackup/CrystalBackup/internal/repo/s3stat"
 	"github.com/CrystalBackup/CrystalBackup/internal/rexposer"
 	webhookv1alpha1 "github.com/CrystalBackup/CrystalBackup/internal/webhook/v1alpha1"
 	// +kubebuilder:scaffold:imports
@@ -310,7 +311,7 @@ func main() {
 		setupLog.Error(err, "Unable to create controller", "controller", "BackupRepository")
 		os.Exit(1)
 	}
-	if err := controller.NewMaintenanceReconciler(
+	maintenanceReconciler := controller.NewMaintenanceReconciler(
 		mgr.GetClient(),
 		mgr.GetScheme(),
 		// Same uncached Secret reader (the cluster KEK + DR S3 credentials); never GetClient().
@@ -322,7 +323,17 @@ func main() {
 		moverImage,
 		mgr.GetEventRecorder("maintenance"),
 		clock.RealClock{},
-	).SetupWithManager(mgr); err != nil {
+	)
+	// The footprint prober reads OBJECT METADATA only — sizes and modification times under the
+	// repository's own prefix — so it needs the location's S3 credentials but never the DEK, and
+	// it cannot see anything encrypted. It is what makes repository_size_bytes and
+	// repository_stale_locks cost a LIST instead of a mover Job (05-observability §2.4).
+	maintenanceReconciler.NewProber = func(
+		s3 crystalbackupiov1alpha1.S3Spec, accessKey, secretKey string,
+	) (s3stat.Prober, error) {
+		return s3stat.New(s3, accessKey, secretKey)
+	}
+	if err := maintenanceReconciler.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Unable to create controller", "controller", "Maintenance")
 		os.Exit(1)
 	}
