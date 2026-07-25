@@ -208,6 +208,17 @@ func (r *DiscoveryReconciler) projectGroup(ctx context.Context, repo *cbv1.Backu
 		}
 		return fmt.Errorf("get namespace %s: %w", key.Namespace, err)
 	}
+	// A TERMINATING namespace still resolves through the Get above, but the API server rejects
+	// every create in it ("unable to create new content in namespace X because it is being
+	// terminated"). Treated as a hard error that aborts the whole reconcile, that transient and
+	// entirely expected state stopped the pass before it could record the inventory, so the retry
+	// re-ran a FULL re-inventory — a fresh `restic snapshots` Job every few seconds for as long as
+	// the namespace took to disappear, with lastDiscoveryTime frozen throughout. It is the same
+	// situation as a namespace that is already gone: skip it, and let the next pass (or the GC)
+	// settle it once the deletion completes.
+	if ns.Status.Phase == corev1.NamespaceTerminating || ns.DeletionTimestamp != nil {
+		return nil
+	}
 
 	var existing cbv1.Backup
 	err := r.Get(ctx, client.ObjectKey{Namespace: key.Namespace, Name: key.Run}, &existing)
