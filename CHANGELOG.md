@@ -4,6 +4,74 @@ All notable changes to Crystal Backup. Versioning follows
 [adr/0014](spec/adr/0014-versioning-and-release.md): milestone `Mn` → minor `0.n.z` on
 major 0; `1.0.0` is a deliberate post-M9 API-stability decision.
 
+## 0.4.0 — M4 "Consistency hooks, verification & maintenance" (unreleased)
+
+Milestone M4 makes a backup **application-consistent** and a repository **maintained**. Backups
+can now quiesce a workload before the snapshot and release it after; repositories prune the space
+their retention policy freed and verify that what they hold is still readable.
+
+Two pieces of the API had been declared since M0 and were dead: `MaintenanceSpec` (nothing ever
+read `pruneSchedule` or `checkSchedule`) and the hook types (nothing ever exec'd). Both are live.
+
+### Added
+
+- **Consistency hooks (R16).** Pre-snapshot quiesce and post-snapshot release, executed through
+  `pods/exec`. Candidate pods are those in the Backup's namespace **mounting the PVCs the run is
+  capturing** — not a namespace-wide label match, which is what confines the operator's
+  cluster-wide exec grant to workloads whose data is actually being captured. Velero's precedence
+  is matched: a pod's `crystalbackup.io/pre-backup-*` annotations **replace** (never merge with)
+  the run's spec hooks for that pod. Commands are an argv, never a shell string.
+- **The freeze window is bounded by the snapshot phase, not the upload** (01-architecture §5). A
+  database held frozen for a multi-hour upload is an outage, not a backup.
+- **The unfreeze is unconditional.** The release fires on the snapshots being *cut*, whatever
+  their outcome: a failed or skipped snapshot leaves the application just as quiesced, so gating
+  the thaw on success would strand exactly the workload whose backup just went wrong. It is
+  retried within a bounded budget and, being derived from `status.hooks`, survives a controller
+  restart — a workload left frozen by a crashed operator is an outage the backup itself caused.
+- **`onError: Fail` aborts before snapshotting.** A snapshot taken after a failed quiesce would
+  *look* application-consistent without being so, which is only discovered at restore time.
+- **Scheduled `prune` and `check` (R17)** on the per-`BackupRepository` exclusive queue, with
+  cron schedules, jitter, `--max-repack-size`, and `check --read-data-subset` to catch silent
+  bit-rot that a structural check cannot see. `status.recentMaintenance` keeps the attempt
+  history; `RepositoryCheckFailed` is raised for the alert.
+- **The seven repository metrics of 05-observability §2.4.** Physical size and stale-lock count
+  come from a single recursive S3 LIST — no mover Job, no image pull, no repository password
+  needed to answer "how big is it, and is anything stuck".
+
+### Changed
+
+- **`prune` drains the movers before running.** Not for corruption — restic's exclusive lock
+  already bars that — but for **throughput**: otherwise a prune and the whole mover fleet contend
+  on `--retry-lock`, and on the shared cluster repository that is every namespace's backup. The
+  drain has its **own** short deadline rather than inheriting the prune's multi-hour one, because
+  mover admission is shut cluster-wide while it waits and one stuck mover must not close the
+  backup plane for hours (adr/0015 §3).
+- **Repository reads pass `--no-lock`** (deferred from M3.1 to land with `prune`). Both read
+  paths: discovery *and* the restore's mediated source listing. Without it a restore resolving
+  its source during a maintenance window would block on the prune's lock.
+- **A stale repository lock is now acted on, not merely counted.** The pre-existing reaper fires
+  when a *data mover* is hard-killed, and a prune is not a data mover. Note what this does and
+  does not do: the count is age-based on restic's own 30-minute horizon, so it never touches a
+  fresh orphan, and at that mark restic removes the lock itself. It does **not** shorten how long
+  an exclusive op can queue behind a dead lock. What it fixes is that the signal was a dead end —
+  `CrystalbackupStaleLocks` fired and nothing ever drove the gauge back down.
+
+### Fixed
+
+- **`pods/exec` was granted by the Helm chart but absent from `config/rbac/role.yaml`.** No
+  kubebuilder marker existed, so `make manifests` had nothing to notice. A kustomize install could
+  never have run a hook.
+- **`Hook.Timeout` had no default.** As a non-pointer `metav1.Duration`, "unset" arrived as `0s`,
+  and `context.WithTimeout(ctx, 0)` expires immediately — every hook without an explicit timeout
+  would have failed before starting.
+
+### Documented
+
+- **[adr/0017](spec/adr/0017-cascade-materialization-backup-carries-identity.md)** — why
+  `Backup.spec` carries **identity, not intent**: two producers write the kind, and discovery
+  (server-side apply with `ForceOwnership`) cannot reconstruct run config from restic snapshots.
+  Records the four accepted costs and the M5 direction.
+
 ## 0.3.2 — M3.2 restore-safety fixes (2026-07-25)
 
 The 0.3.1 audit closed the throughput question and left four items behind, one of which was
