@@ -4,6 +4,54 @@ All notable changes to Crystal Backup. Versioning follows
 [adr/0014](spec/adr/0014-versioning-and-release.md): milestone `Mn` → minor `0.n.z` on
 major 0; `1.0.0` is a deliberate post-M9 API-stability decision.
 
+## 0.3.1 — M3.1 operator throughput audit (2026-07-25)
+
+A **measure-first** hardening patch. The M3 full-suite crucible run kept timing out differently
+on every attempt, and the roadmap's working hypothesis was that discovery's `restic snapshots`
+re-scan was O(snapshots). Instrumenting the released 0.3.0 operator on a live cluster showed
+something else: **the discovery controller's single reconcile worker was ~100 % saturated for an
+entire run at only three snapshots** — `reconcile_time_seconds{controller="discovery"}` summed to
+1991 s inside a 1980 s window, while every other controller combined stayed under 100 s. The
+operator was never resource-bound (CPU ~0.01 core, RSS ~290 MB). The full audit, with the
+per-controller table and the two restic scaling curves, is in
+[docs/audit-m3.1-throughput.md](docs/audit-m3.1-throughput.md).
+
+No API, CRD or chart-value change: this is behaviour only.
+
+### Fixed
+
+- **Discovery no longer re-triggers itself.** Discovery writes `snapshotCount`,
+  `namespacesPresent` and `lastDiscoveryTime` onto the very BackupRepository it watches, and the
+  watch had no predicate — so each write came straight back as an event and re-enqueued discovery
+  immediately. `RequeueAfter: discovery.interval` never got to fire and the controller spun
+  back-to-back, blocking its worker on a fresh cold `restic snapshots` Job every ~6 s. It now
+  honours its configured interval (~10x duty-cycle reduction). The filter is narrow on purpose:
+  it drops an update only when the change is confined to those three fields, so the `Initialized`
+  flip, another controller's status write and any metadata change still wake discovery.
+- **The inventory Job no longer storms the BackupRepository controller.** That Job was
+  controller-owned by the repository, and the repository reconciler watches `Owns(Job)` for its
+  init Job — so every listing Job's lifecycle events woke it too: ~2700 no-op reconciles in 33
+  minutes. A plain owner reference still cascades the GC on repository delete.
+- **The inventory runs off the reconcile worker.** A pass creates a Job, polls it and reads its
+  pod log — seconds, cold every time. It now runs single-flight per repository on a background
+  goroutine and re-enqueues the repository when it lands (with a watchdog requeue backing up the
+  wake), so multiple repositories stop serializing behind one worker. A panicking pass is
+  recovered and retried instead of wedging that repository.
+
+### Changed
+
+- The crucible suite's `go test` budget is 90 m (was a hardcoded 60 m, which the M3 full-suite run
+  overran — the binary panicked and took the report with it) and is overridable via
+  `CRUCIBLE_TIMEOUT`.
+
+### Known issues
+
+- A restore twin PV was seen failing to mount with `internal RBD image not found` after two
+  earlier restores on the same volume had succeeded (Ceph otherwise healthy). Tracked with a
+  reproduction plan in the audit — deliberately **not** fixed on a hypothesis, because the two
+  candidate explanations (a Ceph-side vanish vs. a teardown that releases a PV under a Delete
+  policy) call for opposite fixes.
+
 ## 0.3.0 — M3 "Manifests & cluster-scoped DR" (2026-07-23)
 
 Milestone M3 adds **Kubernetes-manifest backup & restore** alongside the existing PVC-data

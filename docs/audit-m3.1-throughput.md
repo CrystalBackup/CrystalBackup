@@ -98,6 +98,38 @@ discovery Job is owner-referenced to the BackupRepository (B above), every disco
 create/update/delete events (a fresh Job every ~6 s) wake the `backuprepository` reconciler →
 ~2700 no-op reconciles in 33 min. Cheap each (15 ms) but pure API/cache waste.
 
+## Validation on the crucible — the same measurement, re-run against the fixes
+
+Same instrumentation, same live RKE2 / Ceph crucible, operator built from this branch:
+
+| controller | 0.3.0 — 33 min run | 0.3.1 — **58.6 min** run |
+|---|---:|---:|
+| **discovery** | **1991 s** over 350 reconciles (5.69 s each) | **9.9 s** over 101 (98 ms each) |
+| **backuprepository** | 40.8 s over **2700** reconciles | 0.67 s over **56** |
+
+Discovery spends **~200x less reconcile time across a run that is 1.8x longer**, and its worker is
+never blocked (`workqueue_longest_running_processor_seconds{discovery}` stayed at 0 — it was up to
+5.7 s before). backuprepository does **48x fewer** reconciles.
+
+The terminating-namespace fix was verified against the real stuck object rather than a mock: with
+`m2-restore` still wedged (22 minutes and counting), deploying it unfroze discovery immediately —
+`lastDiscoveryTime` went from stuck at `00:07:26` to `00:26:28`, snapshot count resumed climbing
+32 → 60, and the "being terminated" errors stopped.
+
+**Suite result: 37 passed, 2 failed, 4 skipped, finished in 58.6 min.** For comparison the 0.3.0
+baseline failed `m1_reliability`, `m1_discovery`, `m1_repository` and an m2 restore, and then blew
+its 60-minute `go test` budget outright — the binary panicked and the report was lost.
+`m1_discovery` and `m1_repository` now pass. The two remaining failures:
+
+- **m2 `[BeforeAll]` — "namespace m2-restore still terminating"**: the spec waits 300 s for the
+  namespace to be gone before recreating it, and that is the SAME namespace left wedged by the
+  previous run's leaked finalizer. It was left in place deliberately, to prove the discovery fix
+  against a real stuck object; the cost was this collateral failure. It is the leak (below), not
+  the restore logic.
+- **m1 OOM — "crashed volume reported as a silent success"**: a SIGKILLed mover's volume ended
+  `Completed` instead of `Failed`. Pre-existing and already on the M3 flaky list; it lives in the
+  backup/mover result path, which this patch does not touch.
+
 ## What shipped in 0.3.1 (all four, in this order)
 
 1. **Self-trigger killed** — `inventoryChurnPredicate` on discovery's `For` watch drops an update
@@ -150,6 +182,36 @@ repository grows into the thousands of snapshots. `--no-lock` still belongs to M
 
 Note: discovery's `--no-lock` stays deferred to M4 (it lands with `prune`, the first exclusive
 lock — it buys nothing before that).
+
+## The flakiness chain — found during the 0.3.1 validation run
+
+The single most useful thing the validation run produced was not a number, it was a **causal
+chain** that explains how one stuck object freezes the whole inventory:
+
+1. An m2 restore leaves a PVC behind carrying the finalizer
+   `snapshot.storage.kubernetes.io/pvc-as-source-protection` — **with zero VolumeSnapshots left in
+   the cluster**, so the finalizer is orphaned and protects nothing.
+2. The PVC therefore never finishes deleting, so its namespace stays `Terminating` indefinitely
+   (observed: 19 minutes and counting).
+3. Discovery's projection pass hits that namespace. It exists (the `IsNotFound` guard does not
+   catch it), but the API server rejects every create in it.
+4. That error aborted the pass **before** it recorded the inventory, so `lastDiscoveryTime` froze
+   and every retry re-ran a FULL re-inventory — a fresh `restic snapshots` Job every few seconds,
+   indefinitely.
+
+So a single leaked finalizer took discovery out of service for the rest of the run. Any spec that
+depends on a fresh inventory — `m1_discovery`'s GC-after-forget above all — then fails on a
+timeout, with a *different* victim depending on which spec was running when the leak happened.
+That is exactly the "fails differently every run" signature M3.1 was chartered to explain.
+
+Step 3 is fixed here (a terminating namespace is skipped like an absent one). Steps 1–2 are a
+**leak-check invariant violation** (roadmap delta 5: zero residual VS/VSC/PVC after every
+scenario) and remain open — see the RBD item below, which is very likely the same incident seen
+from the other end.
+
+Also still open: **any** projection error still discards the consumed inventory, so the retry pays
+for a full re-listing. Making a pass survive a per-group failure (accumulate, record the inventory,
+report the failures) is the follow-up.
 
 ## Open — the m2-Recreate RBD flake (investigated, NOT fixed: needs reproduction)
 
