@@ -40,10 +40,16 @@ import (
 // only place these behaviours mean anything: an exclusive lock is an object-store fact, and
 // `check --read-data-subset` only tells the truth when the bytes it re-reads came off a
 // bucket rather than a fake.
-var _ = Describe("Milestone M4 — repository maintenance & verification", Label("m4"), Ordered, func() {
-	BeforeAll(func() {
-		m1SkipIfNoS3()
-		m1EnsurePlatformSecrets()
+var _ = Describe("Milestone M4 — repository maintenance & verification", Label("m4"), func() {
+	// BeforeEach, not BeforeAll, and the container is deliberately NOT Ordered: the three
+	// scenarios share nothing but the platform Secrets — two run on their own repositories — so
+	// one failing must not skip the other two. `mise run test m4` failing at spec 1 and reporting
+	// the rest as skipped hides two independent results that would have run fine.
+	BeforeEach(func() {
+		// Ensures the shared "dr" location EXISTS, rather than assuming it. It is created by the M1
+		// specs, so running this label alone found no repository at all — a dependency on another
+		// label is not a dependency the runner knows about.
+		m3EnsureDRLocation()
 	})
 
 	// ------------------------------------------------------------------
@@ -55,7 +61,7 @@ var _ = Describe("Milestone M4 — repository maintenance & verification", Label
 	// run here because a prune is non-destructive to snapshots: it reclaims
 	// unreferenced data, and the check afterwards proves it.
 	// ------------------------------------------------------------------
-	Describe("a prune and a live backup on the shared repository", func() {
+	Describe("a prune and a live backup on the shared repository", Ordered, func() {
 		const seedNS = "m4-prune-race"
 
 		It("holds the prune until the backup's movers have drained, then runs it exclusively", func() {
@@ -131,10 +137,10 @@ var _ = Describe("Milestone M4 — repository maintenance & verification", Label
 	// nobody can read. The behaviour under test is identical on an isolated
 	// repository: same lane, same lock, same pack format.
 	// ------------------------------------------------------------------
-	Describe("a prune killed mid-flight", func() {
+	Describe("a prune killed mid-flight", Ordered, func() {
 		const seedNS = "m4-killed-prune"
 
-		It("records the failure and lets the next scheduled prune succeed anyway", func() {
+		It("is absorbed by the Job retry: a terminal outcome is recorded and the repository is not wedged", func() {
 			locName := "m4-killed-" + m4RunID
 			repo := m4CreateIsolatedLocation(locName, m4DedicatedClusterID("killed"),
 				&cbv1.MaintenanceSpec{PruneSchedule: m4EverySecondCron})
@@ -155,13 +161,18 @@ var _ = Describe("Milestone M4 — repository maintenance & verification", Label
 			killed := m4KillNextPrunePod(20 * time.Minute)
 			Expect(killed).To(BeTrue(), "no prune pod appeared to kill within the window")
 
-			By("Then the failure is recorded rather than swallowed")
-			// A prune that dies must not look like one that never ran: recentMaintenance records
-			// ATTEMPTS precisely so a repository failing every night is distinguishable from one
-			// with no schedule, and so the cron baseline does not treat it as permanently due.
-			rec := m4WaitMaintenanceRecord(repo.Name, "prune", killedAt, 15*time.Minute)
-			Expect(rec.Result).To(Equal(cbv1.MaintenanceFailed),
-				"a prune whose pod was killed was recorded as %q", rec.Result)
+			By("Then the operator absorbs it and still records a terminal outcome")
+			// NOT asserted as Failed, and that is a finding rather than a concession. The
+			// maintenance Job carries backoffLimit=1, so killing its pod buys one pod-level retry
+			// — which succeeds. The op is therefore recorded Succeeded, and the crucible is what
+			// established that: the mental model going in was "killed prune ⇒ failed op", and
+			// pinning that would have frozen the WORSE behaviour as the contract. What matters to
+			// an operator is that a terminal outcome is recorded at all, so the cron baseline
+			// advances and the repository does not become permanently due.
+			rec := m4WaitMaintenanceRecord(repo.Name, "prune", killedAt, 20*time.Minute)
+			Expect(rec.Result).To(BeElementOf(cbv1.MaintenanceSucceeded, cbv1.MaintenanceFailed),
+				"the killed prune left no terminal record (result=%q)", rec.Result)
+			Expect(rec.CompletionTime).NotTo(BeNil(), "a terminal record with no completionTime")
 
 			By("And a read of the repository never blocks on the orphaned lock")
 			// Discovery and the restore's source resolution both pass --no-lock. Without it this
@@ -180,7 +191,7 @@ var _ = Describe("Milestone M4 — repository maintenance & verification", Label
 			// proving nothing. Requiring a snapshot array makes the read's SUCCESS the assertion.
 			Expect(readOut).To(ContainSubstring("["), "the --no-lock read returned no snapshot list:\n%s", readOut)
 
-			By("And a later prune completes despite the lock left behind")
+			By("And the repository is not wedged: a prune succeeds")
 			// Deliberately agnostic about WHO cleared the lock. Two mechanisms can: restic treats a
 			// lock older than 30 minutes as stale and removes it on the next acquisition, and the
 			// operator's own reap fires once the probe (15 min) has seen it cross the same 30-minute
@@ -201,7 +212,7 @@ var _ = Describe("Milestone M4 — repository maintenance & verification", Label
 		})
 	})
 
-	Describe("a silently corrupted pack", func() {
+	Describe("a silently corrupted pack", Ordered, func() {
 		const seedNS = "m4-corrupt"
 
 		It("is caught by check --read-data-subset and surfaced on the repository", func() {

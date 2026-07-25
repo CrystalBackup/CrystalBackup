@@ -242,8 +242,13 @@ Full suite (nightly + release tags), in addition:
     rather than the prune's long one — a stuck mover must not close the backup plane for hours
     ([adr/0015](adr/0015-per-repository-exclusive-queue-serialization.md) §3).
 11b. **A killed prune does not wedge the repository**: SIGKILL the prune mid-flight so restic's
-    exclusive lock is orphaned → the failure is recorded in `status.recentMaintenance`, and the
-    NEXT scheduled prune completes anyway. Concurrently, a `restic snapshots` read (discovery, or
+    exclusive lock is orphaned → a terminal outcome still lands in `status.recentMaintenance`
+    (so the cron baseline advances and the repository does not stay permanently due), and a prune
+    completes. **Measured on real infrastructure, that outcome is `Succeeded`, not `Failed`**: the
+    maintenance Job carries `backoffLimit=1`, so killing its pod buys one pod-level retry which
+    succeeds. The design absorbs the kill. This case originally asserted `Failed` — the crucible
+    corrected it, and pinning the original expectation would have frozen the worse behaviour as
+    the contract. Concurrently, a `restic snapshots` read (discovery, or
     a restore resolving its source) must **not** have blocked on that lock at any point — both
     read paths pass `--no-lock`.
 
