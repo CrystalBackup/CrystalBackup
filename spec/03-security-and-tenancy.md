@@ -303,6 +303,13 @@ xattrs, ACLs and device nodes (R10). Known limit: `trusted.*` xattrs need `CAP_S
 and are **not** restored — documented, covered by the metadata-fidelity suite
 ([08-testing-and-dod.md](08-testing-and-dod.md)).
 
+`crystal-mover` securityContext (**maintenance**, i.e. every job with no data volume —
+`init`/`forget`/`prune`/`check`/`snapshots`/`unlock` and the manifest shapes): same, with
+`capabilities: {drop: [ALL]}` and **no adds at all**. The capability set follows what a job can
+touch, not what it is called: with no PVC mounted there are no foreign-uid files in reach, only
+root-owned `emptyDir`s (restic cache, `/tmp`, the manifest scratch) and a read-only Secret, all of
+which uid 0 already reads and writes. `DAC_OVERRIDE` here bought nothing.
+
 No `hostPath`, no host namespaces, no privileged containers anywhere in v1.
 
 ## 7. NetworkPolicies
