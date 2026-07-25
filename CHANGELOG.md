@@ -4,6 +4,69 @@ All notable changes to Crystal Backup. Versioning follows
 [adr/0014](spec/adr/0014-versioning-and-release.md): milestone `Mn` → minor `0.n.z` on
 major 0; `1.0.0` is a deliberate post-M9 API-stability decision.
 
+## 0.3.2 — M3.2 restore-safety fixes (2026-07-25)
+
+The 0.3.1 audit closed the throughput question and left four items behind, one of which was
+recorded as "two explanations calling for opposite fixes → reproduce, do not guess". Reproducing
+it took five minutes on a fresh crucible and turned up **two distinct bugs on the restore path,
+the second of which destroys user data**. Both are fixed here.
+
+No API or CRD change. The sanitization ruleset gains a rule (S8), so manifest snapshots taken by
+0.3.2 differ from earlier ones — older snapshots are restored safely by the applier's own guard.
+
+### Fixed
+
+- **`Recreate` mode no longer destroys the volume it is restoring.** A `Restore`/`ClusterRestore`
+  in `Recreate` mode deleted every selected resource before recreating it from the backup —
+  including the `PersistentVolumeClaim`. Deleting a PVC releases its PersistentVolume, and a
+  dynamically-provisioned volume's reclaimPolicy is `Delete`, so the CSI driver **destroyed the
+  user's data** as a side effect of restoring a manifest; the recreated claim then bound a fresh
+  empty volume. Worse, the data half of the same restore was already mounting a twin PV built
+  from that volume's handle, so it hung forever on `internal RBD image not found` — the volume it
+  was restoring had been deleted underneath it. PVCs and PVs are now reconciled **in place** even
+  in `Recreate` mode (reported `Configured`, not `Recreated`). Nothing is lost: the mode's promise
+  for the *contents* is delivered by `restic restore --delete` on the data path.
+- **A restore can no longer leave a namespace stuck in `Terminating` forever.** The manifest
+  capture photographs live objects, and the CSI snapshot-controller holds
+  `snapshot.storage.kubernetes.io/pvc-as-source-protection` on a snapshot's source PVC for the
+  ~2 s it takes the snapshot to become ready — so the dump caught it, and the restore re-applied
+  it onto a PVC with no VolumeSnapshot behind it. Nothing would ever remove it: the PVC could not
+  be deleted and its namespace never finished terminating. Sanitization rule **S8** now strips
+  **every** finalizer at capture (enumerating them by name is a losing game — every CSI driver and
+  operator adds its own), and the applier strips them again on the way in so snapshots taken
+  before 0.3.2 are safe too. A finalizer the target cluster genuinely warrants is re-added by its
+  own controller.
+- **A whole-namespace `Recreate` restore no longer reports `PartiallyFailed` for an object that
+  came back on its own.** The control plane recreates a namespace's `default` ServiceAccount the
+  instant it is deleted, so `Recreate`'s create always found the replacement already there and
+  reported that one object `Failed` — enough to make the entire restore `PartiallyFailed`. An
+  `AlreadyExists` on the recreate now falls back to the in-place apply, which converges on exactly
+  the state `Recreate` asked for.
+- **A projection failure no longer discards the whole inventory.** One namespace refusing a
+  projection aborted the discovery pass before it recorded what it had just listed, so
+  `lastDiscoveryTime` froze and every retry paid for a full re-listing from S3. Per-group failures
+  are now accumulated and reported (`ProjectionIncomplete`), the inventory is recorded either way,
+  and the retry reuses the listing it already has rather than re-running it.
+
+### Changed
+
+- **Least privilege: a maintenance mover gets no added capabilities at all.** The capability set
+  now follows what a Job can touch rather than what it is called: `DAC_OVERRIDE` exists so a data
+  mover can walk a tenant's files, and a Job with no PVC mounted — `init`, `forget`, `prune`,
+  `check`, `snapshots`, `unlock` and the manifest shapes — has no foreign-uid file in reach. Only
+  a data job keeps `DAC_OVERRIDE`; a restore keeps the metadata-fidelity set (R10) unchanged.
+
+### Tests
+
+- The crucible's OOM spec was **not** testing what it claimed. It killed whichever
+  `crystalbackup.io`-labelled mover pod happened to be Running, which could be another run's mover
+  or the same run's *manifest* mover — after which the data volume completed normally and the
+  spec failed. It is now scoped to its own run's data movers, and asserts only about the volumes
+  it actually killed (`c-db` has two PVCs, so "no volume is Completed" was never satisfiable).
+- Specs that restore into a namespace now tear it down with `deleteNamespaceAndWaitGone`, which
+  fails with the namespace's own "finalizers remaining" message — so the next leak of this class
+  fails the run that caused it instead of the run after.
+
 ## 0.3.1 — M3.1 operator throughput audit (2026-07-25)
 
 A **measure-first** hardening patch. The M3 full-suite crucible run kept timing out differently
