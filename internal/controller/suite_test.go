@@ -83,6 +83,10 @@ var (
 	// make a daily prune window fire without waiting a day. Separate from scheduleClock: the two
 	// controllers are advanced independently, and sharing one would couple unrelated specs.
 	maintenanceClock *clocktesting.FakeClock
+	// hookExecutor is the stub the Backup reconciler execs consistency hooks through. envtest has
+	// no kubelet, so a real pods/exec is impossible; the stub records every call and lets a spec
+	// make a specific pod's hook fail or hang.
+	hookExecutor *stubHookExecutor
 	// discoveryLister is the stub inventory the DiscoveryReconciler reads; the discovery specs feed
 	// it canned snapshots (mutex-guarded, since the manager reconciles on another goroutine).
 	discoveryLister *stubSnapshotLister
@@ -200,7 +204,8 @@ var _ = BeforeSuite(func() {
 	// CSI driver: the stub creates a real temp clone PVC in the operator namespace (so the mover
 	// Job has something to mount) and reports Ready immediately. envtest has no kubelet, so specs
 	// SIMULATE each mover Job's outcome exactly as the BackupRepository specs do.
-	Expect(NewBackupReconciler(
+	hookExecutor = &stubHookExecutor{}
+	backupReconciler := NewBackupReconciler(
 		mgr.GetClient(),
 		mgr.GetScheme(),
 		secrets.NewByNameReader(mgr.GetAPIReader()),
@@ -214,7 +219,11 @@ var _ = BeforeSuite(func() {
 		// sets a retention policy and no mover is simulated as hard-killed, so the forget/unlock
 		// triggers stay inert here; the real ops are crucible-validated.
 		repoQueue,
-	).SetupWithManager(mgr)).To(Succeed())
+	)
+	// envtest has no kubelet, so pods/exec cannot work: the hook specs drive a stub that records
+	// what would have been exec'd and replays canned outcomes.
+	backupReconciler.Hooks = hookExecutor
+	Expect(backupReconciler.SetupWithManager(mgr)).To(Succeed())
 
 	// The ClusterBackup fan-out reconciler. It creates child Backups (which the registered Backup
 	// reconciler above then drives via the stub exposer), so a ClusterBackup spec exercises the

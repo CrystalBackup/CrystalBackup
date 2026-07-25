@@ -45,6 +45,7 @@ import (
 	"github.com/CrystalBackup/CrystalBackup/internal/client/secrets"
 	"github.com/CrystalBackup/CrystalBackup/internal/concurrency"
 	"github.com/CrystalBackup/CrystalBackup/internal/exposer"
+	"github.com/CrystalBackup/CrystalBackup/internal/hooks"
 	"github.com/CrystalBackup/CrystalBackup/internal/keys"
 	"github.com/CrystalBackup/CrystalBackup/internal/mover"
 	"github.com/CrystalBackup/CrystalBackup/internal/repo/queue"
@@ -132,6 +133,11 @@ type BackupReconciler struct {
 	// BackupRepository name == the location name), so they can never race an init or another
 	// maintenance op on the same repository (adr/0010).
 	Queue *queue.Manager
+	// Hooks executes consistency hooks inside the workload's own containers (R16). A seam: the
+	// production implementation is hooks.PodExecutor over pods/exec, envtest supplies a fake, and
+	// nil means "no exec path wired" — which is a hard failure when a run declares hooks, never a
+	// silent downgrade to a crash-consistent snapshot the operator believes is better than that.
+	Hooks hooks.Executor
 }
 
 // NewBackupReconciler builds a BackupReconciler. Callers (main.go, the envtest suite) go through
@@ -316,6 +322,12 @@ func (r *BackupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		return ctrl.Result{}, fmt.Errorf("enumerate PVCs for Backup %s/%s: %w", backup.Namespace, backup.Name, err)
 	}
 
+	// (9b) The freeze window opens here (R16), before any VolumeSnapshot exists.
+	hookSt := hookState(&backup)
+	if res, done, err := r.openFreezeWindow(ctx, &backup, hookSt, run.Hooks); done {
+		return res, err
+	}
+
 	// (10) Drive ONE non-terminal PVC forward this reconcile (sequential in M1; intra-Backup
 	// parallelism + the global maxConcurrentMovers semaphore are deferred to task #22).
 	teardownPVC := ""
@@ -334,6 +346,11 @@ func (r *BackupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	manifestsDone, teardownManifests, err := r.advanceManifests(ctx, &backup, rc,
 		includeManifests(run), run.ManifestOptions.ExcludeSecretData)
 	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// (10c) The freeze window CLOSES here, on the snapshots being cut.
+	if err := r.closeFreezeWindow(ctx, &backup, hookSt, run.Hooks); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -417,6 +434,28 @@ func (r *BackupReconciler) writeStatus(ctx context.Context, backup *cbv1.Backup,
 		return ctrl.Result{}, nil
 	}
 	return ctrl.Result{RequeueAfter: backupPollInterval}, nil
+}
+
+// failHooks terminates a Backup whose pre-snapshot quiesce failed with onError=Fail.
+//
+// This is a hard Failed, not a partial: the point of a pre hook is to make the snapshot
+// trustworthy, so capturing anyway would produce a backup that LOOKS application-consistent and is
+// not — the one outcome worse than having no backup, because it is discovered at restore time.
+// It never requeues: Failed is terminal, so the caller's pass simply ends here.
+func (r *BackupReconciler) failHooks(ctx context.Context, backup *cbv1.Backup, message string) error {
+	backup.Status.Phase = string(status.BackupPhaseFailed)
+	if backup.Status.BackupTime == nil {
+		now := metav1.Now()
+		backup.Status.BackupTime = &now
+	}
+	status.SetCondition(&backup.Status.Conditions, ConditionReady, metav1.ConditionFalse,
+		"PreHookFailed", message, backup.Generation)
+	if err := r.Status().Update(ctx, backup); err != nil {
+		return fmt.Errorf("update status for Backup %s/%s: %w", backup.Namespace, backup.Name, err)
+	}
+	r.Recorder.Eventf(backup, nil, corev1.EventTypeWarning, "BackupFailed", "PreHookFailed",
+		"no snapshot was taken: %s", message)
+	return nil
 }
 
 // gate records a non-terminal blocker (no parent, missing location, repository not ready, KEK/DEK

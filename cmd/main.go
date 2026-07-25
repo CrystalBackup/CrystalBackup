@@ -48,6 +48,7 @@ import (
 	"github.com/CrystalBackup/CrystalBackup/internal/controller"
 	"github.com/CrystalBackup/CrystalBackup/internal/escrow"
 	"github.com/CrystalBackup/CrystalBackup/internal/exposer"
+	"github.com/CrystalBackup/CrystalBackup/internal/hooks"
 	"github.com/CrystalBackup/CrystalBackup/internal/metrics"
 	"github.com/CrystalBackup/CrystalBackup/internal/repo/queue"
 	"github.com/CrystalBackup/CrystalBackup/internal/repo/s3stat"
@@ -337,7 +338,14 @@ func main() {
 		setupLog.Error(err, "Unable to create controller", "controller", "Maintenance")
 		os.Exit(1)
 	}
-	if err := controller.NewBackupReconciler(
+	// The pod-exec path for consistency hooks (R16). Built once at startup so a broken REST config
+	// fails here, with a message, rather than at the first backup with a nil dereference.
+	hookExecutor, err := hooks.NewPodExecutor(mgr.GetConfig())
+	if err != nil {
+		setupLog.Error(err, "Unable to build the consistency-hook executor")
+		os.Exit(1)
+	}
+	backupReconciler := controller.NewBackupReconciler(
 		mgr.GetClient(),
 		mgr.GetScheme(),
 		// Same uncached Secret reader (the cluster KEK + DR S3 credentials); never GetClient().
@@ -355,7 +363,9 @@ func main() {
 		// controller enqueues retention-forget and stale-lock-unlock on it, serialised per repository
 		// against init and each other.
 		repoQueue,
-	).SetupWithManager(mgr); err != nil {
+	)
+	backupReconciler.Hooks = hookExecutor
+	if err := backupReconciler.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Unable to create controller", "controller", "Backup")
 		os.Exit(1)
 	}

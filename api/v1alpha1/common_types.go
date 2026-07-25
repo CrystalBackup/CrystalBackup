@@ -321,6 +321,50 @@ type Hook struct {
 	OnError HookErrorPolicy `json:"onError,omitempty"`
 }
 
+// HookResult is the outcome of one hook execution.
+// +kubebuilder:validation:Enum=Succeeded;Failed;Skipped
+type HookResult string
+
+// Hook outcomes.
+const (
+	// HookSucceeded means the command exited 0 within its timeout.
+	HookSucceeded HookResult = "Succeeded"
+	// HookFailed means it exited non-zero, timed out, or could not be started.
+	HookFailed HookResult = "Failed"
+	// HookSkipped means an earlier hook in the same phase failed with onError=Fail, so this one
+	// never ran. Recorded rather than omitted: a list showing three of five hooks invites the
+	// reader to assume the missing two passed.
+	HookSkipped HookResult = "Skipped"
+)
+
+// HookStatus is one hook execution's durable record.
+type HookStatus struct {
+	// phase the hook ran in: "pre" (before snapshotting) or "post" (after every snapshot was cut).
+	// +required
+	// +kubebuilder:validation:Enum=pre;post
+	Phase string `json:"phase"`
+	// pod the command ran in, and container within it.
+	// +required
+	Pod string `json:"pod"`
+	// +optional
+	Container string `json:"container,omitempty"`
+	// source records where the hook was declared: an annotation on the pod itself, or the CR spec.
+	// +optional
+	// +kubebuilder:validation:Enum=annotation;spec
+	Source string `json:"source,omitempty"`
+	// result of the execution.
+	// +required
+	Result HookResult `json:"result"`
+	// message carries the failure, including the command's own stderr — usually the whole
+	// diagnosis. Empty on success.
+	// +optional
+	// +kubebuilder:validation:MaxLength=1024
+	Message string `json:"message,omitempty"`
+	// finishedAt is when the execution ended.
+	// +optional
+	FinishedAt *metav1.Time `json:"finishedAt,omitempty"`
+}
+
 // HooksSpec groups pre/post hooks and annotation honouring (R16).
 type HooksSpec struct {
 	// honorAnnotations enables the crystalbackup.io/pre-backup-* and post-backup-* pod
