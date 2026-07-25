@@ -42,6 +42,16 @@ namespace-plane `BackupSchedule` or a cluster-plane `ClusterBackup`. Therefore:
 - **Tenant visibility is native**: `Backup` objects are namespaced, so standard RBAC lets
   a user `kubectl get backups` see only their own — never other tenants'.
 
+**The `CronJob` analogy stops at `ClusterBackup`.** The top hop is a real template stamp
+(`spec.template.spec` copied wholesale into the run); the hop below it is **not** — a child
+`Backup` receives only `scheduleRef` and `locationRef`, and its run configuration is resolved
+from the parent at reconcile time via the `crystalbackup.io/cluster-backup` label. That is
+deliberate: the same kind is also written by **discovery**, which projects `Backup`s out of
+restic snapshots by server-side apply, and a field manager that owns a field must be able to
+reproduce it from the repository alone. See
+[adr/0017](adr/0017-cascade-materialization-backup-carries-identity.md) for the decision, its
+accepted costs, and the M5 direction.
+
 ## Repository is the source of truth
 
 `Backup` CRs are a **projection** of the restic repository, not the source of truth. The
@@ -72,14 +82,18 @@ and [01-architecture.md](01-architecture.md).
 
 - **`Backup` is the execution unit and the projection.** Created by a run *and* by
   discovery; deleted only when its snapshots are `forget`-ten (CR lifetime = data lifetime,
-  so `kubectl get backups -n X` lists exactly what is restorable in X).
+  so `kubectl get backups -n X` lists exactly what is restorable in X). Its `spec` therefore
+  carries **identity, not intent** — run configuration is resolved from the parent at reconcile
+  time ([adr/0017](adr/0017-cascade-materialization-backup-carries-identity.md)).
 - **Cluster DR repo is admin-owned.** Its key never leaves `crystal-backup-system`. Users
   reach DR data only through a `Restore` referencing a cluster-origin `Backup` in their own
   namespace; the operator mediates with a **server-side tag filter `namespace=<the CR's
   namespace>`** that users cannot forge — the R2/R14 cornerstone.
-- **Cluster-origin `Backup` objects are read-only to users** (admission): users may
-  get/list/watch them but not create/update/delete; a user-created `Backup`/`BackupSchedule`
-  must reference a **namespaced `BackupLocation`**, never a `ClusterBackupLocation`.
+- **Cluster-origin `Backup` objects are read-only to users** — by **RBAC**, not admission:
+  the tenant ClusterRole grants only `get`/`list`/`watch` on `backups`, so users never
+  create/update/delete them. Separately, and this part *is* admission (rule 2), a user-created
+  `Backup`/`BackupSchedule` must reference a **namespaced `BackupLocation`**, never a
+  `ClusterBackupLocation`.
 - **Namespace-plane isolation is by construction**: a `BackupLocation` references Secrets in
   its own namespace; a `Restore` only reads its own namespace's `Backup` objects.
 - Every CR exposes `status.conditions` (`metav1.Condition`) and a human `phase`;

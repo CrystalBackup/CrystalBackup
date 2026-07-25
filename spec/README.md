@@ -54,6 +54,7 @@ Architecture Decision Records live in [adr/](adr/). Key ones:
 - [0014 — Versioning & release scheme (SemVer; milestone → minor on major 0)](adr/0014-versioning-and-release.md)
 - [0015 — Per-repository exclusive-queue serialization (movers are readers, maintenance ops are writers)](adr/0015-per-repository-exclusive-queue-serialization.md)
 - [0016 — Restore execution: operator-namespace movers, PV-level target exposure, server-side snapshot resolution](adr/0016-restore-execution-and-target-exposure.md)
+- [0017 — Cascade materialization: `Backup` carries identity, pulls its run configuration](adr/0017-cascade-materialization-backup-carries-identity.md)
 
 ## Research
 
