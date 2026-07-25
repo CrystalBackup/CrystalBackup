@@ -200,7 +200,15 @@ Core suite (every PR):
    `Backup` is **denied** by admission (read-only projection).
 7. **Hook failure policies (R16)**: pre-hook with `onError: Fail` aborts the backup
    before snapshots; `onError: Continue` proceeds and records the hook error in status;
-   hook timeout enforced.
+   hook timeout enforced. Plus the two properties the freeze window rests on:
+   **the unfreeze is unconditional** (a run whose volumes end `Failed`/`Skipped` still records a
+   `post` hook — the application is quiesced either way), and **it survives a restart** (delete the
+   operator pod between the `pre` and the `post` record → the new leader reads `status.hooks`,
+   sees a `pre` with no `post`, and releases). The restart case is the feature's most important
+   test: nothing about the window is held in memory, and a workload left frozen by a crashed
+   operator is an outage the backup itself caused.
+   Confinement is asserted too: a `Running` pod in the same namespace that mounts **none** of the
+   run's PVCs is never exec'd into.
 8. **Metrics smoke (R19)**: `/metrics` exposes
    `crystalbackup_backup_last_success_timestamp_seconds{namespace="tenant-a"}` (full
    catalogue asserted per [05-observability.md](05-observability.md); every series carries
@@ -228,7 +236,16 @@ Full suite (nightly + release tags), in addition:
     then runs exclusively; `restic check` clean after both. (One shared repo ⇒ one prune
     window — [adr/0009](adr/0009-shared-cluster-repo-tag-tenancy.md); backups take shared
     locks, prune/check/forget/init/erasure require the exclusive lock — this test proves
-    the operator serializes them per `BackupRepository`.)
+    the operator serializes them per `BackupRepository`.) Note the operator drains the movers
+    *before* the prune rather than letting them contend: the assertion is that new movers are
+    held back while a prune is pending, and that the drain gives up on its **own** short deadline
+    rather than the prune's long one — a stuck mover must not close the backup plane for hours
+    ([adr/0015](adr/0015-per-repository-exclusive-queue-serialization.md) §3).
+11b. **A killed prune does not wedge the repository**: SIGKILL the prune mid-flight so restic's
+    exclusive lock is orphaned → the next scheduled maintenance run reaps the stale lock
+    (`unlock --remove-all`, `locks_reaped_total` increments) and completes. Concurrently, a
+    `restic snapshots` read (discovery, or a restore resolving its source) must **not** have
+    blocked on that lock at any point — both read paths pass `--no-lock`.
 12. **`check` catches tampering (R17)**: flip bytes inside a pack object under `data/` in
     SeaweedFS via `mc`; the next scheduled `restic check --read-data-subset` fails, surfacing
     `BackupRepository.status.lastCheckResult: Failed`, the `RepositoryCheckFailed` condition and

@@ -151,11 +151,23 @@ For one `Backup` (R11, R12, R15, R16):
 1. **Resolve** location + `BackupRepository`; **init** the restic repo on first use
    (serialized through the per-repo exclusive queue to avoid an init race —
    [adr/0009](adr/0009-shared-cluster-repo-tag-tenancy.md)); list target PVCs.
-2. **Hooks (pre)** (R16): exec into selected pods (Velero-style, `onError` policy).
+2. **Hooks (pre)** (R16) — **delivered in M4**: exec into the pods **mounting the PVCs this run is
+   backing up**, with Velero-style precedence (a pod's `pre.hook.crystalbackup.io/*` annotations
+   *replace* the run's spec hooks for that pod) and the `onError` policy. Candidacy by *mounted
+   PVC* rather than by label is what confines the exec to workloads whose data is actually being
+   captured. The run then **stops and persists** the record before any snapshot exists: a
+   controller that dies between the quiesce and the snapshot must come back knowing it froze
+   something. `onError: Fail` aborts the run without snapshotting — a snapshot taken after a failed
+   quiesce would *look* application-consistent without being so, and that is only discovered at
+   restore time.
 3. **Snapshot**: create one `VolumeSnapshot` per PVC in the origin namespace; wait
    `ReadyToUse` (crash-consistent point-in-time, R11).
-4. **Hooks (post)**: run as soon as all snapshots are cut (hooks bound the freeze window,
-   not the upload).
+4. **Hooks (post)**: run as soon as all snapshots are **cut** — not on their having *succeeded*.
+   Hooks bound the freeze window, not the upload (a database held frozen for a multi-hour upload is
+   an outage, not a backup), and the release is **unconditional**: a failed or skipped snapshot
+   leaves the application just as quiesced, so gating the thaw on success would strand exactly the
+   workload whose backup just went wrong. Failures are retried within a bounded budget and, being
+   derived from `status.hooks`, survive a controller restart.
 5. **Expose & move** ([adr/0003](adr/0003-snapshot-exposure-csi-generic-first.md)): per PVC,
    the operator selects the **least-data-movement exposer** for the PVC's CSI —
    `cephfs-shallow` (ROX `backingSnapshot`, zero copy) for CephFS, `csi-generic` (re-bind the
@@ -213,12 +225,15 @@ serialized against running backups (restic locking) — never inline:
 
 - **`forget`** (schedule retention, R24): enqueued by each successful backup; applied
   per-PVC (`--group-by host,paths`).
-- **`prune`**: per-location `maintenance.pruneSchedule`, jittered to avoid S3 bursts.
-  Because the cluster plane is **one shared repo**, its prune is a **single cluster-wide
+- **`prune`** — **delivered in M4**: per-location `maintenance.pruneSchedule`, jittered to avoid S3
+  bursts. Because the cluster plane is **one shared repo**, its prune is a **single cluster-wide
   exclusive window** (long and memory-heavy on large clusters → schedule off-peak,
-  `--max-repack-size`; [adr/0009](adr/0009-shared-cluster-repo-tag-tenancy.md)). Immutable
+  `--max-repack-size`; [adr/0009](adr/0009-shared-cluster-repo-tag-tenancy.md)). It **drains the
+  movers** first — not for corruption (restic's lock already bars that) but for **throughput**:
+  otherwise the prune and the whole mover fleet contend on `--retry-lock`
+  ([adr/0015](adr/0015-per-repository-exclusive-queue-serialization.md) §3). Immutable
   locations never prune ([adr/0005](adr/0005-immutability-mode.md)).
-- **`check`** (R17) — repository integrity: `restic check` (structure) plus scheduled
+- **`check`** (R17) — **delivered in M4** — repository integrity: `restic check` (structure) plus scheduled
   `check --read-data-subset` (reads a sample of pack data to catch silent bucket / bit-rot
   corruption), per location schedule; result surfaced in `BackupRepository.status`, metrics and
   the `RepositoryCheckFailed` alert. **Restore-testing is the administrator's responsibility**

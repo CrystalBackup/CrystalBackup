@@ -108,6 +108,18 @@ canary metric in v1, R17.)
 | `crystalbackup_repository_stale_locks` | gauge | location, scope, namespace, cluster | Repo lock files older than the restic staleness threshold (30 min) currently present. Normally reaped to 0 by the orphan reaper. |
 | `crystalbackup_repository_locks_reaped_total` | counter | location, scope, namespace, cluster | Stale locks removed by the reaper (`restic unlock`). |
 
+**A never-measured series is absent, not zero** — the alerts above depend on it. A repository that
+has not yet been checked emits no `last_check_*` sample at all: a `0` success would page
+`CrystalbackupRepositoryCheckFailed` the moment a location is created, and a `0` timestamp renders
+as 1970 in every dashboard. Absence is the honest encoding of "not measured yet", and it makes both
+rules no-op until there is something real to say. Same reasoning for `last_maintenance_*` on
+`Immutable` locations, which never prune by design ([adr/0005](adr/0005-immutability-mode.md)) —
+`CrystalbackupMaintenanceStalled` must not fire on them.
+
+All seven are **state-derived**: a collector reads them off `BackupRepository.status` at scrape
+time, so they survive an operator restart with no replay. `locks_reaped_total` is the one exception
+and is necessarily a real counter — it records an event, and events are not recoverable from state.
+
 ### 2.5 Discovery (repository→Backup projection, R26)
 
 Per `BackupRepository`; derived from `restic snapshots` grouped by `(namespace, run)` and
@@ -255,6 +267,15 @@ groups:
         labels: { severity: warning }
         annotations:
           summary: "Stale restic locks persist on {{ $labels.location }} (reaper not clearing)"
+      - alert: CrystalbackupMaintenanceStalled
+        # A prune that keeps FAILING never advances lastMaintenanceTime, so staleness is the
+        # signal — one rule covers "never ran", "erroring every night" and "controller wedged".
+        # 26h ⇒ a daily pruneSchedule may miss one window without paging.
+        expr: time() - crystalbackup_repository_last_maintenance_timestamp_seconds > 26 * 3600
+        for: 1h
+        labels: { severity: warning }
+        annotations:
+          summary: "No successful prune on {{ $labels.location }} for over 26h — the repository is growing unreclaimed"
       - alert: CrystalbackupDiscoveryFailed
         expr: crystalbackup_discovery_last_success == 0
         for: 30m

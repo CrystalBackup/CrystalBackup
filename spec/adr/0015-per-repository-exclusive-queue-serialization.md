@@ -74,10 +74,27 @@ backup⇄unlock mutex** with two halves:
   in-flight mover Job is re-adopted, not blocked).
 - **Writer drain (waits for readers to clear).** Before the lock-destroying op runs, the maintenance
   path (`waitForMoverQuiescence` / `maintenanceOpBlocksMovers`) drains in-flight mover Jobs — using
-  the live Job set as restart-safe ground truth — bounded by the maintenance deadline.
+  the live Job set as restart-safe ground truth — bounded by its **own** deadline, *not* the op's
+  (see below).
 
 Writers that are exclusive *by construction of what they rewrite* but do not remove a live reader's
 lock (e.g. `forget`, `check`) do **not** set `blocksMovers`: the queue turn is enough.
+
+**`OpPrune` sets `blocksMovers` for a different reason than `OpUnlock` (M4).** restic's own
+exclusive lock already bars a prune from corrupting a concurrent backup, so the corruption argument
+does not apply — the reason is **throughput**. Without the drain, a prune and a fleet of movers
+stare at each other on `--retry-lock` until one gives up; on the shared cluster repo
+([adr/0009](0009-shared-cluster-repo-tag-tenancy.md)) that is every namespace's backup. Quiescing
+first converts a contention storm into one short serialized window. Marking a *new* op
+`blocksMovers` therefore has two distinct justifications, and the checklist below asks for either.
+
+**Deadlines are per-op, and the drain has its own (M4).** A single maintenance deadline cannot serve
+both halves. `prune` and `check --read-data-subset` repack and re-read real data, so a 10-minute cap
+sized for `forget`/`unlock` would kill every prune before convergence — permanently, since the next
+run starts from the same backlog. But raising the deadline to hours cannot also govern the drain:
+the drain holds mover admission shut **cluster-wide**, so one stuck mover would close the backup
+plane for the whole window. Hence `maintenanceOpDeadline(op)` (long, per-op, a correctness budget)
+and `moverQuiescenceDeadline` (short, an availability budget) are separate constants.
 
 ### 4. In-process, not a Kubernetes Lease or mutex CRD
 
@@ -103,13 +120,17 @@ starred items reintroduces a corruption-class race:
 1. Add its `OpKind` constant in `internal/repo/queue/queue.go` and **enqueue it** — never call
    restic directly. (The `OpKind`s already exist as stubs; wiring the reconciler is the work.)
 2. ★ **If the op removes or rewrites locks/packs a live backup mover could hold or reference**
-   (`prune` and `erase` both do), make `blocksMovers(kind)` return `true`, **and** perform the
-   writer-side drain (`waitForMoverQuiescence`) before running it. Marking `blocksMovers` without
-   the drain, or vice-versa, is only half the mutex.
-3. Reads stay off the queue.
-4. Add the op to `spec/01-architecture.md` §7 (maintenance) and, if it changes the readers/writers
+   (`prune` and `erase` both do), **or would otherwise contend with the whole mover fleet for the
+   repository lock**, make `blocksMovers(kind)` return `true`, **and** perform the writer-side drain
+   (`waitForMoverQuiescence`) before running it. Marking `blocksMovers` without the drain, or
+   vice-versa, is only half the mutex.
+3. Reads stay off the queue — and pass `--no-lock`, so a read never queues behind a maintenance
+   window it does not need to wait for (M4: discovery and the restore's mediated listing).
+4. Give it a deadline sized to **its own** convergence, not a shared one, and never let the drain
+   inherit it (§3).
+5. Add the op to `spec/01-architecture.md` §7 (maintenance) and, if it changes the readers/writers
    picture, update this ADR's table and §2/§3.
-5. Cover it in the crucible: a live test that the op does not corrupt or unlock a **concurrent**
+6. Cover it in the crucible: a live test that the op does not corrupt or unlock a **concurrent**
    backup on the same repository (mirror the M1 `An OOMKilled mover … reported as a failure` +
    leak-check pattern, which exercises the `OpUnlock` mutex under a sibling mover).
 
