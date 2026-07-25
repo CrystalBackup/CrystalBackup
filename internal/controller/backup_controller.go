@@ -195,6 +195,16 @@ type backupRunContext struct {
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;delete
 // +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
+// pods/exec is the consistency-hook grant (R16) — the ability to run arbitrary commands inside a
+// tenant's containers, and the largest privilege in the backup path. It is bounded by the
+// controller invariant that a hook only ever execs into pods MOUNTING the volumes being
+// snapshotted, in the CR's own namespace (03-security-and-tenancy.md §5).
+//
+// The marker itself is the fix for a real split: the Helm chart has granted pods/exec since M0,
+// while config/rbac/role.yaml never has, because no marker existed for controller-gen to find. A
+// kustomize install therefore could not run a hook at all, and `make manifests` could never
+// discover that it should.
+// +kubebuilder:rbac:groups="",resources=pods/exec,verbs=create
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;create;update;patch;delete
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=snapshot.storage.k8s.io,resources=volumesnapshots;volumesnapshotcontents,verbs=get;list;watch;create;update;patch;delete

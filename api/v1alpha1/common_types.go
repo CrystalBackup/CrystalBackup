@@ -292,19 +292,28 @@ const (
 	HookErrorPolicyContinue HookErrorPolicy = "Continue"
 )
 
-// Hook is an exec hook run in a selected pod around snapshotting (R16).
+// Hook is an exec hook run in a selected pod around snapshotting (R16). Candidate pods are those
+// MOUNTING the volumes being snapshotted, always in the CR's own namespace; podSelector narrows
+// that set further, and an empty selector means "every pod holding this data".
 type Hook struct {
-	// podSelector selects the pod(s) to exec into.
+	// podSelector selects the pod(s) to exec into, among those mounting the backed-up volumes.
+	// Empty matches them all.
 	// +optional
 	PodSelector metav1.LabelSelector `json:"podSelector,omitempty"`
-	// container name to exec into.
+	// container name to exec into. Empty uses the pod's FIRST container.
 	// +optional
 	Container string `json:"container,omitempty"`
-	// command to run.
+	// command to run, as an argv. It is exec'd directly, NOT through a shell, so pipes and
+	// redirections need an explicit interpreter (e.g. ["sh","-c","..."]).
 	// +required
+	// +kubebuilder:validation:MinItems=1
 	Command []string `json:"command"`
-	// timeout for the hook.
+	// timeout for the hook, bounding how long the application stays quiesced. It defaults to 30s
+	// rather than to the zero value on purpose: this is a non-pointer duration, so an omitted
+	// timeout would arrive as 0s, and a literal zero deadline expires immediately — every hook
+	// that did not set one would fail before it ran.
 	// +optional
+	// +kubebuilder:default="30s"
 	Timeout metav1.Duration `json:"timeout,omitempty"`
 	// onError governs whether a failure fails the backup or is tolerated.
 	// +optional
@@ -314,7 +323,10 @@ type Hook struct {
 
 // HooksSpec groups pre/post hooks and annotation honouring (R16).
 type HooksSpec struct {
-	// honorAnnotations enables crystalbackup.io/pre-backup-* pod annotations.
+	// honorAnnotations enables the crystalbackup.io/pre-backup-* and post-backup-* pod
+	// annotations. It is opt-in because it delegates WHAT the operator execs to whoever can
+	// annotate a pod in the backed-up namespace. When a pod carries them they take precedence and
+	// the hooks below are skipped for that pod — never merged (the same rule Velero applies).
 	// +optional
 	HonorAnnotations bool `json:"honorAnnotations,omitempty"`
 	// pre hooks run before snapshotting.
