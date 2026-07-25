@@ -58,6 +58,16 @@ const (
 	m4DemoNS   = "m4-demo"
 	m4Location = "dr-e2e-m4"
 
+	// m4DEKSecret is the operator-generated wrapped-DEK Secret for this location
+	// (keys.DEKSecretName => "crystal-dek-<location>"). It MUST be dropped on setup, and the
+	// reason is not hypothetical: this suite mints a FRESH KEK on every run, while `make e2e` only
+	// runs cleanup-test-e2e AFTER the tests — so a failing run leaves its kind cluster standing and
+	// the next one reuses it. The new KEK is then handed a DEK wrapped under the old one and the
+	// repository never initialises ("identity did not match any of the recipients"), which surfaces
+	// far downstream as a Backup stuck in Pending. M3 documents the same trap; this container
+	// reused its provisioning without its hygiene.
+	m4DEKSecret = "crystal-dek-" + m4Location
+
 	// m4HookedPVC is the claim the hooked pod mounts, and the only one the runs select.
 	m4HookedPVC = "hooked-data"
 	// m4BystanderPVC is mounted by a second Running pod in the SAME namespace. It is never in a
@@ -253,6 +263,13 @@ spec:
 var _ = Describe("M4 — consistency hooks (R16)", Ordered, func() {
 	BeforeAll(func() {
 		m4ClusterID = fmt.Sprintf("e2e-m4-%d", time.Now().Unix())
+
+		By("clearing leftovers from a prior run (the cluster survives a failed run)")
+		_, _ = kubectl("delete", "clusterbackuplocation", m4Location, "--ignore-not-found", "--wait=false")
+		_, _ = kubectl("delete", "secret", m4DEKSecret, "-n", m3OperatorNS, "--ignore-not-found")
+		for _, run := range []string{"m4-confine", "m4-annotation", "m4-onerror-fail", "m4-crash-window"} {
+			_, _ = kubectl("delete", "clusterbackup", run, "--ignore-not-found", "--wait=false")
+		}
 
 		m3RemoveForeignOperators()
 		m3DeployOperatorViaHelm()
@@ -498,14 +515,40 @@ spec:
 	_, err := m3Apply(manifest)
 	Expect(err).NotTo(HaveOccurred(), "apply ClusterBackupLocation")
 
-	By("waiting for the location to become Ready (repository initialised by a mover Job)")
+	By("waiting for the location to become Ready")
 	Eventually(func(g Gomega) {
 		out, err := kubectl("get", "clusterbackuplocation", m4Location,
 			"-o", "jsonpath={.status.conditions[?(@.type=='Ready')].status}")
 		g.Expect(err).NotTo(HaveOccurred())
 		g.Expect(strings.TrimSpace(out)).To(Equal("True"),
-			"location not Ready yet (repo init mover still running or S3 unreachable)")
+			"location not Ready yet (credentials or KEK unresolved, or S3 unreachable)")
 	}, 6*time.Minute, 5*time.Second).Should(Succeed())
+
+	By("waiting for its BackupRepository to report initialized")
+	// A Ready LOCATION does not mean an initialised REPOSITORY: they are two objects, and the
+	// location goes Ready on its credentials and key resolving, well before the restic-init mover
+	// Job has run. A Backup gates on the repository, so waiting on the location alone pushed the
+	// wait into the first spec, where it surfaced as "no hooks after 5 minutes" — a sentence that
+	// points at the feature under test rather than at the setup that was not finished.
+	Eventually(func(g Gomega) {
+		repo, err := kubectl("get", "clusterbackuplocation", m4Location,
+			"-o", "jsonpath={.status.repositoryRef}")
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(strings.TrimSpace(repo)).NotTo(BeEmpty(), "location has no repositoryRef yet")
+
+		init, err := kubectl("get", "backuprepository", strings.TrimSpace(repo),
+			"-o", "jsonpath={.status.initialized}")
+		g.Expect(err).NotTo(HaveOccurred())
+		if strings.TrimSpace(init) != "true" {
+			cond, _ := kubectl("get", "backuprepository", strings.TrimSpace(repo),
+				"-o", "jsonpath={.status.conditions[*].message}")
+			jobs, _ := kubectl("get", "jobs", "-n", m3OperatorNS, "-o",
+				"jsonpath={range .items[*]}{.metadata.name}={.status.succeeded}/{.status.failed} {end}")
+			g.Expect(strings.TrimSpace(init)).To(Equal("true"),
+				"repository %s not initialized — conditions=%q jobs=[%s]",
+				strings.TrimSpace(repo), strings.TrimSpace(cond), strings.TrimSpace(jobs))
+		}
+	}, 8*time.Minute, 5*time.Second).Should(Succeed())
 }
 
 // m4SeedDemoNamespace creates two claims and two Running pods: one mounting the claim the runs
