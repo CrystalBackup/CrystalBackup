@@ -609,9 +609,16 @@ func (e *restoreEngine) adviseVolume(ctx context.Context, rc *restoreExecContext
 		// state), and re-enqueuing an exclusive unlock each 5s would flood the repository
 		// lane and hold mover admission shut for its whole tail.
 		if rerr != nil && e.shouldEnqueueUnlock(rc.ownerID+"/"+plan.pvc) {
-			enqueueRepoMaintenance(ctx, e.Queue, e.maintenanceDeps(), rc.repoName, queue.OpUnlock,
-				maintenanceResourceName(prefix, "unlock"), mover.OpUnlock, restic.UnlockArgs(),
-				rc.repoURL, rc.dek, rc.s3CredsSecret)
+			enqueueRepoMaintenance(ctx, e.Queue, e.maintenanceDeps(), repoMaintenanceRequest{
+				RepoName:      rc.repoName,
+				Kind:          queue.OpUnlock,
+				Name:          maintenanceResourceName(prefix, "unlock"),
+				Op:            mover.OpUnlock,
+				ResticArgs:    restic.UnlockArgs(),
+				RepoURL:       rc.repoURL,
+				DEK:           rc.dek,
+				S3CredsSecret: rc.s3CredsSecret,
+			})
 		}
 		return volumeOutcome{settled: true, failed: true, reason: moverFailureReason(result, rerr)}, nil
 	}

@@ -37,6 +37,8 @@ limitations under the License.
 package restic
 
 import (
+	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -355,4 +357,80 @@ func ForgetCommand(r v1alpha1.RetentionSpec) (argv []string, ok bool) {
 // that, so no live backup lock exists when this runs.
 func UnlockArgs() []string {
 	return []string{"unlock", "--remove-all"}
+}
+
+// pruneCmd/checkCmd are restic's two repository-maintenance subcommands (M4, R17).
+// flagMaxRepackSize bounds how much data ONE prune run repacks — the knob that keeps a prune
+// of the shared cluster repository from running unboundedly long on a large cluster
+// (adr/0009); flagReadDataSubset makes `check` actually READ a sample of pack data instead of
+// verifying structure alone, which is the only way to catch silent bucket corruption or
+// bit-rot (R17).
+const (
+	pruneCmd           = "prune"
+	checkCmd           = "check"
+	flagMaxRepackSize  = "--max-repack-size"
+	flagReadDataSubset = "--read-data-subset"
+)
+
+// repackSizePattern and readDataSubsetPattern are restic's own value grammars, transcribed
+// from `restic prune --help` and `restic check --help` (pinned engine 0.19.1,
+// build/melange/restic.yaml):
+//
+//	--max-repack-size size      "allowed suffixes for size: k/K, m/M, g/G, t/T"
+//	--read-data-subset subset   "'n/t' for specific part, or either 'x%' or 'x.y%' or a size
+//	                             in bytes with suffixes k/K, m/M, g/G, t/T"
+//
+// These are validated HERE, at argv-build time, rather than left to the mover: both values
+// come from MaintenanceSpec, which is admin free text with no CEL pattern behind it, and a
+// typo like "50 GB" would otherwise become a Job that starts, pulls an image, opens the
+// repository and only then dies on a flag parse error — burning an exclusive queue turn and a
+// maintenance window to report a spelling mistake. Rejecting it before the Job exists lets the
+// controller surface the problem as a condition instead.
+var (
+	repackSizePattern     = regexp.MustCompile(`^[0-9]+(?:\.[0-9]+)?[kKmMgGtT]?$`)
+	readDataSubsetPattern = regexp.MustCompile(`^(?:[0-9]+/[0-9]+|[0-9]+(?:\.[0-9]+)?%|[0-9]+(?:\.[0-9]+)?[kKmMgGtT]?)$`)
+)
+
+// PruneCommand is the complete restic argv for a repository prune: the "prune" subcommand,
+// --retry-lock, and --max-repack-size when the location sets one. An empty maxRepackSize means
+// "no cap" — restic's own default, i.e. repack whatever the run needs.
+//
+// --retry-lock is NOT merely defensive here. prune takes restic's EXCLUSIVE on-repo lock, and
+// the per-repository queue that serialises our own writers is in-process only (adr/0015 §4).
+// One shared repository may serve several clusters (R20, host = clusterID), so another
+// cluster's operator can legitimately be mid-backup holding a shared lock that our queue knows
+// nothing about. --retry-lock is precisely the "rely on restic's on-repo lock with retry"
+// fallback adr/0015 §4 names for that case: wait it out, and if the window closes, fail this
+// run and let the next scheduled prune take its turn — never force past a live writer.
+func PruneCommand(maxRepackSize string) ([]string, error) {
+	if maxRepackSize == "" {
+		return []string{pruneCmd, flagRetryLock, retryLockFor}, nil
+	}
+	if !repackSizePattern.MatchString(maxRepackSize) {
+		return nil, fmt.Errorf(
+			"invalid maintenance.pruneMaxRepackSize %q: want a byte count with an optional k/K, m/M, g/G or t/T suffix (e.g. %q)",
+			maxRepackSize, "50G")
+	}
+	return []string{pruneCmd, flagRetryLock, retryLockFor, flagMaxRepackSize, maxRepackSize}, nil
+}
+
+// CheckCommand is the complete restic argv for a repository integrity check (R17): the "check"
+// subcommand, --retry-lock, and --read-data-subset when the location asks for a sampled data
+// read.
+//
+// An empty readDataSubset yields a STRUCTURAL check — restic verifies the index, the snapshot
+// tree and that every referenced pack exists, without reading pack contents. That catches a
+// truncated or missing object but NOT a silently corrupted one: an S3 object whose bytes rotted
+// still has the right name and length. Only the sampled read does, which is why R17 names both
+// and why the two share one schedule (checkSchedule) with the sample size as a separate knob.
+func CheckCommand(readDataSubset string) ([]string, error) {
+	if readDataSubset == "" {
+		return []string{checkCmd, flagRetryLock, retryLockFor}, nil
+	}
+	if !readDataSubsetPattern.MatchString(readDataSubset) {
+		return nil, fmt.Errorf(
+			"invalid maintenance.checkReadDataSubset %q: want %q for a specific part, a percentage like %q, or a size with a k/K, m/M, g/G or t/T suffix",
+			readDataSubset, "n/t", "5%")
+	}
+	return []string{checkCmd, flagRetryLock, retryLockFor, flagReadDataSubset, readDataSubset}, nil
 }

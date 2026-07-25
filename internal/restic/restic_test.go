@@ -700,3 +700,77 @@ func TestForgetCommand(t *testing.T) {
 		t.Fatal("ForgetCommand with no keep policy must return ok=false")
 	}
 }
+
+func TestPruneCommand(t *testing.T) {
+	// No cap: restic's own default, i.e. repack whatever the run needs. --retry-lock is always
+	// present — it is what makes a prune wait out another CLUSTER's mover on a shared repository
+	// (R20) rather than force past a live writer.
+	got, err := PruneCommand("")
+	if err != nil {
+		t.Fatalf("PruneCommand(\"\"): %v", err)
+	}
+	if want := []string{"prune", "--retry-lock", "5m"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("PruneCommand(\"\") = %v, want %v", got, want)
+	}
+
+	got, err = PruneCommand("50G")
+	if err != nil {
+		t.Fatalf("PruneCommand(50G): %v", err)
+	}
+	if want := []string{"prune", "--retry-lock", "5m", "--max-repack-size", "50G"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("PruneCommand(50G) = %v, want %v", got, want)
+	}
+
+	// restic's grammar, from `restic prune --help`: suffixes k/K, m/M, g/G, t/T (or plain bytes).
+	for _, ok := range []string{"0", "500", "50k", "50K", "10m", "10M", "2g", "2G", "1t", "1T", "1.5G"} {
+		if _, err := PruneCommand(ok); err != nil {
+			t.Errorf("PruneCommand(%q) rejected a value restic accepts: %v", ok, err)
+		}
+	}
+	// Rejected HERE rather than in the pod: MaintenanceSpec is admin free text with no CEL pattern
+	// behind it, and a typo would otherwise cost an exclusive queue turn and a maintenance window
+	// to report a spelling mistake.
+	for _, bad := range []string{"50 GB", "50GB", "fifty", "-5G", "G", "50%", ""} {
+		if bad == "" {
+			continue // the empty string means "no cap", asserted above.
+		}
+		if _, err := PruneCommand(bad); err == nil {
+			t.Errorf("PruneCommand(%q) accepted a value restic would reject at flag-parse time", bad)
+		}
+	}
+}
+
+func TestCheckCommand(t *testing.T) {
+	// No subset: a STRUCTURAL check. It verifies the index, the snapshot tree and that every
+	// referenced pack exists — which catches a missing or truncated object but NOT a silently
+	// corrupted one, whose bytes rotted while its name and length stayed right. Only the sampled
+	// read catches that, which is the whole point of R17.
+	got, err := CheckCommand("")
+	if err != nil {
+		t.Fatalf("CheckCommand(\"\"): %v", err)
+	}
+	if want := []string{"check", "--retry-lock", "5m"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("CheckCommand(\"\") = %v, want %v", got, want)
+	}
+
+	got, err = CheckCommand("5%")
+	if err != nil {
+		t.Fatalf("CheckCommand(5%%): %v", err)
+	}
+	if want := []string{"check", "--retry-lock", "5m", "--read-data-subset", "5%"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("CheckCommand(5%%) = %v, want %v", got, want)
+	}
+
+	// restic's grammar, from `restic check --help`: 'n/t' for a specific part, or 'x%' / 'x.y%',
+	// or a size in bytes with suffixes k/K, m/M, g/G, t/T.
+	for _, ok := range []string{"1/5", "12/100", "5%", "2.5%", "100", "500M", "1g", "2G", "1T"} {
+		if _, err := CheckCommand(ok); err != nil {
+			t.Errorf("CheckCommand(%q) rejected a value restic accepts: %v", ok, err)
+		}
+	}
+	for _, bad := range []string{"5 %", "half", "1/", "/5", "5%%", "-1/5", "500 MB"} {
+		if _, err := CheckCommand(bad); err == nil {
+			t.Errorf("CheckCommand(%q) accepted a value restic would reject at flag-parse time", bad)
+		}
+	}
+}
