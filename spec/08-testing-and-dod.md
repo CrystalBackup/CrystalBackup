@@ -242,10 +242,21 @@ Full suite (nightly + release tags), in addition:
     rather than the prune's long one — a stuck mover must not close the backup plane for hours
     ([adr/0015](adr/0015-per-repository-exclusive-queue-serialization.md) §3).
 11b. **A killed prune does not wedge the repository**: SIGKILL the prune mid-flight so restic's
-    exclusive lock is orphaned → the next scheduled maintenance run reaps the stale lock
-    (`unlock --remove-all`, `locks_reaped_total` increments) and completes. Concurrently, a
-    `restic snapshots` read (discovery, or a restore resolving its source) must **not** have
-    blocked on that lock at any point — both read paths pass `--no-lock`.
+    exclusive lock is orphaned → the failure is recorded in `status.recentMaintenance`, and the
+    NEXT scheduled prune completes anyway. Concurrently, a `restic snapshots` read (discovery, or
+    a restore resolving its source) must **not** have blocked on that lock at any point — both
+    read paths pass `--no-lock`.
+
+    > **The reap itself is deliberately NOT asserted here, and the reason is a property of the
+    > design rather than a gap in the test.** `status.staleLocks` is age-based on the lock object's
+    > `LastModified`, using restic's own 30-minute staleness horizon — a lock younger than that may
+    > well belong to something still running, and nothing in the object store can distinguish the
+    > two. So the reap cannot fire inside any reasonable test window, and at the 30-minute mark
+    > restic would remove the lock itself on the next acquisition anyway. The operator-driven
+    > `unlock` does not shorten that window; what it fixes is that the **signal** used to be a dead
+    > end (`CrystalbackupStaleLocks` fired and nothing ever drove the gauge back down). That is
+    > covered by unit tests, which can control the clock. Asserting it on live infrastructure would
+    > mean a 30-minute sleep to prove something restic does for us.
 12. **`check` catches tampering (R17)**: flip bytes inside a pack object under `data/` in
     SeaweedFS via `mc`; the next scheduled `restic check --read-data-subset` fails, surfacing
     `BackupRepository.status.lastCheckResult: Failed`, the `RepositoryCheckFailed` condition and
