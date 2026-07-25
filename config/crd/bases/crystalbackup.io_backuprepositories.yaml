@@ -62,7 +62,10 @@ spec:
             description: status defines the observed state of BackupRepository
             properties:
               approximateSizeBytes:
-                description: approximateSizeBytes of the deduplicated repository.
+                description: |-
+                  approximateSizeBytes is the repository's PHYSICAL size: the sum of the objects actually
+                  stored under its prefix, post-dedup and post-compression. For the shared cluster
+                  repository that is the whole cluster's footprint in that bucket, all namespaces together.
                 format: int64
                 type: integer
               conditions:
@@ -135,10 +138,18 @@ spec:
                   type: string
                 type: array
               lastCheckResult:
-                description: lastCheckResult of the most recent check.
+                description: |-
+                  lastCheckResult of the most recent check. Failed means restic found repository damage
+                  (R17) — it is the RepositoryCheckFailed alert, not a transient error.
+                enum:
+                - Passed
+                - Failed
                 type: string
               lastCheckTime:
-                description: lastCheckTime is when restic check last ran.
+                description: |-
+                  lastCheckTime is when restic check last ran — success or failure, unlike
+                  lastMaintenanceTime. Paired with lastCheckResult it distinguishes "verified recently and
+                  it was bad" from "not verified in weeks", which are different incidents.
                 format: date-time
                 type: string
               lastDiscoveryTime:
@@ -146,7 +157,10 @@ spec:
                 format: date-time
                 type: string
               lastMaintenanceTime:
-                description: lastMaintenanceTime is when prune last ran.
+                description: |-
+                  lastMaintenanceTime is when prune last SUCCEEDED. A failed prune deliberately leaves it
+                  alone: the field answers "how long since this repository was actually reclaimed", and the
+                  staleness alert depends on a failure not refreshing it.
                 format: date-time
                 type: string
               location:
@@ -176,6 +190,49 @@ spec:
               ownerNamespace:
                 description: ownerNamespace is set for a namespaced (tenant) repository.
                 type: string
+              recentMaintenance:
+                description: |-
+                  recentMaintenance is a capped, NEWEST-FIRST history of maintenance attempts. The
+                  maintenance Job and its pod are deleted as soon as an op finishes, so this is the only
+                  durable record of what ran and why it failed.
+                items:
+                  description: |-
+                    MaintenanceRecord is one completed repository-maintenance attempt, kept so an operator can see
+                    WHY a repository is unhealthy without going to the operator log — the maintenance Job and its
+                    pod are deleted as soon as the op finishes (no ownerReference is possible: the Job lives in the
+                    operator namespace, the triggering object does not), so this record is the only durable trace.
+                  properties:
+                    completionTime:
+                      description: completionTime is when it finished. Absent while
+                        it is still running.
+                      format: date-time
+                      type: string
+                    message:
+                      description: message carries the failure reason, truncated.
+                        Empty on success.
+                      maxLength: 512
+                      type: string
+                    operation:
+                      description: operation that ran, e.g. "prune" or "check".
+                      type: string
+                    result:
+                      description: result of the attempt.
+                      enum:
+                      - Succeeded
+                      - Failed
+                      type: string
+                    startTime:
+                      description: |-
+                        startTime is when the operation began (when its queue turn started, not when it was
+                        enqueued — the wait for the lane is not part of the operation's own duration).
+                      format: date-time
+                      type: string
+                  required:
+                  - operation
+                  - startTime
+                  type: object
+                maxItems: 10
+                type: array
               repositoryURL:
                 description: repositoryURL is the restic repository URL (published
                   for the standalone CLI, R8).
@@ -188,6 +245,14 @@ spec:
                 type: string
               snapshotCount:
                 description: snapshotCount in the repository.
+                format: int32
+                type: integer
+              staleLocks:
+                description: |-
+                  staleLocks is the number of repository lock objects older than restic's 30-minute
+                  staleness threshold. Normally zero: a hard-killed mover's lock is cleared by an unlock op.
+                  A persistent non-zero value means locks are accumulating faster than they are reaped, and
+                  every exclusive operation will eventually stall behind them.
                 format: int32
                 type: integer
             type: object

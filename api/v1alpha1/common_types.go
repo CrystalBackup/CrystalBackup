@@ -128,20 +128,75 @@ type DiscoverySpec struct {
 	Interval metav1.Duration `json:"interval,omitempty"`
 }
 
-// MaintenanceSpec configures Standard-mode repository maintenance.
+// MaintenanceSpec configures Standard-mode repository maintenance. Immutable locations never
+// prune (object-lock forbids it, adr/0005) — admission rule 6 denies pruneSchedule there.
+//
+// The two value fields carry restic's OWN grammars, pinned here as CRD patterns so a typo is
+// rejected at apply time instead of becoming a maintenance Job that starts, pulls an image, opens
+// the repository and only then dies on a flag parse error. internal/restic re-validates them at
+// argv-build time: these patterns bind only what this API accepts, and the repository contract
+// belongs to the package that owns the argv.
 type MaintenanceSpec struct {
-	// pruneSchedule (cron) for the repository-wide exclusive prune window.
+	// pruneSchedule (cron) for the repository-wide exclusive prune window. One shared cluster
+	// repository means ONE cluster-wide prune window (adr/0009) during which no namespace can
+	// start a backup — schedule it off-peak.
 	// +optional
+	// +kubebuilder:validation:MinLength=1
 	PruneSchedule string `json:"pruneSchedule,omitempty"`
-	// pruneMaxRepackSize caps repacking per prune run (e.g. "50G").
+	// pruneMaxRepackSize caps repacking per prune run (e.g. "50G") — the practical bound on how
+	// long that exclusive window lasts. Empty means restic's default: repack whatever the run
+	// needs. A byte count with an optional k/K, m/M, g/G or t/T suffix.
 	// +optional
+	// +kubebuilder:validation:Pattern=`^[0-9]+(\.[0-9]+)?[kKmMgGtT]?$`
 	PruneMaxRepackSize string `json:"pruneMaxRepackSize,omitempty"`
 	// checkSchedule (cron) for restic check.
 	// +optional
+	// +kubebuilder:validation:MinLength=1
 	CheckSchedule string `json:"checkSchedule,omitempty"`
-	// checkReadDataSubset is the fraction of pack data to verify (e.g. "5%").
+	// checkReadDataSubset is how much pack data each check actually READS (R17). Empty means a
+	// structural check only, which catches a missing or truncated object but never a silently
+	// corrupted one — its bytes rotted while its name and length stayed right. Accepts "n/t" for
+	// a specific part, a percentage like "5%" or "2.5%", or a size with a k/K, m/M, g/G or t/T
+	// suffix.
 	// +optional
+	// +kubebuilder:validation:Pattern=`^([0-9]+/[0-9]+|[0-9]+(\.[0-9]+)?%|[0-9]+(\.[0-9]+)?[kKmMgGtT]?)$`
 	CheckReadDataSubset string `json:"checkReadDataSubset,omitempty"`
+}
+
+// MaintenanceResult is the outcome of one repository-maintenance attempt.
+// +kubebuilder:validation:Enum=Succeeded;Failed
+type MaintenanceResult string
+
+// Repository-maintenance outcomes.
+const (
+	// MaintenanceSucceeded means the maintenance Job ran to completion with exit status 0.
+	MaintenanceSucceeded MaintenanceResult = "Succeeded"
+	// MaintenanceFailed means the Job failed, timed out, or never got its turn on the lane.
+	MaintenanceFailed MaintenanceResult = "Failed"
+)
+
+// MaintenanceRecord is one completed repository-maintenance attempt, kept so an operator can see
+// WHY a repository is unhealthy without going to the operator log — the maintenance Job and its
+// pod are deleted as soon as the op finishes (no ownerReference is possible: the Job lives in the
+// operator namespace, the triggering object does not), so this record is the only durable trace.
+type MaintenanceRecord struct {
+	// operation that ran, e.g. "prune" or "check".
+	// +required
+	Operation string `json:"operation"`
+	// startTime is when the operation began (when its queue turn started, not when it was
+	// enqueued — the wait for the lane is not part of the operation's own duration).
+	// +required
+	StartTime metav1.Time `json:"startTime"`
+	// completionTime is when it finished. Absent while it is still running.
+	// +optional
+	CompletionTime *metav1.Time `json:"completionTime,omitempty"`
+	// result of the attempt.
+	// +optional
+	Result MaintenanceResult `json:"result,omitempty"`
+	// message carries the failure reason, truncated. Empty on success.
+	// +optional
+	// +kubebuilder:validation:MaxLength=512
+	Message string `json:"message,omitempty"`
 }
 
 // ObjectLockMode selects the immutability enforcement mechanism.
