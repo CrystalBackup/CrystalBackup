@@ -35,6 +35,7 @@ import (
 
 	batchv1 "k8s.io/api/batch/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	cbv1 "github.com/CrystalBackup/CrystalBackup/api/v1alpha1"
@@ -71,8 +72,11 @@ func m4DedicatedClusterID(spec string) string {
 }
 
 // m4LocationObject builds a location on its own clusterID with an explicit maintenance block.
-// Discovery is OFF: these repositories exist to be pruned and checked, and a discovery pass
-// projecting Backups out of them would only add unrelated reconciles to read through.
+//
+// Discovery is turned OFF explicitly rather than by omission — the field defaults to TRUE, so
+// leaving it alone would enable it. These repositories exist to be pruned and checked; a discovery
+// pass projecting Backups out of them would only add unrelated reconciles to read through when a
+// spec fails.
 func m4LocationObject(name, clusterID string, maintenance *cbv1.MaintenanceSpec) *cbv1.ClusterBackupLocation {
 	return &cbv1.ClusterBackupLocation{
 		ObjectMeta: metav1.ObjectMeta{Name: name},
@@ -91,6 +95,7 @@ func m4LocationObject(name, clusterID string, maintenance *cbv1.MaintenanceSpec)
 				ClusterKEKSecretRef: cbv1.LocalObjectReference{Name: m1KEKSecretName},
 			},
 			Maintenance: maintenance,
+			Discovery:   cbv1.DiscoverySpec{Enabled: ptr.To(false)},
 		},
 	}
 }
@@ -205,24 +210,29 @@ func m4CorruptOnePack(clusterID string) string {
 // Maintenance observation
 // ---------------------------------------------------------------------------
 
-// m4WaitMaintenanceRecord waits for a recentMaintenance entry for op with a terminal result and
-// returns it. The history is the operator's own account of what it attempted, and unlike the
-// lastMaintenanceTime/lastCheckTime fields it records FAILURES too — which is what the two
-// destructive specs assert on.
-func m4WaitMaintenanceRecord(repoName, op string, timeout time.Duration) cbv1.MaintenanceRecord {
+// m4WaitMaintenanceRecord waits for a recentMaintenance entry for op that STARTED at or after
+// `since`, and returns it. The history is the operator's own account of what it attempted, and
+// unlike lastMaintenanceTime/lastCheckTime it records failures too.
+//
+// The `since` cutoff is not optional bookkeeping. These repositories carry a once-a-minute
+// schedule, so by the time a spec has seeded a volume and waited out a backup, several runs have
+// already succeeded. Without a cutoff the helper returns the NEWEST existing record — a pre-event
+// success — and an assertion like "the killed prune was recorded as Failed" fails against a record
+// that predates the kill. Pass the moment the event under test happened.
+func m4WaitMaintenanceRecord(repoName, op string, since time.Time, timeout time.Duration) cbv1.MaintenanceRecord {
 	GinkgoHelper()
 	var found cbv1.MaintenanceRecord
 	Eventually(func(g Gomega) {
 		var repo cbv1.BackupRepository
 		g.Expect(k8s.Get(ctx, client.ObjectKey{Name: repoName}, &repo)).To(Succeed())
 		for _, rec := range repo.Status.RecentMaintenance {
-			if rec.Operation == op && rec.Result != "" {
+			if rec.Operation == op && rec.Result != "" && !rec.StartTime.Time.Before(since) {
 				found = rec
 				return
 			}
 		}
-		g.Expect(false).To(BeTrue(), "no terminal %s record on repository %s yet (history=%d)",
-			op, repoName, len(repo.Status.RecentMaintenance))
+		g.Expect(false).To(BeTrue(), "no terminal %s record on repository %s started at/after %s (history=%d)",
+			op, repoName, since.Format(time.RFC3339), len(repo.Status.RecentMaintenance))
 	}, timeout, 5*time.Second).Should(Succeed())
 	return found
 }

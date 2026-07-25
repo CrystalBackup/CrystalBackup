@@ -398,7 +398,9 @@ func (r *DiscoveryReconciler) discoverySettings(ctx context.Context, repo *cbv1.
 	if interval < discoveryMinInterval {
 		interval = discoveryMinInterval
 	}
-	return loc.Spec.Discovery.Enabled, interval, nil
+	// nil means the admin did not say, and discovery defaults ON — the CRD default covers the
+	// API-server path, this covers a Go client that never round-tripped through it.
+	return loc.Spec.Discovery.Enabled == nil || *loc.Spec.Discovery.Enabled, interval, nil
 }
 
 // inventoryChurnPredicate filters the BackupRepository stream feeding discovery. Discovery WRITES

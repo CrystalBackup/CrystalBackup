@@ -60,6 +60,7 @@ var _ = Describe("Milestone M4 — repository maintenance & verification", Label
 
 		It("holds the prune until the backup's movers have drained, then runs it exclusively", func() {
 			repo := m1WaitRepositoryInitialized(m1LocationName)
+			startedAt := time.Now()
 
 			By("Given a namespace with data to back up")
 			ensureNamespace(seedNS)
@@ -83,6 +84,12 @@ var _ = Describe("Milestone M4 — repository maintenance & verification", Label
 			// This is the drain, and it is the reason prune sets blocksMovers at all: without it a
 			// prune and the mover fleet would sit on --retry-lock staring at each other, and on the
 			// shared repository that is every namespace's backup (adr/0015 §3).
+			// Wait for at least one mover to be live first. Without this the Consistently below can
+			// spend its whole window before any mover pod reaches Running, and "no prune started
+			// while movers ran" would be asserted against a period in which nothing ran at all.
+			Eventually(func() int { return len(m4LiveDataMovers(run)) },
+				10*time.Minute, 2*time.Second).Should(BeNumerically(">", 0),
+				"no data mover ever started, so the drain assertion would prove nothing")
 			Consistently(func(g Gomega) {
 				if len(m4LiveDataMovers(run)) == 0 {
 					return // the backup finished; the drain no longer has anything to prove
@@ -95,11 +102,15 @@ var _ = Describe("Milestone M4 — repository maintenance & verification", Label
 
 			By("And the backup reaches a terminal phase")
 			cb := m1WaitClusterBackupTerminal(run, 15*time.Minute)
-			Expect(cb.Status.Phase).To(BeElementOf("Completed", "PartiallyCompleted"),
+			// PartiallyFailed, not "PartiallyCompleted": the latter is a Backup phase and does not
+			// exist on ClusterBackup (clusterbackup_types.go enumerates
+			// Pending;Running;Completed;PartiallyFailed;Failed), so asserting it would have made the
+			// tolerance unreachable and the realistic mixed outcome a failure.
+			Expect(cb.Status.Phase).To(BeElementOf("Completed", "PartiallyFailed"),
 				"the backup did not survive sharing its repository with a prune")
 
 			By("And the prune then runs and succeeds")
-			rec := m4WaitMaintenanceRecord(repo.Name, "prune", 20*time.Minute)
+			rec := m4WaitMaintenanceRecord(repo.Name, "prune", startedAt, 20*time.Minute)
 			Expect(rec.Result).To(Equal(cbv1.MaintenanceSucceeded), "prune failed: %s", rec.Message)
 
 			By("And the repository is structurally intact afterwards")
@@ -140,6 +151,7 @@ var _ = Describe("Milestone M4 — repository maintenance & verification", Label
 			m1WaitClusterBackupTerminal(run, 15*time.Minute)
 
 			By("When its prune is killed mid-flight, orphaning restic's exclusive lock")
+			killedAt := time.Now()
 			killed := m4KillNextPrunePod(20 * time.Minute)
 			Expect(killed).To(BeTrue(), "no prune pod appeared to kill within the window")
 
@@ -147,7 +159,7 @@ var _ = Describe("Milestone M4 — repository maintenance & verification", Label
 			// A prune that dies must not look like one that never ran: recentMaintenance records
 			// ATTEMPTS precisely so a repository failing every night is distinguishable from one
 			// with no schedule, and so the cron baseline does not treat it as permanently due.
-			rec := m4WaitMaintenanceRecord(repo.Name, "prune", 15*time.Minute)
+			rec := m4WaitMaintenanceRecord(repo.Name, "prune", killedAt, 15*time.Minute)
 			Expect(rec.Result).To(Equal(cbv1.MaintenanceFailed),
 				"a prune whose pod was killed was recorded as %q", rec.Result)
 
@@ -158,15 +170,23 @@ var _ = Describe("Milestone M4 — repository maintenance & verification", Label
 			done := make(chan string, 1)
 			go func() {
 				defer GinkgoRecover()
-				done <- m1ResticExec(locName, "snapshots", "--json", "--no-lock")
+				done <- m1ResticExecOn(m4DedicatedClusterID("killed"), locName, "snapshots", "--json", "--no-lock")
 			}()
-			Eventually(done, 6*time.Minute, 5*time.Second).Should(Receive(),
+			var readOut string
+			Eventually(done, 6*time.Minute, 5*time.Second).Should(Receive(&readOut),
 				"a --no-lock read blocked behind the orphaned exclusive lock")
+			// m1ResticExecOn returns the Job log without asserting the Job succeeded, so a read that
+			// died instantly (wrong repository, wrong password) would satisfy the Receive above while
+			// proving nothing. Requiring a snapshot array makes the read's SUCCESS the assertion.
+			Expect(readOut).To(ContainSubstring("["), "the --no-lock read returned no snapshot list:\n%s", readOut)
 
 			By("And a later prune completes despite the lock left behind")
-			// Not because the operator reaped it -- staleLocks is age-based on restic's own
-			// 30-minute horizon and cannot fire inside a test window (see 08-testing case 11b).
-			// The assertion is the user-visible one: the repository is not wedged.
+			// Deliberately agnostic about WHO cleared the lock. Two mechanisms can: restic treats a
+			// lock older than 30 minutes as stale and removes it on the next acquisition, and the
+			// operator's own reap fires once the probe (15 min) has seen it cross the same 30-minute
+			// threshold. Both land inside this window, and pinning the assertion on one of them would
+			// make the spec fail when the other got there first. The user-visible property is the
+			// same either way: the repository is not wedged.
 			Eventually(func(g Gomega) {
 				var live cbv1.BackupRepository
 				g.Expect(k8s.Get(ctx, client.ObjectKey{Name: repo.Name}, &live)).To(Succeed())
@@ -205,11 +225,12 @@ var _ = Describe("Milestone M4 — repository maintenance & verification", Label
 				_ = k8s.Delete(ctx, &cbv1.ClusterBackup{ObjectMeta: metav1.ObjectMeta{Name: run}})
 			})
 			m1WaitClusterBackupTerminal(run, 15*time.Minute)
+			seededAt := time.Now()
 
 			By("And a check that passes before any tampering")
 			// Asserting the clean state FIRST is what makes the failure below mean something: without
 			// it, a check that fails for an unrelated reason would read as a caught corruption.
-			clean := m4WaitMaintenanceRecord(repo.Name, "check", 20*time.Minute)
+			clean := m4WaitMaintenanceRecord(repo.Name, "check", seededAt, 20*time.Minute)
 			Expect(clean.Result).To(Equal(cbv1.MaintenanceSucceeded),
 				"the repository was already unhealthy before the test corrupted anything: %s", clean.Message)
 

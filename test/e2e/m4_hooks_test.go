@@ -68,6 +68,25 @@ const (
 	m4BystanderPod  = "bystander-app"
 	m4HookContainer = "app"
 
+	// m4SnapPVCs / m4SnapPod are the ONLY fixtures on snapshot-capable storage. They exist for the
+	// crash spec alone, which needs a real pre->post window to step into.
+	m4SnapPVCA = "snap-data-a"
+	m4SnapPVCB = "snap-data-b"
+	m4SnapPod  = "snap-app"
+
+	// m4SnapClass is kind's CSI-hostpath class, the one with a VolumeSnapshotClass.
+	m4SnapClass = "csi-hostpath-sc"
+	// m4NoSnapClass is kind's built-in local-path class, which has NO VolumeSnapshotClass. A PVC on
+	// it is reported Skipped/CSISnapshotUnsupported within a reconcile or two.
+	//
+	// Three of the four specs use it deliberately, and not merely for speed. They are about the
+	// freeze WINDOW -- does the quiesce reach the right pod, does the release always follow -- and
+	// a Skipped volume exercises the release's hardest case: the backup produced nothing for that
+	// claim and the application was quiesced anyway. Standing the window's tests on a working data
+	// path would also make every one of them fail whenever the data path did, which is how a
+	// milestone's real finding arrives as four red specs pointing at the wrong thing.
+	m4NoSnapClass = "standard"
+
 	// m4MarkerDir is a writable emptyDir the hooks touch. A hook's only observable effect through
 	// kubectl is what it leaves in the pod's filesystem, so the markers ARE the evidence that a
 	// command ran inside that specific container.
@@ -105,17 +124,46 @@ spec:
 `, name, m4DemoNS, pvc, m4HookContainer, m4MarkerDir)
 }
 
-// m4PVCManifest renders a small CSI-hostpath claim. Small on purpose: these runs are about the
-// hook boundary, and the upload that follows is incidental.
-func m4PVCManifest(name string) string {
+// m4TwoClaimPodManifest renders a pod mounting two claims, for the crash spec: the controller
+// advances ONE volume per reconcile, so two claims widen the pre->post window.
+func m4TwoClaimPodManifest(name, pvcA, pvcB string) string {
+	return fmt.Sprintf(`apiVersion: v1
+kind: Pod
+metadata:
+  name: %[1]s
+  namespace: %[2]s
+  labels: { app: snap }
+spec:
+  restartPolicy: Never
+  containers:
+    - name: %[5]s
+      image: busybox:1.36
+      command: ["sh", "-c", "sleep 3600"]
+      volumeMounts:
+        - { name: a, mountPath: /data-a }
+        - { name: b, mountPath: /data-b }
+        - { name: marks, mountPath: %[6]s }
+  volumes:
+    - name: a
+      persistentVolumeClaim: { claimName: %[3]s }
+    - name: b
+      persistentVolumeClaim: { claimName: %[4]s }
+    - name: marks
+      emptyDir: {}
+`, name, m4DemoNS, pvcA, pvcB, m4HookContainer, m4MarkerDir)
+}
+
+// m4PVCManifest renders a small claim on the given class. Small on purpose: these runs are about
+// the hook boundary, and the upload that follows is incidental.
+func m4PVCManifest(name, storageClass string) string {
 	return fmt.Sprintf(`apiVersion: v1
 kind: PersistentVolumeClaim
 metadata: { name: %s, namespace: %s }
 spec:
   accessModes: [ReadWriteOnce]
-  storageClassName: csi-hostpath-sc
+  storageClassName: %s
   resources: { requests: { storage: 64Mi } }
-`, name, m4DemoNS)
+`, name, m4DemoNS, storageClass)
 }
 
 // m4MarkerExists reports whether a hook left its marker inside the pod. This is the ground truth
@@ -153,6 +201,27 @@ func m4HooksInPhase(run, phase string) []map[string]any {
 		}
 	}
 	return out
+}
+
+// m4BackupDiag renders the Backup's phase and per-volume phases for a failure message.
+//
+// It exists because the first run of this suite failed with "hooks are empty" and that sentence
+// contains no information: it cannot distinguish "the Backup was never created" from "the hooks
+// never ran" from "the volumes never left the snapshot phase, so the release was never owed". The
+// release is gated on the volumes, so the volumes belong in the message.
+func m4BackupDiag(run string) string {
+	phase, err := kubectl("get", "backup", run, "-n", m4DemoNS, "-o", "jsonpath={.status.phase}")
+	if err != nil {
+		return "no Backup " + m4DemoNS + "/" + run + " exists (the run never fanned out): " + err.Error()
+	}
+	vols, _ := kubectl("get", "backup", run, "-n", m4DemoNS,
+		"-o", "jsonpath={range .status.volumes[*]}{.pvc}={.phase}({.reason}) {end}")
+	hooks, _ := kubectl("get", "backup", run, "-n", m4DemoNS,
+		"-o", "jsonpath={range .status.hooks[*]}{.phase}/{.pod}={.result} {end}")
+	cond, _ := kubectl("get", "backup", run, "-n", m4DemoNS,
+		"-o", "jsonpath={.status.conditions[?(@.type=='Ready')].message}")
+	return fmt.Sprintf("Backup phase=%q volumes=[%s] hooks=[%s] ready=%q",
+		strings.TrimSpace(phase), strings.TrimSpace(vols), strings.TrimSpace(hooks), strings.TrimSpace(cond))
 }
 
 // m4RunBackup creates a ClusterBackup over the named PVCs with the given hooks block. Manifests
@@ -219,12 +288,17 @@ var _ = Describe("M4 — consistency hooks (R16)", Ordered, func() {
         container: `+m4HookContainer+`
         command: ["touch", "`+m4MarkerDir+`/pre-ran"]
         timeout: 30s
-        onError: Fail`)
+        onError: Fail
+    post:
+      - podSelector: {}
+        container: `+m4HookContainer+`
+        command: ["touch", "`+m4MarkerDir+`/post-ran"]
+        timeout: 30s`)
 
 		By("the pre hook is recorded against the pod mounting the run's PVC")
 		Eventually(func(g Gomega) {
 			pre := m4HooksInPhase(run, "pre")
-			g.Expect(pre).To(HaveLen(1), "expected exactly one pre-hook record")
+			g.Expect(pre).To(HaveLen(1), "expected exactly one pre-hook record — %s", m4BackupDiag(run))
 			g.Expect(pre[0]["pod"]).To(Equal(m4HookedPod))
 			g.Expect(pre[0]["container"]).To(Equal(m4HookContainer))
 			g.Expect(pre[0]["result"]).To(Equal("Succeeded"))
@@ -242,10 +316,15 @@ var _ = Describe("M4 — consistency hooks (R16)", Ordered, func() {
 		Expect(m4MarkerExists(m4BystanderPod, "pre-ran")).To(BeFalse(),
 			"a pod holding none of the backed-up data was exec'd into")
 
-		By("the release runs once every snapshot is cut, and the run reaches a terminal phase")
+		By("the release still runs even though the claim could not be snapshotted at all")
+		// The claim is on a class with no VolumeSnapshotClass, so the volume goes Skipped and the
+		// backup produces NOTHING for it. The application was quiesced regardless, which is exactly
+		// the case a release conditioned on success would strand.
 		Eventually(func(g Gomega) {
-			g.Expect(m4HooksInPhase(run, "post")).NotTo(BeEmpty())
+			g.Expect(m4HooksInPhase(run, "post")).NotTo(BeEmpty(), "%s", m4BackupDiag(run))
 		}, 6*time.Minute, 3*time.Second).Should(Succeed())
+		Expect(m4MarkerExists(m4HookedPod, "post-ran")).To(BeTrue(),
+			"status records a release the container never saw")
 	})
 
 	It("lets a pod's own annotation REPLACE the run's hook for that pod", func() {
@@ -277,7 +356,7 @@ var _ = Describe("M4 — consistency hooks (R16)", Ordered, func() {
 		By("the annotation's command ran and is recorded as the source")
 		Eventually(func(g Gomega) {
 			pre := m4HooksInPhase(run, "pre")
-			g.Expect(pre).To(HaveLen(1))
+			g.Expect(pre).To(HaveLen(1), "%s", m4BackupDiag(run))
 			g.Expect(pre[0]["source"]).To(Equal("annotation"))
 			g.Expect(pre[0]["result"]).To(Equal("Succeeded"))
 		}, 5*time.Minute, 2*time.Second).Should(Succeed())
@@ -307,7 +386,7 @@ var _ = Describe("M4 — consistency hooks (R16)", Ordered, func() {
 			g.Expect(strings.TrimSpace(phase)).To(Equal("Failed"))
 
 			pre := m4HooksInPhase(run, "pre")
-			g.Expect(pre).NotTo(BeEmpty())
+			g.Expect(pre).NotTo(BeEmpty(), "%s", m4BackupDiag(run))
 			g.Expect(pre[0]["result"]).To(Equal("Failed"))
 			// The command's own stderr/exit is the diagnosis an operator reads first.
 			g.Expect(pre[0]["message"]).NotTo(BeEmpty(), "a failed hook recorded no message")
@@ -326,18 +405,19 @@ var _ = Describe("M4 — consistency hooks (R16)", Ordered, func() {
 		const run = "m4-crash-window"
 
 		By("running a backup whose release writes a marker")
-		// BOTH claims are in this run. The controller advances ONE volume per reconcile, spending
-		// at least a backupPollInterval on each, so two volumes widen the pre->post window to tens
-		// of seconds. That is what makes the crash injection below deterministic rather than a race
-		// against a single fast snapshot.
-		m4RunBackup(run, []string{m4HookedPVC, m4BystanderPVC}, `  hooks:
+		// This is the ONE spec that needs a working data path: it steps into the gap between the
+		// quiesce and the release, and a Skipped volume closes that gap in a single reconcile. Both
+		// snapshot-capable claims are in the run because the controller advances ONE volume per
+		// reconcile, spending at least a backupPollInterval on each, so two volumes widen the window
+		// to tens of seconds — deterministic, rather than a race against one fast snapshot.
+		m4RunBackup(run, []string{m4SnapPVCA, m4SnapPVCB}, `  hooks:
     pre:
-      - podSelector: {}
+      - podSelector: { matchLabels: { app: snap } }
         container: `+m4HookContainer+`
         command: ["touch", "`+m4MarkerDir+`/frozen"]
         timeout: 30s
     post:
-      - podSelector: {}
+      - podSelector: { matchLabels: { app: snap } }
         container: `+m4HookContainer+`
         command: ["touch", "`+m4MarkerDir+`/thawed"]
         timeout: 30s`)
@@ -348,7 +428,7 @@ var _ = Describe("M4 — consistency hooks (R16)", Ordered, func() {
 		// least one backupPollInterval per volume waiting for ReadyToUse, which is the window we
 		// step into.
 		Eventually(func(g Gomega) {
-			g.Expect(m4HooksInPhase(run, "pre")).NotTo(BeEmpty(), "quiesce not recorded yet")
+			g.Expect(m4HooksInPhase(run, "pre")).NotTo(BeEmpty(), "quiesce not recorded yet — %s", m4BackupDiag(run))
 			g.Expect(m4HooksInPhase(run, "post")).To(BeEmpty(), "the release already ran")
 		}, 5*time.Minute, 250*time.Millisecond).Should(Succeed())
 
@@ -366,8 +446,8 @@ var _ = Describe("M4 — consistency hooks (R16)", Ordered, func() {
 		}, 2*time.Minute, 2*time.Second).Should(Succeed())
 
 		By("the application is left quiesced with nothing running to release it")
-		Expect(m4MarkerExists(m4HookedPod, "frozen")).To(BeTrue(), "the quiesce never reached the pod")
-		Expect(m4MarkerExists(m4HookedPod, "thawed")).To(BeFalse(),
+		Expect(m4MarkerExists(m4SnapPod, "frozen")).To(BeTrue(), "the quiesce never reached the pod")
+		Expect(m4MarkerExists(m4SnapPod, "thawed")).To(BeFalse(),
 			"the release ran before the operator was stopped — the window was not actually open")
 		Expect(m4HooksInPhase(run, "post")).To(BeEmpty())
 
@@ -382,9 +462,10 @@ var _ = Describe("M4 — consistency hooks (R16)", Ordered, func() {
 		// old one but the Backup's status, so a release that happens here can only have been
 		// derived from it.
 		Eventually(func(g Gomega) {
-			g.Expect(m4HooksInPhase(run, "post")).NotTo(BeEmpty(), "the release never ran after the restart")
+			g.Expect(m4HooksInPhase(run, "post")).NotTo(BeEmpty(),
+				"the release never ran after the restart — %s", m4BackupDiag(run))
 		}, 6*time.Minute, 3*time.Second).Should(Succeed())
-		Expect(m4MarkerExists(m4HookedPod, "thawed")).To(BeTrue(),
+		Expect(m4MarkerExists(m4SnapPod, "thawed")).To(BeTrue(),
 			"status records a release the container never saw")
 	})
 })
@@ -439,7 +520,11 @@ func m4SeedDemoNamespace() {
 	Expect(err).NotTo(HaveOccurred(), "create %s", m4DemoNS)
 
 	for _, pvc := range []string{m4HookedPVC, m4BystanderPVC} {
-		_, err = m3Apply(m4PVCManifest(pvc))
+		_, err = m3Apply(m4PVCManifest(pvc, m4NoSnapClass))
+		Expect(err).NotTo(HaveOccurred(), "apply PVC %s", pvc)
+	}
+	for _, pvc := range []string{m4SnapPVCA, m4SnapPVCB} {
+		_, err = m3Apply(m4PVCManifest(pvc, m4SnapClass))
 		Expect(err).NotTo(HaveOccurred(), "apply PVC %s", pvc)
 	}
 
@@ -447,9 +532,11 @@ func m4SeedDemoNamespace() {
 	Expect(err).NotTo(HaveOccurred(), "apply hooked pod")
 	_, err = m3Apply(m4PodManifest(m4BystanderPod, m4BystanderPVC))
 	Expect(err).NotTo(HaveOccurred(), "apply bystander pod")
+	_, err = m3Apply(m4TwoClaimPodManifest(m4SnapPod, m4SnapPVCA, m4SnapPVCB))
+	Expect(err).NotTo(HaveOccurred(), "apply snapshot-capable pod")
 
-	By("waiting for both pods to be Running (a hook candidate must be Running)")
-	for _, pod := range []string{m4HookedPod, m4BystanderPod} {
+	By("waiting for every pod to be Running (a hook candidate must be Running)")
+	for _, pod := range []string{m4HookedPod, m4BystanderPod, m4SnapPod} {
 		_, err = kubectl("wait", "--for=condition=Ready", "pod/"+pod, "-n", m4DemoNS, "--timeout=4m")
 		Expect(err).NotTo(HaveOccurred(), "pod %s never became Ready", pod)
 	}

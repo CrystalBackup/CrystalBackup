@@ -118,9 +118,17 @@ type NamespaceEncryptionSpec struct {
 // DiscoverySpec configures repository→Backup projection.
 type DiscoverySpec struct {
 	// enabled turns on inventory and projection of Backup objects from the repository.
+	//
+	// A POINTER, like ClusterResourceCaptureSpec.Enabled, and for the same reason: this defaults to
+	// TRUE, and a plain bool cannot express all three states a default-true field needs. With
+	// `omitempty` encoding/json drops `false`, so no Go client could ever disable discovery (the
+	// API server would substitute the default) even though `kubectl apply` with `enabled: false`
+	// worked. Without `omitempty` the zero value serialises as an explicit `false`, so every caller
+	// that left the struct alone would silently switch discovery OFF. Only nil-means-unset
+	// distinguishes "I did not say" from "I said no".
 	// +optional
 	// +kubebuilder:default=true
-	Enabled bool `json:"enabled,omitempty"`
+	Enabled *bool `json:"enabled,omitempty"`
 
 	// interval between periodic discovery passes.
 	// +optional

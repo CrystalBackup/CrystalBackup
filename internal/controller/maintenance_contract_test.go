@@ -23,6 +23,7 @@ import (
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	clocktesting "k8s.io/utils/clock/testing"
 
 	cbv1 "github.com/CrystalBackup/CrystalBackup/api/v1alpha1"
 	"github.com/CrystalBackup/CrystalBackup/internal/mover"
@@ -154,5 +155,74 @@ func TestUnlockIsNotGatedOnASchedule(t *testing.T) {
 	}
 	if maintenanceOpDeadline(mover.OpUnlock) != maintenanceJobDeadline {
 		t.Error("the reap is a short op; it must not inherit the multi-hour prune backstop")
+	}
+}
+
+// TestReapDueRateLimitsAndGivesUp is the regression guard for a fix that was, unbounded, worse
+// than the problem it addressed.
+//
+// A FAILED unlock correctly leaves staleLocks standing, and the reap returns before the schedules
+// are consulted. Without a cooldown and a give-up, a repository whose unlock keeps failing would
+// never run prune or check again — and since unlock drains the movers, every attempt would shut
+// mover admission cluster-wide for up to moverQuiescenceDeadline.
+func TestReapDueRateLimitsAndGivesUp(t *testing.T) {
+	now := time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC)
+	r := &MaintenanceReconciler{Clock: clocktesting.NewFakeClock(now)}
+
+	failed := func(at time.Time) cbv1.MaintenanceRecord {
+		return cbv1.MaintenanceRecord{
+			Operation: string(mover.OpUnlock), Result: cbv1.MaintenanceFailed,
+			StartTime: metav1.NewTime(at),
+		}
+	}
+
+	cases := []struct {
+		name    string
+		history []cbv1.MaintenanceRecord
+		want    bool
+	}{
+		{"never attempted: reap immediately", nil, true},
+		{"just failed: wait out the cooldown", []cbv1.MaintenanceRecord{failed(now.Add(-time.Minute))}, false},
+		{"cooldown elapsed: try again", []cbv1.MaintenanceRecord{failed(now.Add(-2 * time.Hour))}, true},
+		{
+			"three consecutive failures: stop, whatever the cooldown says",
+			[]cbv1.MaintenanceRecord{
+				failed(now.Add(-2 * time.Hour)), failed(now.Add(-3 * time.Hour)), failed(now.Add(-4 * time.Hour)),
+			},
+			false,
+		},
+		{
+			// A success between failures resets the run, so an intermittent problem does not
+			// permanently disable the reap.
+			"a success in between resets the count",
+			[]cbv1.MaintenanceRecord{
+				failed(now.Add(-2 * time.Hour)),
+				{Operation: string(mover.OpUnlock), Result: cbv1.MaintenanceSucceeded, StartTime: metav1.NewTime(now.Add(-3 * time.Hour))},
+				failed(now.Add(-4 * time.Hour)), failed(now.Add(-5 * time.Hour)),
+			},
+			true,
+		},
+		{
+			// Other operations' failures must not count against the reap.
+			"a failing prune is not a failing unlock",
+			[]cbv1.MaintenanceRecord{
+				{Operation: string(mover.OpPrune), Result: cbv1.MaintenanceFailed, StartTime: metav1.NewTime(now.Add(-time.Minute))},
+			},
+			true,
+		},
+	}
+	for _, tc := range cases {
+		repo := &cbv1.BackupRepository{Status: cbv1.BackupRepositoryStatus{
+			StaleLocks: 2, RecentMaintenance: tc.history,
+		}}
+		if got := r.reapDue(repo); got != tc.want {
+			t.Errorf("%s: reapDue = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+
+	if unlockRetryCooldown <= moverQuiescenceDeadline {
+		t.Errorf("the reap cooldown (%v) must exceed the drain budget (%v), or admission would be shut "+
+			"more often than open on a repository whose drain keeps timing out",
+			unlockRetryCooldown, moverQuiescenceDeadline)
 	}
 }

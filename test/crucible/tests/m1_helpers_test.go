@@ -32,6 +32,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"filippo.io/age"
@@ -152,7 +153,7 @@ func m1LocationObject(name string, isDefault bool) *cbv1.ClusterBackupLocation {
 			// forget only happens on a periodic re-inventory, so the reliability/discovery windows need
 			// the repository re-listed within minutes of a forget, not within the hour.
 			Discovery: cbv1.DiscoverySpec{
-				Enabled:  true,
+				Enabled:  ptr.To(true),
 				Interval: metav1.Duration{Duration: time.Minute},
 			},
 		},

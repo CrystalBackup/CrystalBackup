@@ -369,7 +369,7 @@ spec:
   pvcSelector: { matchLabels: {}, include: [], exclude: [] }   # default all
   includeManifests: true
   hooks:                             # R16
-    honorAnnotations: true           # default; see "Hook resolution" below
+    honorAnnotations: true           # OPT-IN (default false); see "Hook resolution" below
     pre:
       - podSelector: { matchLabels: { app: postgres } }
         container: postgres          # default: the pod's FIRST container
@@ -398,9 +398,13 @@ precedence, deliberately matched so an operator's mental model carries over):
 
 | Pod annotations present | `honorAnnotations` | Hooks run for that pod |
 |---|---|---|
-| `crystalbackup.io/pre-backup-command` (+ `-container`, `-timeout`, `-on-error`) | `true` (default) | the **annotation** hook only — the spec's `pre` list is ignored *for this pod* |
-| same | `false` | the spec's matching `pre` hooks |
+| `crystalbackup.io/pre-backup-command` (+ `-container`, `-timeout`, `-on-error`) | `true` | the **annotation** hook only — the spec's `pre` list is ignored *for this pod* |
+| same | `false` (**default**) | the spec's matching `pre` hooks |
 | none | either | the spec's matching `pre` hooks whose `podSelector` matches |
+
+`honorAnnotations` is **opt-in**, not on by default, and that is deliberate: turning it on delegates
+*what the operator execs* to anyone who can annotate a pod in the backed-up namespace. Given the
+operator holds cluster-wide `pods/exec`, that is a decision an admin makes explicitly.
 
 `command` is an **argv**: a JSON array (`'["psql","-c","CHECKPOINT"]'`) or a single bare command.
 The operator never wraps it in `sh -c`, so shell metacharacters are inert. A malformed

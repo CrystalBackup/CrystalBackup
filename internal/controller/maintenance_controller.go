@@ -93,6 +93,15 @@ const (
 	// repositoryProbeDeadline bounds one measurement, so a black-holed endpoint cannot leave a
 	// repository permanently "probing" and therefore never re-measured.
 	repositoryProbeDeadline = 10 * time.Minute
+
+	// unlockRetryCooldown paces the stale-lock reap. It is deliberately LONGER than
+	// moverQuiescenceDeadline: each attempt drains the movers first, so a cooldown shorter than the
+	// drain's own budget would keep admission shut more often than open on a repository where the
+	// drain keeps timing out.
+	unlockRetryCooldown = time.Hour
+
+	// unlockMaxConsecutiveFailures is where the operator stops trying. See reapDue.
+	unlockMaxConsecutiveFailures = 3
 )
 
 // MaintenanceReconciler runs a repository's SCHEDULED maintenance: `restic prune` to reclaim space
@@ -224,7 +233,7 @@ func (r *MaintenanceReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	// not wait for a window: a lock left by a hard-killed maintenance Job blocks the NEXT exclusive
 	// op for restic's full staleness horizon, and the backup path's own reaper does not cover it —
 	// that one fires on a hard-killed data mover, and a prune is not a data mover.
-	if repo.Status.StaleLocks > 0 {
+	if repo.Status.StaleLocks > 0 && r.reapDue(&repo) {
 		due := maintenanceDue{op: mover.OpUnlock, kind: queue.OpUnlock, tick: r.Clock.Now()}
 		if err := r.submit(ctx, &repo, loc, due); err != nil {
 			log.Info("stale-lock unlock not submitted; will retry", "repository", repo.Name, "err", err.Error())
@@ -370,6 +379,47 @@ func (r *MaintenanceReconciler) nextDue(repo *cbv1.BackupRepository, loc *cbv1.C
 		return due, earliest
 	}
 	return nil, earliest
+}
+
+// reapDue rate-limits the stale-lock reap, and gives up on it entirely after a few failures.
+//
+// Both halves exist because the count that triggers the reap is only refreshed by the probe every
+// fifteen minutes, so a FAILED unlock leaves staleLocks standing (correctly — the locks are still
+// there) and every reconcile in between would see it and resubmit. Unbounded, that is strictly
+// worse than the problem it was added for: the reap returns before the schedules are consulted, so
+// prune and check would never run again, and because unlock drains the movers each attempt shuts
+// admission cluster-wide for up to moverQuiescenceDeadline. One wedged mover would become
+// permanently blocked backups AND permanently skipped maintenance.
+//
+// After unlockMaxConsecutiveFailures the operator stops trying and leaves it to a human. That is
+// the honest outcome: if force-removing a lock keeps failing, the repository has a problem no retry
+// cadence fixes, and CrystalbackupStaleLocks is already firing on the gauge this deliberately
+// leaves non-zero.
+func (r *MaintenanceReconciler) reapDue(repo *cbv1.BackupRepository) bool {
+	var (
+		consecutive int
+		lastTry     time.Time
+	)
+	for i := range repo.Status.RecentMaintenance {
+		rec := repo.Status.RecentMaintenance[i]
+		if rec.Operation != string(mover.OpUnlock) {
+			continue
+		}
+		if lastTry.IsZero() {
+			lastTry = rec.StartTime.Time // newest-first
+		}
+		if rec.Result != cbv1.MaintenanceFailed {
+			break
+		}
+		consecutive++
+	}
+	if consecutive >= unlockMaxConsecutiveFailures {
+		return false
+	}
+	if lastTry.IsZero() {
+		return true // never attempted on this repository
+	}
+	return r.Clock.Now().Sub(lastTry) >= unlockRetryCooldown
 }
 
 // lastAttempt is the cron baseline for one operation: when it was last TRIED, from the attempt
