@@ -66,6 +66,10 @@ No API or CRD change. The sanitization ruleset gains a rule (S8), so manifest sn
 - Specs that restore into a namespace now tear it down with `deleteNamespaceAndWaitGone`, which
   fails with the namespace's own "finalizers remaining" message — so the next leak of this class
   fails the run that caused it instead of the run after.
+- Full crucible suite on live Hetzner/RKE2/Ceph: **42 passed, 0 failed, 1 skipped in 36m51s** (the
+  skip is conditional on a released image). 0.3.1 was 37 passed / 2 failed / 4 skipped in 58.6 min;
+  0.3.0 failed four specs and then overran its budget outright. The m2 `Recreate` spec passes for
+  the first time — 41 s, where it previously hung 20 minutes and failed.
 
 ## 0.3.1 — M3.1 operator throughput audit (2026-07-25)
 

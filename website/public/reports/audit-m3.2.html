@@ -117,6 +117,17 @@
     </tbody>
   </table>
 
+  <h2>Validated</h2>
+  <table>
+    <thead><tr><th>Full crucible suite</th><th>Result</th></tr></thead>
+    <tbody>
+      <tr><td>0.3.0</td><td>four specs failed, then the run overran its 60-minute budget and panicked, losing its own report</td></tr>
+      <tr><td>0.3.1</td><td>37 passed · 2 failed · 4 skipped &mdash; 58m36s</td></tr>
+      <tr><td><b>0.3.2</b></td><td><b>42 passed · 0 failed · 1 skipped &mdash; 36m51s</b> <span class="muted">(the skip is conditional on a released image)</span></td></tr>
+    </tbody>
+  </table>
+  <p class="muted">The m2 <code>Recreate</code> spec passes for the first time — in <b>41 s</b>, where it previously hung 20 minutes and then failed. Every namespace the suite creates now finishes deleting.</p>
+
   <p class="foot">
     Method: the M3.1 report&rsquo;s own reproduction plan, run verbatim — one milestone label alone on a fresh cluster, so no other spec&rsquo;s churn was in play. That isolation is what made the answer legible: the failure reproduced in five minutes, and the API server&rsquo;s <code>managedFields</code> identified the writer without any guesswork. Fixes gated by <code>make test</code> (unit + envtest), <code>golangci-lint</code> over the full tree, the kind e2e suite, and the full crucible suite on live Hetzner infrastructure.
   </p>
