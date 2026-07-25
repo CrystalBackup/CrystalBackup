@@ -107,6 +107,9 @@ const (
 	groupByHostPaths = "host,paths"
 	forgetCmd        = "forget"
 	snapshotsCmd     = "snapshots"
+	// flagNoLock skips taking a repository lock. Only ever valid on a pure READ (see SnapshotsArgs);
+	// putting it on anything that mutates would defeat the locking the whole queue exists to respect.
+	flagNoLock = "--no-lock"
 )
 
 // Tag renders one restic tag as "key=value". Centralising the "="-joined format means the
@@ -325,12 +328,24 @@ func ForgetArgs(r v1alpha1.RetentionSpec) []string {
 }
 
 // SnapshotsArgs is the complete restic argv (subcommand first) discovery inventories the
-// repository with: `snapshots --json --tag crystalbackup`. The --tag filter scopes the listing
-// to CrystalBackup's own snapshots (never a foreign tool's), and --json makes the output the
-// machine-readable array ParseSnapshots decodes. Unlike ForgetArgs (retention flags a caller
+// repository with: `snapshots --json --tag crystalbackup --no-lock`. The --tag filter scopes the
+// listing to CrystalBackup's own snapshots (never a foreign tool's), and --json makes the output
+// the machine-readable array ParseSnapshots decodes. Unlike ForgetArgs (retention flags a caller
 // prepends "forget" to), this is a whole command with no dynamic parts.
+//
+// --no-lock lands in M4, WITH prune, and not before — deliberately (90-roadmap.md, M3.1). A
+// listing takes only restic's shared lock, so until an exclusive operation existed it contended
+// with nobody and the flag bought nothing. Now that prune exists it buys two things: discovery no
+// longer waits out a prune window that can last hours, and — the direction that actually matters —
+// a periodic listing can no longer hold the shared lock a prune is waiting to escalate past.
+//
+// It is safe for this command because the risk it trades away is bounded: reading unlocked while a
+// prune repacks means a listing can occasionally observe a snapshot mid-removal and error. That
+// costs one inventory pass, retried at the next interval, against an operation whose cost is a
+// stalled prune. `snapshots` reads the snapshot set, never pack contents, so there is no torn-read
+// hazard beyond that.
 func SnapshotsArgs() []string {
-	return []string{snapshotsCmd, flagJSON, flagTag, TagBase}
+	return []string{snapshotsCmd, flagJSON, flagTag, TagBase, flagNoLock}
 }
 
 // ForgetCommand is the complete restic argv for the per-PVC retention forget: the "forget"

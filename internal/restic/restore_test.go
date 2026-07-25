@@ -95,7 +95,7 @@ func TestSnapshotsFilterArgs(t *testing.T) {
 	}
 
 	got := SnapshotsFilterArgs(Tag(TagKeyNamespace, "team-x"), Tag(TagKeyRun, "daily-20260718-010000"))
-	want := []string{"snapshots", "--json", "--tag", "crystalbackup,namespace=team-x,run=daily-20260718-010000"}
+	want := []string{"snapshots", "--json", "--tag", "crystalbackup,namespace=team-x,run=daily-20260718-010000", "--no-lock"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("SnapshotsFilterArgs(namespace,run) = %v, want %v", got, want)
 	}
@@ -139,7 +139,7 @@ func TestSnapshotsFilterArgsProperty(t *testing.T) {
 	for i := 0; i < 2000; i++ {
 		ns, run := dnsName(r), dnsName(r)
 		args := SnapshotsFilterArgs(Tag(TagKeyNamespace, ns), Tag(TagKeyRun, run))
-		if len(args) != 4 || args[2] != "--tag" {
+		if len(args) != 5 || args[2] != "--tag" || args[4] != "--no-lock" {
 			t.Fatalf("unexpected shape: %v", args)
 		}
 		parts := strings.Split(args[3], ",")

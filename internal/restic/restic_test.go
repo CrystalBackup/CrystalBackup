@@ -670,7 +670,9 @@ func TestGroupByNamespaceRun(t *testing.T) {
 }
 
 func TestSnapshotsArgs(t *testing.T) {
-	if got, want := SnapshotsArgs(), []string{"snapshots", "--json", "--tag", TagBase}; !reflect.DeepEqual(got, want) {
+	// --no-lock is part of the contract from M4 on: a periodic listing must neither wait out a
+	// multi-hour prune window nor hold the shared lock a prune is waiting to escalate past.
+	if got, want := SnapshotsArgs(), []string{"snapshots", "--json", "--tag", TagBase, "--no-lock"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("SnapshotsArgs() = %v, want %v", got, want)
 	}
 }
