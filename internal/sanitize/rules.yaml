@@ -64,6 +64,23 @@ rules:
     ops:
       - { op: remove, path: metadata.namespace }
 
+  - id: S8
+    description: Finalizers — the sibling of S5, and the same failure mode with the sign
+      flipped. A finalizer is one controller's claim on ONE live object instance, not a
+      property of the object; the controller that would release it never saw the restored
+      copy, so a transplanted finalizer is a claim nobody will ever drop and the object
+      becomes undeletable — taking its whole namespace down with it (Terminating forever).
+      Measured, not theorised - M3.2 caught the capture photographing a PVC inside the
+      2-second window where the CSI snapshot-controller holds
+      snapshot.storage.kubernetes.io/pvc-as-source-protection on it; the restore re-applied
+      that finalizer onto a live PVC with no VolumeSnapshot behind it, and the namespace could
+      never finish deleting. Enumerating the known ones is a losing game (every CSI driver and
+      every operator adds its own), and nothing is lost by dropping them all - a finalizer that
+      is still warranted in the target cluster is re-added by its own controller.
+    match: { kind: "*" }
+    ops:
+      - { op: remove, path: metadata.finalizers }
+
   - id: S7
     description: Drop annotation/label maps left empty by the rules above, so an object that
       only ever had server annotations does not carry an empty map forever.
@@ -103,6 +120,8 @@ rules:
       binding annotations go. dataSource/dataSourceRef point at VolumeSnapshots excluded by
       E9 — the data comes back through the volume restore path, not through the manifest.
       storageClassName is KEPT because it is the input of storageClassMapping at restore.
+      It used to drop kubernetes.io/pvc-protection by name; S8 now drops every finalizer
+      generically, which is the only version of that rule a CSI driver cannot outrun.
     match: { group: "", kind: PersistentVolumeClaim }
     ops:
       - { op: remove, path: spec.volumeName }
@@ -113,7 +132,6 @@ rules:
       - { op: removeAnnotation, path: volume.beta.kubernetes.io/storage-provisioner }
       - { op: removeAnnotation, path: volume.kubernetes.io/storage-provisioner }
       - { op: removeAnnotation, path: volume.kubernetes.io/selected-node }
-      - { op: removeFinalizer, path: kubernetes.io/pvc-protection }
       - { op: keep, path: spec.storageClassName }
       - { op: pruneEmptyMap, path: metadata.annotations }
 

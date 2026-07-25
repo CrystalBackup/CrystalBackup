@@ -181,7 +181,7 @@ func BuildJob(req JobRequest) *batchv1.Job {
 			ReadOnlyRootFilesystem:   ptrTo(true),
 			Capabilities: &corev1.Capabilities{
 				Drop: []corev1.Capability{capAll},
-				Add:  moverCapabilities(req.Operation),
+				Add:  moverCapabilities(req),
 			},
 			SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 		},
@@ -232,19 +232,32 @@ func BuildJob(req JobRequest) *batchv1.Job {
 	}
 }
 
-// moverCapabilities returns the capability set added on top of Drop:ALL for one operation.
-// Every operation reads files it does not own, so DAC_OVERRIDE is universal. A RESTORE
-// additionally re-creates metadata (R10): CHOWN (arbitrary uid/gid ownership), FOWNER
-// (mode/timestamp changes on files it now owns as root-with-DAC), SETFCAP
-// (security.capability xattrs) and MKNOD (device nodes). All five are in the container
-// runtime's default set, so PSA `baseline` on the operator namespace still admits the pod
-// (03-security-and-tenancy.md §6); trusted.* xattrs would need CAP_SYS_ADMIN and are
-// documented as NOT restored. The list order is pinned for byte-reproducible Job specs.
-func moverCapabilities(op Operation) []corev1.Capability {
-	if op == OpRestore {
+// moverCapabilities returns the capability set added on top of Drop:ALL for one Job, keyed on what
+// that Job can actually touch rather than on its operation name.
+//
+// DAC_OVERRIDE exists for ONE reason: a data job walks a tenant's files, owned by arbitrary uids
+// the mover is not. That is true exactly when a data volume is mounted (req.PVC != nil). A
+// MAINTENANCE job — init, forget, prune, check, snapshots, unlock, and the manifest shapes — mounts
+// no PVC at all: it touches its own root-owned emptyDirs (restic cache, /tmp, the manifest scratch)
+// and a read-only Secret, all of which uid 0 already reads and writes without overriding a single
+// permission check. Granting it there was the catch-all's doing, not a requirement (M3.2; the case
+// that made it visible was OpSnapshots, discovery's listing Job, which mounts `PVC: nil`).
+//
+// A RESTORE additionally re-creates metadata (R10): CHOWN (arbitrary uid/gid ownership), FOWNER
+// (mode/timestamp changes on files it now owns as root-with-DAC), SETFCAP (security.capability
+// xattrs) and MKNOD (device nodes). All five are in the container runtime's default set, so PSA
+// `baseline` on the operator namespace still admits the pod (03-security-and-tenancy.md §6);
+// trusted.* xattrs would need CAP_SYS_ADMIN and are documented as NOT restored. The list order is
+// pinned for byte-reproducible Job specs.
+func moverCapabilities(req JobRequest) []corev1.Capability {
+	switch {
+	case req.Operation == OpRestore:
 		return []corev1.Capability{capChown, capDACOverride, capFowner, capMknod, capSetfcap}
+	case req.PVC != nil:
+		return []corev1.Capability{capDACOverride}
+	default:
+		return nil // maintenance shape: no data volume, nothing to override
 	}
-	return []corev1.Capability{capDACOverride}
 }
 
 // spreadConstraints returns the soft topology-spread constraint selecting pods by labels, or nil

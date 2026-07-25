@@ -1,0 +1,40 @@
+# The M3.2 regression case. A PVC captured DURING a backup carries the CSI snapshot-controller's
+# transient snapshot.storage.kubernetes.io/pvc-as-source-protection finalizer: it is added when a
+# VolumeSnapshot naming the PVC as source is created and removed ~2 s later, once the snapshot is
+# ready. The manifest dump runs inside that window.
+#
+# Restoring that finalizer is a one-way door. No VolumeSnapshot exists behind the restored copy, so
+# the snapshot-controller never processes it and never removes it — the PVC cannot be deleted, and
+# its namespace stays Terminating forever. A third-party operator's finalizer is here for the same
+# reason: enumerating the known ones by name is a losing game.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: data
+  namespace: m2-restore
+  uid: 2a9c3d25-0000-4000-8000-000000000009
+  resourceVersion: "10290"
+  creationTimestamp: "2026-07-25T10:35:28Z"
+  finalizers:
+    - kubernetes.io/pvc-protection
+    - snapshot.storage.kubernetes.io/pvc-as-source-protection
+    - example.com/some-operator-holds-this
+  labels:
+    app: postgres
+  annotations:
+    pv.kubernetes.io/bind-completed: "yes"
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+  storageClassName: ceph-block
+  volumeMode: Filesystem
+  volumeName: pvc-7a87ade0-c107-4eda-83ff-3a8941ad46be
+status:
+  accessModes:
+    - ReadWriteOnce
+  capacity:
+    storage: 1Gi
+  phase: Bound

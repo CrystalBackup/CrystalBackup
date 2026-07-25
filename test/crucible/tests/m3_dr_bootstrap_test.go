@@ -82,7 +82,10 @@ var _ = Describe("M3 — DR bootstrap (ClusterRestore into a fresh namespace)", 
 	AfterAll(func() {
 		_ = k8s.Delete(ctx, &cbv1.ClusterRestore{ObjectMeta: metav1.ObjectMeta{Name: "m3-dr-bootstrap"}})
 		_ = k8s.Delete(ctx, &cbv1.ClusterBackup{ObjectMeta: metav1.ObjectMeta{Name: runName}})
-		deleteNamespace(rebornNS)
+		// The reborn namespace was BUILT by a restore, so it is the likeliest place for a
+		// transplanted finalizer to strand a PVC (M3.2, rule S8); the source namespace was only
+		// backed up, so a plain delete is enough there.
+		deleteNamespaceAndWaitGone(rebornNS, 5*time.Minute)
 		deleteNamespace(srcNS)
 		m1AssertNoResidualSnapshotObjects(srcNS, rebornNS)
 		m2AssertNoResidualRestoreObjects()

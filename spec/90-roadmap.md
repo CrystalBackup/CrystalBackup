@@ -212,25 +212,52 @@ compute. Details and numbers: [docs/audit-m3.1-throughput.md](../docs/audit-m3.1
       panic took the report with it. Full-suite result on 0.3.1: **37 passed / 2 failed / 4 skipped
       in 58.6 min**, with `m1_discovery` and `m1_repository` now passing.
 
-### Deferred to `0.3.2`
+## M3.2 — Restore safety (post-M3.1 hardening) — DONE (0.3.2)
 
-- [ ] **The leak behind the flakiness chain.** The validation traced why the suite "fails differently
-      every run": an orphaned `pvc-as-source-protection` finalizer (with **zero** VolumeSnapshots
-      left) wedges a PVC → wedges its namespace in `Terminating` → froze discovery entirely → the
-      next spec needing a fresh inventory failed. The namespace half is fixed; the leak that creates
-      it is not. Related and probably the same incident from the other end: a restore twin PV failing
-      to mount with `internal RBD image not found` after two earlier restores on the same volume
-      succeeded — the twin copies the volume handle verbatim under `Retain` precisely so it can never
-      destroy the user's volume, so this is either a Ceph-side vanish or a teardown releasing a PV
-      under a Delete policy. **Two explanations calling for opposite fixes** → shipped as a
-      reproduction plan, not a patch (audit § "the m2-Recreate RBD flake").
-- [ ] **A projection failure still discards the whole inventory**, forcing a full re-listing on the
-      retry. Make a pass survive a per-group failure (accumulate, record the inventory, report).
-- [ ] **Pre-existing OOM-detection flake**: a SIGKILLed mover's volume was reported `Completed`
-      instead of `Failed` (`m1_reliability`). On the backup/mover result path, untouched by 0.3.1.
-- [ ] Least-privilege trim: `OpSnapshots` mounts no data volume yet still receives `DAC_OVERRIDE`.
-      (The PodSecurity `restricted` **warning** is driven by `runAsUser=0`, not by capabilities, so
-      quieting it means a non-root mover image — its own lot, with restore-fidelity risk.)
+M3.1's four deferred items, taken in one patch. The first of them was deliberately shipped as a
+**reproduction plan rather than a patch** — two explanations, opposite fixes, so guessing was the
+one thing not to do. Reproducing it took five minutes on a fresh crucible (`mise run test m2`
+alone) and answered the question by finding **two** bugs, not one.
+
+- [x] **The leak that wedged a namespace: it was ours.** `m2-restore` sat in `Terminating` on a PVC
+      carrying `snapshot.storage.kubernetes.io/pvc-as-source-protection` with zero VolumeSnapshots
+      in the cluster. The snapshot-controller's own log showed it ADDING that finalizer at 10:35:44
+      and REMOVING it at 10:35:46; the PVC's `managedFields` then named the culprit —
+      `manager: crystalbackup-restore, operation: Apply` at 10:36:38, owning
+      `f:metadata:f:finalizers`. The manifest capture had photographed the PVC inside that two-second
+      window and the restore re-applied the finalizer onto a PVC with no snapshot behind it, where
+      nothing would ever remove it. Fixed at both ends: sanitization rule **S8** strips every
+      finalizer at capture, and the applier strips them again so pre-0.3.2 snapshots are safe
+      ([04-manifest-backup.md §4.4](04-manifest-backup.md)).
+- [x] **The RBD image that "vanished" was deleted by us — a data-loss bug.** Not a Ceph-side vanish:
+      `Recreate` mode **deleted the user's PVC** as part of restoring its manifest, the released PV
+      (reclaimPolicy `Delete`, the dynamic-provisioning default) had the CSI driver destroy the RBD
+      image, and the data half of the same restore — mounting a twin PV built from that very
+      `volumeHandle` — then hung forever on `internal RBD image not found`. Proven on the cluster:
+      the twin's handle was absent from `rbd ls`, and the PVC had rebound to a brand-new empty
+      volume. `Recreate` now reconciles PVCs and PVs **in place**
+      ([04-manifest-backup.md §5.2](04-manifest-backup.md)).
+- [x] **`Recreate` of an auto-recreated object no longer fails the restore.** The third bug the
+      reproduction turned up, and the reason the m2 `Recreate` spec had never once passed: the
+      control plane puts a namespace's `default` ServiceAccount back the instant it is deleted, so
+      the create always hit `AlreadyExists`, that object reported `Failed`, and the whole restore
+      came back `PartiallyFailed`. It now falls back to the in-place apply.
+- [x] **A projection failure no longer discards the inventory**: per-group failures are accumulated
+      and reported (`ProjectionIncomplete`), the inventory is recorded regardless, and the retry
+      reuses the listing instead of paying for a fresh one (bounded by the discovery interval).
+- [x] **The OOM spec was not testing what it claimed.** It SIGKILLed whichever
+      `crystalbackup.io`-labelled mover pod was Running — another run's, or the same run's *manifest*
+      mover — after which the data volume completed normally and the spec failed on its own
+      assertion. Scoped to its own run's DATA movers, and asserting only about the volumes it
+      actually killed (`c-db` has two PVCs, so "no volume is Completed" was never satisfiable). The
+      operator's crash handling was correct all along.
+- [x] **Least-privilege trim**: the capability set now follows what a Job can touch, not its name.
+      A maintenance Job (no PVC mounted: `init`/`forget`/`prune`/`check`/`snapshots`/`unlock` and
+      the manifest shapes) adds **nothing** on top of `drop: ALL`; `DAC_OVERRIDE` stays on data jobs,
+      and the restore keeps its metadata-fidelity set (R10).
+- [x] **Leak-check that fails the run that caused it**: specs restoring into a namespace tear it
+      down with `deleteNamespaceAndWaitGone`, which surfaces the namespace's own
+      "finalizers remaining" message instead of leaving the wedge for a later run to trip over.
 
 ## M4 — Consistency hooks, verification & maintenance (R16, R17)
 

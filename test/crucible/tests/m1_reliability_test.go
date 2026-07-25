@@ -70,30 +70,41 @@ var _ = Describe("M1 — convergence and no orphans", Label("m1"), Ordered, func
 	// seedSelector selects the seeded tenant namespaces for a whole-platform run.
 	seedSelector := cbv1.NamespaceSelector{MatchLabels: map[string]string{m1SeedLabel: m1SeedValue}}
 
-	// listActiveMoverJobs returns the mover Jobs — a crystalbackup.io/* label, in the operator
-	// namespace — that still have an active pod. The operator pod and the restic-oracle Jobs
-	// carry only app.kubernetes.io/* labels (never crystalbackup.io/*), so this predicate
-	// selects exactly the run's data/manifests movers.
-	listActiveMoverJobs := func() []batchv1.Job {
+	// listActiveMoverJobs returns the mover Jobs of ONE run that still have an active pod. Every
+	// data and manifest mover of a run carries crystalbackup.io/cluster-backup=<run> (internal/
+	// controller exposureLabels / manifestsLabels), whereas the operator pod and the restic-oracle
+	// Jobs carry only app.kubernetes.io/* labels — so this selects exactly that run's movers.
+	//
+	// The run filter is not cosmetic. These helpers used to match ANY crystalbackup.io/*-labelled
+	// object in the operator namespace, which is every concurrently running spec's movers too: in
+	// the full suite this spec reached into other features' runs, and the SIGKILL scenario below
+	// killed THEIR movers instead of (or as well as) its own. One spec silently failing another is
+	// exactly the "different victim every run" signature M3.1 chased
+	// (docs/audit-m3.1-throughput.md); a spec must only ever touch objects it owns.
+	listActiveMoverJobs := func(run string) []batchv1.Job {
 		var jobs batchv1.JobList
-		Expect(k8s.List(ctx, &jobs, client.InNamespace(operatorNS))).To(Succeed())
+		Expect(k8s.List(ctx, &jobs, client.InNamespace(operatorNS),
+			client.MatchingLabels{apiconst.LabelClusterBackup: run})).To(Succeed())
 		var active []batchv1.Job
 		for i := range jobs.Items {
-			if m1HasCrystalLabel(jobs.Items[i].Labels) && jobs.Items[i].Status.Active > 0 {
+			if jobs.Items[i].Status.Active > 0 {
 				active = append(active, jobs.Items[i])
 			}
 		}
 		return active
 	}
 
-	// listRunningMoverPods returns the currently-Running mover pods (same crystalbackup.io/*
-	// label discriminator, in the operator namespace).
-	listRunningMoverPods := func() []corev1.Pod {
+	// listRunningDataMoverPods returns the currently-Running DATA mover pods of ONE run. The PVC
+	// label is what makes it a data mover: a run also fans out a manifest mover per namespace
+	// (manifestsLabels — same run label, no crystalbackup.io/pvc), and killing that one instead
+	// would let the data volume complete normally and quietly invert the SIGKILL scenario below.
+	listRunningDataMoverPods := func(run string) []corev1.Pod {
 		var pods corev1.PodList
-		Expect(k8s.List(ctx, &pods, client.InNamespace(operatorNS))).To(Succeed())
+		Expect(k8s.List(ctx, &pods, client.InNamespace(operatorNS),
+			client.MatchingLabels{apiconst.LabelClusterBackup: run})).To(Succeed())
 		var movers []corev1.Pod
 		for i := range pods.Items {
-			if m1HasCrystalLabel(pods.Items[i].Labels) && pods.Items[i].Status.Phase == corev1.PodRunning {
+			if pods.Items[i].Labels[apiconst.LabelPVC] != "" && pods.Items[i].Status.Phase == corev1.PodRunning {
 				movers = append(movers, pods.Items[i])
 			}
 		}
@@ -192,7 +203,7 @@ var _ = Describe("M1 — convergence and no orphans", Label("m1"), Ordered, func
 			g.Expect(k8s.Get(ctx, client.ObjectKey{Name: restartRun.Name}, &cb)).To(Succeed())
 			g.Expect(cb.Status.Phase).To(Equal("Running"),
 				"ClusterBackup %s is not Running yet (phase=%q)", restartRun.Name, cb.Status.Phase)
-			active := listActiveMoverJobs()
+			active := listActiveMoverJobs(restartRun.Name)
 			g.Expect(active).NotTo(BeEmpty(), "no mover Job is running yet for run %s", restartRun.Name)
 			for _, j := range active {
 				moverJobsBefore[j.Name] = j.UID
@@ -250,12 +261,14 @@ var _ = Describe("M1 — convergence and no orphans", Label("m1"), Ordered, func
 		oomRun = m1RunClusterBackup(fmt.Sprintf("m1rel-oom-%d", time.Now().Unix()), m1LocationName,
 			cbv1.NamespaceSelector{MatchNames: []string{oomNS}})
 
+		killed := map[string]bool{}
 		Eventually(func(g Gomega) {
-			movers := listRunningMoverPods()
-			g.Expect(movers).NotTo(BeEmpty(), "no mover pod is Running yet for run %s", oomRun.Name)
+			movers := listRunningDataMoverPods(oomRun.Name)
+			g.Expect(movers).NotTo(BeEmpty(), "no data mover pod is Running yet for run %s", oomRun.Name)
 			for i := range movers {
 				g.Expect(k8s.Delete(ctx, &movers[i], client.GracePeriodSeconds(0))).To(Succeed(),
 					"SIGKILL mover pod %s/%s", movers[i].Namespace, movers[i].Name)
+				killed[movers[i].Labels[apiconst.LabelPVC]] = true
 			}
 		}, 10*time.Minute, 2*time.Second).Should(Succeed())
 
@@ -266,6 +279,9 @@ var _ = Describe("M1 — convergence and no orphans", Label("m1"), Ordered, func
 			g.Expect(bk.Status.Volumes).NotTo(BeEmpty(), "Backup %s/%s has no volume status yet", oomNS, oomRun.Name)
 			failed := false
 			for _, v := range bk.Status.Volumes {
+				if !killed[v.Pvc] {
+					continue // a volume whose mover we never killed says nothing about crash handling
+				}
 				// The crash must never be laundered into a Completed (silent success) volume.
 				g.Expect(string(v.Phase)).NotTo(Equal("Completed"),
 					"crashed volume %s of Backup %s/%s was reported as a silent success", v.Pvc, oomNS, oomRun.Name)
@@ -273,7 +289,8 @@ var _ = Describe("M1 — convergence and no orphans", Label("m1"), Ordered, func
 					failed = true
 				}
 			}
-			g.Expect(failed).To(BeTrue(), "no volume of Backup %s/%s is Failed after the mover crash", oomNS, oomRun.Name)
+			g.Expect(failed).To(BeTrue(), "no killed volume of Backup %s/%s is Failed after the mover crash (killed: %v)",
+				oomNS, oomRun.Name, killed)
 		}, clusterBackupTerminalTimeout, 10*time.Second).Should(Succeed())
 
 		By("And the repository lock is checked and cleared so the next run is not blocked by a stale lock")

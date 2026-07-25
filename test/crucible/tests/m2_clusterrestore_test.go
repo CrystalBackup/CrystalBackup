@@ -87,7 +87,9 @@ var _ = Describe("M2 — ClusterRestore reconstitutes a deleted namespace", Labe
 	AfterAll(func() {
 		_ = k8s.Delete(ctx, &cbv1.ClusterRestore{ObjectMeta: metav1.ObjectMeta{Name: "m2-reconstitute"}})
 		_ = k8s.Delete(ctx, &cbv1.ClusterBackup{ObjectMeta: metav1.ObjectMeta{Name: runName}})
-		deleteNamespace(rebornNS)
+		// The reborn namespace is entirely the restore's output — if the restore transplanted a
+		// finalizer, this is where it strands a PVC forever (M3.2, rule S8).
+		deleteNamespaceAndWaitGone(rebornNS, 5*time.Minute)
 		m2AssertNoResidualRestoreObjects()
 	})
 

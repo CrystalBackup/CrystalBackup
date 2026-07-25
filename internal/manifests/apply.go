@@ -206,6 +206,7 @@ func (a *Applier) plan(idx *Index, opts ApplyOptions) ([]plannedResource, *Repor
 		if !opts.ClusterScoped {
 			obj.SetNamespace(opts.TargetNamespace)
 		}
+		stripFinalizers(obj)
 		if isPVC(entry.Group, entry.Kind) {
 			applyStorageClassMapping(obj, opts.StorageClassMapping)
 		}
@@ -245,6 +246,25 @@ func readManifest(path string) (*unstructured.Unstructured, error) {
 }
 
 func isPVC(group, kind string) bool { return group == coreGroup && kind == kindPVC }
+
+// stripFinalizers drops metadata.finalizers before the apply. Sanitization rule S8 already
+// removes them at CAPTURE time, so for anything backed up since M3.2 this is a no-op — it is here
+// for the snapshots that already exist, and it is worth the duplication because the failure it
+// prevents is unrecoverable without manual surgery.
+//
+// A finalizer is one controller's claim on ONE live object instance. Applied to a restored copy it
+// is a claim nobody holds and nobody will release: the object can never be deleted, and a
+// namespaced one keeps its whole namespace in Terminating forever. The case that found this was a
+// PVC captured inside the ~2 s window where the CSI snapshot-controller holds
+// snapshot.storage.kubernetes.io/pvc-as-source-protection on a snapshot source; the restore
+// re-applied it with no VolumeSnapshot behind it, and the namespace never finished deleting.
+//
+// Nothing is lost: a finalizer the target cluster genuinely warrants is re-added by its own
+// controller (kube-controller-manager puts kubernetes.io/pvc-protection back the moment the claim
+// is in use). Applying one we cannot honour is the only irreversible option of the two.
+func stripFinalizers(obj *unstructured.Unstructured) {
+	unstructured.RemoveNestedField(obj.Object, "metadata", "finalizers")
+}
 
 // applyStorageClassMapping rewrites a PVC's class. The three cases are distinct and the
 // middle one is easy to get wrong: mapping to "" must REMOVE the field (so the target's
@@ -299,11 +319,35 @@ func (a *Applier) applyOne(ctx context.Context, p *plannedResource, opts ApplyOp
 		return
 	}
 
-	if opts.Mode == ModeRecreate {
+	if opts.Mode == ModeRecreate && !isStorageHandle(p.entry.Group, p.entry.Kind) {
 		a.recreate(ctx, ri, p, live, opts, report)
 		return
 	}
 	a.overwrite(ctx, ri, p, live, opts, report)
+}
+
+// isStorageHandle reports whether a kind is a HANDLE to data rather than a description of it —
+// PersistentVolumeClaim and PersistentVolume. Recreate must never delete one.
+//
+// "Delete then create from the backup" is a safe reading for a Deployment or a ConfigMap: the
+// object IS its definition, so replacing it loses nothing. A PVC is the opposite. Deleting it
+// releases its PersistentVolume, and a dynamically-provisioned volume's reclaimPolicy is Delete —
+// so the CSI driver destroys the user's data, permanently, as a side effect of restoring a
+// manifest. The recreated claim then binds a fresh empty volume.
+//
+// This is not hypothetical (M3.2): the crucible's m2 Recreate spec did exactly that. The manifest
+// half deleted PVC `data`, ceph-csi destroyed the RBD image behind it, and the data half — already
+// mounting a twin PV built from that same volumeHandle — hung forever on
+// "internal RBD image not found". The volume it was restoring had been deleted underneath it.
+//
+// Nothing is lost by reconciling in place instead. The data half of a Recreate restore already
+// delivers the mode's promise for the CONTENTS (`restic restore --delete` = exact match, extras
+// removed), and the manifest half's job for a PVC is to CREATE the claim when it is absent (DR
+// bootstrap into an empty namespace), never to replace a live one. Most of a bound PVC's spec is
+// immutable anyway, so a delete-and-recreate was the only way the manifest could have changed it —
+// by destroying what it claims.
+func isStorageHandle(group, kind string) bool {
+	return group == coreGroup && (kind == kindPVC || kind == kindPersistentVolume)
 }
 
 // overwrite server-side applies (04-manifest-backup.md §5.2).
@@ -382,10 +426,25 @@ func (a *Applier) recreate(
 		}
 	}
 
-	if _, err := ri.Create(ctx, p.obj, metav1.CreateOptions{
+	_, err := ri.Create(ctx, p.obj, metav1.CreateOptions{
 		FieldManager: FieldManager,
 		DryRun:       dryRunOption(opts.DryRun),
-	}); err != nil {
+	})
+	if apierrors.IsAlreadyExists(err) {
+		// The name came back between the delete settling and this create. That is not a race we
+		// lost, it is how some objects work: the control plane recreates a namespace's `default`
+		// ServiceAccount the moment it disappears, so Recreate on it could NEVER succeed — the
+		// create always found the replacement already there, the resource was reported Failed, and
+		// every Recreate restore of a whole namespace came back PartiallyFailed for that one object
+		// alone (M3.2; the crucible's m2 Recreate spec had never passed).
+		//
+		// Reconciling in place converges on exactly the state Recreate asked for, so fall through
+		// to the apply and report it as Configured rather than failing a restore that in fact
+		// delivered what it promised.
+		a.overwrite(ctx, ri, p, live, opts, report)
+		return
+	}
+	if err != nil {
 		report.fail(p.entry, err.Error())
 		return
 	}

@@ -127,6 +127,7 @@ implemented in-house: neat's behavior is a reference, not a dependency.
 | S4 | `metadata.annotations["kubectl.kubernetes.io/last-applied-configuration"]` | Strip. |
 | S5 | `metadata.ownerReferences` | Strip — **restored objects are unowned** (see §4.3). |
 | S6 | `metadata.namespace` | Strip (reinjected at apply time; enables cross-namespace `ClusterRestore`). |
+| S8 | `metadata.finalizers` | Strip **all of them** — a finalizer is one controller's claim on one live instance, and a transplanted one is never released (see §4.4). |
 | S7 | Empty `metadata.annotations` / `metadata.labels` maps after stripping | Remove the empty map. |
 
 ### 4.2 Kind-specific rules
@@ -134,7 +135,7 @@ implemented in-house: neat's behavior is a reference, not a dependency.
 | # | Kind | Rule |
 |---|---|---|
 | S10 | `Service` | Strip `spec.clusterIP`, `spec.clusterIPs`, `spec.ipFamilies` — **except the literal value `None`, which is kept** (see below). **Preserve `spec.ports[].nodePort` and `spec.healthCheckNodePort`** (agreed decision; Velero only does this behind `--preserve-nodeports`). |
-| S11 | `PersistentVolumeClaim` | Strip `spec.volumeName` (PV binding is cluster-local); strip `spec.dataSource` and `spec.dataSourceRef` (source objects excluded per E9; data comes back through the volume restore path); strip annotations `pv.kubernetes.io/bind-completed`, `pv.kubernetes.io/bound-by-controller`, `volume.beta.kubernetes.io/storage-provisioner`, `volume.kubernetes.io/storage-provisioner`, `volume.kubernetes.io/selected-node`; strip finalizer `kubernetes.io/pvc-protection` (re-added by the control plane). **Keep `spec.storageClassName`** — it is the input of storageClassMapping (§5.3). |
+| S11 | `PersistentVolumeClaim` | Strip `spec.volumeName` (PV binding is cluster-local); strip `spec.dataSource` and `spec.dataSourceRef` (source objects excluded per E9; data comes back through the volume restore path); strip annotations `pv.kubernetes.io/bind-completed`, `pv.kubernetes.io/bound-by-controller`, `volume.beta.kubernetes.io/storage-provisioner`, `volume.kubernetes.io/storage-provisioner`, `volume.kubernetes.io/selected-node`. Finalizers are no longer named here — S8 strips all of them (§4.4). **Keep `spec.storageClassName`** — it is the input of storageClassMapping (§5.3). |
 | S12 | `Pod` (standalone) | Strip `spec.nodeName`, `spec.priority` (derived from kept `priorityClassName`), deprecated `spec.serviceAccount` alias; strip projected token volumes named `kube-api-access-*` and their volumeMounts. |
 | S13 | `Deployment` | Strip annotation `deployment.kubernetes.io/revision`. |
 
@@ -164,7 +165,28 @@ objects that were owned (e.g. StatefulSet PVCs under a `persistentVolumeClaimRet
 come back standalone, and controllers re-adopt via selectors where they support it. This
 holds in both restore modes (§5.2).
 
-### 4.4 Webhook-injected fields caveat
+### 4.4 Finalizers policy
+
+All finalizers are dropped (S8), and the restore drops them again on the way in
+(`internal/manifests` `stripFinalizers`) so that snapshots taken before this rule existed are
+safe too. Rationale: a finalizer is not a property of the object, it is **one controller's claim
+on one live instance**. The controller that would release it never saw the restored copy, so a
+transplanted finalizer is a claim nobody will ever drop — the object becomes undeletable and,
+if namespaced, holds its whole namespace in `Terminating` forever. It is S5's failure mode with
+the sign flipped: a dangling ownerReference deletes what was restored, a dangling finalizer makes
+it immortal.
+
+**How this was found (M3.2, 2026-07-25.)** The rule originally named `kubernetes.io/pvc-protection`
+alone, on PVCs. The crucible's `m2` restore left `m2-restore` stuck in `Terminating` on a PVC
+carrying `snapshot.storage.kubernetes.io/pvc-as-source-protection` with **zero** VolumeSnapshots in
+the cluster. The API server's `managedFields` named the culprit: the snapshot-controller adds that
+finalizer when a VolumeSnapshot names the PVC as source and removes it ~2 s later once the snapshot
+is ready — and the manifest dump had photographed the PVC inside that window. `crystalbackup-restore`
+then re-applied it onto a live PVC with no snapshot behind it. Enumerating finalizers by name is a
+losing game: every CSI driver and every operator adds its own. Nothing is lost by dropping them
+all — one the target cluster genuinely warrants is re-added by its own controller.
+
+### 4.5 Webhook-injected fields caveat
 
 The dump reads the **live** object: API-server defaulting and mutating-webhook output
 (injected sidecars, volumes, env — e.g. Istio/Linkerd) are captured **as-is**; there is
@@ -213,12 +235,33 @@ skip rule:
   field manager `crystalbackup-restore`). Objects present in the target but **absent from
   the backup are kept** (extras preserved) — additive recovery.
 - **`Recreate`** — each selected resource that already exists is **deleted, then created**
-  from the backup (a clean replace); absent ones are simply created.
+  from the backup (a clean replace); absent ones are simply created. **Except
+  `PersistentVolumeClaim` and `PersistentVolume`**, which are never deleted — see below.
+
+**Recreate never deletes a storage handle (M3.2).** A PVC is not a description of data, it is a
+*handle* to it: deleting one releases its PersistentVolume, and a dynamically-provisioned
+volume's reclaimPolicy is `Delete`, so the CSI driver **destroys the user's data** as a side
+effect of restoring a manifest. Measured on the crucible before the fix: the m2 `Recreate` spec
+deleted PVC `data`, ceph-csi destroyed the RBD image behind it, and the data half of the same
+restore — already mounting a twin PV built from that very `volumeHandle` — hung forever on
+`internal RBD image not found`. It was restoring a volume that had just been deleted underneath
+it. Both kinds are therefore reconciled **in place** (the `Overwrite` path) even in `Recreate`
+mode, and the outcome is reported `Configured` rather than `Recreated`. Nothing is lost: the
+mode's promise for the *contents* is delivered by the data half (`restic restore --delete` = an
+exact match, extras removed), and the manifest half's job for a PVC is to **create** the claim
+when it is absent (DR bootstrap into an empty namespace), never to replace a live one.
 
 Both modes **modify pre-existing objects** when the target already holds them, so they
 require `spec.confirmation == <target namespace>` (R23). A restore that only creates —
 e.g. `ClusterRestore` into a fresh namespace via `target.createNamespace` — is
 non-destructive and needs no confirmation.
+
+**A name that comes back is reconciled, not failed (M3.2).** Some objects are recreated by the
+control plane the instant they disappear — a namespace's `default` ServiceAccount above all — so
+`Recreate`'s create found the replacement already there and reported that object `Failed`. One
+such object was enough to make every whole-namespace `Recreate` restore come back
+`PartiallyFailed`. An `AlreadyExists` on the recreate now falls back to the in-place apply, which
+converges on exactly the state `Recreate` asked for, and is reported `Configured`.
 
 Caveats: a `Recreate` delete honors finalizers — an object stuck on a finalizer is
 reported `Failed` (reason surfaced), never force-deleted, and the restore continues. It

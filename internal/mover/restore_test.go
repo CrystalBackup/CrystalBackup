@@ -65,30 +65,48 @@ func TestBuildJobRestoreMountsReadWrite(t *testing.T) {
 	}
 }
 
-// TestMoverCapabilitiesByOperation pins the per-operation capability sets
-// (03-security-and-tenancy.md §6): restore gets the metadata-fidelity set (CHOWN,
-// DAC_OVERRIDE, FOWNER, MKNOD, SETFCAP — all within the runtime default set, so PSA
-// baseline still admits the pod), everything else keeps the single DAC_OVERRIDE. Drop:ALL
-// is asserted too — the adds only ever sit on top of a full drop.
-func TestMoverCapabilitiesByOperation(t *testing.T) {
+// TestMoverCapabilitiesByShape pins the capability sets (03-security-and-tenancy.md §6), which
+// follow what a Job can TOUCH rather than what it is called:
+//
+//   - restore — the metadata-fidelity set (CHOWN, DAC_OVERRIDE, FOWNER, MKNOD, SETFCAP), all
+//     within the runtime default set so PSA baseline still admits the pod;
+//   - any other DATA job (a mounted PVC) — DAC_OVERRIDE alone, because it walks a tenant's files
+//     owned by uids the mover is not;
+//   - every MAINTENANCE job (PVC nil: init/forget/prune/check/snapshots/unlock and the manifest
+//     shapes) — NOTHING. It touches only root-owned emptyDirs and a read-only Secret, which uid 0
+//     already reads and writes; the DAC_OVERRIDE it used to receive came from a catch-all, not
+//     from a need (M3.2). OpSnapshots is the case that made it visible: discovery's listing Job
+//     mounts no data volume at all.
+//
+// Drop:ALL is asserted too — the adds only ever sit on top of a full drop.
+func TestMoverCapabilitiesByShape(t *testing.T) {
 	restoreCaps := []corev1.Capability{"CHOWN", "DAC_OVERRIDE", "FOWNER", "MKNOD", "SETFCAP"}
+	dataPVC := &PVCMount{ClaimName: "c", MountPath: "/data/ns/c"}
 	for _, tc := range []struct {
+		name string
 		op   Operation
+		pvc  *PVCMount
 		want []corev1.Capability
 	}{
-		{OpRestore, restoreCaps},
-		{OpBackup, []corev1.Capability{"DAC_OVERRIDE"}},
-		{OpInit, []corev1.Capability{"DAC_OVERRIDE"}},
-		{OpPrune, []corev1.Capability{"DAC_OVERRIDE"}},
+		{"restore keeps the metadata-fidelity set", OpRestore, &PVCMount{ClaimName: "t", MountPath: "/crystal/target", ReadWrite: true}, restoreCaps},
+		{"backup keeps DAC_OVERRIDE for the tenant's files", OpBackup, dataPVC, []corev1.Capability{"DAC_OVERRIDE"}},
+		{"snapshots adds nothing", OpSnapshots, nil, nil},
+		{"init adds nothing", OpInit, nil, nil},
+		{"prune adds nothing", OpPrune, nil, nil},
+		{"unlock adds nothing", OpUnlock, nil, nil},
+		{"manifests-backup adds nothing", OpManifestsBackup, nil, nil},
+		{"manifests-restore adds nothing", OpManifestsRestore, nil, nil},
 	} {
-		job := BuildJob(JobRequest{Name: "j", Namespace: "ns", Operation: tc.op, SecretName: "j"})
-		caps := job.Spec.Template.Spec.Containers[0].SecurityContext.Capabilities
-		if len(caps.Drop) != 1 || caps.Drop[0] != "ALL" {
-			t.Errorf("op %s: Drop = %v, want [ALL]", tc.op, caps.Drop)
-		}
-		if !reflect.DeepEqual(caps.Add, tc.want) {
-			t.Errorf("op %s: Add = %v, want %v", tc.op, caps.Add, tc.want)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			job := BuildJob(JobRequest{Name: "j", Namespace: "ns", Operation: tc.op, SecretName: "j", PVC: tc.pvc})
+			caps := job.Spec.Template.Spec.Containers[0].SecurityContext.Capabilities
+			if len(caps.Drop) != 1 || caps.Drop[0] != "ALL" {
+				t.Errorf("op %s: Drop = %v, want [ALL]", tc.op, caps.Drop)
+			}
+			if !reflect.DeepEqual(caps.Add, tc.want) {
+				t.Errorf("op %s: Add = %v, want %v", tc.op, caps.Add, tc.want)
+			}
+		})
 	}
 }
 
