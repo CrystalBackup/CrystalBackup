@@ -92,7 +92,10 @@ fi
 # ─── Run the suite in every lane in parallel ──────────────────────────────────
 echo "==> running the suite in ${N} lanes"
 for lane in "${lanes[@]}"; do
-  CRUCIBLE_LANE="${lane}" mise run test ${LABELS:+"${LABELS}"} > "${log_dir}/${lane}-test.log" 2>&1 &
+  # CRUCIBLE_TIMEOUT must be forwarded: without it the children fall back to the default and get
+  # TRUNCATED mid-suite, which then reads as "specs failed" rather than "the run was cut off".
+  CRUCIBLE_LANE="${lane}" CRUCIBLE_TIMEOUT="${CRUCIBLE_TIMEOUT:-150m}" \
+    mise run test ${LABELS:+"${LABELS}"} > "${log_dir}/${lane}-test.log" 2>&1 &
 done
 # Deliberately NOT failing on a non-zero test exit: a red lane is the interesting case, and the
 # comparison below is the output that matters.
@@ -115,8 +118,14 @@ for lane in "${lanes[@]}"; do
     echo "  ${lane}: NO REPORT (see ${log_dir}/${lane}-test.log)"
     continue
   fi
-  sed -n 's/^- \(✅\|❌\)  \(.*\)$/\1\t\2/p' "${report}" \
-    | sed 's/  _(.*)_$//' > "${tmp}/${lane}"
+  # Whitespace-tolerant on purpose: the first version demanded exactly two spaces after the mark
+  # and silently matched NOTHING, so the verdict read "0 passed, 0 failed" for three lanes that had
+  # all produced real reports. A parser that yields nothing must never look like a clean result.
+  sed -n 's/^- \(✅\|❌\)[[:space:]]*\(.*\)$/\1\t\2/p' "${report}" \
+    | sed 's/[[:space:]]*_(.*)_$//' > "${tmp}/${lane}"
+  if [[ ! -s "${tmp}/${lane}" ]]; then
+    echo "  ${lane}: report exists but NO spec lines parsed — the report format changed" >&2
+  fi
   printf '  %-6s %s passed, %s failed\n' "${lane}" \
     "$(grep -c '^✅' "${tmp}/${lane}" || true)" "$(grep -c '^❌' "${tmp}/${lane}" || true)"
 done

@@ -54,7 +54,7 @@ if [[ -f "${CRUCIBLE_REPORT_PATH}" ]]; then
   echo "────────────────────────────────────────────────────────────────────────"
   cat "${CRUCIBLE_REPORT_PATH}"
   echo "────────────────────────────────────────────────────────────────────────"
-  echo "(report saved to test/crucible/artifacts/crucible-report.md)"
+  echo "(report saved to ${CRUCIBLE_REPORT_PATH})"
 else
   echo "WARNING: no report produced — the suite likely failed to start (see output above)." >&2
 fi
