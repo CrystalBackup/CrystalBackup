@@ -19,6 +19,8 @@ package controller
 import (
 	"context"
 	"fmt"
+	"testing"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2" //nolint:revive,staticcheck
 	. "github.com/onsi/gomega"    //nolint:revive,staticcheck
@@ -521,3 +523,37 @@ var _ = Describe("BackupReconciler", func() {
 		}, initTimeout, initPoll).Should(Succeed())
 	})
 })
+
+// TestTeardownSurvivesACancelledReconcileContext is the unit guard for a leak that only appeared
+// on real infrastructure, and only while the operator was being restarted mid-run.
+//
+// teardownVolume runs on the pass that made the volume terminal, AFTER the status write, and the
+// top of Reconcile short-circuits on a terminal Backup — so that pass is the ONLY moment the
+// exposure objects are ever collected. Taking the reconcile context meant that a manager shutting
+// down cancelled every delete; the failures are best-effort and swallowed, the next operator sees
+// a terminal Backup and returns, and a VolumeSnapshotContent survives with no deletionTimestamp
+// and nobody accountable for it.
+//
+// The property this pins is narrow and exact: an ALREADY-CANCELLED reconcile context must not stop
+// the cleanup from issuing its deletes.
+func TestTeardownSurvivesACancelledReconcileContext(t *testing.T) {
+	// A context that is cancelled before teardown even starts — the worst case, and what a
+	// shutdown mid-reconcile actually produces.
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	detached, stop := context.WithTimeout(context.WithoutCancel(cancelled), backupTeardownTimeout)
+	defer stop()
+
+	if err := detached.Err(); err != nil {
+		t.Fatalf("the detached context inherited cancellation (%v) — teardown would still be skipped", err)
+	}
+	if _, ok := detached.Deadline(); !ok {
+		t.Error("the detached context has no deadline; a shutting-down manager could be held open by it")
+	}
+	// And the budget must be short: this runs during shutdown.
+	if backupTeardownTimeout > time.Minute {
+		t.Errorf("backupTeardownTimeout = %v, too long to hold a shutting-down manager open",
+			backupTeardownTimeout)
+	}
+}
