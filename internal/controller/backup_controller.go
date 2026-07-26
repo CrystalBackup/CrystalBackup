@@ -60,6 +60,11 @@ import (
 // cross-namespace Owns() cannot deliver.
 const backupPollInterval = 5 * time.Second
 
+// backupTeardownTimeout bounds the detached exposure/Job cleanup. Short: it is a handful of
+// deletes, and a manager that is shutting down should not be held open by them — but it MUST have
+// its own budget rather than inheriting a reconcile context that is already cancelled.
+const backupTeardownTimeout = 30 * time.Second
+
 const (
 	// moverJobTTLSeconds is the data-mover Job's ttlSecondsAfterFinished: a finished mover Job
 	// self-cleans after an hour even if the explicit post-result delete is missed. The
@@ -911,7 +916,23 @@ func (r *BackupReconciler) advanceUploading(ctx context.Context, backup *cbv1.Ba
 // been persisted, best-effort (the orphan reaper backstops any residue). Called by Reconcile
 // AFTER the status write so a status-write conflict never deletes the Job before the result it
 // carries is recorded.
-func (r *BackupReconciler) teardownVolume(ctx context.Context, backup *cbv1.Backup, pvcName string) {
+func (r *BackupReconciler) teardownVolume(reconcileCtx context.Context, backup *cbv1.Backup, pvcName string) {
+	// DETACHED from the reconcile context, and this is load-bearing rather than defensive.
+	//
+	// Teardown runs on the same pass that made the volume terminal, AFTER the status write — and
+	// the pass above it short-circuits on a terminal Backup, so this is the ONLY moment the
+	// exposure objects are ever collected. If the manager is shutting down, controller-runtime
+	// cancels the reconcile context: every delete below fails, the failure is best-effort and
+	// therefore swallowed, and the next operator sees a terminal Backup and returns without
+	// looking. The result is a VolumeSnapshotContent nobody ever asked to delete — no
+	// deletionTimestamp, parent VolumeSnapshot correctly gone — which is exactly what the M1
+	// leak-check found on real infrastructure while the operator was being restarted mid-run.
+	//
+	// The maintenance path already does this (see maintenanceCleanupTimeout); the backup path
+	// never did.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(reconcileCtx), backupTeardownTimeout)
+	defer cancel()
+
 	if err := r.cleanupVolumeExposure(ctx, backup, pvcName); err != nil {
 		logf.FromContext(ctx).Error(err, "best-effort exposure cleanup after mover finish failed",
 			"backup", backup.Name, "pvc", pvcName)

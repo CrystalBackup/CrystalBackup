@@ -39,6 +39,16 @@ if [[ "${CONFIRM:-}" != "yes" ]]; then
   exit 1
 fi
 
+# The image under test. Exported into every lane so all three exercise the SAME operator —
+# comparing lanes is only meaningful if they run identical code. Empty falls back to the chart
+# defaults, which is right for a plain "does the suite pass" fanout and wrong for a hunt.
+if [[ -n "${OPERATOR_IMAGE_DIGEST:-}" ]]; then
+  echo "fanout: operator ${OPERATOR_IMAGE_DIGEST}"
+fi
+if [[ -n "${MOVER_IMAGE_DIGEST:-}" ]]; then
+  echo "fanout: mover    ${MOVER_IMAGE_DIGEST}"
+fi
+
 lanes=()
 for i in $(seq 1 "${N}"); do lanes+=("l${i}"); done
 
@@ -49,10 +59,20 @@ mkdir -p "${log_dir}"
 # Provisioning is ~20 minutes of mostly waiting, so serialising N lanes would throw away the whole
 # point. Each child gets its own CRUCIBLE_LANE and therefore its own workspace, artifacts and
 # inventory; nothing is shared but the Hetzner account and the local disk.
+# Create every lane's workspace SERIALLY first. tofu's local backend keeps one lock per state
+# directory, and `workspace new` writes there — doing it concurrently is what produced "Error
+# acquiring the state lock" on the first attempt at a parallel fanout.
+echo "==> creating ${N} workspaces (serial — the state lock is shared)"
+for lane in "${lanes[@]}"; do
+  CRUCIBLE_LANE="${lane}" scripts/tofu-lane.sh init -input=false >/dev/null
+done
+
 echo "==> bringing up ${N} lanes"
 pids=()
 for lane in "${lanes[@]}"; do
-  ( CRUCIBLE_LANE="${lane}" mise run up && CRUCIBLE_LANE="${lane}" mise run seed ) \
+  ( CRUCIBLE_LANE="${lane}" OPERATOR_IMAGE_DIGEST="${OPERATOR_IMAGE_DIGEST:-}" \
+      MOVER_IMAGE_DIGEST="${MOVER_IMAGE_DIGEST:-}" mise run up \
+    && CRUCIBLE_LANE="${lane}" mise run seed ) \
     > "${log_dir}/${lane}-up.log" 2>&1 &
   pids+=("$!")
 done
