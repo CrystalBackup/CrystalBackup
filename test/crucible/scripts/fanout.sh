@@ -89,17 +89,36 @@ if (( ${#up_failed[@]} > 0 )); then
   exit 1
 fi
 
-# ─── Run the suite in every lane in parallel ──────────────────────────────────
-echo "==> running the suite in ${N} lanes"
+# ─── Run the suites ONE AT A TIME ─────────────────────────────────────────────
+# Provisioning above parallelises well — it is mostly waiting on Hetzner. The SUITES do not:
+# three concurrent Ginkgo runs, three Ansible-provisioned clusters and one Hetzner account
+# contend badly enough that a previous attempt had every lane hit its suite timeout, one of them
+# after only 3 specs of 46. A truncated run is worse than no run: it reports specs as failed when
+# they were merely cut off.
+#
+# Sequential suites keep what lanes are actually FOR — three independent samples of the same code
+# on genuinely separate infrastructure — and drop only the wall-clock saving, which was never the
+# point.
+#
+# Each lane is destroyed the moment its suite ends, so lanes are not billed while waiting their
+# turn: the last one would otherwise pay for the whole window doing nothing.
+echo "==> running the suite in ${N} lanes, SEQUENTIALLY (see the comment: concurrent suites truncate)"
 for lane in "${lanes[@]}"; do
-  # CRUCIBLE_TIMEOUT must be forwarded: without it the children fall back to the default and get
-  # TRUNCATED mid-suite, which then reads as "specs failed" rather than "the run was cut off".
+  echo "--> lane ${lane}"
   CRUCIBLE_LANE="${lane}" CRUCIBLE_TIMEOUT="${CRUCIBLE_TIMEOUT:-150m}" \
-    mise run test ${LABELS:+"${LABELS}"} > "${log_dir}/${lane}-test.log" 2>&1 &
+    mise run test ${LABELS:+"${LABELS}"} > "${log_dir}/${lane}-test.log" 2>&1 || true
+
+  # Residual exposure objects, read BEFORE teardown. This is the one measurement that depends on
+  # neither the report parser nor the suite running to completion.
+  residual="$(KUBECONFIG="${CRUCIBLE_DIR}/artifacts/lanes/${lane}/kubeconfig" \
+    kubectl get volumesnapshotcontent -l app.kubernetes.io/managed-by=crystal-backup \
+    --no-headers 2>/dev/null | wc -l | tr -d ' ')"
+  echo "${residual}" > "${log_dir}/${lane}-residual.txt"
+  echo "--> lane ${lane}: ${residual} residual VolumeSnapshotContent(s); destroying it now"
+
+  CRUCIBLE_LANE="${lane}" CONFIRM=yes mise run down > "${log_dir}/${lane}-down.log" 2>&1 \
+    || echo "fanout: lane ${lane} FAILED to destroy — it is still billing" >&2
 done
-# Deliberately NOT failing on a non-zero test exit: a red lane is the interesting case, and the
-# comparison below is the output that matters.
-wait || true
 
 # ─── Compare ──────────────────────────────────────────────────────────────────
 # One spec per line per lane, so a plain sort|uniq tells us who disagreed. The report renders
@@ -118,11 +137,20 @@ for lane in "${lanes[@]}"; do
     echo "  ${lane}: NO REPORT (see ${log_dir}/${lane}-test.log)"
     continue
   fi
-  # Whitespace-tolerant on purpose: the first version demanded exactly two spaces after the mark
-  # and silently matched NOTHING, so the verdict read "0 passed, 0 failed" for three lanes that had
-  # all produced real reports. A parser that yields nothing must never look like a clean result.
-  sed -n 's/^- \(✅\|❌\)[[:space:]]*\(.*\)$/\1\t\2/p' "${report}" \
-    | sed 's/[[:space:]]*_(.*)_$//' > "${tmp}/${lane}"
+  # awk, NOT sed. BSD sed (which is what macOS gives a SCRIPT, whatever the interactive shell
+  # aliases to) has no \| alternation in BREs, so the previous pattern matched nothing and three
+  # real reports rendered as "0 passed, 0 failed" — a parser returning empty must never read as
+  # consensus. awk behaves identically on both platforms.
+  awk '
+    /^- ✅/ { mark="✅" }
+    /^- ❌/ { mark="❌" }
+    /^- (✅|❌)/ {
+      line = $0
+      sub(/^- (✅|❌)[ \t]*/, "", line)     # drop the bullet and the mark
+      sub(/[ \t]*_\(.*\)_$/, "", line)     # drop the trailing duration, or lanes never match
+      sub(/[ \t]*—.*$/, "", line)          # drop any trailing " — reason", same rationale
+      print mark "\t" line
+    }' "${report}" > "${tmp}/${lane}"
   if [[ ! -s "${tmp}/${lane}" ]]; then
     echo "  ${lane}: report exists but NO spec lines parsed — the report format changed" >&2
   fi
@@ -155,6 +183,12 @@ for lane in "${lanes[@]}"; do [[ -f "${tmp}/${lane}" ]] && grep '^❌' "${tmp}/$
   | sort | uniq -c | awk -v n="${N}" '$1 == n { $1=""; print "  " substr($0,2) }'
 
 echo
+echo "Residual exposure objects per lane (0 everywhere is the release gate):"
+for lane in "${lanes[@]}"; do
+  printf '  %-6s %s\n' "${lane}" "$(cat "${log_dir}/${lane}-residual.txt" 2>/dev/null || echo '?')"
+done
+
+echo
 echo "Per-lane reports: artifacts/lanes/<lane>/crucible-report.md"
-echo "⚠  ${N} lanes are still running and still billing — tear them down:"
-echo "     CONFIRM=yes scripts/fanout-down.sh ${N}"
+echo "Lanes are destroyed as each suite finishes. Verify nothing lingers:"
+for i in $(seq 1 "${N}"); do echo "  CRUCIBLE_LANE=l${i} mise run status"; done
