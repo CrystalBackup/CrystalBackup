@@ -54,6 +54,10 @@ for i in $(seq 1 "${N}"); do lanes+=("l${i}"); done
 
 log_dir="${CRUCIBLE_DIR}/artifacts/fanout"
 mkdir -p "${log_dir}"
+# Purge the PREVIOUS run's measurements. A run that aborts before its suites (a lane failing to
+# provision) must leave EMPTY slots, not last run's numbers: stale residual files were once read
+# as this round's "0/0/0" during an incident review.
+rm -f "${log_dir}"/*-residual.txt "${log_dir}"/*-test.log "${log_dir}"/*-up.log "${log_dir}"/*-down.log
 
 # ─── Bring every lane up in parallel ──────────────────────────────────────────
 # Provisioning is ~20 minutes of mostly waiting, so serialising N lanes would throw away the whole
