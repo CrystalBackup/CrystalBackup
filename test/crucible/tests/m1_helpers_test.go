@@ -19,6 +19,7 @@ limitations under the License.
 package crucible
 
 import (
+	"fmt"
 	"os"
 	"strings"
 	"time"
@@ -332,11 +333,21 @@ func m1AssertNoResidualSnapshotObjects(namespaces ...string) {
 		})
 		g.Expect(k8s.List(ctx, vsc)).To(Succeed())
 		for i := range vsc.Items {
-			labelled := m1HasCrystalLabel(vsc.Items[i].GetLabels())
-			refNS, _, _ := unstructured.NestedString(vsc.Items[i].Object, "spec", "volumeSnapshotRef", "namespace")
+			item := &vsc.Items[i]
+			labelled := m1HasCrystalLabel(item.GetLabels())
+			refNS, _, _ := unstructured.NestedString(item.Object, "spec", "volumeSnapshotRef", "namespace")
+			// The forensics below exist because one real leak cost three paid crucible rounds to
+			// attribute: the failure message must carry everything needed to identify the residue's
+			// nature (deletionPolicy Retain = the operator's handover park; a set deletionTimestamp
+			// = something DID ask for deletion and is stuck; a dynamic snapcontent-<uuid> name vs
+			// our static <prefix>-vsc = which cleanup step was missed) without another run.
+			policy, _, _ := unstructured.NestedString(item.Object, "spec", "deletionPolicy")
+			refName, _, _ := unstructured.NestedString(item.Object, "spec", "volumeSnapshotRef", "name")
 			g.Expect(labelled || checkSet[refNS]).To(BeFalse(),
-				"residual VolumeSnapshotContent %s (labels %v, refNS %s)",
-				vsc.Items[i].GetName(), vsc.Items[i].GetLabels(), refNS)
+				"residual VolumeSnapshotContent %s (labels %v, refNS %s/%s, deletionPolicy %s, created %s, deletionTimestamp %v, ownerRefs %v, operator restarts: %s)",
+				item.GetName(), item.GetLabels(), refNS, refName, policy,
+				item.GetCreationTimestamp().Format(time.RFC3339), item.GetDeletionTimestamp(),
+				item.GetOwnerReferences(), m1OperatorRestartSummary())
 		}
 
 		// (3) No temporary clone PVCs (a crystalbackup.io/* label, but not a seed PVC) in any checked
@@ -356,6 +367,35 @@ func m1AssertNoResidualSnapshotObjects(namespaces ...string) {
 		// every backup's teardown. The objects DO drain (the m3-only run clears them well under 2m);
 		// this only needs headroom for the loaded case, so it stays a real leak-check, not a sleep.
 	}, 5*time.Minute, 5*time.Second).Should(Succeed())
+}
+
+// m1OperatorRestartSummary reports the operator pods' identity, start time and container restart
+// counts as one string, for the leak-check's failure forensics: a residual whose message shows a
+// fresh pod (or a non-zero restartCount) points at the restart window; a stable pod excludes it.
+// Best-effort — the summary must never turn an unreadable pod list into a spec failure.
+func m1OperatorRestartSummary() string {
+	var pods corev1.PodList
+	if err := k8s.List(ctx, &pods, client.InNamespace(operatorNS),
+		client.MatchingLabels{"app.kubernetes.io/name": "crystal-backup"}); err != nil {
+		return "unreadable: " + err.Error()
+	}
+	parts := make([]string, 0, len(pods.Items))
+	for i := range pods.Items {
+		p := &pods.Items[i]
+		restarts := int32(0)
+		for _, cs := range p.Status.ContainerStatuses {
+			restarts += cs.RestartCount
+		}
+		started := "?"
+		if p.Status.StartTime != nil {
+			started = p.Status.StartTime.Format(time.RFC3339)
+		}
+		parts = append(parts, fmt.Sprintf("%s(started %s, restarts %d)", p.Name, started, restarts))
+	}
+	if len(parts) == 0 {
+		return "no operator pod found"
+	}
+	return strings.Join(parts, ", ")
 }
 
 // m1DeleteOperatorPod deletes the operator pod(s) (app.kubernetes.io/name=crystal-backup) to

@@ -33,18 +33,34 @@ mkdir -p "${_artifacts}"
 export CRUCIBLE_REPORT_PATH="${_artifacts}/crucible-report.md"
 rm -f "${CRUCIBLE_REPORT_PATH}"
 
-ginkgo_args=(--ginkgo.label-filter="${LABELS}")
-[[ "${CRUCIBLE_VERBOSE:-}" == "1" ]] && ginkgo_args+=(--ginkgo.v)
-
 # Whole-suite wall-clock budget. 60m was overrun by the M3 full-suite run (go test panicked
 # mid-flight, losing the report), so the default is 90m — the suite's own Eventually deadlines,
 # not this, are what should fail a spec. Override for a long debugging run:
 #   CRUCIBLE_TIMEOUT=3h mise run test
 CRUCIBLE_TIMEOUT="${CRUCIBLE_TIMEOUT:-90m}"
 
+# BOTH timeouts, and the Ginkgo one is the load-bearing fix: Ginkgo enforces its OWN suite
+# timeout (default 1h) independently of `go test -timeout`. Passing only the go-test budget let a
+# 120m fanout lane announce "timeout 120m" and still be cut by Ginkgo at exactly 3600s — 36 of 46
+# specs run, the rest reported as failed/skipped when they were merely truncated. A truncated run
+# is worse than no run.
+ginkgo_args=(--ginkgo.label-filter="${LABELS}" --ginkgo.timeout="${CRUCIBLE_TIMEOUT}")
+[[ "${CRUCIBLE_VERBOSE:-}" == "1" ]] && ginkgo_args+=(--ginkgo.v)
+
 echo "==> running crucible suite  (labels: '${LABELS:-<all>}', timeout ${CRUCIBLE_TIMEOUT})"
 cd "${REPO_ROOT}"
-go test -tags crucible ./test/crucible/tests -timeout "${CRUCIBLE_TIMEOUT}" -args "${ginkgo_args[@]}"
+# The go-test budget gets 5 extra minutes so Ginkgo's timeout always fires FIRST: Ginkgo
+# interrupts gracefully (per-spec verdicts, report written), while go test panics the whole
+# binary and loses the report.
+go test -tags crucible ./test/crucible/tests -timeout "$(awk -v t="${CRUCIBLE_TIMEOUT}" '
+  BEGIN{
+    mins=0
+    if (t ~ /^[0-9]+h$/)      mins=int(t)*60
+    else if (t ~ /^[0-9]+m$/) mins=int(t)
+    else if (t ~ /^[0-9]+h[0-9]+m$/){split(t,a,/h/); mins=int(a[1])*60+int(a[2])}
+    if (mins==0) mins=90
+    printf "%dm", mins+5
+  }')" -args "${ginkgo_args[@]}"
 rc=$?
 
 # The readable report is the last thing the operator sees — `go test` hides a

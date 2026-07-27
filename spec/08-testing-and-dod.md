@@ -266,6 +266,17 @@ Full suite (nightly + release tags), in addition:
     SeaweedFS via `mc`; the next scheduled `restic check --read-data-subset` fails, surfacing
     `BackupRepository.status.lastCheckResult: Failed`, the `RepositoryCheckFailed` condition and
     alert metric. (Restore-testing itself is the admin's job — no automated canary in v1, R17.)
+12b. **Crash-only teardown — a kill at the terminal transition leaks nothing**: watch a
+    single-namespace run's child `Backup` at high frequency and SIGKILL the operator (grace 0)
+    the instant the terminal phase appears — inside, or hard against, the
+    [terminal status write → exposure deletes] window. The fresh operator's terminal re-entry
+    sweep must re-run the teardown, stamp `crystalbackup.io/exposures-cleaned`, preserve the
+    terminal record, and the leak-check invariant must hold (zero residual VS/VSC/clone PVC).
+    This case exists because a three-lane fanout measured that exact window leaking a
+    Retain-parked `VolumeSnapshotContent` ~1 run in 3 — and because the kill's landing point is
+    nondeterministic, the assertion is deliberately *indifference to where it lands*, which is
+    the property the fix guarantees. Runs where the inline teardown wins the race are valid
+    samples, not misses.
 13. **Orphan reaper**: kill a `crystal-mover` pod mid-upload (grace 0) and cordon+delete
     its node (node-drain simulation on a multi-node kind cluster) → temp PVC, static
     VS/VSC and tenant VolumeSnapshot are garbage-collected, the stale restic lock is

@@ -109,10 +109,16 @@ for lane in "${lanes[@]}"; do
     mise run test ${LABELS:+"${LABELS}"} > "${log_dir}/${lane}-test.log" 2>&1 || true
 
   # Residual exposure objects, read BEFORE teardown. This is the one measurement that depends on
-  # neither the report parser nor the suite running to completion.
-  residual="$(KUBECONFIG="${CRUCIBLE_DIR}/artifacts/lanes/${lane}/kubeconfig" \
+  # neither the report parser nor the suite running to completion. A kubectl failure records "?",
+  # never "0": an unreadable cluster and a clean cluster are different claims, and conflating
+  # them is how a leak hides behind a flaky API server.
+  if residual_raw="$(KUBECONFIG="${CRUCIBLE_DIR}/artifacts/lanes/${lane}/kubeconfig" \
     kubectl get volumesnapshotcontent -l app.kubernetes.io/managed-by=crystal-backup \
-    --no-headers 2>/dev/null | wc -l | tr -d ' ')"
+    --no-headers --ignore-not-found 2>/dev/null)"; then
+    residual="$(printf '%s' "${residual_raw}" | grep -c . || true)"
+  else
+    residual="?"
+  fi
   echo "${residual}" > "${log_dir}/${lane}-residual.txt"
   echo "--> lane ${lane}: ${residual} residual VolumeSnapshotContent(s); destroying it now"
 
@@ -160,9 +166,11 @@ done
 
 echo
 echo "Specs that did NOT agree across lanes (these are your flakes):"
-found_flake=0
 # Build the union of spec names, then check whether every lane returned the same mark for it.
-cat "${tmp}"/* 2>/dev/null | cut -f2- | sort -u | while IFS= read -r spec; do
+# The whole comparison runs inside a command substitution, NOT a pipeline-fed while loop: a
+# variable set in a pipeline stage dies with its subshell, which is how a previous version
+# printed "(none — every lane agreed)" right AFTER listing two disagreements.
+flakes="$(cat "${tmp}"/* 2>/dev/null | cut -f2- | sort -u | while IFS= read -r spec; do
   marks=""
   for lane in "${lanes[@]}"; do
     [[ -f "${tmp}/${lane}" ]] || continue
@@ -172,10 +180,13 @@ cat "${tmp}"/* 2>/dev/null | cut -f2- | sort -u | while IFS= read -r spec; do
   # Disagreement = at least one ✅ and at least one ❌ for the same spec.
   if [[ "${marks}" == *"✅"* && "${marks}" == *"❌"* ]]; then
     printf '  %s  %s\n' "${marks}" "${spec}"
-    found_flake=1
   fi
-done
-(( found_flake == 0 )) && echo "  (none — every lane agreed on every spec)"
+done)"
+if [[ -n "${flakes}" ]]; then
+  printf '%s\n' "${flakes}"
+else
+  echo "  (none — every lane agreed on every spec)"
+fi
 
 echo
 echo "Specs that failed in EVERY lane (these are your bugs):"
