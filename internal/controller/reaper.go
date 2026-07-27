@@ -26,12 +26,15 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	cbv1 "github.com/CrystalBackup/CrystalBackup/api/v1alpha1"
 	"github.com/CrystalBackup/CrystalBackup/internal/apiconst"
+	"github.com/CrystalBackup/CrystalBackup/internal/exposer"
 	"github.com/CrystalBackup/CrystalBackup/internal/status"
 )
 
@@ -49,18 +52,25 @@ const (
 
 // OrphanReaper is the periodic backstop that keeps a run from leaking storage objects when the
 // happy-path teardown was missed (an operator crash mid-cleanup, a namespace deleted out from under
-// an in-flight backup). It sweeps the operator namespace for the NATIVE per-PVC exposure objects a
-// backup creates — the temp clone PVC, the mover Job and its per-Job creds Secret, all stamped with
-// the exposure labels — and deletes any whose owning Backup is gone, or whose volume for that PVC
-// has already reached a terminal phase (so its teardown should already have run). It is a
-// manager.Runnable (a timer loop), not a reconciler: there is no single object to reconcile, and a
-// periodic full sweep is exactly the shape of a leak backstop.
+// an in-flight backup). It sweeps the NATIVE per-PVC exposure objects a backup creates in the
+// operator namespace — the temp clone PVC, the mover Job and its per-Job creds Secret — AND the
+// labelled VolumeSnapshot / VolumeSnapshotContent residue cluster-wide, deleting whatever's owning
+// Backup is gone, or whose volume for that PVC has already reached a terminal phase (so its
+// teardown should already have run). It is a manager.Runnable (a timer loop), not a reconciler:
+// there is no single object to reconcile, and a periodic full sweep is exactly the shape of a
+// leak backstop.
 //
-// The VolumeSnapshot / VolumeSnapshotContent objects (and the storage-snapshot reclaim by
-// snapshotHandle / Retain re-assertion) are NOT swept here: their lifecycle is the exposer's
-// (internal/exposer's ordered Cleanup and its reclaimOrphanOriginVSC crash-window recovery, which
-// reason about deletionPolicy correctly), and they are exercised by the crucible against a real CSI
-// driver. This reaper owns the native residue an operator without CSI can still verify.
+// The VS/VSC half exists because the leak audit proved its absence was load-bearing: four
+// comments across this codebase promised "the orphan reaper is the ultimate backstop" for
+// crash-window snapshot residue while the reaper's charter explicitly excluded exactly that
+// object class — so a single interrupted teardown stranded a cluster-scoped, Retain-parked,
+// owner-less VolumeSnapshotContent forever (the fanout's residual). The sweep delegates the
+// policy-correct semantics to the exposer (exposer.ReapOrphanVolumeSnapshotContent: object-only
+// for the static re-bind alias, restore-then-delete for a dynamic origin content) so the storage
+// snapshot is reclaimed exactly once; see reapSnapshotObjects for the ordering. The terminal
+// re-entry sweep (ensureTerminalTeardown) is the FAST path — seconds after a restart, while the
+// Backup CR still exists; this reaper is the SLOW, unconditional one that also covers a deleted
+// CR, at MinAge distance.
 type OrphanReaper struct {
 	client.Client
 	// OperatorNamespace is where the temp clone PVCs, mover Jobs and creds Secrets live.
@@ -173,6 +183,9 @@ func (r *OrphanReaper) sweepOnce(ctx context.Context) error {
 	for i := range pvs.Items {
 		r.reapRestorePV(ctx, &pvs.Items[i], cutoff)
 	}
+	// The labelled snapshot residue (VolumeSnapshots + VolumeSnapshotContents) — the leak
+	// audit's missing half. See reapSnapshotObjects for why its internal order matters.
+	r.reapSnapshotObjects(ctx, cutoff)
 	// Transient manifest-mover RoleBindings, swept on their own (much shorter) clock — see
 	// reapManifestBindings.
 	r.reapManifestBindings(ctx)
@@ -180,6 +193,102 @@ func (r *OrphanReaper) sweepOnce(ctx context.Context) error {
 	// which live in no namespace and so need a separate list.
 	r.reapClusterManifestBindings(ctx)
 	return nil
+}
+
+// reapSnapshotObjects sweeps the labelled VolumeSnapshot / VolumeSnapshotContent residue whose
+// happy-path teardown never completed. Selection mirrors the native sweep exactly — managed-by +
+// a POSITIVE per-PVC label, then orphaned()'s owner-gone / volume-terminal / MinAge vetting — but
+// the objects live cluster-wide (the origin VS in a tenant namespace, the VSCs in no namespace at
+// all), so the lists are not namespace-scoped.
+//
+// The internal order is cleanup()'s reclamation-last, restated for a flat sweep:
+//
+//  1. pre-provisioned (static re-bind) contents — object-only deletes, always safe (Retain by
+//     construction; the backend snapshot is the origin content's to reclaim);
+//  2. VolumeSnapshots — plain deletes (a bound Delete-policy content cascades correctly via the
+//     external snapshot-controller; a Retain-parked one becomes pass-3 residue);
+//  3. dynamically-provisioned contents — exposer.ReapOrphanVolumeSnapshotContent's
+//     restore-then-delete, so the storage-side snapshot is reclaimed exactly once, and never
+//     while a static alias still references its handle.
+//
+// Best-effort per object, like the native sweep. A cluster without the snapshot CRDs (NoMatch)
+// skips silently: no such kind, no such residue.
+func (r *OrphanReaper) reapSnapshotObjects(ctx context.Context, cutoff time.Time) {
+	log := logf.FromContext(ctx).WithName("orphan-reaper")
+	sel := client.MatchingLabels{apiconst.LabelManagedBy: apiconst.ManagedByValue}
+	hasPVC := client.HasLabels{apiconst.LabelPVC}
+
+	vscs := exposer.VolumeSnapshotContentList()
+	if err := r.List(ctx, vscs, sel, hasPVC); err != nil {
+		if !apimeta.IsNoMatchError(err) {
+			log.Error(err, "orphan reaper: listing VolumeSnapshotContents")
+		}
+		return
+	}
+	vss := exposer.VolumeSnapshotList()
+	if err := r.List(ctx, vss, sel, hasPVC); err != nil {
+		if !apimeta.IsNoMatchError(err) {
+			log.Error(err, "orphan reaper: listing VolumeSnapshots")
+		}
+		return
+	}
+
+	var staticVSCs, dynamicVSCs []*unstructured.Unstructured
+	for i := range vscs.Items {
+		item := &vscs.Items[i]
+		if exposer.IsPreProvisionedContent(item) {
+			staticVSCs = append(staticVSCs, item)
+		} else {
+			dynamicVSCs = append(dynamicVSCs, item)
+		}
+	}
+
+	reapVSC := func(item *unstructured.Unstructured) {
+		orphaned, err := r.orphaned(ctx, item, cutoff)
+		if err != nil {
+			log.Error(err, "orphan reaper: VolumeSnapshotContent orphan check failed", "name", item.GetName())
+			return
+		}
+		if !orphaned {
+			return
+		}
+		if err := exposer.ReapOrphanVolumeSnapshotContent(ctx, r.Client, item); err != nil {
+			log.Error(err, "orphan reaper: VolumeSnapshotContent reap failed", "name", item.GetName())
+			return
+		}
+		// A content reaching this path means BOTH the inline teardown and the terminal re-entry
+		// sweep missed it (or its Backup CR is long gone) — worth noticing, never routine.
+		log.Info("orphan reaper: reaped leftover VolumeSnapshotContent; its nominal teardown never completed",
+			"name", item.GetName(), "preProvisioned", exposer.IsPreProvisionedContent(item),
+			"run", item.GetLabels()[apiconst.LabelClusterBackup], "pvc", item.GetLabels()[apiconst.LabelPVC])
+	}
+
+	for _, item := range staticVSCs {
+		reapVSC(item)
+	}
+	for i := range vss.Items {
+		item := &vss.Items[i]
+		orphaned, err := r.orphaned(ctx, item, cutoff)
+		if err != nil {
+			log.Error(err, "orphan reaper: VolumeSnapshot orphan check failed",
+				"namespace", item.GetNamespace(), "name", item.GetName())
+			continue
+		}
+		if !orphaned {
+			continue
+		}
+		if err := r.Delete(ctx, item); err != nil && !apierrors.IsNotFound(err) {
+			log.Error(err, "orphan reaper: VolumeSnapshot delete failed",
+				"namespace", item.GetNamespace(), "name", item.GetName())
+			continue
+		}
+		log.Info("orphan reaper: reaped leftover VolumeSnapshot; its nominal teardown never completed",
+			"namespace", item.GetNamespace(), "name", item.GetName(),
+			"run", item.GetLabels()[apiconst.LabelClusterBackup], "pvc", item.GetLabels()[apiconst.LabelPVC])
+	}
+	for _, item := range dynamicVSCs {
+		reapVSC(item)
+	}
 }
 
 // reapManifestBindings sweeps tenant namespaces for transient manifest-mover RoleBindings whose
