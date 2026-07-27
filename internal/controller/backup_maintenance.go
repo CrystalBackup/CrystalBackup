@@ -371,10 +371,49 @@ func runRepoMaintenance(opCtx context.Context, deps repoMaintenanceDeps, name st
 	// No ownerReference: the Job is in the operator namespace and the triggering CR is in a
 	// tenant namespace (or cluster-scoped), so an ownerRef is illegal/impossible. It is tracked
 	// by its deterministic name and cleaned up explicitly below.
-	if err := deps.Create(ctx, job); err != nil && !apierrors.IsAlreadyExists(err) {
-		return fmt.Errorf("create %s job %s/%s: %w", op, deps.OperatorNamespace, name, err)
+	if err := createMaintenanceJob(ctx, deps, op, job); err != nil {
+		return err
 	}
 	return waitForMaintenanceJob(ctx, deps.Client, deps.OperatorNamespace, name)
+}
+
+// createMaintenanceJob creates the op's Job, disambiguating the deterministic-name collision that
+// AlreadyExists alone cannot: a leftover with that name has two very different faces.
+//
+//   - A LIVE leftover (no deletionTimestamp) is a crashed previous run's Job: adopt it — that
+//     re-adoption is the restart contract deterministic names exist for.
+//   - A TERMINATING one is the PREVIOUS op's foreground delete still collecting its pods, and
+//     adopting it is how a real cluster recorded a prune as Failed with "get maintenance job …:
+//     not found": back-to-back schedules queue op B behind op A on the exclusive queue, A's
+//     deferred cleanup leaves its Job visible-but-dying, B's Create hits AlreadyExists, and the
+//     grave vanishes mid-poll. Worse, a dying SUCCEEDED Job could hand B a success it never
+//     earned. So a terminating grave is waited out (bounded by the op context), then the create
+//     is retried against the emptied name.
+func createMaintenanceJob(ctx context.Context, deps repoMaintenanceDeps, op mover.Operation, job *batchv1.Job) error {
+	for {
+		err := deps.Create(ctx, job)
+		if err == nil {
+			return nil
+		}
+		if !apierrors.IsAlreadyExists(err) {
+			return fmt.Errorf("create %s job %s/%s: %w", op, job.Namespace, job.Name, err)
+		}
+		var existing batchv1.Job
+		switch getErr := deps.Get(ctx, client.ObjectKeyFromObject(job), &existing); {
+		case apierrors.IsNotFound(getErr):
+			continue // the grave emptied between Create and Get: retry the create immediately.
+		case getErr != nil:
+			return fmt.Errorf("inspect existing %s job %s/%s: %w", op, job.Namespace, job.Name, getErr)
+		case existing.DeletionTimestamp.IsZero():
+			return nil // a live leftover from a crashed run: adopt it.
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("waiting for the previous %s job %s/%s to finish deleting: %w",
+				op, job.Namespace, job.Name, ctx.Err())
+		case <-time.After(maintenanceJobPollInterval):
+		}
+	}
 }
 
 // waitForMaintenanceJob polls the maintenance Job until terminal success (Succeeded >= 1 / the
