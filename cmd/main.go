@@ -365,6 +365,9 @@ func main() {
 		repoQueue,
 	)
 	backupReconciler.Hooks = hookExecutor
+	// The uncached reader behind writeStatus's ambiguity check: after a status Update errors
+	// client-side, only a straight-from-apiserver GET can tell whether it committed anyway.
+	backupReconciler.APIReader = mgr.GetAPIReader()
 	if err := backupReconciler.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Unable to create controller", "controller", "Backup")
 		os.Exit(1)

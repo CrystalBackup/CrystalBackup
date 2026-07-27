@@ -84,12 +84,20 @@ const (
 // string is a cross-repo contract.
 const backupReasonSkippedUnsupported = "CSISnapshotUnsupported"
 
-// ExposerRegistry is the seam the Backup controller resolves a per-PVC SnapshotExposer through.
-// It is the one method of internal/exposer.Registry the controller needs, extracted as an
-// interface so envtest — which has no external snapshot CRDs or CSI driver — can inject a stub
-// registry that returns a stub exposer. Production wires in *exposer.Registry.
+// ExposerRegistry is the seam the Backup controller reaches internal/exposer.Registry through,
+// extracted as an interface so envtest — which has no external snapshot CRDs or CSI driver — can
+// inject a stub. Production wires in *exposer.Registry. Its two methods are the two halves of an
+// exposure's life, and they are deliberately asymmetric:
+//
+//   - For resolves the per-PVC SnapshotExposer that CREATES and polls an exposure — it must read
+//     the live PVC (storage class → provisioner → exposer kind).
+//   - TeardownExposure DESTROYS by derived identity alone (origin namespace + name prefix +
+//     labels), never reading the PVC and never creating: teardown must work after the PVC or its
+//     whole namespace is gone, and must be safe to re-run from the terminal re-entry sweep and
+//     the orphan reaper.
 type ExposerRegistry interface {
 	For(ctx context.Context, pvc *corev1.PersistentVolumeClaim) (exposer.SnapshotExposer, error)
+	TeardownExposure(ctx context.Context, originNamespace, namePrefix string, labels map[string]string) error
 }
 
 // BackupReconciler reconciles a Backup: CrystalBackup's single, plane-agnostic UNIT OF
@@ -143,6 +151,13 @@ type BackupReconciler struct {
 	// nil means "no exec path wired" — which is a hard failure when a run declares hooks, never a
 	// silent downgrade to a crash-consistent snapshot the operator believes is better than that.
 	Hooks hooks.Executor
+	// APIReader reads STRAIGHT from the apiserver, bypassing the cache. Its one caller is the
+	// writeStatus ambiguity check (terminalPhaseCommitted): after a status Update errors
+	// client-side, only an uncached read can tell whether the write nonetheless committed
+	// server-side — the cache may still be serving the pre-write object. Set post-construction
+	// (mgr.GetAPIReader()), like Hooks; nil skips the check, degrading to "treat the error as
+	// not-persisted", which the terminal re-entry sweep then heals on a later pass.
+	APIReader client.Reader
 }
 
 // NewBackupReconciler builds a BackupReconciler. Callers (main.go, the envtest suite) go through
@@ -258,10 +273,14 @@ func (r *BackupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		return ctrl.Result{Requeue: true}, nil
 	}
 
-	// Terminal Backups are done: they neither re-execute nor requeue. Re-entry (e.g. a stray
-	// Job watch event) returns here without touching status, preserving the terminal record.
+	// Terminal Backups are done: they neither re-execute nor requeue. But before this pass goes
+	// quiet forever, the sweep verifies the exposure teardown actually completed — the leak audit
+	// proved this short-circuit used to seal ANY missed teardown permanently (the one-shot pass
+	// that wrote the terminal status was also the only one that ever deleted the VS/VSC pair, and
+	// nothing, reaper included, ever retried). Once AnnotationExposuresCleaned is stamped, the
+	// short-circuit returns without touching status, preserving the terminal record.
 	if isTerminalBackupPhase(backup.Status.Phase) {
-		return ctrl.Result{}, nil
+		return r.ensureTerminalTeardown(ctx, &backup)
 	}
 
 	// (6) Resolve the effective run spec from the parent ClusterBackup named by the link label.
@@ -363,9 +382,20 @@ func (r *BackupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	// backupTime once, and write status exactly once.
 	res, err := r.writeStatus(ctx, &backup, manifestsDone)
 	if err != nil {
-		// Status not persisted (e.g. a write conflict): return WITHOUT tearing down, so the mover
-		// Job survives and the next reconcile re-reads and re-records the same terminal result.
-		return res, err
+		// A status-write ERROR is not proof the status was not WRITTEN. A clean Conflict is (the
+		// server rejected it), but a cancellation or connection reset in flight — SIGTERM cancels
+		// this very context — can surface client-side while the apiserver commits anyway. If the
+		// phase we just tried to persist was terminal and an uncached re-read shows it landed,
+		// returning here would be the sealed-forever path the leak audit confirmed: the next pass
+		// short-circuits on the committed terminal phase and this pass's teardown below never runs
+		// (the terminal re-entry sweep would heal it, but only a process-lifetime later). So on an
+		// ambiguous error, disambiguate and fall through to the teardown when the write really
+		// committed. Otherwise: return WITHOUT tearing down, so the mover Job survives and the
+		// next reconcile re-reads and re-records the same terminal result.
+		if !r.terminalPhaseCommitted(ctx, &backup, err) {
+			return res, err
+		}
+		res = ctrl.Result{} // the terminal write committed: proceed exactly as on success
 	}
 	// A Backup whose volumes are all terminal but whose manifests are still in flight must keep
 	// being reconciled: writeStatus only reasons about volumes, so without this the run would go
@@ -476,32 +506,37 @@ func (r *BackupReconciler) gate(ctx context.Context, backup *cbv1.Backup, reason
 }
 
 // finalize tears down anything a Backup left live before dropping its finalizer — the
-// "effective cancel / no leak on delete" guarantee. For every volume it best-effort
-// foreground-deletes the mover Job + its creds Secret by deterministic name (a no-op for a
-// volume that never got one), and for the two phases where an exposure is provably still live
-// (Snapshotting, Uploading) it reconstructs and Cleanup()s that exposure. A Completed/Failed
-// volume's exposure was already torn down by the state machine, and a Pending/Skipped one never
-// created any — re-exposing those just to clean them would spuriously create a fresh CSI
-// snapshot, so they are left to the state machine's own teardown (and, for any residual crash
-// window, the orphan reaper, M1 task #22). Nothing in the repository is ever erased (adr/0009).
+// "effective cancel / no leak on delete" guarantee. For EVERY volume that may have exposed
+// (everything but Skipped — Pending included, since a crash between Expose and the first status
+// write leaves a live origin VS on a still-Pending volume, and a Completed/Failed volume's
+// inline teardown may itself have been interrupted) it tears the exposure down by derived
+// identity and best-effort foreground-deletes the mover Job + its creds Secret. Teardown can no
+// longer CREATE (cleanupVolumeExposure derives, never Exposes), which is what makes sweeping the
+// never-exposed phases safe: for those it is a handful of tolerated NotFounds.
+//
+// An exposure-cleanup failure HOLDS the finalizer: the error requeues finalize with backoff
+// until the deletes succeed, because removing the finalizer over unswept residue would orphan a
+// cluster-scoped, Retain-parked VolumeSnapshotContent with its owning record gone — the exact
+// leak shape the audit root-caused. Nothing in the repository is ever erased (adr/0009).
 func (r *BackupReconciler) finalize(ctx context.Context, backup *cbv1.Backup) (ctrl.Result, error) {
 	if !controllerutil.ContainsFinalizer(backup, apiconst.FinalizerBackup) {
 		return ctrl.Result{}, nil
 	}
-	log := logf.FromContext(ctx)
 
+	var errs []error
 	for i := range backup.Status.Volumes {
 		vol := &backup.Status.Volumes[i]
 		if vol.Phase == status.VolumePhaseSkipped {
 			continue // never exposed, never had a Job
 		}
-		if vol.Phase == status.VolumePhaseSnapshotting || vol.Phase == status.VolumePhaseUploading {
-			if err := r.cleanupVolumeExposure(ctx, backup, vol.Pvc); err != nil {
-				log.Error(err, "best-effort exposure cleanup on delete failed; leaving to the orphan reaper",
-					"backup", backup.Name, "pvc", vol.Pvc)
-			}
+		if err := r.cleanupVolumeExposure(ctx, backup, vol.Pvc); err != nil {
+			errs = append(errs, fmt.Errorf("exposure cleanup of PVC %s on delete: %w", vol.Pvc, err))
+			continue
 		}
 		r.deleteMoverJobAndSecret(ctx, moverNamePrefix(backup.Namespace, backup.Name, vol.Pvc))
+	}
+	if len(errs) > 0 {
+		return ctrl.Result{}, errors.Join(errs...)
 	}
 
 	// The manifest half leaves residue of its own, and one piece of it is a live privilege: the
@@ -913,23 +948,20 @@ func (r *BackupReconciler) advanceUploading(ctx context.Context, backup *cbv1.Ba
 }
 
 // teardownVolume tears an exposure + mover Job + creds Secret down after its terminal result has
-// been persisted, best-effort (the orphan reaper backstops any residue). Called by Reconcile
-// AFTER the status write so a status-write conflict never deletes the Job before the result it
-// carries is recorded.
+// been persisted, best-effort — it is the RESPONSIVE half of teardown (objects go the moment the
+// volume finishes), while the terminal re-entry sweep (ensureTerminalTeardown) is the RELIABLE
+// half that verifies and re-runs anything this pass missed. Called by Reconcile AFTER the status
+// write so a status-write conflict never deletes the Job before the result it carries is
+// recorded.
 func (r *BackupReconciler) teardownVolume(reconcileCtx context.Context, backup *cbv1.Backup, pvcName string) {
-	// DETACHED from the reconcile context, and this is load-bearing rather than defensive.
-	//
-	// Teardown runs on the same pass that made the volume terminal, AFTER the status write — and
-	// the pass above it short-circuits on a terminal Backup, so this is the ONLY moment the
-	// exposure objects are ever collected. If the manager is shutting down, controller-runtime
-	// cancels the reconcile context: every delete below fails, the failure is best-effort and
-	// therefore swallowed, and the next operator sees a terminal Backup and returns without
-	// looking. The result is a VolumeSnapshotContent nobody ever asked to delete — no
-	// deletionTimestamp, parent VolumeSnapshot correctly gone — which is exactly what the M1
-	// leak-check found on real infrastructure while the operator was being restarted mid-run.
-	//
-	// The maintenance path already does this (see maintenanceCleanupTimeout); the backup path
-	// never did.
+	// DETACHED from the reconcile context: teardown runs on the same pass that made the volume
+	// terminal, AFTER the status write — and if the manager is shutting down, controller-runtime
+	// has already cancelled the reconcile context, which would fail every delete below on a pass
+	// that (for a mid-run volume, Backup not yet terminal) may not be revisited for this PVC.
+	// Detachment lets an orderly shutdown finish the deletes; the fanout proved it is NOT
+	// sufficient alone (a killed process takes its detached contexts with it), which is why the
+	// terminal re-entry sweep exists. The maintenance path does the same (see
+	// maintenanceCleanupTimeout).
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(reconcileCtx), backupTeardownTimeout)
 	defer cancel()
 
@@ -938,6 +970,104 @@ func (r *BackupReconciler) teardownVolume(reconcileCtx context.Context, backup *
 			"backup", backup.Name, "pvc", pvcName)
 	}
 	r.deleteMoverJobAndSecret(ctx, moverNamePrefix(backup.Namespace, backup.Name, pvcName))
+}
+
+// ensureTerminalTeardown is the terminal short-circuit's re-entry sweep: before a terminal Backup
+// goes quiet forever, verify its teardown COMPLETED, and re-run it if not. The per-pass teardown
+// above (teardownVolume, called the moment each volume goes terminal) is best-effort by design —
+// its failures are swallowed and, worse, no in-process effort survives the process: a kill at any
+// instant between the durable terminal status write and the last delete used to strand the
+// exposure objects permanently, because this short-circuit barred every later pass and the
+// cluster-scoped, Retain-parked origin VolumeSnapshotContent has no owner to garbage-collect it.
+// That is the leak the audit root-caused (the fanout's residual VSC), and re-entry — not a wider
+// in-flight effort — is the only shape that closes it under SIGKILL at ANY instant.
+//
+// The sweep re-runs cleanupVolumeExposure for every volume that may have exposed (everything but
+// Skipped; Pending included, because a crash between Expose and the first status write leaves a
+// live origin VS on a still-Pending volume) plus the mover Job/Secret and manifest residue, all
+// idempotent and derive-only (nothing here can create). Only when every exposure teardown
+// SUCCEEDED is AnnotationExposuresCleaned stamped; from then on the short-circuit returns without
+// touching anything, preserving the terminal record exactly as before. On any failure the marker
+// is withheld and the error requeues this pass with backoff — and since controller-runtime
+// re-reconciles every object on startup, a sweep the dying process could not finish is re-run by
+// the next process within seconds of election.
+//
+// Runs on the live reconcile context deliberately: unlike teardownVolume there is nothing to
+// detach FOR — if shutdown cancels the sweep mid-way, the marker stays absent and re-entry
+// finishes the job. Cost: one extra reconcile pass per Backup lifetime (the terminal status write
+// itself triggers it via the watch), a handful of idempotent deletes, then the marker seals it.
+func (r *BackupReconciler) ensureTerminalTeardown(ctx context.Context, backup *cbv1.Backup) (ctrl.Result, error) {
+	if backup.Annotations[apiconst.AnnotationExposuresCleaned] == apiconst.AnnotationExposuresCleanedValue {
+		return ctrl.Result{}, nil
+	}
+
+	var errs []error
+	for i := range backup.Status.Volumes {
+		vol := &backup.Status.Volumes[i]
+		if vol.Phase == status.VolumePhaseSkipped {
+			continue // never exposed, never had a Job (finalize applies the same rule)
+		}
+		if err := r.cleanupVolumeExposure(ctx, backup, vol.Pvc); err != nil {
+			errs = append(errs, fmt.Errorf("sweep exposure of PVC %s: %w", vol.Pvc, err))
+			continue
+		}
+		r.deleteMoverJobAndSecret(ctx, moverNamePrefix(backup.Namespace, backup.Name, vol.Pvc))
+	}
+	// The manifest half's residue includes a live privilege (the transient RoleBinding), so the
+	// sweep covers it unconditionally, exactly as finalize does. Best-effort: its objects are all
+	// namespaced and label-stamped, squarely inside the orphan reaper's native charter.
+	r.teardownManifests(ctx, backup, manifestsJobPrefix(backup.Namespace, backup.Name))
+
+	if len(errs) > 0 {
+		// Marker withheld: the error requeues this sweep with backoff until the deletes succeed.
+		return ctrl.Result{}, errors.Join(errs...)
+	}
+
+	base := backup.DeepCopy()
+	if backup.Annotations == nil {
+		backup.Annotations = map[string]string{}
+	}
+	backup.Annotations[apiconst.AnnotationExposuresCleaned] = apiconst.AnnotationExposuresCleanedValue
+	if err := r.Patch(ctx, backup, client.MergeFrom(base)); err != nil {
+		return ctrl.Result{}, fmt.Errorf("stamp %s on Backup %s/%s: %w",
+			apiconst.AnnotationExposuresCleaned, backup.Namespace, backup.Name, err)
+	}
+	return ctrl.Result{}, nil
+}
+
+// terminalPhaseCommitted disambiguates a failed writeStatus whose intended phase was terminal:
+// did the update error client-side yet commit server-side? That seam is real — SIGTERM cancels
+// the reconcile context mid-round-trip, and the comment at the writeStatus call site used to
+// assume "error ⇒ not persisted", which sealed the teardown forever once the committed terminal
+// phase hit the short-circuit on the next pass (the audit's confirmed "ambiguous status write"
+// finding, the one place the detached-context fix could not reach).
+//
+// A clean Conflict is a definitive rejection — no read needed. Anything else warrants one
+// uncached GET (the cache may still serve the pre-write object) on a context detached from the
+// possibly-already-cancelled reconcile: if the server shows exactly the phase we tried to write,
+// the write committed and the caller proceeds to teardown in this same pass. Any doubt — reader
+// unavailable, GET failed, phase differs — reports false, and the caller returns the original
+// error; the terminal re-entry sweep still heals that path, just later.
+func (r *BackupReconciler) terminalPhaseCommitted(reconcileCtx context.Context, backup *cbv1.Backup, writeErr error) bool {
+	if r.APIReader == nil || !isTerminalBackupPhase(backup.Status.Phase) {
+		return false
+	}
+	if apierrors.IsConflict(writeErr) {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(reconcileCtx), backupTeardownTimeout)
+	defer cancel()
+	var fresh cbv1.Backup
+	if err := r.APIReader.Get(ctx, client.ObjectKeyFromObject(backup), &fresh); err != nil {
+		return false
+	}
+	if fresh.Status.Phase != backup.Status.Phase {
+		return false
+	}
+	logf.FromContext(reconcileCtx).Info(
+		"status write errored client-side but committed server-side; proceeding to teardown",
+		"backup", backup.Namespace+"/"+backup.Name, "phase", backup.Status.Phase, "writeError", writeErr.Error())
+	return true
 }
 
 // exposeRequest builds the ExposeRequest for one source PVC, deterministically from the
@@ -961,8 +1091,10 @@ func (r *BackupReconciler) exposeRequest(backup *cbv1.Backup, pvc *corev1.Persis
 // reconstructExposure re-derives an exposer and its Exposure for a PVC without persisting either:
 // it re-reads the PVC, re-resolves the exposer (Registry.For), and calls the idempotent Expose to
 // obtain the deterministic Exposure (Expose tolerates AlreadyExists, so this converges on an
-// existing exposure instead of duplicating it). Used by both the Snapshotting Ready() poll and
-// the Cleanup teardown so they always operate on identically-named objects.
+// existing exposure instead of duplicating it). Used ONLY by the ADVANCE path (the Snapshotting
+// Ready() poll) — teardown goes through cleanupVolumeExposure's derive-only route instead,
+// because a cleanup that can call Expose can re-CREATE the origin VolumeSnapshot mid-teardown
+// and then leak it (the audit's "cleanup path can create" finding).
 func (r *BackupReconciler) reconstructExposure(ctx context.Context, backup *cbv1.Backup, pvcName string) (exposer.SnapshotExposer, *exposer.Exposure, error) {
 	var pvc corev1.PersistentVolumeClaim
 	if err := r.Get(ctx, client.ObjectKey{Namespace: backup.Namespace, Name: pvcName}, &pvc); err != nil {
@@ -979,19 +1111,21 @@ func (r *BackupReconciler) reconstructExposure(ctx context.Context, backup *cbv1
 	return ex, exposure, nil
 }
 
-// cleanupVolumeExposure reconstructs the exposure and tears it down (exposer.Cleanup, which is
-// idempotent and NotFound-tolerant). A source PVC that no longer exists, or one whose storage is
-// unsupported (never exposed), is treated as "nothing to clean" — the orphan reaper backstops any
-// residual objects those cases could leave.
+// cleanupVolumeExposure tears a volume's exposure down by DERIVED identity (namespace + name
+// prefix + labels — every exposure name is deterministic from those), through the registry's
+// TeardownExposure. Two properties are load-bearing, both audit findings:
+//
+//   - No PVC read: the old shape treated a missing source PVC as "nothing to clean", which is
+//     exactly wrong late in a run — the PVC (or its namespace) being gone says nothing about the
+//     cluster-scoped, Retain-parked VolumeSnapshotContent still holding a storage snapshot.
+//   - No create: the old shape reconstructed via Expose, which can re-create the origin
+//     VolumeSnapshot during teardown; a fresh unbound VS then defeats the Retain→Delete restore.
+//
+// Idempotent and NotFound-tolerant end to end, so the terminal re-entry sweep and finalize can
+// re-run it freely.
 func (r *BackupReconciler) cleanupVolumeExposure(ctx context.Context, backup *cbv1.Backup, pvcName string) error {
-	ex, exposure, err := r.reconstructExposure(ctx, backup, pvcName)
-	if err != nil {
-		if apierrors.IsNotFound(err) || errors.Is(err, exposer.ErrUnsupported) {
-			return nil
-		}
-		return err
-	}
-	return ex.Cleanup(ctx, exposure)
+	return r.Exposers.TeardownExposure(ctx, backup.Namespace,
+		moverNamePrefix(backup.Namespace, backup.Name, pvcName), exposureLabels(backup, pvcName))
 }
 
 // ensureMoverCredsSecret creates the per-Job Secret the mover consumes: the DEK as the restic

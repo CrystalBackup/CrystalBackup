@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -64,6 +65,17 @@ const stubKind = "stub"
 type stubExposerRegistry struct {
 	client            client.Client
 	operatorNamespace string
+
+	// mu guards the teardown instrumentation below — the manager reconciles on its own
+	// goroutine while specs read these.
+	mu sync.Mutex
+	// teardowns records every TeardownExposure call as "<originNamespace>/<namePrefix>", so a
+	// spec can assert the terminal re-entry sweep really swept a given volume.
+	teardowns []string
+	// failTeardown, when non-nil, is consulted on every TeardownExposure call; a non-nil error
+	// fails that call, letting a spec pin that the sweep withholds its marker (and finalize its
+	// finalizer) until teardown succeeds.
+	failTeardown func(originNamespace, namePrefix string) error
 }
 
 var _ ExposerRegistry = (*stubExposerRegistry)(nil)
@@ -74,6 +86,37 @@ func (s *stubExposerRegistry) For(_ context.Context, pvc *corev1.PersistentVolum
 			stubUnsupportedStorageClass, exposer.ErrUnsupported)
 	}
 	return &stubExposer{client: s.client, operatorNamespace: s.operatorNamespace}, nil
+}
+
+// TeardownExposure mirrors the real registry's derive-only teardown on the one object the stub
+// exposer actually creates — the temp clone PVC (with the envtest pvc-protection finalizer
+// strip; see stubExposer.Cleanup) — recording the call and honouring the spec-armed failure.
+func (s *stubExposerRegistry) TeardownExposure(ctx context.Context, originNamespace, namePrefix string, _ map[string]string) error {
+	s.mu.Lock()
+	s.teardowns = append(s.teardowns, originNamespace+"/"+namePrefix)
+	fail := s.failTeardown
+	s.mu.Unlock()
+	if fail != nil {
+		if err := fail(originNamespace, namePrefix); err != nil {
+			return err
+		}
+	}
+	return (&stubExposer{client: s.client, operatorNamespace: s.operatorNamespace}).Cleanup(ctx,
+		&exposer.Exposure{OperatorNamespace: s.operatorNamespace, TempPVCName: namePrefix + "-clone"})
+}
+
+// teardownCalls snapshots the recorded TeardownExposure calls.
+func (s *stubExposerRegistry) teardownCalls() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.teardowns...)
+}
+
+// setFailTeardown arms (or, with nil, disarms) the per-call failure hook.
+func (s *stubExposerRegistry) setFailTeardown(f func(originNamespace, namePrefix string) error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.failTeardown = f
 }
 
 type stubExposer struct {
