@@ -362,11 +362,15 @@ func m1AssertNoResidualSnapshotObjects(namespaces ...string) {
 					"residual temporary clone PVC %s/%s (labels %v)", ns, p.Name, p.Labels)
 			}
 		}
-		// 5 min (was 2): finalizer teardown of VolumeSnapshots/VSContents/clone PVCs on Ceph is
-		// slow under full-suite load, and M3's default manifest capture adds a manifest-mover Job to
-		// every backup's teardown. The objects DO drain (the m3-only run clears them well under 2m);
-		// this only needs headroom for the loaded case, so it stays a real leak-check, not a sleep.
-	}, 5*time.Minute, 5*time.Second).Should(Succeed())
+		// 10 min (was 5, was 2): finalizer teardown of VolumeSnapshots/VSContents/clone PVCs on
+		// Ceph is slow under full-suite load, and M3's default manifest capture adds a
+		// manifest-mover Job to every backup's teardown. The objects DO drain — a round-1
+		// validation lane measured the external snapshot-controller taking just over 5 minutes to
+		// collect a Delete-policy content whose teardown was already complete (the SAME helper
+		// passed at 5m12.8s in the very next spec, and the lane ended at zero residuals) — so 5
+		// was the knife's edge of a latency we do not own. This stays a real leak-check, not a
+		// sleep: the property asserted is unchanged, only the external controller's patience.
+	}, 10*time.Minute, 5*time.Second).Should(Succeed())
 }
 
 // m1OperatorRestartSummary reports the operator pods' identity, start time and container restart

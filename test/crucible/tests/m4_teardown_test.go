@@ -129,8 +129,11 @@ var _ = Describe("M4 — crash-only teardown (terminal re-entry sweep)", Ordered
 		}, 3*time.Minute, 5*time.Second).Should(Succeed())
 
 		By("And the terminal re-entry sweep verifies the teardown and stamps exposures-cleaned")
-		// The marker is the fix's own receipt: it is only stamped AFTER every exposure delete
-		// succeeded, by whichever process got to finish — the killed one or its successor.
+		// The marker is the fix's own receipt: it is only stamped once NOTHING remains — the
+		// sweep re-verifies (and re-drives the direct reclaim) while the external
+		// snapshot-controller's cascade drains, so under full-suite load the stamp can lag the
+		// terminal phase by minutes. 10 min mirrors the leak-check helper's budget, and for the
+		// same measured reason.
 		Eventually(func(g Gomega) {
 			var bk cbv1.Backup
 			g.Expect(k8s.Get(ctx, client.ObjectKey{Namespace: targetNS, Name: run.Name}, &bk)).To(Succeed())
@@ -139,7 +142,7 @@ var _ = Describe("M4 — crash-only teardown (terminal re-entry sweep)", Ordered
 				"the re-entry sweep never verified the teardown of Backup %s/%s", targetNS, run.Name)
 			g.Expect(bk.Status.Phase).To(BeElementOf("Completed", "PartiallyCompleted", "PartiallyFailed", "Failed"),
 				"the sweep must never disturb the terminal record")
-		}, 5*time.Minute, 5*time.Second).Should(Succeed())
+		}, 10*time.Minute, 5*time.Second).Should(Succeed())
 
 		By("And the leak-check invariant holds: zero residual snapshot objects")
 		m1AssertNoResidualSnapshotObjects(targetNS)

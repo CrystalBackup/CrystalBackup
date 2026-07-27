@@ -29,6 +29,7 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -64,6 +65,12 @@ const backupPollInterval = 5 * time.Second
 // deletes, and a manager that is shutting down should not be held open by them — but it MUST have
 // its own budget rather than inheriting a reconcile context that is already cancelled.
 const backupTeardownTimeout = 30 * time.Second
+
+// exposureDrainRecheckInterval is how soon the terminal teardown sweep re-verifies when the
+// deletes succeeded but labelled residue is still DRAINING (the external snapshot-controller's
+// cascade, a Terminating clone PVC). Short and error-free: each re-pass also re-drives the
+// direct reclaim, so the sweep accelerates the drain instead of merely observing it.
+const exposureDrainRecheckInterval = 15 * time.Second
 
 const (
 	// moverJobTTLSeconds is the data-mover Job's ttlSecondsAfterFinished: a finished mover Job
@@ -1023,6 +1030,21 @@ func (r *BackupReconciler) ensureTerminalTeardown(ctx context.Context, backup *c
 		return ctrl.Result{}, errors.Join(errs...)
 	}
 
+	// The marker asserts "nothing REMAINS", not "deletes were issued" — the difference is the
+	// external snapshot-controller's queue. A round-1 validation lane caught it: teardown had
+	// done its whole job (origin VS deleted, content policy Delete), yet the VolumeSnapshotContent
+	// lingered ~10 minutes under full-suite load waiting on that controller, with the marker
+	// already stamped and the sweep gone quiet. Re-verifying instead ALSO accelerates the drain:
+	// each pass re-runs reclaimOrphanOriginVSC, which deletes the labelled content directly the
+	// moment its VolumeSnapshot is finally gone, rather than waiting on the external resync.
+	// The requeue carries no error — draining is expected, not a fault; the reaper (MinAge)
+	// remains the backstop if the external controller is broken outright.
+	if residue := r.exposureResidueRemains(ctx, backup); residue != "" {
+		logf.FromContext(ctx).Info("terminal teardown sweep: exposure residue still draining; re-verifying",
+			"backup", backup.Namespace+"/"+backup.Name, "residue", residue)
+		return ctrl.Result{RequeueAfter: exposureDrainRecheckInterval}, nil
+	}
+
 	base := backup.DeepCopy()
 	if backup.Annotations == nil {
 		backup.Annotations = map[string]string{}
@@ -1033,6 +1055,53 @@ func (r *BackupReconciler) ensureTerminalTeardown(ctx context.Context, backup *c
 			apiconst.AnnotationExposuresCleaned, backup.Namespace, backup.Name, err)
 	}
 	return ctrl.Result{}, nil
+}
+
+// exposureResidueRemains reports the first piece of STORAGE residue still present for this
+// Backup's exposures — a labelled VolumeSnapshotContent (cluster-scoped), a labelled
+// VolumeSnapshot in the tenant or operator namespace, or a temp clone PVC — as a short
+// human-readable description, or "" when everything is genuinely gone. This is the sweep's
+// verification read: it deliberately checks what the crucible leak-check checks, scoped by the
+// exposure labels (managed-by + run + namespace). A cluster without the snapshot CRDs vacuously
+// has no VS/VSC residue (NoMatch tolerated); an errored LIST reports residue rather than
+// clean — never let an unreadable cluster read as a clean one.
+func (r *BackupReconciler) exposureResidueRemains(ctx context.Context, backup *cbv1.Backup) string {
+	sel := client.MatchingLabels{
+		apiconst.LabelManagedBy:     apiconst.ManagedByValue,
+		apiconst.LabelClusterBackup: backup.Labels[apiconst.LabelClusterBackup],
+		apiconst.LabelNamespace:     backup.Namespace,
+	}
+
+	vscs := exposer.VolumeSnapshotContentList()
+	switch err := r.List(ctx, vscs, sel); {
+	case err == nil:
+		if len(vscs.Items) > 0 {
+			return "VolumeSnapshotContent " + vscs.Items[0].GetName()
+		}
+	case !apimeta.IsNoMatchError(err):
+		return "VolumeSnapshotContent list unreadable: " + err.Error()
+	}
+
+	for _, ns := range []string{backup.Namespace, r.OperatorNamespace} {
+		vss := exposer.VolumeSnapshotList()
+		switch err := r.List(ctx, vss, sel, client.InNamespace(ns)); {
+		case err == nil:
+			if len(vss.Items) > 0 {
+				return "VolumeSnapshot " + ns + "/" + vss.Items[0].GetName()
+			}
+		case !apimeta.IsNoMatchError(err):
+			return "VolumeSnapshot list unreadable: " + err.Error()
+		}
+	}
+
+	var pvcs corev1.PersistentVolumeClaimList
+	if err := r.List(ctx, &pvcs, sel, client.InNamespace(r.OperatorNamespace)); err != nil {
+		return "temp clone PVC list unreadable: " + err.Error()
+	}
+	if len(pvcs.Items) > 0 {
+		return "temp clone PVC " + r.OperatorNamespace + "/" + pvcs.Items[0].Name
+	}
+	return ""
 }
 
 // terminalPhaseCommitted disambiguates a failed writeStatus whose intended phase was terminal:
