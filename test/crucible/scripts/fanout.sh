@@ -203,3 +203,24 @@ echo
 echo "Per-lane reports: artifacts/lanes/<lane>/crucible-report.md"
 echo "Lanes are destroyed as each suite finishes. Verify nothing lingers:"
 for i in $(seq 1 "${N}"); do echo "  CRUCIBLE_LANE=l${i} mise run status"; done
+
+# ─── Machine-readable verdict ─────────────────────────────────────────────────
+# Exit 0 ONLY when every lane produced a parsed report with zero ❌ AND measured zero residuals.
+# Anything else — a missing report, an unparsed one, a failed spec, a residual, an unreadable
+# residual ('?') — exits 1, so an automation chaining rounds stops on the first dirty one
+# instead of spending the next round's money on a gate that is already red.
+verdict=0
+for lane in "${lanes[@]}"; do
+  if [[ ! -s "${tmp}/${lane}" ]]; then
+    echo "verdict: ${lane} has no parsed specs — NOT clean" >&2; verdict=1; continue
+  fi
+  if grep -q '^❌' "${tmp}/${lane}"; then
+    echo "verdict: ${lane} has failed specs — NOT clean" >&2; verdict=1
+  fi
+  res="$(cat "${log_dir}/${lane}-residual.txt" 2>/dev/null || echo '?')"
+  if [[ "${res}" != "0" ]]; then
+    echo "verdict: ${lane} residual='${res}' — NOT clean" >&2; verdict=1
+  fi
+done
+if (( verdict == 0 )); then echo "verdict: CLEAN — every lane green, zero residuals everywhere"; fi
+exit "${verdict}"
