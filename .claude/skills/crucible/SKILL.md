@@ -8,6 +8,11 @@ description: Drive the real-conditions e2e suite on Hetzner Cloud (test/crucible
 Everything is driven from `test/crucible/` via **mise tasks** (`mise run <task>`).
 Full context: `test/crucible/README.md`.
 
+> This skill is the **suite mechanics**. When the goal is to drive a milestone or
+> patch all the way to a **release** (build `:dev` → deploy → iterate to green →
+> report → teardown → tag → site), use the **`deliver`** skill — it orchestrates
+> this one.
+
 ## Ground rules
 
 1. **Money**: `mise run up` creates ~€0.52/hour of Hetzner resources (≈€12.5/day;

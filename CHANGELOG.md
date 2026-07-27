@@ -72,6 +72,34 @@ read `pruneSchedule` or `checkSchedule`) and the hook types (nothing ever exec'd
 
 ### Fixed
 
+- **A backup's exposure teardown is now crash-only: re-entrant until verified, never one-shot.**
+  A three-lane crucible fanout kept reproducing (~1 run in 3) a single residual
+  `VolumeSnapshotContent` — `deletionPolicy: Retain`, no `deletionTimestamp`, no owner — and the
+  audit that followed proved the shape was structural, and **predates 0.4.0**: the reconcile pass
+  that persisted a Backup's terminal status was also the *only* pass that ever deleted its
+  VolumeSnapshot/VolumeSnapshotContent pair; the terminal short-circuit barred every later pass,
+  ownerReference GC cannot reach a cluster-scoped Retain content, and the orphan reaper's charter
+  excluded exactly that object class while four comments promised it as the backstop. One process
+  death (or one status `Update` that *commits server-side while erroring client-side* — SIGTERM
+  cancelling the call in flight) inside that window leaked the content, and with it a storage-side
+  snapshot, forever. Four changes close it, each of which stands alone:
+  - the terminal short-circuit now **re-runs an idempotent teardown sweep until it has verified
+    every delete**, then stamps `crystalbackup.io/exposures-cleaned` — a kill at any instant just
+    means the next pass (or the next process: controller-runtime re-reconciles everything on
+    startup) finishes the job;
+  - teardown is **derive-only**: it reconstructs every object name from the Backup+PVC identity
+    and can no longer call `Expose` (which could re-create the origin VolumeSnapshot
+    mid-teardown) nor conclude "nothing to clean" from a deleted source PVC;
+  - an ambiguous terminal status write is **disambiguated with an uncached re-read** instead of
+    being assumed unpersisted;
+  - the orphan reaper now actually **sweeps labelled VolumeSnapshots and
+    VolumeSnapshotContents**, restore-then-deleting a dynamic origin content (the storage
+    snapshot is reclaimed exactly once) and object-only-deleting the static re-bind alias — the
+    backstop those four comments promised.
+  Deleting a Backup now also **holds its finalizer until the exposure teardown succeeds**, and
+  covers every volume phase (a crash between `Expose` and the first status write leaves residue
+  on a still-`Pending` volume). On upgrade, the operator sweeps every historical terminal Backup
+  once — idempotent, a handful of tolerated NotFounds per volume — and stamps the marker.
 - **`pods/exec` was granted by the Helm chart but absent from `config/rbac/role.yaml`.** No
   kubebuilder marker existed, so `make manifests` had nothing to notice. A kustomize install could
   never have run a hook.
