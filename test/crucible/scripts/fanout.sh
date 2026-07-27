@@ -49,8 +49,12 @@ if [[ -n "${MOVER_IMAGE_DIGEST:-}" ]]; then
   echo "fanout: mover    ${MOVER_IMAGE_DIGEST}"
 fi
 
+# LANE_PREFIX lets a rerun sidestep a poisoned lane name: a Hetzner-side volume lock from a
+# wedged backend action blocks BOTH the destroy and any re-create under the same name, and the
+# lock's lifetime is the provider's, not ours. Fresh names cost nothing; waiting costs hours.
+LANE_PREFIX="${LANE_PREFIX:-l}"
 lanes=()
-for i in $(seq 1 "${N}"); do lanes+=("l${i}"); done
+for i in $(seq 1 "${N}"); do lanes+=("${LANE_PREFIX}${i}"); done
 
 log_dir="${CRUCIBLE_DIR}/artifacts/fanout"
 mkdir -p "${log_dir}"
@@ -206,7 +210,7 @@ done
 echo
 echo "Per-lane reports: artifacts/lanes/<lane>/crucible-report.md"
 echo "Lanes are destroyed as each suite finishes. Verify nothing lingers:"
-for i in $(seq 1 "${N}"); do echo "  CRUCIBLE_LANE=l${i} mise run status"; done
+for i in $(seq 1 "${N}"); do echo "  CRUCIBLE_LANE=${LANE_PREFIX}${i} mise run status"; done
 
 # ─── Machine-readable verdict ─────────────────────────────────────────────────
 # Exit 0 ONLY when every lane produced a parsed report with zero ❌ AND measured zero residuals.

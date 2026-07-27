@@ -18,9 +18,10 @@ fi
 # Serial, not parallel. Teardown is the step that must not be clever: N concurrent destroys
 # against one Hetzner account hit rate limits, and a rate-limited destroy leaves servers behind
 # while reporting success.
+LANE_PREFIX="${LANE_PREFIX:-l}"
 failed=()
 for i in $(seq 1 "${N}"); do
-  lane="l${i}"
+  lane="${LANE_PREFIX}${i}"
   echo "==> destroying lane ${lane}"
   if ! CRUCIBLE_LANE="${lane}" CONFIRM=yes mise run down; then
     failed+=("${lane}")
@@ -37,4 +38,4 @@ fi
 
 echo
 echo "All ${N} lanes destroyed. Verify nothing lingers:"
-for i in $(seq 1 "${N}"); do echo "  CRUCIBLE_LANE=l${i} mise run status"; done
+for i in $(seq 1 "${N}"); do echo "  CRUCIBLE_LANE=${LANE_PREFIX}${i} mise run status"; done
