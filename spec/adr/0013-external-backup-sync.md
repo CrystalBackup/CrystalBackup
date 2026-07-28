@@ -126,6 +126,41 @@ kept current at the same cadence as restic; and restic spawns `rclone serve rest
 process, so the shim must propagate its death honestly — a mover that is dead while reported alive
 is a failure mode this project has already paid for (M3.2).
 
+### The isolation cost, paid on day one (2026-07-28)
+
+The very first CI run of the sync image failed its trivy 0-CVE gate: rclone `1.74.3-r0` carries
+**CVE-2026-46602** and **CVE-2026-46604**, two HIGH findings in the TIFF decoder of
+`golang.org/x/image/tiff`. Wolfi's advisory names `1.74.3-r5` as the fix; at that moment the index
+offered nothing past `r0` on either architecture, so there was no pin to apply.
+
+Recorded because it settles the "third image or bigger mover" question with evidence rather than
+argument. In the same run:
+
+| image | trivy gate |
+|---|---|
+| operator | pass |
+| **mover** | **pass** |
+| sync | **fail** (2 HIGH, rclone) |
+
+Had rclone been added to the mover image — the simpler option — the red gate would have sat on
+the **data path**, blocking every backup and restore release, for a dependency neither of them
+uses. Instead it sits on an image nothing pulls until an ExternalSync exists.
+
+**Decision: wait for Wolfi.** Re-running CI re-resolves the apko lock, so the gate clears itself
+once `r5` publishes; the release train re-arms both gates anyway. Two alternatives were considered
+and rejected *for now*, not forever:
+
+- **VEX the two CVEs** as `vulnerable_code_not_in_execute_path`. Defensible on the merits — the
+  sync path never decodes an image, rclone is only a pipe to S3 — but it reverses the "no VEX
+  suppression path for rclone" decision recorded above, and reversing it *because a gate is red*
+  is the wrong reason to reverse anything.
+- **Build rclone from source with an `x/image` override**, mirroring what
+  `build/melange/restic.yaml` already does for `x/text` and grpc. The established pattern, and the
+  fallback if Wolfi is slow — at the price of doubling the source-pin maintenance surface and
+  lengthening an already slow build.
+
+Revisit if the wait ever blocks a release; the ordering above is the arbitration to apply.
+
 ### What did not change
 
 The snapshot-level, re-encrypting model, the two CRDs, `Mirror`/`AppendOnly`, tag selectivity, and
