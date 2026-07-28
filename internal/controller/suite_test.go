@@ -277,6 +277,15 @@ var _ = BeforeSuite(func() {
 		mgr.GetEventRecorder("clusterbackupschedule"),
 	).SetupWithManager(mgr)).To(Succeed())
 
+	// The namespace plane's cron (M5), on the SAME fake clock so a spec advancing time drives
+	// both planes' activations from one place.
+	Expect(NewBackupScheduleReconciler(
+		mgr.GetClient(),
+		mgr.GetScheme(),
+		scheduleClock,
+		mgr.GetEventRecorder("backupschedule"),
+	).SetupWithManager(mgr)).To(Succeed())
+
 	// The discovery reconciler, reading the repository inventory from a stub lister the specs feed
 	// canned snapshots to (production runs a restic Job — internal/controller's jobSnapshotLister,
 	// wired with the mover image in M1 task #24 — which envtest cannot exercise).

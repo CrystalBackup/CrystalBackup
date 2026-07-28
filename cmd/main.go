@@ -412,6 +412,17 @@ func main() {
 		setupLog.Error(err, "Unable to create controller", "controller", "ClusterBackupSchedule")
 		os.Exit(1)
 	}
+	// The namespace plane's cron (M5). Same mechanics, but it stamps Backups — restore points —
+	// directly into the user's namespace, so it neither owns nor garbage-collects them.
+	if err := controller.NewBackupScheduleReconciler(
+		mgr.GetClient(),
+		mgr.GetScheme(),
+		clock.RealClock{},
+		mgr.GetEventRecorder("backupschedule"),
+	).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Unable to create controller", "controller", "BackupSchedule")
+		os.Exit(1)
+	}
 
 	// The discovery reconciler projects a shared repository's snapshots back into read-only Backup
 	// CRs so a DR repository is restorable with no pre-existing objects. Its production lister runs a

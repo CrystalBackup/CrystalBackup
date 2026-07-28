@@ -53,6 +53,11 @@ const (
 	scheduleMinRequeue = 5 * time.Second
 	scheduleMaxRequeue = 60 * time.Second
 
+	// concurrencyPolicyForbid is the default (and, in M5, the only implemented) overlap policy on
+	// both planes. Defaulting an UNSET value to Forbid rather than Allow is the safe direction:
+	// overlapping runs on one repository contend for the same restic locks.
+	concurrencyPolicyForbid = cbv1.ConcurrencyPolicy("Forbid")
+
 	// defaultRunsHistoryLimit is the fallback kept-run count when a history limit is unset (the CRD
 	// defaults both to 10; this guards objects that predate the default so a 0 never means "delete
 	// all history").
@@ -380,7 +385,7 @@ func activeRun(runs []cbv1.ClusterBackup) *cbv1.ClusterBackup {
 // concurrencyPolicyOf returns the effective policy (defaulting to Forbid, the CRD default).
 func concurrencyPolicyOf(sched *cbv1.ClusterBackupSchedule) cbv1.ConcurrencyPolicy {
 	if sched.Spec.ConcurrencyPolicy == "" {
-		return cbv1.ConcurrencyPolicy("Forbid")
+		return concurrencyPolicyForbid
 	}
 	return sched.Spec.ConcurrencyPolicy
 }

@@ -89,6 +89,7 @@ rules:
   - crystalbackup.io
   resources:
   - backuplocations
+  - backupschedules
   - clusterbackuplocations
   - clusterbackupschedules
   - clusterrestores
@@ -116,6 +117,7 @@ rules:
   - backuplocations/status
   - backuprepositories/status
   - backups/status
+  - backupschedules/status
   - clusterbackuplocations/status
   - clusterbackups/status
   - clusterbackupschedules/status
