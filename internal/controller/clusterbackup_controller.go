@@ -264,6 +264,13 @@ func (r *ClusterBackupReconciler) ensureChildBackup(ctx context.Context, cb *cbv
 				Kind: kindClusterBackupLocation,
 				Name: cb.Spec.LocationRef.Name,
 			},
+			// Materialize the run configuration into the child (adr/0017 §5) instead of leaving
+			// it to be pulled back through the label at every reconcile. The child then executes
+			// what this run declared AT FAN-OUT TIME, and keeps executing it after the parent has
+			// been edited or garbage-collected — the link is a label on purpose, so nothing keeps
+			// the parent alive for its children. DeepCopy, not a shared pointer: cb is a cache
+			// object and the child is about to be serialized.
+			Run: cb.Spec.BackupRunSpec.DeepCopy(),
 		},
 	}
 	if err := r.Create(ctx, child); err != nil {

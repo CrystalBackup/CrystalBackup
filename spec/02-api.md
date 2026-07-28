@@ -43,14 +43,23 @@ namespace-plane `BackupSchedule` or a cluster-plane `ClusterBackup`. Therefore:
   a user `kubectl get backups` see only their own — never other tenants'.
 
 **The `CronJob` analogy stops at `ClusterBackup`.** The top hop is a real template stamp
-(`spec.template.spec` copied wholesale into the run); the hop below it is **not** — a child
-`Backup` receives only `scheduleRef` and `locationRef`, and its run configuration is resolved
-from the parent at reconcile time via the `crystalbackup.io/cluster-backup` label. That is
-deliberate: the same kind is also written by **discovery**, which projects `Backup`s out of
-restic snapshots by server-side apply, and a field manager that owns a field must be able to
-reproduce it from the repository alone. See
-[adr/0017](adr/0017-cascade-materialization-backup-carries-identity.md) for the decision, its
-accepted costs, and the M5 direction.
+(`spec.template.spec` copied wholesale into the run). The hop below it is a **partial** one: a
+child `Backup` receives `scheduleRef`, `locationRef` and `spec.run` — the shared `BackupRunSpec`
+(`pvcSelector`, `includeManifests`, `manifestOptions`, `hooks`, `maxConcurrentMovers`,
+`backoffLimit`), materialized once at creation — but never the fan-out fields (`namespaces`,
+`clusterResources`), which are the parent's business alone. Materializing is what lets a `Backup`
+outlive its parent: run records are history-limited and garbage-collected while their children
+live as long as their snapshots, and the link is a label precisely so GC never cascades. Reading
+the parent survives only as the compatibility path for `Backup`s created before `spec.run`
+existed.
+
+What `Backup.spec` must **not** grow is a field discovery cannot reproduce: the same kind is also
+written by **discovery**, which projects `Backup`s out of restic snapshots by server-side apply,
+and a field manager that owns a field must be able to reproduce it from the repository alone.
+Discovery therefore never names `spec.run` in its apply — projections leave it absent, and
+adopting a terminal execution `Backup` leaves whatever was materialized untouched. See
+[adr/0017](adr/0017-cascade-materialization-backup-carries-identity.md) for the decision and its
+accepted costs.
 
 ## Repository is the source of truth
 
@@ -82,9 +91,11 @@ and [01-architecture.md](01-architecture.md).
 
 - **`Backup` is the execution unit and the projection.** Created by a run *and* by
   discovery; deleted only when its snapshots are `forget`-ten (CR lifetime = data lifetime,
-  so `kubectl get backups -n X` lists exactly what is restorable in X). Its `spec` therefore
-  carries **identity, not intent** — run configuration is resolved from the parent at reconcile
-  time ([adr/0017](adr/0017-cascade-materialization-backup-carries-identity.md)).
+  so `kubectl get backups -n X` lists exactly what is restorable in X). Its `spec` carries
+  **identity** (`locationRef`, `scheduleRef`) plus the run configuration **materialized by its
+  creator** into `spec.run`; what it never carries is anything discovery would have to own and
+  could not reconstruct from the repository
+  ([adr/0017](adr/0017-cascade-materialization-backup-carries-identity.md)).
 - **Cluster DR repo is admin-owned.** Its key never leaves `crystal-backup-system`. Users
   reach DR data only through a `Restore` referencing a cluster-origin `Backup` in their own
   namespace; the operator mediates with a **server-side tag filter `namespace=<the CR's

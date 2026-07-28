@@ -174,8 +174,10 @@ var _ = Describe("M3 — manifest backup & restore round-trip", Label("m3"), Ord
 					ClusterBackupRunSpec: cbv1.ClusterBackupRunSpec{
 						LocationRef:      cbv1.LocalObjectReference{Name: m1LocationName},
 						Namespaces:       cbv1.NamespaceSelector{MatchNames: []string{nsName}},
-						PVCSelector:      cbv1.PVCSelector{Exclude: []string{"*"}},
 						ClusterResources: cbv1.ClusterResourceCaptureSpec{Enabled: &enabled},
+						BackupRunSpec: cbv1.BackupRunSpec{
+							PVCSelector: cbv1.PVCSelector{Exclude: []string{"*"}},
+						},
 					},
 				},
 			})).To(Succeed(), "create manifest-only ClusterBackup %s", runName)

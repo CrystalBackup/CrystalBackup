@@ -691,15 +691,25 @@ type FailureRecord struct {
 	Message string `json:"message,omitempty"`
 }
 
-// ClusterBackupRunSpec is the run configuration shared by a ClusterBackupSchedule
-// template and a (manual or fanned-out) ClusterBackup.
-type ClusterBackupRunSpec struct {
-	// locationRef is the ClusterBackupLocation to write to.
-	// +required
-	LocationRef LocalObjectReference `json:"locationRef"`
-	// namespaces selects the namespaces to back up (rule 8: one positive form + optional exclude).
-	// +optional
-	Namespaces NamespaceSelector `json:"namespaces,omitempty"`
+// BackupRunSpec is the run configuration of ONE namespace's backup: what to select, how to
+// move it, what to exec. It deliberately holds nothing that says WHICH namespaces or WHICH
+// repository — that is the caller's business and differs per plane.
+//
+// The split exists because two planes stamp the same execution unit (adr/0017 §5). The cluster
+// plane inlines it into ClusterBackupRunSpec alongside the fan-out fields (namespaces,
+// clusterResources, locationRef); the namespace plane's BackupSchedule declares the same fields
+// on its own tenant-facing surface. Both MATERIALIZE this struct into Backup.spec.run at
+// creation, so a Backup no longer has to pull its configuration from a parent that may already
+// be gone.
+//
+// Two invariants ride on this type, both from adr/0017:
+//   - Discovery must NEVER own spec.run. A projection's only input is the repository, and none
+//     of these fields was ever written to restic — an owner that cannot reproduce a field must
+//     not claim it under server-side apply.
+//   - It is TENANT-SUBMITTABLE on the namespace plane. Every field added here becomes something
+//     a namespace user can make the operator do on their behalf; hooks in particular are why
+//     admission has to check the creator's own exec rights (03-security-and-tenancy.md §5).
+type BackupRunSpec struct {
 	// pvcSelector selects PVCs per namespace (default all).
 	// +optional
 	PVCSelector PVCSelector `json:"pvcSelector,omitempty"`
@@ -710,18 +720,37 @@ type ClusterBackupRunSpec struct {
 	// manifestOptions tunes what the manifest dump captures (03-security-and-tenancy.md §10).
 	// +optional
 	ManifestOptions ManifestOptions `json:"manifestOptions,omitempty"`
-	// clusterResources captures cluster-scoped objects for full DR (adr/0011).
-	// +optional
-	ClusterResources ClusterResourceCaptureSpec `json:"clusterResources,omitempty"`
 	// hooks are exec hooks around snapshotting (R16).
 	// +optional
 	Hooks HooksSpec `json:"hooks,omitempty"`
-	// maxConcurrentMovers caps parallel mover Jobs.
+	// maxConcurrentMovers caps parallel mover Jobs. The cap is CLUSTER-WIDE (it is checked
+	// against every mover Job in the operator namespace, not just this run's), which is why it
+	// stays off the tenant-facing BackupSchedule surface: a namespace user setting it would be
+	// setting a platform-wide limit.
 	// +optional
 	MaxConcurrentMovers int32 `json:"maxConcurrentMovers,omitempty"`
 	// backoffLimit for mover Jobs.
 	// +optional
 	BackoffLimit int32 `json:"backoffLimit,omitempty"`
+}
+
+// ClusterBackupRunSpec is the run configuration shared by a ClusterBackupSchedule
+// template and a (manual or fanned-out) ClusterBackup: the cluster-plane fan-out fields plus
+// the per-namespace BackupRunSpec every child inherits.
+type ClusterBackupRunSpec struct {
+	// locationRef is the ClusterBackupLocation to write to.
+	// +required
+	LocationRef LocalObjectReference `json:"locationRef"`
+	// namespaces selects the namespaces to back up (rule 8: one positive form + optional exclude).
+	// +optional
+	Namespaces NamespaceSelector `json:"namespaces,omitempty"`
+	// clusterResources captures cluster-scoped objects for full DR (adr/0011).
+	// +optional
+	ClusterResources ClusterResourceCaptureSpec `json:"clusterResources,omitempty"`
+
+	// BackupRunSpec is the per-namespace run configuration, inlined so the serialized shape of
+	// a ClusterBackup/ClusterBackupSchedule is unchanged by the adr/0017 §5 split.
+	BackupRunSpec `json:",inline"`
 }
 
 // ClusterBackupTemplate wraps a ClusterBackupRunSpec as a schedule's jobTemplate analogue.

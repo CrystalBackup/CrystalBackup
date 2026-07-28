@@ -290,18 +290,17 @@ func (r *BackupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		return r.ensureTerminalTeardown(ctx, &backup)
 	}
 
-	// (6) Resolve the effective run spec from the parent ClusterBackup named by the link label.
-	// In M1 an execution Backup ALWAYS has a cluster parent (the namespace plane is M2); a
-	// truly parentless manual Backup defaulting to all-PVCs is deferred to M2. Absent the
-	// parent, degrade and requeue rather than invent a run.
+	// (6) Resolve the effective run spec: the materialized spec.run, or — for objects created
+	// before materialization existed — a pull from the parent ClusterBackup named by the link
+	// label. With neither, degrade and requeue rather than invent a run.
 	run, ok, err := r.resolveRun(ctx, &backup)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 	if !ok {
-		return r.gate(ctx, &backup, "NoParent",
-			"no parent ClusterBackup resolved from label "+apiconst.LabelClusterBackup+
-				" (an execution Backup requires a cluster parent in M1)")
+		return r.gate(ctx, &backup, "NoRunSpec",
+			"no run configuration: spec.run is absent and no parent ClusterBackup resolved from label "+
+				apiconst.LabelClusterBackup)
 	}
 
 	// (7) Resolve the location and its repository; gate on the repository being initialized.
@@ -436,7 +435,7 @@ func (r *BackupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 // includeManifests resolves the run's includeManifests, which defaults to TRUE: a namespace
 // backup without its manifests restores data into nothing, so the safe default is to capture
 // them and the explicit act is to opt out.
-func includeManifests(run *cbv1.ClusterBackupRunSpec) bool {
+func includeManifests(run *cbv1.BackupRunSpec) bool {
 	return run.IncludeManifests == nil || *run.IncludeManifests
 }
 
@@ -566,11 +565,26 @@ func (r *BackupReconciler) finalize(ctx context.Context, backup *cbv1.Backup) (c
 	return ctrl.Result{}, nil
 }
 
-// resolveRun reads the effective ClusterBackupRunSpec from the parent ClusterBackup named by the
-// crystalbackup.io/cluster-backup link label. ok=false (with a nil error) means "no parent
-// resolvable yet" — either the label is absent or the ClusterBackup is gone — which the caller
-// treats as a degrade-and-requeue, never a hard failure.
-func (r *BackupReconciler) resolveRun(ctx context.Context, backup *cbv1.Backup) (*cbv1.ClusterBackupRunSpec, bool, error) {
+// resolveRun returns the effective run configuration for this Backup, preferring the
+// MATERIALIZED spec.run and falling back to a pull from the parent ClusterBackup named by the
+// crystalbackup.io/cluster-backup link label (adr/0017 §5).
+//
+// The materialized copy wins because it is the only one that cannot dangle: run records are
+// history-limited and garbage-collected while their children live as long as their snapshots,
+// and the parent link is a label rather than an ownerReference precisely so GC never cascades.
+// A Backup created before this field existed has no copy, so the pull stays as the compatibility
+// path — an in-flight run at upgrade time must not be stranded on NoParent for the rest of its
+// life. It is a fallback, not a second source of truth: nothing re-reads the parent once
+// spec.run is set, so editing a finished run's parent no longer rewrites what that run appears
+// to have done.
+//
+// ok=false (with a nil error) means "nothing resolvable yet" — no materialized run AND either no
+// label or a vanished ClusterBackup — which the caller treats as a degrade-and-requeue, never a
+// hard failure.
+func (r *BackupReconciler) resolveRun(ctx context.Context, backup *cbv1.Backup) (*cbv1.BackupRunSpec, bool, error) {
+	if backup.Spec.Run != nil {
+		return backup.Spec.Run, true, nil
+	}
 	runName := backup.Labels[apiconst.LabelClusterBackup]
 	if runName == "" {
 		return nil, false, nil
@@ -582,7 +596,7 @@ func (r *BackupReconciler) resolveRun(ctx context.Context, backup *cbv1.Backup) 
 		}
 		return nil, false, fmt.Errorf("get parent ClusterBackup %s: %w", runName, err)
 	}
-	return &cb.Spec.ClusterBackupRunSpec, true, nil
+	return &cb.Spec.BackupRunSpec, true, nil
 }
 
 // ensureDEK reads the cluster KEK and returns the plaintext platform DEK (the restic repository

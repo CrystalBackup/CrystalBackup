@@ -352,7 +352,11 @@ spec:
                     type: boolean
                 type: object
               maxConcurrentMovers:
-                description: maxConcurrentMovers caps parallel mover Jobs.
+                description: |-
+                  maxConcurrentMovers caps parallel mover Jobs. The cap is CLUSTER-WIDE (it is checked
+                  against every mover Job in the operator namespace, not just this run's), which is why it
+                  stays off the tenant-facing BackupSchedule surface: a namespace user setting it would be
+                  setting a platform-wide limit.
                 format: int32
                 type: integer
               namespaces:

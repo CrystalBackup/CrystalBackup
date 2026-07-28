@@ -212,8 +212,8 @@ func createParentClusterBackup(name, location string, sel cbv1.PVCSelector) {
 		ObjectMeta: metav1.ObjectMeta{Name: name},
 		Spec: cbv1.ClusterBackupSpec{
 			ClusterBackupRunSpec: cbv1.ClusterBackupRunSpec{
-				LocationRef: cbv1.LocalObjectReference{Name: location},
-				PVCSelector: sel,
+				LocationRef:   cbv1.LocalObjectReference{Name: location},
+				BackupRunSpec: cbv1.BackupRunSpec{PVCSelector: sel},
 			},
 		},
 	}
@@ -235,9 +235,11 @@ func createVolumeOnlyParent(name, location string, sel cbv1.PVCSelector) {
 		ObjectMeta: metav1.ObjectMeta{Name: name},
 		Spec: cbv1.ClusterBackupSpec{
 			ClusterBackupRunSpec: cbv1.ClusterBackupRunSpec{
-				LocationRef:      cbv1.LocalObjectReference{Name: location},
-				PVCSelector:      sel,
-				IncludeManifests: &off,
+				LocationRef: cbv1.LocalObjectReference{Name: location},
+				BackupRunSpec: cbv1.BackupRunSpec{
+					PVCSelector:      sel,
+					IncludeManifests: &off,
+				},
 			},
 		},
 	}

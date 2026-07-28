@@ -76,8 +76,8 @@ var _ = Describe("Backup mover concurrency gate", func() {
 		parent := &cbv1.ClusterBackup{
 			ObjectMeta: metav1.ObjectMeta{Name: run},
 			Spec: cbv1.ClusterBackupSpec{ClusterBackupRunSpec: cbv1.ClusterBackupRunSpec{
-				LocationRef:         cbv1.LocalObjectReference{Name: location},
-				MaxConcurrentMovers: 1,
+				LocationRef:   cbv1.LocalObjectReference{Name: location},
+				BackupRunSpec: cbv1.BackupRunSpec{MaxConcurrentMovers: 1},
 			}},
 		}
 		Expect(k8sClient.Create(ctx, parent)).To(Succeed())
