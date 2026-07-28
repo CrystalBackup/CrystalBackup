@@ -302,6 +302,21 @@ var _ = BeforeSuite(func() {
 	// play the missing kube controllers (binder, PV lifecycle) by patching status, exactly as
 	// the rexposer unit tests do against the fake client. The mediated lister is the stub.
 	restoreLister = &stubFilteredLister{}
+
+	// The right-to-erasure reconciler (M5, R21), on the SAME exclusive queue so its forget+prune
+	// serialises against init/backup exactly as in production. It counts its scope through the
+	// stub filtered lister the restore specs already feed.
+	Expect(NewClusterErasureReconciler(
+		mgr.GetClient(),
+		mgr.GetScheme(),
+		secrets.NewByNameReader(mgr.GetAPIReader()),
+		repoQueue,
+		restoreLister,
+		suiteOperatorNamespace,
+		suiteMoverImage,
+		mgr.GetEventRecorder("clustererasure"),
+	).SetupWithManager(mgr)).To(Succeed())
+
 	restoreTargets := rexposer.NewTargetExposer(mgr.GetClient(), suiteOperatorNamespace)
 	Expect(NewRestoreReconciler(
 		mgr.GetClient(),

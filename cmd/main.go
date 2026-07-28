@@ -491,6 +491,21 @@ func main() {
 		setupLog.Error(err, "Unable to create controller", "controller", "ClusterRestore")
 		os.Exit(1)
 	}
+	// The right-to-erasure controller (M5, R21): forget+prune on the repository's exclusive queue,
+	// behind a typed confirmation, blocked on Immutable locations.
+	if err := controller.NewClusterErasureReconciler(
+		mgr.GetClient(),
+		mgr.GetScheme(),
+		secrets.NewByNameReader(mgr.GetAPIReader()),
+		repoQueue,
+		snapshotLister,
+		operatorNamespace,
+		moverImage,
+		mgr.GetEventRecorder("clustererasure"),
+	).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Unable to create controller", "controller", "ClusterErasure")
+		os.Exit(1)
+	}
 
 	// The orphan reaper is a periodic Runnable (not a reconciler): it sweeps the operator namespace
 	// for leftover native per-PVC exposure objects (temp clone PVCs, mover Jobs, creds Secrets) a

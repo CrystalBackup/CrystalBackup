@@ -803,3 +803,72 @@ func TestCheckCommand(t *testing.T) {
 		}
 	}
 }
+
+// TestErasureTagFilterUsesOneANDedTag is the assertion that keeps a right-to-erasure from
+// deleting other tenants' data.
+//
+// restic reads a comma-separated --tag as AND and a REPEATED --tag as OR. A namespace+pvc erasure
+// emitted as two flags would therefore match "every snapshot of that namespace" OR "every snapshot
+// of any PVC by that name, in any namespace" — a scope that spans tenants. One flag, one comma.
+func TestErasureTagFilterUsesOneANDedTag(t *testing.T) {
+	filter, ok := ErasureTagFilter(v1alpha1.ErasureTarget{Namespace: "team-x", PVC: "data"})
+	if !ok {
+		t.Fatal("namespace+pvc must select something")
+	}
+	want := "crystalbackup,namespace=team-x,pvc=data"
+	if filter != want {
+		t.Fatalf("filter = %q, want %q", filter, want)
+	}
+
+	argv, err := ErasureForgetArgs(v1alpha1.ErasureTarget{Namespace: "team-x", PVC: "data"})
+	if err != nil {
+		t.Fatalf("ErasureForgetArgs: %v", err)
+	}
+	tagFlags := 0
+	for _, a := range argv {
+		if a == "--tag" {
+			tagFlags++
+		}
+		if strings.HasPrefix(a, "--keep-") {
+			t.Fatalf("erasure argv carries a keep flag (%q); a retention flag would turn a GDPR "+
+				"erasure into a partial no-op that still reports success", a)
+		}
+	}
+	if tagFlags != 1 {
+		t.Fatalf("argv has %d --tag flags, want exactly 1 (repeating --tag means OR, which widens "+
+			"the erasure across tenants): %v", tagFlags, argv)
+	}
+}
+
+// TestErasureRefusesAnEmptyOrAmbiguousTarget: the failure mode of getting this wrong is erasing
+// every snapshot CrystalBackup has ever written, so an under-specified target must yield NOTHING
+// rather than an unfiltered command.
+func TestErasureRefusesAnEmptyOrAmbiguousTarget(t *testing.T) {
+	for name, target := range map[string]v1alpha1.ErasureTarget{
+		"empty":                 {},
+		"pvc without namespace": {PVC: "data"}, // a bare PVC name is not an identity
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, ok := ErasureTagFilter(target); ok {
+				t.Fatal("target was accepted; an unfiltered erasure would remove every snapshot")
+			}
+			if _, err := ErasureForgetArgs(target); err == nil {
+				t.Fatal("ErasureForgetArgs built a command for a target that selects nothing")
+			}
+		})
+	}
+}
+
+// TestErasureTargetPrecedence pins which field wins when several are set: the NARROWEST scope.
+// Widening on ambiguity would be the wrong direction for a destructive operation.
+func TestErasureTargetPrecedence(t *testing.T) {
+	filter, ok := ErasureTagFilter(v1alpha1.ErasureTarget{
+		Tenant: "acme", Namespace: "team-x", PVC: "data",
+	})
+	if !ok {
+		t.Fatal("fully-specified target must select something")
+	}
+	if filter != "crystalbackup,namespace=team-x,pvc=data" {
+		t.Fatalf("filter = %q; the narrowest scope must win", filter)
+	}
+}

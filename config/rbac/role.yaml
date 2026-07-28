@@ -98,6 +98,7 @@ rules:
   - backupschedules
   - clusterbackuplocations
   - clusterbackupschedules
+  - clustererasures
   - clusterrestores
   - restores
   verbs:
@@ -127,6 +128,7 @@ rules:
   - clusterbackuplocations/status
   - clusterbackups/status
   - clusterbackupschedules/status
+  - clustererasures/status
   - clusterrestores/status
   - restores/status
   verbs:
