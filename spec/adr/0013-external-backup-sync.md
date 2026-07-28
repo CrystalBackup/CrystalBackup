@@ -70,6 +70,68 @@ What siloing preserves here is **where the data ends up** — the client's copy 
 **client's** key, holding **only their** snapshots — not a claim that the operator never touches
 plaintext (it already does, to back them up).
 
+## Amendment (2026-07-28, M5 implementation) — rclone as the backend, and a dedicated sync image
+
+Implementing this ADR surfaced a limitation that invalidates one of its stated properties. Recorded
+here rather than silently worked around, because the property was load-bearing in the original
+decision.
+
+### The limitation
+
+`restic copy` handles **two keys** but only **one backend configuration**. Verified against the
+pinned restic 0.19.1:
+
+- The two REPOSITORY PASSWORDS are fully independent — `--password-file` / `RESTIC_PASSWORD_FILE`
+  for the destination, `--from-password-file` / `RESTIC_FROM_PASSWORD_FILE` (or
+  `--from-password-command` / `RESTIC_FROM_PASSWORD`) for the source. The whole `--from-*` family
+  is `--from-repo`, `--from-repository-file`, `--from-password-file`, `--from-password-command`,
+  `--from-key-hint`. Re-encryption to the destination's own key therefore works exactly as this
+  ADR describes.
+- The S3 CREDENTIALS are not. There is no `--from-option`, and `AWS_ACCESS_KEY_ID` /
+  `AWS_SECRET_ACCESS_KEY` are consumed by the backend library beneath restic, not by restic, so one
+  process has one set. restic's own documentation states it: *"In case the source and destination
+  repository use the same backend, the configuration options and environment variables used to
+  configure the backend may apply to both repositories – for example it might not be possible to
+  specify different accounts for the source and destination repository."*
+
+So the Decision's claim that sync *"works to **any** S3, including cross-provider, because it is
+client-side"* was **false as written**. Direct `s3:` addressing only works when both repositories
+open with the SAME credentials — the same account, a different bucket — which is the narrow case,
+not the secondary-location case R28 exists for.
+
+### The amendment
+
+**Both repositories are addressed through the `rclone:` backend**, which restic's documentation
+names as the one way around this: *"You can avoid this limitation by using the rclone backend along
+with remotes which are configured in rclone."* Each remote carries its own credentials, so the
+source and destination may be different accounts, different providers, or both.
+
+- Remotes are defined **entirely from environment**, no config file: `RCLONE_CONFIG_<REMOTE>_<KEY>`.
+  The per-remote form is the load-bearing detail — the sibling `RCLONE_S3_*` form is global to the
+  s3 backend and would reinstate exactly the limitation being escaped. `RCLONE_CONFIG_SRC_*` and
+  `RCLONE_CONFIG_DST_*` are independent.
+- Credentials still arrive in the per-Job projected Secret and are consumed as env, so the handling
+  is the one already reviewed under "Not key-blind — and why that is fine". Nothing new is durable.
+- **Direction is counter-intuitive and is pinned by a test**: `--repo`/`-r` is the DESTINATION,
+  `--from-repo` is the SOURCE. Reading `-r` as "the repository I am working on" gets it backwards,
+  and backwards means copying the secondary over the primary.
+
+**A dedicated `sync` image.** rclone is a large Go binary, and this project's release gate has
+already blocked once on a transitive dependency of restic (GO-2026-6061). Adding it to the shared
+mover image would put that surface in front of every backup and restore. apko already builds two
+images; a third is marginal, and it keeps the CVE surface of the sync path off the data path.
+
+Two costs accepted knowingly: the sync image carries rclone's vulnerability surface and must be
+kept current at the same cadence as restic; and restic spawns `rclone serve restic` as a CHILD
+process, so the shim must propagate its death honestly — a mover that is dead while reported alive
+is a failure mode this project has already paid for (M3.2).
+
+### What did not change
+
+The snapshot-level, re-encrypting model, the two CRDs, `Mirror`/`AppendOnly`, tag selectivity, and
+the queue/lock behaviour are all unaffected. rclone changes only HOW a repository is addressed, not
+what the copy means.
+
 ## Consequences
 
 ### Positive
