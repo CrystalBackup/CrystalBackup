@@ -111,6 +111,11 @@ var (
 // SIMULATE the Job's outcome by patching its status.
 const suiteMoverImage = "crystal-mover:test"
 
+// suiteSyncImage is the placeholder external-sync image (crystal-mover + restic + rclone). It is
+// DIFFERENT from suiteMoverImage so a spec that asserts a sync Job runs the sync image is actually
+// testing something; identical values would make that assertion pass by accident.
+const suiteSyncImage = "crystal-sync:test"
+
 // The manifest mover identity and grant, as the chart would resolve them. envtest has no
 // kubelet so no Job ever runs, but the RoleBinding IS really created against the API server,
 // which is what exercises the transient-grant path.
@@ -315,6 +320,34 @@ var _ = BeforeSuite(func() {
 		suiteOperatorNamespace,
 		suiteMoverImage,
 		mgr.GetEventRecorder("clustererasure"),
+	).SetupWithManager(mgr)).To(Succeed())
+
+	// The two external-sync reconcilers (M5, R28). They share the exclusive queue (their Mirror
+	// forget half runs on it) and read the same stub filtered lister, whose seeded snapshots the
+	// specs use to drive the copied/lag accounting. suiteSyncImage is distinct from the mover
+	// image on purpose: a spec asserting the Job's image would pass either way if they were equal.
+	Expect(NewClusterBackupExternalSyncReconciler(
+		mgr.GetClient(),
+		mgr.GetScheme(),
+		secrets.NewByNameReader(mgr.GetAPIReader()),
+		repoQueue,
+		restoreLister,
+		suiteOperatorNamespace,
+		suiteSyncImage,
+		scheduleClock,
+		mgr.GetEventRecorder("clusterbackupexternalsync"),
+	).SetupWithManager(mgr)).To(Succeed())
+	Expect(NewBackupExternalSyncReconciler(
+		mgr.GetClient(),
+		mgr.GetScheme(),
+		secrets.NewByNameReader(mgr.GetAPIReader()),
+		keys.NewUserKeyManager(mgr.GetClient()),
+		repoQueue,
+		restoreLister,
+		suiteOperatorNamespace,
+		suiteSyncImage,
+		scheduleClock,
+		mgr.GetEventRecorder("backupexternalsync"),
 	).SetupWithManager(mgr)).To(Succeed())
 
 	restoreTargets := rexposer.NewTargetExposer(mgr.GetClient(), suiteOperatorNamespace)

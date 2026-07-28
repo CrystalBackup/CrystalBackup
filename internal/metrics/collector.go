@@ -142,6 +142,10 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- repositoryLastCheckSuccessDesc
 	ch <- repositoryLastMaintenanceDesc
 	ch <- repositoryStaleLocksDesc
+	ch <- externalSyncLastSuccessDesc
+	ch <- externalSyncSnapshotsCopiedDesc
+	ch <- externalSyncLagDesc
+	ch <- externalSyncFailuresDesc
 }
 
 // Collect implements prometheus.Collector. It reads the live objects once and emits
@@ -197,6 +201,16 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 	var repos cbv1.BackupRepositoryList
 	if err := c.reader.List(ctx, &repos); err == nil {
 		collectRepositories(ch, repos.Items, clusterByLocation)
+	}
+
+	// The external-sync family (M5, R28). One family, both planes — an operator asking whether
+	// their secondary is current is asking the same question on either.
+	var clusterSyncs cbv1.ClusterBackupExternalSyncList
+	var namespacedSyncs cbv1.BackupExternalSyncList
+	clusterSyncsListed := c.reader.List(ctx, &clusterSyncs) == nil
+	namespacedSyncsListed := c.reader.List(ctx, &namespacedSyncs) == nil
+	if clusterSyncsListed || namespacedSyncsListed {
+		collectExternalSyncs(ch, clusterSyncs.Items, namespacedSyncs.Items, clusterByLocation)
 	}
 }
 

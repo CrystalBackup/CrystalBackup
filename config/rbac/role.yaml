@@ -94,8 +94,10 @@ rules:
 - apiGroups:
   - crystalbackup.io
   resources:
+  - backupexternalsyncs
   - backuplocations
   - backupschedules
+  - clusterbackupexternalsyncs
   - clusterbackuplocations
   - clusterbackupschedules
   - clustererasures
@@ -110,21 +112,12 @@ rules:
 - apiGroups:
   - crystalbackup.io
   resources:
-  - backuplocations/finalizers
-  - backuprepositories/finalizers
-  - backups/finalizers
-  - clusterbackuplocations/finalizers
-  - clusterrestores/finalizers
-  - restores/finalizers
-  verbs:
-  - update
-- apiGroups:
-  - crystalbackup.io
-  resources:
+  - backupexternalsyncs/status
   - backuplocations/status
   - backuprepositories/status
   - backups/status
   - backupschedules/status
+  - clusterbackupexternalsyncs/status
   - clusterbackuplocations/status
   - clusterbackups/status
   - clusterbackupschedules/status
@@ -134,6 +127,17 @@ rules:
   verbs:
   - get
   - patch
+  - update
+- apiGroups:
+  - crystalbackup.io
+  resources:
+  - backuplocations/finalizers
+  - backuprepositories/finalizers
+  - backups/finalizers
+  - clusterbackuplocations/finalizers
+  - clusterrestores/finalizers
+  - restores/finalizers
+  verbs:
   - update
 - apiGroups:
   - crystalbackup.io

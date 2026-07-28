@@ -513,6 +513,39 @@ func main() {
 		setupLog.Error(err, "Unable to create controller", "controller", "ClusterErasure")
 		os.Exit(1)
 	}
+	// External sync (M5, R28, adr/0013): `restic copy` from one location to another, re-encrypting
+	// to the destination's own key. Both planes run the same driver and differ only in how they
+	// resolve their two endpoints — admin cluster locations and platform DEKs on one side, the
+	// user's own same-namespace locations and their own keys on the other.
+	if err := controller.NewClusterBackupExternalSyncReconciler(
+		mgr.GetClient(),
+		mgr.GetScheme(),
+		secrets.NewByNameReader(mgr.GetAPIReader()),
+		repoQueue,
+		snapshotLister,
+		operatorNamespace,
+		syncImage,
+		clock.RealClock{},
+		mgr.GetEventRecorder("clusterbackupexternalsync"),
+	).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Unable to create controller", "controller", "ClusterBackupExternalSync")
+		os.Exit(1)
+	}
+	if err := controller.NewBackupExternalSyncReconciler(
+		mgr.GetClient(),
+		mgr.GetScheme(),
+		secrets.NewByNameReader(mgr.GetAPIReader()),
+		keys.NewUserKeyManager(mgr.GetClient()),
+		repoQueue,
+		snapshotLister,
+		operatorNamespace,
+		syncImage,
+		clock.RealClock{},
+		mgr.GetEventRecorder("backupexternalsync"),
+	).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Unable to create controller", "controller", "BackupExternalSync")
+		os.Exit(1)
+	}
 
 	// The orphan reaper is a periodic Runnable (not a reconciler): it sweeps the operator namespace
 	// for leftover native per-PVC exposure objects (temp clone PVCs, mover Jobs, creds Secrets) a

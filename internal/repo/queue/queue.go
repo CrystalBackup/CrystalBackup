@@ -112,6 +112,14 @@ const (
 	// pending/in-flight, and the op itself drains the in-flight movers before it runs — the two
 	// halves of the per-repo backup⇄unlock mutex.
 	OpUnlock OpKind = "unlock"
+	// OpSync is one `restic copy` into a destination repository (adr/0013). It is the ONE kind
+	// that is not enqueued under a repository's own name: a copy writes new packs and a new
+	// snapshot under a NON-exclusive restic lock, exactly like a backup, so it has no business on
+	// the exclusive lane — a multi-hour copy there would stall the destination's prune and check
+	// for its whole duration. Controllers enqueue it under a separate per-destination key
+	// ("sync/<repo>"), which still stops two copies into the same destination from overlapping
+	// while leaving that repository's maintenance lane free.
+	OpSync OpKind = "sync"
 )
 
 // blocksMovers reports whether an op of this kind requires data-mover QUIESCENCE: no concurrent
@@ -131,7 +139,8 @@ const (
 //     maintenance.pruneMaxRepackSize and scheduled off-peak (adr/0009, M4).
 //
 // OpErase joins them in M5. init/forget/check do not: forget stays best-effort and simply retries
-// behind a lock, and check only reads.
+// behind a lock, and check only reads. Neither does OpSync — a copy takes the same non-exclusive
+// lock a backup takes, so movers and copies coexist the way two backups do.
 func blocksMovers(kind OpKind) bool {
 	return kind == OpUnlock || kind == OpPrune
 }
