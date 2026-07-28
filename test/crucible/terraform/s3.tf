@@ -16,7 +16,7 @@ resource "random_id" "bucket" {
 }
 
 locals {
-  bucket_name = "${var.name_prefix}-${random_id.bucket.hex}"
+  bucket_name = "${local.name_prefix}-${random_id.bucket.hex}"
 }
 
 resource "null_resource" "backup_bucket" {

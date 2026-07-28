@@ -56,8 +56,21 @@ func m1ResticImage() string {
 // do not accumulate completed Jobs.
 func m1ResticExec(locationName string, args ...string) string {
 	GinkgoHelper()
+	return m1ResticExecOn(m1ClusterID, locationName, args...)
+}
 
-	repoURL := restic.RepoURL(os.Getenv("S3_ENDPOINT"), os.Getenv("S3_BUCKET"), m1S3Prefix, m1ClusterID)
+// m1ResticExecOn is m1ResticExec against an explicit clusterID — the repository PATH segment.
+//
+// m1ResticExec hardcoded m1ClusterID while taking the location name only for the password, which
+// is fine while every spec shares the "dr" repository and silently wrong the moment one does not:
+// the Job would open the SHARED repository with the OTHER location's DEK, restic would exit on a
+// wrong password, and since this helper returns the log without asserting success the caller would
+// read that as an answer. M4's isolated repositories are the first callers that need the two to
+// agree.
+func m1ResticExecOn(clusterID, locationName string, args ...string) string {
+	GinkgoHelper()
+
+	repoURL := restic.RepoURL(os.Getenv("S3_ENDPOINT"), os.Getenv("S3_BUCKET"), m1S3Prefix, clusterID)
 	password := m1UnwrapDEK(locationName)
 
 	backoff, deadline := int32(0), int64(300)

@@ -22,10 +22,22 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
+
+// absentOK reports whether err means the object — or its whole KIND — cannot exist, which a
+// teardown treats as success. NotFound is the obvious case; NoKindMatch is its cluster-level
+// twin: on a cluster where the external-snapshotter CRDs were never installed, no
+// VolumeSnapshot/VolumeSnapshotContent can exist either, so their collection is vacuously
+// complete. That case is reachable: a Backup can go terminal without ever exposing (every volume
+// Skipped as unsupported, or a pre-hook failure before the first snapshot), and the terminal
+// re-entry sweep still tears it down by derived name.
+func absentOK(err error) bool {
+	return apierrors.IsNotFound(err) || apimeta.IsNoMatchError(err)
+}
 
 // cleanup is the shared Cleanup() body and the leak-check contract (ADR 0003 step 5). It tears
 // the exposure down in the EXACT order the ADR pins, and every step tolerates NotFound so a
@@ -97,6 +109,9 @@ func reclaimOrigin(ctx context.Context, c client.Client, ex *Exposure) error {
 	case apierrors.IsNotFound(err):
 		return reclaimOrphanOriginVSC(ctx, c, ex)
 
+	case apimeta.IsNoMatchError(err):
+		return nil // no snapshot CRDs on this cluster ⇒ no VS/VSC can exist to reclaim.
+
 	default:
 		return fmt.Errorf("get origin VolumeSnapshot %s/%s: %w", ex.OriginNamespace, ex.OriginVSName, err)
 	}
@@ -115,6 +130,9 @@ func reclaimOrphanOriginVSC(ctx context.Context, c client.Client, ex *Exposure) 
 	}
 	list := newUnstructuredList(volumeSnapshotContentGVK())
 	if err := c.List(ctx, list, client.MatchingLabels(ex.Labels)); err != nil {
+		if apimeta.IsNoMatchError(err) {
+			return nil // no snapshot CRDs on this cluster ⇒ nothing Retain-parked to reclaim.
+		}
 		return fmt.Errorf("list origin VolumeSnapshotContents by exposure labels: %w", err)
 	}
 	for i := range list.Items {
@@ -176,23 +194,24 @@ func deletePVC(ctx context.Context, c client.Client, namespace, name string) err
 	return nil
 }
 
-// deleteVolumeSnapshot deletes a (namespaced) VolumeSnapshot by namespace/name, tolerating NotFound.
+// deleteVolumeSnapshot deletes a (namespaced) VolumeSnapshot by namespace/name, tolerating both
+// NotFound and a cluster with no snapshot CRDs at all (absentOK).
 func deleteVolumeSnapshot(ctx context.Context, c client.Client, namespace, name string) error {
 	vs := newUnstructured(volumeSnapshotGVK())
 	vs.SetNamespace(namespace)
 	vs.SetName(name)
-	if err := c.Delete(ctx, vs); err != nil && !apierrors.IsNotFound(err) {
+	if err := c.Delete(ctx, vs); err != nil && !absentOK(err) {
 		return fmt.Errorf("delete VolumeSnapshot %s/%s: %w", namespace, name, err)
 	}
 	return nil
 }
 
 // deleteVolumeSnapshotContent deletes a (cluster-scoped) VolumeSnapshotContent by name, tolerating
-// NotFound.
+// both NotFound and a cluster with no snapshot CRDs at all (absentOK).
 func deleteVolumeSnapshotContent(ctx context.Context, c client.Client, name string) error {
 	vsc := newUnstructured(volumeSnapshotContentGVK())
 	vsc.SetName(name)
-	if err := c.Delete(ctx, vsc); err != nil && !apierrors.IsNotFound(err) {
+	if err := c.Delete(ctx, vsc); err != nil && !absentOK(err) {
 		return fmt.Errorf("delete VolumeSnapshotContent %s: %w", name, err)
 	}
 	return nil

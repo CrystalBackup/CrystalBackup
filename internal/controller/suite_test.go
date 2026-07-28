@@ -79,6 +79,22 @@ var (
 	// schedule specs drive cron activations deterministically. A BeforeEach in the schedule Describe
 	// resets it to real-time-ish before each spec (it is shared process-wide).
 	scheduleClock *clocktesting.FakeClock
+	// maintenanceClock is the fake clock the MaintenanceReconciler reads "now" from, so a spec can
+	// make a daily prune window fire without waiting a day. Separate from scheduleClock: the two
+	// controllers are advanced independently, and sharing one would couple unrelated specs.
+	maintenanceClock *clocktesting.FakeClock
+	// hookExecutor is the stub the Backup reconciler execs consistency hooks through. envtest has
+	// no kubelet, so a real pods/exec is impossible; the stub records every call and lets a spec
+	// make a specific pod's hook fail or hang.
+	hookExecutor *stubHookExecutor
+	// backupExposers is the stub exposer registry the Backup reconciler is wired with, hoisted
+	// to a suite var so the teardown-sweep specs can read its recorded TeardownExposure calls
+	// and arm per-call failures.
+	backupExposers *stubExposerRegistry
+	// backupStatusFailer arms the AMBIGUOUS status write for one Backup: the terminal status
+	// Update is performed for real, then reported to the reconciler as a transport error —
+	// exercising terminalPhaseCommitted's committed-despite-error path deterministically.
+	backupStatusFailer *statusUpdateFailer
 	// discoveryLister is the stub inventory the DiscoveryReconciler reads; the discovery specs feed
 	// it canned snapshots (mutex-guarded, since the manager reconciles on another goroutine).
 	discoveryLister *stubSnapshotLister
@@ -175,16 +191,38 @@ var _ = BeforeSuite(func() {
 		mgr.GetEventRecorder("backuprepository"),
 	).SetupWithManager(mgr)).To(Succeed())
 
+	// The maintenance reconciler (M4), on the SAME exclusive queue so prune/check serialise against
+	// init/forget/unlock exactly as in production. It reads "now" from its own fake clock: the specs
+	// advance it to make a daily cron fire without waiting a day. It stays inert unless a spec sets
+	// maintenance on a location — no schedule, nothing due, nothing submitted.
+	maintenanceClock = clocktesting.NewFakeClock(time.Now())
+	Expect(NewMaintenanceReconciler(
+		mgr.GetClient(),
+		mgr.GetScheme(),
+		secrets.NewByNameReader(mgr.GetAPIReader()),
+		repoQueue,
+		suiteOperatorNamespace,
+		suiteMoverImage,
+		mgr.GetEventRecorder("maintenance"),
+		maintenanceClock,
+	).SetupWithManager(mgr)).To(Succeed())
+
 	// The Backup reconciler under test. Its exposer seam is a STUB (stubExposerRegistry, defined
 	// in backup_controller_test.go) so the suite needs neither the external snapshot CRDs nor a
 	// CSI driver: the stub creates a real temp clone PVC in the operator namespace (so the mover
 	// Job has something to mount) and reports Ready immediately. envtest has no kubelet, so specs
 	// SIMULATE each mover Job's outcome exactly as the BackupRepository specs do.
-	Expect(NewBackupReconciler(
-		mgr.GetClient(),
+	hookExecutor = &stubHookExecutor{}
+	backupExposers = &stubExposerRegistry{client: mgr.GetClient(), operatorNamespace: suiteOperatorNamespace}
+	backupStatusFailer = &statusUpdateFailer{}
+	backupReconciler := NewBackupReconciler(
+		// The manager client, with ONE seam added: statusFailingClient lets a spec make a single
+		// Backup status Update commit server-side yet error client-side (the ambiguous write).
+		// Disarmed — the default — it is a pure passthrough.
+		&statusFailingClient{Client: mgr.GetClient(), failer: backupStatusFailer},
 		mgr.GetScheme(),
 		secrets.NewByNameReader(mgr.GetAPIReader()),
-		&stubExposerRegistry{client: mgr.GetClient(), operatorNamespace: suiteOperatorNamespace},
+		backupExposers,
 		suiteOperatorNamespace,
 		suiteMoverImage,
 		suiteManifestMoverSA,
@@ -194,7 +232,13 @@ var _ = BeforeSuite(func() {
 		// sets a retention policy and no mover is simulated as hard-killed, so the forget/unlock
 		// triggers stay inert here; the real ops are crucible-validated.
 		repoQueue,
-	).SetupWithManager(mgr)).To(Succeed())
+	)
+	// envtest has no kubelet, so pods/exec cannot work: the hook specs drive a stub that records
+	// what would have been exec'd and replays canned outcomes.
+	backupReconciler.Hooks = hookExecutor
+	// The uncached reader behind the writeStatus ambiguity check, as production wires it.
+	backupReconciler.APIReader = mgr.GetAPIReader()
+	Expect(backupReconciler.SetupWithManager(mgr)).To(Succeed())
 
 	// The ClusterBackup fan-out reconciler. It creates child Backups (which the registered Backup
 	// reconciler above then drives via the stub exposer), so a ClusterBackup spec exercises the

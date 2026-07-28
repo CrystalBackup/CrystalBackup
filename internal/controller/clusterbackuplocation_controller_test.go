@@ -147,10 +147,16 @@ var _ = Describe("ClusterBackupLocationReconciler", func() {
 			To(Succeed(), "retention must remain editable on an existing location")
 	})
 
-	It("provisions an owned BackupRepository and reports Ready for a valid location", func() {
+	// This spec pins the MEANING of the location's Ready condition: Ready=True means the
+	// location is USABLE — a Backup created against it will run — not merely that its config
+	// parsed and a BackupRepository object was stamped out. The two are separated in time by the
+	// restic-init mover Job, and the window between them is what this asserts: Ready must stay
+	// False, under a distinct non-Degraded phase, for as long as init is in flight.
+	It("stays Initializing until the repository is initialized, then reports Ready", func() {
 		const name = "cbl-happy"
 		createKEKSecret("kek-happy", generateAgeIdentity())
 		createS3CredsSecret("s3-happy")
+		registerRepoCleanup(name)
 		createTestLocation(newTestLocation(name, "kek-happy", "s3-happy", false))
 
 		By("a cluster-scoped BackupRepository is created, owned by the location")
@@ -165,16 +171,32 @@ var _ = Describe("ClusterBackupLocationReconciler", func() {
 		Expect(owner.Kind).To(Equal("ClusterBackupLocation"))
 		Expect(owner.Name).To(Equal(name))
 
-		By("the location reports repositoryRef, Reachable, EncryptionValid, Ready, and carries the finalizer")
+		By("while init is in flight the location is Initializing — provisioned, not yet Ready")
 		Eventually(func(g Gomega) {
 			var got cbv1.ClusterBackupLocation
 			g.Expect(k8sClient.Get(ctx, client.ObjectKey{Name: name}, &got)).To(Succeed())
 			g.Expect(got.Status.RepositoryRef).To(Equal(name))
 			g.Expect(apimeta.IsStatusConditionTrue(got.Status.Conditions, ConditionReachable)).To(BeTrue())
 			g.Expect(apimeta.IsStatusConditionTrue(got.Status.Conditions, ConditionEncryptionValid)).To(BeTrue())
+			g.Expect(controllerutil.ContainsFinalizer(&got, apiconst.FinalizerLocation)).To(BeTrue())
+
+			cond := apimeta.FindStatusCondition(got.Status.Conditions, ConditionReady)
+			g.Expect(cond).NotTo(BeNil())
+			g.Expect(cond.Status).To(Equal(metav1.ConditionFalse),
+				"an uninitialized repository must not read Ready — a Backup against it would sit in Pending")
+			g.Expect(cond.Reason).To(Equal("RepositoryInitializing"))
+			// The phase must distinguish "wait" from "act": an admin who reads Degraded here
+			// goes looking for a misconfiguration that does not exist.
+			g.Expect(got.Status.Phase).To(Equal("Initializing"))
+		}, eventuallyTimeout, eventuallyPoll).Should(Succeed())
+
+		By("Ready follows the repository's Initialized flip, via the Owns watch")
+		simulateRepositoryInitialized(name)
+		Eventually(func(g Gomega) {
+			var got cbv1.ClusterBackupLocation
+			g.Expect(k8sClient.Get(ctx, client.ObjectKey{Name: name}, &got)).To(Succeed())
 			g.Expect(apimeta.IsStatusConditionTrue(got.Status.Conditions, ConditionReady)).To(BeTrue())
 			g.Expect(got.Status.Phase).To(Equal("Ready"))
-			g.Expect(controllerutil.ContainsFinalizer(&got, apiconst.FinalizerLocation)).To(BeTrue())
 		}, eventuallyTimeout, eventuallyPoll).Should(Succeed())
 	})
 
@@ -236,7 +258,13 @@ var _ = Describe("ClusterBackupLocationReconciler", func() {
 		createS3CredsSecret("s3-default")
 
 		By("a lone default location reports MultipleDefaults=False")
+		registerRepoCleanup(nameA)
+		registerRepoCleanup(nameB)
 		createTestLocation(newTestLocation(nameA, "kek-default", "s3-default", true))
+		// Ready folds in repository initialization, so a lone default only reaches Ready once
+		// its init has succeeded — simulate it, otherwise this spec would be asserting the
+		// init timing rather than the defaults election it is about.
+		simulateRepositoryInitialized(nameA)
 		Eventually(func(g Gomega) {
 			var got cbv1.ClusterBackupLocation
 			g.Expect(k8sClient.Get(ctx, client.ObjectKey{Name: nameA}, &got)).To(Succeed())
@@ -246,6 +274,10 @@ var _ = Describe("ClusterBackupLocationReconciler", func() {
 
 		By("a second default location causes at least one of the two to flag MultipleDefaults=True")
 		createTestLocation(newTestLocation(nameB, "kek-default", "s3-default", true))
+		// Initialize B's repository too, so that the ONLY thing that can hold either location
+		// back from Ready below is the defaults conflict. Without this, readyDefaults<=1 would
+		// pass for the uninteresting reason that B was still initializing.
+		simulateRepositoryInitialized(nameB)
 		Eventually(func(g Gomega) {
 			flagged, readyDefaults := 0, 0
 			for _, name := range []string{nameA, nameB} {

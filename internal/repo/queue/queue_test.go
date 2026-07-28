@@ -473,17 +473,28 @@ func TestLen(t *testing.T) {
 	close(block)
 }
 
-// TestBlocksMovers pins which OpKinds require mover quiescence (the backup⇄unlock mutex). Only
-// OpUnlock does in M1 — it force-removes every lock; adding OpPrune/OpErase later is a deliberate,
-// test-guarded change.
+// TestBlocksMovers pins WHICH OpKinds require mover quiescence, because getting this set wrong is
+// silent in both directions: too small and a lock-destroying or pack-rewriting op runs while movers
+// hold locks (adr/0015 §3); too large and every op needlessly stalls the cluster's backups behind a
+// drain. The table is the contract, restated exhaustively so adding an OpKind forces a deliberate
+// answer rather than inheriting whatever the zero value happens to be.
 func TestBlocksMovers(t *testing.T) {
-	for _, k := range []OpKind{OpInit, OpForget, OpPrune, OpCheck, OpErase} {
-		if blocksMovers(k) {
-			t.Errorf("blocksMovers(%q) = true, want false", k)
+	want := map[OpKind]bool{
+		OpInit:   false, // creates the repository; no packs, and no live reader to strip.
+		OpForget: false, // rewrites the snapshot set only, and retries behind a lock.
+		OpCheck:  false, // read-only.
+		OpErase:  false, // M5 — flips to true WITH its writer-side drain, never one without the other.
+		OpUnlock: true,  // `unlock --remove-all` would rip out a live backup's lock (M1).
+		OpPrune:  true,  // repacks and deletes packs; the cluster-wide exclusive window (M4).
+	}
+	for kind, expected := range want {
+		if got := blocksMovers(kind); got != expected {
+			t.Errorf("blocksMovers(%q) = %v, want %v", kind, got, expected)
 		}
 	}
-	if !blocksMovers(OpUnlock) {
-		t.Errorf("blocksMovers(OpUnlock) = false, want true")
+	// An unrecognised kind must not accidentally demand quiescence.
+	if blocksMovers(OpKind("something-new")) {
+		t.Error("blocksMovers must default to false for an unrecognised kind")
 	}
 }
 
@@ -546,6 +557,37 @@ func TestQuiescenceRequired(t *testing.T) {
 	close(block2) // release the head; the unlock then runs and resolves
 	if !eventually(func() bool { return !m.QuiescenceRequired("k2") }) {
 		t.Errorf("QuiescenceRequired stayed true after the pending OpUnlock drained")
+	}
+}
+
+// TestQuiescenceRequiredForPrune is TestBlocksMovers's end-to-end half for the kind M4
+// adds: it asserts the ADMISSION signal the Backup controller actually reads goes true while a
+// prune is in-flight. blocksMovers alone is a private predicate; QuiescenceRequired is what holds
+// movers back, and adr/0015 §3 requires both halves.
+func TestQuiescenceRequiredForPrune(t *testing.T) {
+	m := NewManager(context.Background())
+	defer m.Stop()
+
+	block := make(chan struct{})
+	entered := make(chan struct{})
+	h, err := m.Enqueue("repo-prune", OpPrune, func(ctx context.Context) error {
+		close(entered)
+		<-block
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Enqueue prune: %v", err)
+	}
+	<-entered
+	if !m.QuiescenceRequired("repo-prune") {
+		t.Error("QuiescenceRequired while an OpPrune is in-flight = false, want true — movers would start against a repacking repository")
+	}
+	close(block)
+	if err := h.Wait(); err != nil {
+		t.Fatalf("prune op: %v", err)
+	}
+	if !eventually(func() bool { return !m.QuiescenceRequired("repo-prune") }) {
+		t.Error("QuiescenceRequired stayed true after the prune resolved — backups would never resume")
 	}
 }
 

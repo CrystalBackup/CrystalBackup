@@ -4,6 +4,116 @@ All notable changes to Crystal Backup. Versioning follows
 [adr/0014](spec/adr/0014-versioning-and-release.md): milestone `Mn` → minor `0.n.z` on
 major 0; `1.0.0` is a deliberate post-M9 API-stability decision.
 
+## 0.4.0 — M4 "Consistency hooks, verification & maintenance" (unreleased)
+
+Milestone M4 makes a backup **application-consistent** and a repository **maintained**. Backups
+can now quiesce a workload before the snapshot and release it after; repositories prune the space
+their retention policy freed and verify that what they hold is still readable.
+
+Two pieces of the API had been declared since M0 and were dead: `MaintenanceSpec` (nothing ever
+read `pruneSchedule` or `checkSchedule`) and the hook types (nothing ever exec'd). Both are live.
+
+### Added
+
+- **Consistency hooks (R16).** Pre-snapshot quiesce and post-snapshot release, executed through
+  `pods/exec`. Candidate pods are those in the Backup's namespace **mounting the PVCs the run is
+  capturing** — not a namespace-wide label match, which is what confines the operator's
+  cluster-wide exec grant to workloads whose data is actually being captured. Velero's precedence
+  is matched: a pod's `crystalbackup.io/pre-backup-*` annotations **replace** (never merge with)
+  the run's spec hooks for that pod. Commands are an argv, never a shell string.
+- **The freeze window is bounded by the snapshot phase, not the upload** (01-architecture §5). A
+  database held frozen for a multi-hour upload is an outage, not a backup.
+- **The unfreeze is unconditional.** The release fires on the snapshots being *cut*, whatever
+  their outcome: a failed or skipped snapshot leaves the application just as quiesced, so gating
+  the thaw on success would strand exactly the workload whose backup just went wrong. It is
+  retried within a bounded budget and, being derived from `status.hooks`, survives a controller
+  restart — a workload left frozen by a crashed operator is an outage the backup itself caused.
+- **`onError: Fail` aborts before snapshotting.** A snapshot taken after a failed quiesce would
+  *look* application-consistent without being so, which is only discovered at restore time.
+- **Scheduled `prune` and `check` (R17)** on the per-`BackupRepository` exclusive queue, with
+  cron schedules, jitter, `--max-repack-size`, and `check --read-data-subset` to catch silent
+  bit-rot that a structural check cannot see. `status.recentMaintenance` keeps the attempt
+  history; `RepositoryCheckFailed` is raised for the alert.
+- **The seven repository metrics of 05-observability §2.4.** Physical size and stale-lock count
+  come from a single recursive S3 LIST — no mover Job, no image pull, no repository password
+  needed to answer "how big is it, and is anything stuck".
+
+### Changed
+
+- **`prune` drains the movers before running.** Not for corruption — restic's exclusive lock
+  already bars that — but for **throughput**: otherwise a prune and the whole mover fleet contend
+  on `--retry-lock`, and on the shared cluster repository that is every namespace's backup. The
+  drain has its **own** short deadline rather than inheriting the prune's multi-hour one, because
+  mover admission is shut cluster-wide while it waits and one stuck mover must not close the
+  backup plane for hours (adr/0015 §3).
+- **Repository reads pass `--no-lock`** (deferred from M3.1 to land with `prune`). Both read
+  paths: discovery *and* the restore's mediated source listing. Without it a restore resolving
+  its source during a maintenance window would block on the prune's lock.
+- **A `ClusterBackupLocation` reports `Ready` only once its repository is initialized.** It used
+  to flip `Ready`/`Phase: Ready` the moment the `BackupRepository` **object** was created, while
+  the `restic init` mover Job behind it was still to run — so the documented sequence (create a
+  location, wait for `Ready`, create a `Backup`) parked the `Backup` in `Pending` with
+  `BackupRepository "<name>" is not initialized yet`, which reads as a `Backup` fault rather than
+  as setup that was not finished. It cost an e2e run five minutes of timeout **inside the feature
+  under test** before pointing anywhere near the actual cause. `Ready` now means **usable**. No
+  controller behaviour changes — `Backup`, `ClusterBackup`, `Restore`, `ClusterRestore`, discovery
+  and maintenance all gated on the repository's own `initialized` already, which is exactly the
+  evidence that the location's verdict was not trusted.
+- **New location phase `Initializing`**, for the window between the two, with `Ready=False` and
+  reason `RepositoryInitializing`. Deliberately **not** `Degraded`: nothing is wrong and there is
+  nothing for an admin to fix. `Degraded` stays reserved for faults that need action, so
+  `kubectl get clusterbackuplocation` tells *wait* from *act*.
+- **A stale repository lock is now acted on, not merely counted.** The pre-existing reaper fires
+  when a *data mover* is hard-killed, and a prune is not a data mover. Note what this does and
+  does not do: the count is age-based on restic's own 30-minute horizon, so it never touches a
+  fresh orphan, and at that mark restic removes the lock itself. It does **not** shorten how long
+  an exclusive op can queue behind a dead lock. What it fixes is that the signal was a dead end —
+  `CrystalbackupStaleLocks` fired and nothing ever drove the gauge back down.
+
+### Fixed
+
+- **A backup's exposure teardown is now crash-only: re-entrant until verified, never one-shot.**
+  A three-lane crucible fanout kept reproducing (~1 run in 3) a single residual
+  `VolumeSnapshotContent` — `deletionPolicy: Retain`, no `deletionTimestamp`, no owner — and the
+  audit that followed proved the shape was structural, and **predates 0.4.0**: the reconcile pass
+  that persisted a Backup's terminal status was also the *only* pass that ever deleted its
+  VolumeSnapshot/VolumeSnapshotContent pair; the terminal short-circuit barred every later pass,
+  ownerReference GC cannot reach a cluster-scoped Retain content, and the orphan reaper's charter
+  excluded exactly that object class while four comments promised it as the backstop. One process
+  death (or one status `Update` that *commits server-side while erroring client-side* — SIGTERM
+  cancelling the call in flight) inside that window leaked the content, and with it a storage-side
+  snapshot, forever. Four changes close it, each of which stands alone:
+  - the terminal short-circuit now **re-runs an idempotent teardown sweep until it has verified
+    every delete**, then stamps `crystalbackup.io/exposures-cleaned` — a kill at any instant just
+    means the next pass (or the next process: controller-runtime re-reconciles everything on
+    startup) finishes the job;
+  - teardown is **derive-only**: it reconstructs every object name from the Backup+PVC identity
+    and can no longer call `Expose` (which could re-create the origin VolumeSnapshot
+    mid-teardown) nor conclude "nothing to clean" from a deleted source PVC;
+  - an ambiguous terminal status write is **disambiguated with an uncached re-read** instead of
+    being assumed unpersisted;
+  - the orphan reaper now actually **sweeps labelled VolumeSnapshots and
+    VolumeSnapshotContents**, restore-then-deleting a dynamic origin content (the storage
+    snapshot is reclaimed exactly once) and object-only-deleting the static re-bind alias — the
+    backstop those four comments promised.
+  Deleting a Backup now also **holds its finalizer until the exposure teardown succeeds**, and
+  covers every volume phase (a crash between `Expose` and the first status write leaves residue
+  on a still-`Pending` volume). On upgrade, the operator sweeps every historical terminal Backup
+  once — idempotent, a handful of tolerated NotFounds per volume — and stamps the marker.
+- **`pods/exec` was granted by the Helm chart but absent from `config/rbac/role.yaml`.** No
+  kubebuilder marker existed, so `make manifests` had nothing to notice. A kustomize install could
+  never have run a hook.
+- **`Hook.Timeout` had no default.** As a non-pointer `metav1.Duration`, "unset" arrived as `0s`,
+  and `context.WithTimeout(ctx, 0)` expires immediately — every hook without an explicit timeout
+  would have failed before starting.
+
+### Documented
+
+- **[adr/0017](spec/adr/0017-cascade-materialization-backup-carries-identity.md)** — why
+  `Backup.spec` carries **identity, not intent**: two producers write the kind, and discovery
+  (server-side apply with `ForceOwnership`) cannot reconstruct run config from restic snapshots.
+  Records the four accepted costs and the M5 direction.
+
 ## 0.3.2 — M3.2 restore-safety fixes (2026-07-25)
 
 The 0.3.1 audit closed the throughput question and left four items behind, one of which was

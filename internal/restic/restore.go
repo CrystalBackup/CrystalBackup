@@ -222,7 +222,7 @@ func ManifestsRestoreArgs(snapshotID, snapshotPath, targetDir string) []string {
 
 // SnapshotsFilterArgs is the restic argv for a FILTERED snapshot listing:
 //
-//	snapshots --json --tag crystalbackup[,<k=v>...]
+//	snapshots --json --tag crystalbackup[,<k=v>...] --no-lock
 //
 // Extra filter tags are AND-combined with the base marker by joining them into ONE --tag
 // value with commas — restic's --tag semantics: comma-joined tags within one flag must ALL
@@ -232,6 +232,13 @@ func ManifestsRestoreArgs(snapshotID, snapshotPath, targetDir string) []string {
 // itself only ever returns snapshots of the CR's own namespace. Tag values are DNS-1123
 // derived (namespace, run names) and can never contain a comma, so the joining is safe;
 // with no extra tags this degenerates to exactly SnapshotsArgs.
+//
+// It carries --no-lock for the same reason SnapshotsArgs does (M4): this is a pure read of the
+// snapshot set, and a restore resolving its source must neither wait out a multi-hour prune window
+// nor hold the shared lock that prune is waiting to escalate past. The two listings deliberately
+// stay identical modulo the filter tags — a test pins that, because a read path that quietly
+// diverged in its locking behaviour is the kind of thing nobody notices until a restore hangs
+// during a maintenance window.
 func SnapshotsFilterArgs(filterTags ...string) []string {
-	return []string{snapshotsCmd, flagJSON, flagTag, strings.Join(append([]string{TagBase}, filterTags...), ",")}
+	return []string{snapshotsCmd, flagJSON, flagTag, strings.Join(append([]string{TagBase}, filterTags...), ","), flagNoLock}
 }

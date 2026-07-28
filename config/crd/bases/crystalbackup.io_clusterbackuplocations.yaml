@@ -76,8 +76,16 @@ spec:
                 properties:
                   enabled:
                     default: true
-                    description: enabled turns on inventory and projection of Backup
-                      objects from the repository.
+                    description: |-
+                      enabled turns on inventory and projection of Backup objects from the repository.
+
+                      A POINTER, like ClusterResourceCaptureSpec.Enabled, and for the same reason: this defaults to
+                      TRUE, and a plain bool cannot express all three states a default-true field needs. With
+                      `omitempty` encoding/json drops `false`, so no Go client could ever disable discovery (the
+                      API server would substitute the default) even though `kubectl apply` with `enabled: false`
+                      worked. Without `omitempty` the zero value serialises as an explicit `false`, so every caller
+                      that left the struct alone would silently switch discovery OFF. Only nil-means-unset
+                      distinguishes "I did not say" from "I said no".
                     type: boolean
                   interval:
                     default: 1h
@@ -126,19 +134,38 @@ spec:
                   mode only).
                 properties:
                   checkReadDataSubset:
-                    description: checkReadDataSubset is the fraction of pack data
-                      to verify (e.g. "5%").
+                    description: |-
+                      checkReadDataSubset is how much pack data each check actually READS (R17). Empty means a
+                      structural check only, which catches a missing or truncated object but never a silently
+                      corrupted one — its bytes rotted while its name and length stayed right. Accepts "n/t" for
+                      a specific part, a percentage like "5%" or "2.5%", or a size with a k/K, m/M, g/G or t/T
+                      suffix.
+                    pattern: ^([0-9]+/[0-9]+|[0-9]+(\.[0-9]+)?%|[0-9]+(\.[0-9]+)?[kKmMgGtT]?)$
                     type: string
                   checkSchedule:
                     description: checkSchedule (cron) for restic check.
+                    minLength: 1
                     type: string
                   pruneMaxRepackSize:
-                    description: pruneMaxRepackSize caps repacking per prune run (e.g.
-                      "50G").
+                    description: |-
+                      pruneMaxRepackSize caps repacking per prune run (e.g. "50G") — the practical bound on how
+                      long that exclusive window lasts. Empty means restic's default: repack whatever the run
+                      needs. A byte count with an optional k/K, m/M, g/G or t/T suffix.
+                    pattern: ^[0-9]+(\.[0-9]+)?[kKmMgGtT]?$
                     type: string
                   pruneSchedule:
-                    description: pruneSchedule (cron) for the repository-wide exclusive
-                      prune window.
+                    description: |-
+                      pruneSchedule (cron) for the repository-wide exclusive prune window. One shared cluster
+                      repository means ONE cluster-wide prune window (adr/0009) during which no namespace can
+                      start a backup — schedule it off-peak.
+                    minLength: 1
+                    type: string
+                  timezone:
+                    description: |-
+                      timezone (IANA name) both cron expressions are interpreted in. Empty means UTC. It matters
+                      more here than it looks: the whole point of pruneSchedule is to put a cluster-wide exclusive
+                      window somewhere off-peak, and "off-peak" is a local-time notion — "0 3 * * *" read as UTC
+                      lands in the middle of the working day for half the world.
                     type: string
                 type: object
               mode:

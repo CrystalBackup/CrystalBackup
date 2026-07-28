@@ -218,10 +218,20 @@ per-namespace user roles (02-api RBAC section):
   namespace-scoped to `crystal-backup-system` to match: the default cluster-wide Job cache
   would otherwise demand a cluster-wide `jobs` `list`/`watch` this Role deliberately
   withholds, CrashLooping the operator (cache sync fails) against its own least-privilege RBAC.
-- `pods`: read; `pods/exec`: `create` (hooks, R16). Controller invariant: a hook only ever
-  execs into pods **in the same namespace as the `BackupSchedule` that declares it** —
-  users can only make the platform run commands they can already run themselves (the
-  platform's namespace-user roles include in-namespace exec).
+- `pods`: read; `pods/exec`: `create` (hooks, R16 — **delivered in M4**). Controller invariant: a
+  hook only ever execs into pods **in the same namespace as the `Backup` that declares it**, and
+  only into those **mounting a PVC the run is capturing** — users can only make the platform run
+  commands they can already run themselves (the platform's namespace-user roles include
+  in-namespace exec). The invariant is *structural*, not a check: `internal/hooks` is handed the
+  candidate pod set and never resolves a pod by name, so it has no way to address a pod outside it.
+  Commands are an **argv**, never a shell string — the operator never interposes `sh -c`, so a
+  hook cannot smuggle a second command through an unquoted value.
+
+  Note the grant is **cluster-wide `pods/exec` `create`**, the operator's single most powerful
+  verb: anyone who can write a hook into a `ClusterBackup`/`BackupSchedule` directs it. That is why
+  the namespace confinement above is a code invariant with a test, and why M5's cascade work
+  ([adr/0017](adr/0017-cascade-materialization-backup-carries-identity.md)) treats a
+  `SubjectAccessReview` on the writer as the escalation mitigation.
 - `secrets`: `get` **only** — no `list`/`watch`; the operator reads Secrets by name via a
   direct API client (cache bypass), so no cluster-wide Secret cache ever exists in its
   memory. Namespace-scoped Secret `list` exists only in the manifest mover's transient

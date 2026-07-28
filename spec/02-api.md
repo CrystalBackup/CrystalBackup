@@ -42,6 +42,16 @@ namespace-plane `BackupSchedule` or a cluster-plane `ClusterBackup`. Therefore:
 - **Tenant visibility is native**: `Backup` objects are namespaced, so standard RBAC lets
   a user `kubectl get backups` see only their own — never other tenants'.
 
+**The `CronJob` analogy stops at `ClusterBackup`.** The top hop is a real template stamp
+(`spec.template.spec` copied wholesale into the run); the hop below it is **not** — a child
+`Backup` receives only `scheduleRef` and `locationRef`, and its run configuration is resolved
+from the parent at reconcile time via the `crystalbackup.io/cluster-backup` label. That is
+deliberate: the same kind is also written by **discovery**, which projects `Backup`s out of
+restic snapshots by server-side apply, and a field manager that owns a field must be able to
+reproduce it from the repository alone. See
+[adr/0017](adr/0017-cascade-materialization-backup-carries-identity.md) for the decision, its
+accepted costs, and the M5 direction.
+
 ## Repository is the source of truth
 
 `Backup` CRs are a **projection** of the restic repository, not the source of truth. The
@@ -72,14 +82,18 @@ and [01-architecture.md](01-architecture.md).
 
 - **`Backup` is the execution unit and the projection.** Created by a run *and* by
   discovery; deleted only when its snapshots are `forget`-ten (CR lifetime = data lifetime,
-  so `kubectl get backups -n X` lists exactly what is restorable in X).
+  so `kubectl get backups -n X` lists exactly what is restorable in X). Its `spec` therefore
+  carries **identity, not intent** — run configuration is resolved from the parent at reconcile
+  time ([adr/0017](adr/0017-cascade-materialization-backup-carries-identity.md)).
 - **Cluster DR repo is admin-owned.** Its key never leaves `crystal-backup-system`. Users
   reach DR data only through a `Restore` referencing a cluster-origin `Backup` in their own
   namespace; the operator mediates with a **server-side tag filter `namespace=<the CR's
   namespace>`** that users cannot forge — the R2/R14 cornerstone.
-- **Cluster-origin `Backup` objects are read-only to users** (admission): users may
-  get/list/watch them but not create/update/delete; a user-created `Backup`/`BackupSchedule`
-  must reference a **namespaced `BackupLocation`**, never a `ClusterBackupLocation`.
+- **Cluster-origin `Backup` objects are read-only to users** — by **RBAC**, not admission:
+  the tenant ClusterRole grants only `get`/`list`/`watch` on `backups`, so users never
+  create/update/delete them. Separately, and this part *is* admission (rule 2), a user-created
+  `Backup`/`BackupSchedule` must reference a **namespaced `BackupLocation`**, never a
+  `ClusterBackupLocation`.
 - **Namespace-plane isolation is by construction**: a `BackupLocation` references Secrets in
   its own namespace; a `Restore` only reads its own namespace's `Backup` objects.
 - Every CR exposes `status.conditions` (`metav1.Condition`) and a human `phase`;
@@ -131,11 +145,37 @@ spec:
     objectLockMode: Governance       # Governance | Compliance | AppendOnlyProxy
     rotationPeriod: 720h
 status:
-  conditions: [...]                  # Ready, Reachable
+  phase: Ready                       # Initializing | Ready | Degraded[: reason]
+  conditions: [...]                  # Ready, Reachable, EncryptionValid, MultipleDefaults,
+                                     #   RetentionIgnored, DEKEscrowed
   repositoryRef: dr-primary
   namespacesProtected: 42
   lastDiscoveryTime: "2026-07-12T02:55:00Z"
 ```
+
+**`Ready` means usable, not merely configured.** It is `True` only when the location is
+reachable, its encryption is valid, it does not conflict with another default, **and** the
+`BackupRepository` it provisioned reports `initialized: true`. Provisioning that repository is
+two steps that are seconds-to-minutes apart: the operator stamps out the `BackupRepository`
+object immediately, then a mover Job runs `restic init` behind it. `Ready` waits for the second.
+This is deliberate — the whole point of a single top-level verdict is that
+`create location → wait for Ready → create a Backup` works. Gating `Ready` on the object alone
+would let that sequence park the `Backup` in `Pending` with
+`BackupRepository "<name>" is not initialized yet`, which reads as a `Backup` fault when in
+fact the setup was simply not finished.
+
+The window between the two steps has its own phase, **`Initializing`** (`Ready=False`, reason
+`RepositoryInitializing`) — deliberately *not* `Degraded`. Nothing is wrong and there is
+nothing for an admin to fix; the init Job has not completed. `Degraded` is reserved for faults
+that need action: an unreachable endpoint, an invalid or missing KEK, a pending DEK recovery, a
+second default location. An operator must be able to tell **wait** from **act** at a glance in
+`kubectl get clusterbackuplocation`, which surfaces `phase`.
+
+Consumers (`Backup`, `ClusterBackup`, `Restore`, `ClusterRestore`, discovery, maintenance) still
+gate on the `BackupRepository`'s own `initialized` rather than on this condition: they need the
+repository object anyway, and a location-level rollup would be a second source of truth that can
+lag. `Ready` is the **human**-facing verdict; `initialized` is the machine-facing one. They are
+now consistent, where before they were not.
 
 ### ClusterBackupSchedule (cluster-scoped, admin) — ≈ CronJob
 
@@ -355,11 +395,12 @@ spec:
   pvcSelector: { matchLabels: {}, include: [], exclude: [] }   # default all
   includeManifests: true
   hooks:                             # R16
+    honorAnnotations: true           # OPT-IN (default false); see "Hook resolution" below
     pre:
       - podSelector: { matchLabels: { app: postgres } }
-        container: postgres
-        command: ["psql", "-c", "CHECKPOINT"]
-        timeout: 30s
+        container: postgres          # default: the pod's FIRST container
+        command: ["psql", "-c", "CHECKPOINT"]   # argv, never a shell string
+        timeout: 30s                 # defaulted; 0 would expire instantly
         onError: Fail                # Fail | Continue
     post: []
   # retention is NOT here: it lives on the BackupLocation — one repo, one policy.
@@ -370,6 +411,30 @@ status:
   nextScheduleTime: "2026-07-13T01:00:00Z"
   conditions: [...]
 ```
+
+#### Hook resolution (R16)
+
+Candidate pods are the **`Running` pods in the backup's own namespace that mount one of the PVCs
+this run is capturing**. Not a namespace-wide label match: a pod holding none of the backed-up data
+is not consistency-relevant, and excluding it structurally is what bounds the blast radius of the
+operator's cluster-wide `pods/exec` grant ([03-security-and-tenancy.md](03-security-and-tenancy.md)).
+
+For each candidate, **annotations win over spec, and they *replace* rather than merge** (Velero's
+precedence, deliberately matched so an operator's mental model carries over):
+
+| Pod annotations present | `honorAnnotations` | Hooks run for that pod |
+|---|---|---|
+| `crystalbackup.io/pre-backup-command` (+ `-container`, `-timeout`, `-on-error`) | `true` | the **annotation** hook only — the spec's `pre` list is ignored *for this pod* |
+| same | `false` (**default**) | the spec's matching `pre` hooks |
+| none | either | the spec's matching `pre` hooks whose `podSelector` matches |
+
+`honorAnnotations` is **opt-in**, not on by default, and that is deliberate: turning it on delegates
+*what the operator execs* to anyone who can annotate a pod in the backed-up namespace. Given the
+operator holds cluster-wide `pods/exec`, that is a decision an admin makes explicitly.
+
+`command` is an **argv**: a JSON array (`'["psql","-c","CHECKPOINT"]'`) or a single bare command.
+The operator never wraps it in `sh -c`, so shell metacharacters are inert. A malformed
+`podSelector` matches **nothing** rather than everything.
 
 ### Backup (namespaced) — execution unit **and** restore-point projection
 
@@ -398,8 +463,28 @@ status:
     - pvc: scratch-nfs
       phase: Skipped                          # CSI cannot snapshot (adr/0003); manifests still captured
       reason: CSISnapshotUnsupported
+  hooks:                                      # R16 — the freeze-window record (see "Hook resolution")
+    - phase: pre                              # pre | post
+      pod: postgres-0
+      container: postgres
+      source: annotation                      # annotation | spec — which one won for this pod
+      result: Succeeded                       # Succeeded | Failed | Skipped
+      finishedAt: "2026-07-12T01:00:03Z"
+    - phase: post
+      pod: postgres-0
+      container: postgres
+      source: annotation
+      result: Succeeded
+      finishedAt: "2026-07-12T01:00:31Z"
+  postHookAttempts: 1                         # bounded retry budget for the release
   conditions: [...]
 ```
+
+`status.hooks` is the **only** record that a freeze window was opened: the controller keeps nothing
+in memory, so a process that dies between the quiesce and the release rebuilds both facts from
+here. A `pre` entry with no matching `post` entry therefore means *an application may still be
+quiesced* — which is why the release is retried and why `Skipped` is a distinct result from
+`Succeeded` (a partial list must never read as "the rest passed").
 
 ### Restore (namespaced, user — self-service)
 
@@ -502,12 +587,33 @@ status:
   snapshotCount: 4123
   namespacesPresent: 42                      # distinct namespace tags found in the repo
   lastDiscoveryTime: "2026-07-12T02:55:00Z"
-  lastMaintenanceTime: ...
-  lastCheckTime: ...
-  lastCheckResult: Passed
-  approximateSizeBytes: ...
-  conditions: [...]
+  lastMaintenanceTime: "2026-07-12T03:40:11Z"   # last SUCCESSFUL prune
+  lastCheckTime: "2026-07-12T03:12:00Z"
+  lastCheckResult: Passed                       # Passed | Failed
+  approximateSizeBytes: 981283472384            # physical, from an S3 LIST (no restic run)
+  staleLocks: 0                                 # lock objects older than 30 min, same LIST
+  recentMaintenance:                            # newest first, capped at 10 (R17)
+    - operation: prune                          # prune | check
+      result: Succeeded                         # Succeeded | Failed
+      startedAt: "2026-07-12T03:30:02Z"
+      finishedAt: "2026-07-12T03:40:11Z"
+    - operation: check
+      result: Failed
+      message: "pack 3f2a…: invalid data returned"
+      startedAt: "2026-07-12T03:12:00Z"
+      finishedAt: "2026-07-12T03:14:47Z"
+  conditions: [...]                             # incl. RepositoryCheckFailed (R17)
 ```
+
+Two notes an operator needs:
+
+- **`lastMaintenanceTime` is a success stamp, not an attempt stamp.** Scheduling reads
+  `recentMaintenance` instead, so a *failing* prune does not stay permanently due and re-fire on
+  every reconcile.
+- **`approximateSizeBytes` and `staleLocks` come from one recursive S3 LIST**, not a mover Job: no
+  pod, no image pull, and no repository password needed to answer "how big is it, and is anything
+  stuck". A listing error yields no value rather than a partial sum — a half-counted repository
+  reads as data loss.
 
 ---
 

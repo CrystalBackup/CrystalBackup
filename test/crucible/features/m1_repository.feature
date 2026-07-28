@@ -15,6 +15,8 @@ Feature: Shared cluster-DR repository lifecycle
     And exactly one Secret "crystal-dek-dr" exists in "crystal-backup-system"
     And the Secret "crystal-dek-dr" holds only the age-wrapped DEK, never a plaintext password
     And the ClusterBackupLocation reports condition Reachable=true and Ready=true
+    And Ready=true means usable: it is reported only once the repository is Initialized, so an
+      admin who waits for it can create a Backup that runs, rather than one that sits Pending
 
   Scenario: The shared repository is initialized exactly once, even under concurrent reconciles
     Given a ClusterBackupLocation "dr" that has provisioned its repository

@@ -148,6 +148,57 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              hooks:
+                description: |-
+                  hooks records what each consistency hook did (R16). It is the durable account of the freeze
+                  window: which pods were quiesced, whether the release ran, and — when it did not — what an
+                  operator has to go and undo by hand.
+                items:
+                  description: HookStatus is one hook execution's durable record.
+                  properties:
+                    container:
+                      type: string
+                    finishedAt:
+                      description: finishedAt is when the execution ended.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message carries the failure, including the command's own stderr — usually the whole
+                        diagnosis. Empty on success.
+                      maxLength: 1024
+                      type: string
+                    phase:
+                      description: 'phase the hook ran in: "pre" (before snapshotting)
+                        or "post" (after every snapshot was cut).'
+                      enum:
+                      - pre
+                      - post
+                      type: string
+                    pod:
+                      description: pod the command ran in, and container within it.
+                      type: string
+                    result:
+                      description: result of the execution.
+                      enum:
+                      - Succeeded
+                      - Failed
+                      - Skipped
+                      type: string
+                    source:
+                      description: 'source records where the hook was declared: an
+                        annotation on the pod itself, or the CR spec.'
+                      enum:
+                      - annotation
+                      - spec
+                      type: string
+                  required:
+                  - phase
+                  - pod
+                  - result
+                  type: object
+                maxItems: 64
+                type: array
               manifests:
                 description: manifests records the namespace-manifests snapshot.
                 properties:
@@ -171,6 +222,14 @@ spec:
                 - PartiallyFailed
                 - Failed
                 type: string
+              postHookAttempts:
+                description: |-
+                  postHookAttempts counts how many times the post-hook (unfreeze) phase has been tried. Post
+                  hooks are retried where pre hooks are not, and the asymmetry is deliberate: a failed pre hook
+                  means the snapshot should not be taken, while a failed post hook means an application may
+                  still be QUIESCED. Retrying is the difference between a transient blip and an outage.
+                format: int32
+                type: integer
               volumes:
                 description: volumes is the per-PVC result set.
                 items:

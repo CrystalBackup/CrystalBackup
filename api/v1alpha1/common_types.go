@@ -118,9 +118,17 @@ type NamespaceEncryptionSpec struct {
 // DiscoverySpec configures repository→Backup projection.
 type DiscoverySpec struct {
 	// enabled turns on inventory and projection of Backup objects from the repository.
+	//
+	// A POINTER, like ClusterResourceCaptureSpec.Enabled, and for the same reason: this defaults to
+	// TRUE, and a plain bool cannot express all three states a default-true field needs. With
+	// `omitempty` encoding/json drops `false`, so no Go client could ever disable discovery (the
+	// API server would substitute the default) even though `kubectl apply` with `enabled: false`
+	// worked. Without `omitempty` the zero value serialises as an explicit `false`, so every caller
+	// that left the struct alone would silently switch discovery OFF. Only nil-means-unset
+	// distinguishes "I did not say" from "I said no".
 	// +optional
 	// +kubebuilder:default=true
-	Enabled bool `json:"enabled,omitempty"`
+	Enabled *bool `json:"enabled,omitempty"`
 
 	// interval between periodic discovery passes.
 	// +optional
@@ -128,20 +136,82 @@ type DiscoverySpec struct {
 	Interval metav1.Duration `json:"interval,omitempty"`
 }
 
-// MaintenanceSpec configures Standard-mode repository maintenance.
+// MaintenanceSpec configures Standard-mode repository maintenance. Immutable locations never
+// prune (object-lock forbids it, adr/0005) — admission rule 6 denies pruneSchedule there.
+//
+// The two value fields carry restic's OWN grammars, pinned here as CRD patterns so a typo is
+// rejected at apply time instead of becoming a maintenance Job that starts, pulls an image, opens
+// the repository and only then dies on a flag parse error. internal/restic re-validates them at
+// argv-build time: these patterns bind only what this API accepts, and the repository contract
+// belongs to the package that owns the argv.
 type MaintenanceSpec struct {
-	// pruneSchedule (cron) for the repository-wide exclusive prune window.
+	// pruneSchedule (cron) for the repository-wide exclusive prune window. One shared cluster
+	// repository means ONE cluster-wide prune window (adr/0009) during which no namespace can
+	// start a backup — schedule it off-peak.
 	// +optional
+	// +kubebuilder:validation:MinLength=1
 	PruneSchedule string `json:"pruneSchedule,omitempty"`
-	// pruneMaxRepackSize caps repacking per prune run (e.g. "50G").
+	// pruneMaxRepackSize caps repacking per prune run (e.g. "50G") — the practical bound on how
+	// long that exclusive window lasts. Empty means restic's default: repack whatever the run
+	// needs. A byte count with an optional k/K, m/M, g/G or t/T suffix.
 	// +optional
+	// +kubebuilder:validation:Pattern=`^[0-9]+(\.[0-9]+)?[kKmMgGtT]?$`
 	PruneMaxRepackSize string `json:"pruneMaxRepackSize,omitempty"`
 	// checkSchedule (cron) for restic check.
 	// +optional
+	// +kubebuilder:validation:MinLength=1
 	CheckSchedule string `json:"checkSchedule,omitempty"`
-	// checkReadDataSubset is the fraction of pack data to verify (e.g. "5%").
+	// timezone (IANA name) both cron expressions are interpreted in. Empty means UTC. It matters
+	// more here than it looks: the whole point of pruneSchedule is to put a cluster-wide exclusive
+	// window somewhere off-peak, and "off-peak" is a local-time notion — "0 3 * * *" read as UTC
+	// lands in the middle of the working day for half the world.
 	// +optional
+	Timezone string `json:"timezone,omitempty"`
+	// checkReadDataSubset is how much pack data each check actually READS (R17). Empty means a
+	// structural check only, which catches a missing or truncated object but never a silently
+	// corrupted one — its bytes rotted while its name and length stayed right. Accepts "n/t" for
+	// a specific part, a percentage like "5%" or "2.5%", or a size with a k/K, m/M, g/G or t/T
+	// suffix.
+	// +optional
+	// +kubebuilder:validation:Pattern=`^([0-9]+/[0-9]+|[0-9]+(\.[0-9]+)?%|[0-9]+(\.[0-9]+)?[kKmMgGtT]?)$`
 	CheckReadDataSubset string `json:"checkReadDataSubset,omitempty"`
+}
+
+// MaintenanceResult is the outcome of one repository-maintenance attempt.
+// +kubebuilder:validation:Enum=Succeeded;Failed
+type MaintenanceResult string
+
+// Repository-maintenance outcomes.
+const (
+	// MaintenanceSucceeded means the maintenance Job ran to completion with exit status 0.
+	MaintenanceSucceeded MaintenanceResult = "Succeeded"
+	// MaintenanceFailed means the Job failed, timed out, or never got its turn on the lane.
+	MaintenanceFailed MaintenanceResult = "Failed"
+)
+
+// MaintenanceRecord is one completed repository-maintenance attempt, kept so an operator can see
+// WHY a repository is unhealthy without going to the operator log — the maintenance Job and its
+// pod are deleted as soon as the op finishes (no ownerReference is possible: the Job lives in the
+// operator namespace, the triggering object does not), so this record is the only durable trace.
+type MaintenanceRecord struct {
+	// operation that ran, e.g. "prune" or "check".
+	// +required
+	Operation string `json:"operation"`
+	// startTime is when the operation was enqueued on the repository's exclusive lane. It
+	// deliberately INCLUDES the wait for its turn: "the prune took three hours" is the number an
+	// operator needs, and the lane is exactly where contention shows up.
+	// +required
+	StartTime metav1.Time `json:"startTime"`
+	// completionTime is when it finished. Absent while it is still running.
+	// +optional
+	CompletionTime *metav1.Time `json:"completionTime,omitempty"`
+	// result of the attempt.
+	// +optional
+	Result MaintenanceResult `json:"result,omitempty"`
+	// message carries the failure reason, truncated. Empty on success.
+	// +optional
+	// +kubebuilder:validation:MaxLength=512
+	Message string `json:"message,omitempty"`
 }
 
 // ObjectLockMode selects the immutability enforcement mechanism.
@@ -218,19 +288,40 @@ type NamespaceSelector struct {
 // +kubebuilder:validation:Enum=Fail;Continue
 type HookErrorPolicy string
 
-// Hook is an exec hook run in a selected pod around snapshotting (R16).
+// Hook failure policies. The zero value is empty, which callers must treat as Fail — matching the
+// CRD default — so a hook whose policy was never set fails closed rather than silently continuing.
+const (
+	// HookErrorPolicyFail aborts the backup when the hook fails. The default, because a
+	// pre-snapshot hook exists precisely to make the snapshot trustworthy: if the quiesce did not
+	// happen, a snapshot taken anyway is a backup that LOOKS application-consistent and is not.
+	HookErrorPolicyFail HookErrorPolicy = "Fail"
+	// HookErrorPolicyContinue records the failure and proceeds — for best-effort hooks whose
+	// absence degrades consistency without invalidating the backup.
+	HookErrorPolicyContinue HookErrorPolicy = "Continue"
+)
+
+// Hook is an exec hook run in a selected pod around snapshotting (R16). Candidate pods are those
+// MOUNTING the volumes being snapshotted, always in the CR's own namespace; podSelector narrows
+// that set further, and an empty selector means "every pod holding this data".
 type Hook struct {
-	// podSelector selects the pod(s) to exec into.
+	// podSelector selects the pod(s) to exec into, among those mounting the backed-up volumes.
+	// Empty matches them all.
 	// +optional
 	PodSelector metav1.LabelSelector `json:"podSelector,omitempty"`
-	// container name to exec into.
+	// container name to exec into. Empty uses the pod's FIRST container.
 	// +optional
 	Container string `json:"container,omitempty"`
-	// command to run.
+	// command to run, as an argv. It is exec'd directly, NOT through a shell, so pipes and
+	// redirections need an explicit interpreter (e.g. ["sh","-c","..."]).
 	// +required
+	// +kubebuilder:validation:MinItems=1
 	Command []string `json:"command"`
-	// timeout for the hook.
+	// timeout for the hook, bounding how long the application stays quiesced. It defaults to 30s
+	// rather than to the zero value on purpose: this is a non-pointer duration, so an omitted
+	// timeout would arrive as 0s, and a literal zero deadline expires immediately — every hook
+	// that did not set one would fail before it ran.
 	// +optional
+	// +kubebuilder:default="30s"
 	Timeout metav1.Duration `json:"timeout,omitempty"`
 	// onError governs whether a failure fails the backup or is tolerated.
 	// +optional
@@ -238,9 +329,56 @@ type Hook struct {
 	OnError HookErrorPolicy `json:"onError,omitempty"`
 }
 
+// HookResult is the outcome of one hook execution.
+// +kubebuilder:validation:Enum=Succeeded;Failed;Skipped
+type HookResult string
+
+// Hook outcomes.
+const (
+	// HookSucceeded means the command exited 0 within its timeout.
+	HookSucceeded HookResult = "Succeeded"
+	// HookFailed means it exited non-zero, timed out, or could not be started.
+	HookFailed HookResult = "Failed"
+	// HookSkipped means an earlier hook in the same phase failed with onError=Fail, so this one
+	// never ran. Recorded rather than omitted: a list showing three of five hooks invites the
+	// reader to assume the missing two passed.
+	HookSkipped HookResult = "Skipped"
+)
+
+// HookStatus is one hook execution's durable record.
+type HookStatus struct {
+	// phase the hook ran in: "pre" (before snapshotting) or "post" (after every snapshot was cut).
+	// +required
+	// +kubebuilder:validation:Enum=pre;post
+	Phase string `json:"phase"`
+	// pod the command ran in, and container within it.
+	// +required
+	Pod string `json:"pod"`
+	// +optional
+	Container string `json:"container,omitempty"`
+	// source records where the hook was declared: an annotation on the pod itself, or the CR spec.
+	// +optional
+	// +kubebuilder:validation:Enum=annotation;spec
+	Source string `json:"source,omitempty"`
+	// result of the execution.
+	// +required
+	Result HookResult `json:"result"`
+	// message carries the failure, including the command's own stderr — usually the whole
+	// diagnosis. Empty on success.
+	// +optional
+	// +kubebuilder:validation:MaxLength=1024
+	Message string `json:"message,omitempty"`
+	// finishedAt is when the execution ended.
+	// +optional
+	FinishedAt *metav1.Time `json:"finishedAt,omitempty"`
+}
+
 // HooksSpec groups pre/post hooks and annotation honouring (R16).
 type HooksSpec struct {
-	// honorAnnotations enables crystalbackup.io/pre-backup-* pod annotations.
+	// honorAnnotations enables the crystalbackup.io/pre-backup-* and post-backup-* pod
+	// annotations. It is opt-in because it delegates WHAT the operator execs to whoever can
+	// annotate a pod in the backed-up namespace. When a pod carries them they take precedence and
+	// the hooks below are skipped for that pod — never merged (the same rule Velero applies).
 	// +optional
 	HonorAnnotations bool `json:"honorAnnotations,omitempty"`
 	// pre hooks run before snapshotting.

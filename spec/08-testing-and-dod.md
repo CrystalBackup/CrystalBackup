@@ -200,7 +200,15 @@ Core suite (every PR):
    `Backup` is **denied** by admission (read-only projection).
 7. **Hook failure policies (R16)**: pre-hook with `onError: Fail` aborts the backup
    before snapshots; `onError: Continue` proceeds and records the hook error in status;
-   hook timeout enforced.
+   hook timeout enforced. Plus the two properties the freeze window rests on:
+   **the unfreeze is unconditional** (a run whose volumes end `Failed`/`Skipped` still records a
+   `post` hook — the application is quiesced either way), and **it survives a restart** (delete the
+   operator pod between the `pre` and the `post` record → the new leader reads `status.hooks`,
+   sees a `pre` with no `post`, and releases). The restart case is the feature's most important
+   test: nothing about the window is held in memory, and a workload left frozen by a crashed
+   operator is an outage the backup itself caused.
+   Confinement is asserted too: a `Running` pod in the same namespace that mounts **none** of the
+   run's PVCs is never exec'd into.
 8. **Metrics smoke (R19)**: `/metrics` exposes
    `crystalbackup_backup_last_success_timestamp_seconds{namespace="tenant-a"}` (full
    catalogue asserted per [05-observability.md](05-observability.md); every series carries
@@ -228,11 +236,47 @@ Full suite (nightly + release tags), in addition:
     then runs exclusively; `restic check` clean after both. (One shared repo ⇒ one prune
     window — [adr/0009](adr/0009-shared-cluster-repo-tag-tenancy.md); backups take shared
     locks, prune/check/forget/init/erasure require the exclusive lock — this test proves
-    the operator serializes them per `BackupRepository`.)
+    the operator serializes them per `BackupRepository`.) Note the operator drains the movers
+    *before* the prune rather than letting them contend: the assertion is that new movers are
+    held back while a prune is pending, and that the drain gives up on its **own** short deadline
+    rather than the prune's long one — a stuck mover must not close the backup plane for hours
+    ([adr/0015](adr/0015-per-repository-exclusive-queue-serialization.md) §3).
+11b. **A killed prune does not wedge the repository**: SIGKILL the prune mid-flight so restic's
+    exclusive lock is orphaned → a terminal outcome still lands in `status.recentMaintenance`
+    (so the cron baseline advances and the repository does not stay permanently due), and a prune
+    completes. **Measured on real infrastructure, that outcome is `Succeeded`, not `Failed`**: the
+    maintenance Job carries `backoffLimit=1`, so killing its pod buys one pod-level retry which
+    succeeds. The design absorbs the kill. This case originally asserted `Failed` — the crucible
+    corrected it, and pinning the original expectation would have frozen the worse behaviour as
+    the contract. Concurrently, a `restic snapshots` read (discovery, or
+    a restore resolving its source) must **not** have blocked on that lock at any point — both
+    read paths pass `--no-lock`.
+
+    > **The reap itself is deliberately NOT asserted here, and the reason is a property of the
+    > design rather than a gap in the test.** `status.staleLocks` is age-based on the lock object's
+    > `LastModified`, using restic's own 30-minute staleness horizon — a lock younger than that may
+    > well belong to something still running, and nothing in the object store can distinguish the
+    > two. So the reap cannot fire inside any reasonable test window, and at the 30-minute mark
+    > restic would remove the lock itself on the next acquisition anyway. The operator-driven
+    > `unlock` does not shorten that window; what it fixes is that the **signal** used to be a dead
+    > end (`CrystalbackupStaleLocks` fired and nothing ever drove the gauge back down). That is
+    > covered by unit tests, which can control the clock. Asserting it on live infrastructure would
+    > mean a 30-minute sleep to prove something restic does for us.
 12. **`check` catches tampering (R17)**: flip bytes inside a pack object under `data/` in
     SeaweedFS via `mc`; the next scheduled `restic check --read-data-subset` fails, surfacing
     `BackupRepository.status.lastCheckResult: Failed`, the `RepositoryCheckFailed` condition and
     alert metric. (Restore-testing itself is the admin's job — no automated canary in v1, R17.)
+12b. **Crash-only teardown — a kill at the terminal transition leaks nothing**: watch a
+    single-namespace run's child `Backup` at high frequency and SIGKILL the operator (grace 0)
+    the instant the terminal phase appears — inside, or hard against, the
+    [terminal status write → exposure deletes] window. The fresh operator's terminal re-entry
+    sweep must re-run the teardown, stamp `crystalbackup.io/exposures-cleaned`, preserve the
+    terminal record, and the leak-check invariant must hold (zero residual VS/VSC/clone PVC).
+    This case exists because a three-lane fanout measured that exact window leaking a
+    Retain-parked `VolumeSnapshotContent` ~1 run in 3 — and because the kill's landing point is
+    nondeterministic, the assertion is deliberately *indifference to where it lands*, which is
+    the property the fix guarantees. Runs where the inline teardown wins the race are valid
+    samples, not misses.
 13. **Orphan reaper**: kill a `crystal-mover` pod mid-upload (grace 0) and cordon+delete
     its node (node-drain simulation on a multi-node kind cluster) → temp PVC, static
     VS/VSC and tenant VolumeSnapshot are garbage-collected, the stale restic lock is

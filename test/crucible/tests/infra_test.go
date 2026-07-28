@@ -22,6 +22,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -85,11 +86,18 @@ var _ = Describe("Infrastructure", Label("infra"), func() {
 	})
 
 	It("reports Ceph HEALTH_OK (via the rook toolbox)", func() {
-		out, err := exec.Command("kubectl", "-n", "rook-ceph",
-			"exec", "deploy/rook-ceph-tools", "--", "ceph", "health").CombinedOutput()
-		Expect(err).NotTo(HaveOccurred(), "ceph health failed: %s", string(out))
-		Expect(strings.TrimSpace(string(out))).To(HavePrefix("HEALTH_OK"),
-			"ceph must be HEALTH_OK, got: %s", string(out))
+		// Eventually, not a one-shot read: on ephemeral cloud VMs Ceph raises TRANSIENT warnings
+		// — "1 OSD(s) experiencing slow operations in BlueStore" failed a validation lane whose
+		// every product spec passed — and those clear on their own when the slow op completes. A
+		// bounded window separates that noise from a genuinely sick platform: persistent WARN
+		// (dead OSD, full disk, stuck PGs) stays WARN for the whole window and still fails.
+		Eventually(func(g Gomega) {
+			out, err := exec.Command("kubectl", "-n", "rook-ceph",
+				"exec", "deploy/rook-ceph-tools", "--", "ceph", "health").CombinedOutput()
+			g.Expect(err).NotTo(HaveOccurred(), "ceph health failed: %s", string(out))
+			g.Expect(strings.TrimSpace(string(out))).To(HavePrefix("HEALTH_OK"),
+				"ceph must be HEALTH_OK, got: %s", string(out))
+		}, 5*time.Minute, 10*time.Second).Should(Succeed())
 	})
 
 	It("reaches the Hetzner Object Storage backup bucket", func() {

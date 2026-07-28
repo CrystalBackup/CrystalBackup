@@ -78,7 +78,10 @@ const (
 	// admission webhook's job.
 	ConditionMultipleDefaults = "MultipleDefaults"
 	// ConditionReady rolls up Reachable, EncryptionValid, MultipleDefaults and repository
-	// provisioning into the single top-level verdict.
+	// READINESS — provisioned AND initialized — into the single top-level verdict. Its
+	// contract is deliberately "usable": Ready=True means a Backup created against this
+	// location will run, not merely that its configuration parsed. See the rollup in
+	// Reconcile for why repository initialization is part of it.
 	ConditionReady = "Ready"
 	// ConditionRetentionIgnored is the advisory set when spec.retention requests a keep policy but
 	// the location is Immutable, where restic keep*/forget is inert (object-lock governs expiry).
@@ -90,6 +93,14 @@ const (
 // locationPhaseDegraded is the Status.Phase a ClusterBackupLocation records when a fail-fast
 // check (encryption or reachability) fails, or when the readiness rollup is otherwise not met.
 const locationPhaseDegraded = "Degraded"
+
+// locationPhaseInitializing is the Status.Phase for a location whose configuration is entirely
+// sound — reachable, valid encryption, no default conflict, BackupRepository provisioned — but
+// whose repository has not finished `restic init` yet. It is deliberately NOT Degraded: nothing
+// is wrong and there is nothing for an admin to fix, the init mover Job simply has not
+// completed. Distinguishing the two is the whole point of the phase: an operator must be able
+// to tell "wait" from "act".
+const locationPhaseInitializing = "Initializing"
 
 const (
 	// kekIdentityDataKey is the data key inside the Secret named by
@@ -298,23 +309,51 @@ func (r *ClusterBackupLocationReconciler) Reconcile(ctx context.Context, req ctr
 		return ctrl.Result{}, fmt.Errorf("ensure BackupRepository for ClusterBackupLocation %s: %w", loc.Name, err)
 	}
 
+	// Repository INITIALIZATION, not merely provisioning, is part of Ready. ensureRepository
+	// above only guarantees the BackupRepository OBJECT exists; the `restic init` behind it runs
+	// asynchronously in a mover Job driven by the BackupRepository controller, and until it
+	// succeeds the repository cannot take a backup. Every consumer already knows this and gates
+	// on repo.Status.Initialized itself (backup, clusterbackup, restore, clusterrestore,
+	// discovery, maintenance) — which is precisely the symptom: Ready was not a usable verdict,
+	// so nobody trusted it. Folding it in here makes "wait for the location to be Ready, then
+	// take a backup" — the flow the docs and the e2e suites describe — actually work, instead of
+	// parking the Backup in Pending on `BackupRepository %q is not initialized yet`.
+	repoInitialized, err := r.repositoryInitialized(ctx, &loc)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
 	// Reachable and EncryptionValid are re-read from the conditions (rather than trusted from
 	// the local bools above) so this rollup stays correct even if the fail-fast early returns
 	// above are ever relaxed — Ready's contract is exactly this AND, independent of how many
-	// of the four other checks are allowed to run in the same pass.
+	// of the other checks are allowed to run in the same pass.
 	reachable := status.IsConditionTrue(loc.Status.Conditions, ConditionReachable)
 	encryptionValid := status.IsConditionTrue(loc.Status.Conditions, ConditionEncryptionValid)
-	ready := reachable && encryptionValid && loc.Status.RepositoryRef != "" && !multipleDefaults
+	provisioned := loc.Status.RepositoryRef != ""
+	ready := reachable && encryptionValid && provisioned && repoInitialized && !multipleDefaults
+
+	// Requeue cadence: an initializing location leans on the Owns(&BackupRepository{}) watch to
+	// re-trigger the moment Initialized flips, so this short requeue is only a backstop against a
+	// dropped event — it must never be the primary path, or Ready would lag init by minutes.
+	requeue := periodicRequeueInterval
 
 	switch {
 	case ready:
 		status.SetCondition(&loc.Status.Conditions, ConditionReady, metav1.ConditionTrue, "Ready",
-			"location is reachable, encryption is valid, and the repository is provisioned", loc.Generation)
+			"location is reachable, encryption is valid, and the repository is initialized and ready to accept backups",
+			loc.Generation)
 		loc.Status.Phase = "Ready"
 	case multipleDefaults:
 		status.SetCondition(&loc.Status.Conditions, ConditionReady, metav1.ConditionFalse, "MultipleDefaults",
 			"this location conflicts with another default ClusterBackupLocation", loc.Generation)
 		loc.Status.Phase = "Degraded: multiple default ClusterBackupLocations"
+	case reachable && encryptionValid && provisioned && !repoInitialized:
+		// Sound configuration, unfinished setup. Not Degraded — see locationPhaseInitializing.
+		status.SetCondition(&loc.Status.Conditions, ConditionReady, metav1.ConditionFalse, "RepositoryInitializing",
+			fmt.Sprintf("repository provisioned; initialization is still in progress — see BackupRepository %q "+
+				"(condition Initialized) for its progress", loc.Status.RepositoryRef), loc.Generation)
+		loc.Status.Phase = locationPhaseInitializing
+		requeue = shortRequeueInterval
 	default:
 		status.SetCondition(&loc.Status.Conditions, ConditionReady, metav1.ConditionFalse, "NotReady",
 			"location is not ready", loc.Generation)
@@ -325,7 +364,29 @@ func (r *ClusterBackupLocationReconciler) Reconcile(ctx context.Context, req ctr
 		return ctrl.Result{}, fmt.Errorf("update status for ClusterBackupLocation %s: %w", loc.Name, err)
 	}
 
-	return ctrl.Result{RequeueAfter: periodicRequeueInterval}, nil
+	return ctrl.Result{RequeueAfter: requeue}, nil
+}
+
+// repositoryInitialized reports whether the BackupRepository named by loc.Status.RepositoryRef
+// has finished `restic init`. A repository that is absent from the cache — the normal case on
+// the very pass that ensureRepository created it — is reported not-initialized rather than as an
+// error: it is a transient, self-correcting state, and the Owns watch re-triggers this location
+// as soon as the object materialises.
+func (r *ClusterBackupLocationReconciler) repositoryInitialized(ctx context.Context, loc *cbv1.ClusterBackupLocation) (bool, error) {
+	if loc.Status.RepositoryRef == "" {
+		return false, nil
+	}
+
+	var repo cbv1.BackupRepository
+	if err := r.Get(ctx, client.ObjectKey{Name: loc.Status.RepositoryRef}, &repo); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("get BackupRepository %s for ClusterBackupLocation %s: %w",
+			loc.Status.RepositoryRef, loc.Name, err)
+	}
+
+	return repo.Status.Initialized, nil
 }
 
 // finalize handles a ClusterBackupLocation with a non-zero DeletionTimestamp. Per adr/0009,
@@ -482,7 +543,10 @@ func (r *ClusterBackupLocationReconciler) ensureRepository(ctx context.Context, 
 
 // SetupWithManager registers this reconciler with mgr: it watches ClusterBackupLocation
 // directly and BackupRepository as an owned type (so a Create/Update/Delete of the owned
-// repository re-triggers its owning location). There is deliberately no Watch on the cluster
+// repository re-triggers its owning location). That Owns is load-bearing, not a nicety: since
+// Ready folds in repo.Status.Initialized, this watch is what flips the location to Ready
+// promptly when the init Job succeeds — it carries status-only updates, which is exactly the
+// event `restic init` finishing produces. There is deliberately no Watch on the cluster
 // KEK Secret or on sibling ClusterBackupLocations — a Secret watch would need list/watch RBAC
 // on Secrets, which invariant I3 forbids, and a self-referential List inside
 // evaluateMultipleDefaults would fire on every sibling's every change if watched naively.

@@ -8,9 +8,9 @@ data "hcloud_ssh_key" "crucible" {
 }
 
 resource "hcloud_network" "crucible" {
-  name     = "${var.name_prefix}-net"
+  name     = "${local.name_prefix}-net"
   ip_range = var.network_cidr
-  labels   = var.labels
+  labels   = local.lane_labels
 }
 
 resource "hcloud_network_subnet" "nodes" {
@@ -26,8 +26,8 @@ resource "hcloud_network_subnet" "nodes" {
 # vxlan 8472/udp, ceph, longhorn, NodePorts, ...) must be allowed explicitly:
 # open the whole private CIDR between nodes, and keep only 22/80/443/6443 public.
 resource "hcloud_firewall" "crucible" {
-  name   = "${var.name_prefix}-fw"
-  labels = var.labels
+  name   = "${local.name_prefix}-fw"
+  labels = local.lane_labels
 
   rule {
     description = "All node-to-node TCP on the private network"
@@ -87,9 +87,9 @@ resource "hcloud_firewall" "crucible" {
 
 # Spread nodes across physical hosts (etcd quorum survives a host failure).
 resource "hcloud_placement_group" "crucible" {
-  name   = "${var.name_prefix}-spread"
+  name   = "${local.name_prefix}-spread"
   type   = "spread"
-  labels = var.labels
+  labels = local.lane_labels
 }
 
 # Shared secret joining the RKE2 cluster (lands only in the generated,

@@ -98,13 +98,31 @@ func TestInventoryChurnPredicate(t *testing.T) {
 		new:  annotated(repoAt(1, true, 3, &t0), "42"),
 		want: true,
 	}, {
-		// Another controller's status write (a prune recording lastMaintenanceTime) is not
-		// discovery's churn and must still wake it.
-		name: "another controller's status write passes",
+		// The maintenance controller's writes are filtered too (M4). A prune recording
+		// lastMaintenanceTime, and especially the periodic physical-size and stale-lock refresh,
+		// would otherwise cost a full `restic snapshots` Job apiece for an inventory nobody asked
+		// to refresh — the same waste as discovery's own self-trigger, one milestone later.
+		name: "the maintenance controller's status write is filtered",
 		old:  repoAt(1, true, 3, &t0),
 		new: func() *cbv1.BackupRepository {
 			r := repoAt(1, true, 3, &t0)
 			r.Status.LastMaintenanceTime = &t1
+			r.Status.LastCheckTime = &t1
+			r.Status.LastCheckResult = "Passed"
+			r.Status.ApproximateSizeBytes = 1 << 30
+			r.Status.StaleLocks = 2
+			r.Status.RecentMaintenance = []cbv1.MaintenanceRecord{{Operation: "prune", StartTime: t0}}
+			return r
+		}(),
+		want: false,
+	}, {
+		// A status write OUTSIDE both controllers' field sets still wakes discovery: keySlots is
+		// the BackupRepository controller's, and discovery has no way to know it is irrelevant.
+		name: "an unrelated status write still passes",
+		old:  repoAt(1, true, 3, &t0),
+		new: func() *cbv1.BackupRepository {
+			r := repoAt(1, true, 3, &t0)
+			r.Status.KeySlots = []string{"platform", "tenant"}
 			return r
 		}(),
 		want: true,

@@ -41,6 +41,7 @@ import (
 	"github.com/CrystalBackup/CrystalBackup/internal/apiconst"
 	clientsecrets "github.com/CrystalBackup/CrystalBackup/internal/client/secrets"
 	"github.com/CrystalBackup/CrystalBackup/internal/concurrency"
+	"github.com/CrystalBackup/CrystalBackup/internal/metrics"
 	"github.com/CrystalBackup/CrystalBackup/internal/mover"
 	"github.com/CrystalBackup/CrystalBackup/internal/repo/queue"
 	"github.com/CrystalBackup/CrystalBackup/internal/restic"
@@ -139,6 +140,10 @@ type restoreExecContext struct {
 	restoredFromRun string
 	// Repository access, resolved by the owning controller.
 	repoName, repoURL, dek, s3CredsSecret string
+	// clusterID labels the repository metrics this path emits (the stale-lock counter). Resolved
+	// from the location alongside the repository access above, so a lock reaped by a restore and one
+	// reaped by a backup land on the SAME metric series rather than splitting into two.
+	clusterID string
 	// startBudget is set by driveVolumes each pass to (restoreOwnerMoverCap - running
 	// movers of this owner); startVolume consumes one unit per mover Job it creates and
 	// holds further volumes back at zero. Per-reconcile state — never shared or persisted.
@@ -609,9 +614,21 @@ func (e *restoreEngine) adviseVolume(ctx context.Context, rc *restoreExecContext
 		// state), and re-enqueuing an exclusive unlock each 5s would flood the repository
 		// lane and hold mover admission shut for its whole tail.
 		if rerr != nil && e.shouldEnqueueUnlock(rc.ownerID+"/"+plan.pvc) {
-			enqueueRepoMaintenance(ctx, e.Queue, e.maintenanceDeps(), rc.repoName, queue.OpUnlock,
-				maintenanceResourceName(prefix, "unlock"), mover.OpUnlock, restic.UnlockArgs(),
-				rc.repoURL, rc.dek, rc.s3CredsSecret)
+			enqueueRepoMaintenance(ctx, e.Queue, e.maintenanceDeps(), repoMaintenanceRequest{
+				RepoName:      rc.repoName,
+				Kind:          queue.OpUnlock,
+				Name:          maintenanceResourceName(prefix, "unlock"),
+				Op:            mover.OpUnlock,
+				ResticArgs:    restic.UnlockArgs(),
+				RepoURL:       rc.repoURL,
+				DEK:           rc.dek,
+				S3CredsSecret: rc.s3CredsSecret,
+				OnDone: func(err error) {
+					if err == nil {
+						metrics.RecordLockReaped(rc.repoName, rc.clusterID)
+					}
+				},
+			})
 		}
 		return volumeOutcome{settled: true, failed: true, reason: moverFailureReason(result, rerr)}, nil
 	}

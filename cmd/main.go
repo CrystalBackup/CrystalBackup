@@ -48,8 +48,10 @@ import (
 	"github.com/CrystalBackup/CrystalBackup/internal/controller"
 	"github.com/CrystalBackup/CrystalBackup/internal/escrow"
 	"github.com/CrystalBackup/CrystalBackup/internal/exposer"
+	"github.com/CrystalBackup/CrystalBackup/internal/hooks"
 	"github.com/CrystalBackup/CrystalBackup/internal/metrics"
 	"github.com/CrystalBackup/CrystalBackup/internal/repo/queue"
+	"github.com/CrystalBackup/CrystalBackup/internal/repo/s3stat"
 	"github.com/CrystalBackup/CrystalBackup/internal/rexposer"
 	webhookv1alpha1 "github.com/CrystalBackup/CrystalBackup/internal/webhook/v1alpha1"
 	// +kubebuilder:scaffold:imports
@@ -310,7 +312,40 @@ func main() {
 		setupLog.Error(err, "Unable to create controller", "controller", "BackupRepository")
 		os.Exit(1)
 	}
-	if err := controller.NewBackupReconciler(
+	maintenanceReconciler := controller.NewMaintenanceReconciler(
+		mgr.GetClient(),
+		mgr.GetScheme(),
+		// Same uncached Secret reader (the cluster KEK + DR S3 credentials); never GetClient().
+		secrets.NewByNameReader(mgr.GetAPIReader()),
+		// The SAME queue instance as init/forget/unlock: prune and check must share one
+		// serialisation lane per repository, or they would race the ops they exist to coexist with.
+		repoQueue,
+		operatorNamespace,
+		moverImage,
+		mgr.GetEventRecorder("maintenance"),
+		clock.RealClock{},
+	)
+	// The footprint prober reads OBJECT METADATA only — sizes and modification times under the
+	// repository's own prefix — so it needs the location's S3 credentials but never the DEK, and
+	// it cannot see anything encrypted. It is what makes repository_size_bytes and
+	// repository_stale_locks cost a LIST instead of a mover Job (05-observability §2.4).
+	maintenanceReconciler.NewProber = func(
+		s3 crystalbackupiov1alpha1.S3Spec, accessKey, secretKey string,
+	) (s3stat.Prober, error) {
+		return s3stat.New(s3, accessKey, secretKey)
+	}
+	if err := maintenanceReconciler.SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Unable to create controller", "controller", "Maintenance")
+		os.Exit(1)
+	}
+	// The pod-exec path for consistency hooks (R16). Built once at startup so a broken REST config
+	// fails here, with a message, rather than at the first backup with a nil dereference.
+	hookExecutor, err := hooks.NewPodExecutor(mgr.GetConfig())
+	if err != nil {
+		setupLog.Error(err, "Unable to build the consistency-hook executor")
+		os.Exit(1)
+	}
+	backupReconciler := controller.NewBackupReconciler(
 		mgr.GetClient(),
 		mgr.GetScheme(),
 		// Same uncached Secret reader (the cluster KEK + DR S3 credentials); never GetClient().
@@ -328,7 +363,12 @@ func main() {
 		// controller enqueues retention-forget and stale-lock-unlock on it, serialised per repository
 		// against init and each other.
 		repoQueue,
-	).SetupWithManager(mgr); err != nil {
+	)
+	backupReconciler.Hooks = hookExecutor
+	// The uncached reader behind writeStatus's ambiguity check: after a status Update errors
+	// client-side, only a straight-from-apiserver GET can tell whether it committed anyway.
+	backupReconciler.APIReader = mgr.GetAPIReader()
+	if err := backupReconciler.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Unable to create controller", "controller", "Backup")
 		os.Exit(1)
 	}

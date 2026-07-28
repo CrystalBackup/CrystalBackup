@@ -50,6 +50,18 @@ type BackupStatus struct {
 	// volumes is the per-PVC result set.
 	// +optional
 	Volumes []VolumeStatus `json:"volumes,omitempty"`
+	// hooks records what each consistency hook did (R16). It is the durable account of the freeze
+	// window: which pods were quiesced, whether the release ran, and — when it did not — what an
+	// operator has to go and undo by hand.
+	// +optional
+	// +kubebuilder:validation:MaxItems=64
+	Hooks []HookStatus `json:"hooks,omitempty"`
+	// postHookAttempts counts how many times the post-hook (unfreeze) phase has been tried. Post
+	// hooks are retried where pre hooks are not, and the asymmetry is deliberate: a failed pre hook
+	// means the snapshot should not be taken, while a failed post hook means an application may
+	// still be QUIESCED. Retrying is the difference between a transient blip and an outage.
+	// +optional
+	PostHookAttempts int32 `json:"postHookAttempts,omitempty"`
 	// conditions represent the current state.
 	// +listType=map
 	// +listMapKey=type

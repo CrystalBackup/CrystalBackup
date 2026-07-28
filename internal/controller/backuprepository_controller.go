@@ -314,27 +314,42 @@ func (r *BackupRepositoryReconciler) resolveOwningLocation(ctx context.Context, 
 // failure it sets ConditionInitialized/Ready=False with a Secret-naming reason (never the key
 // material) and returns ok=false; the caller persists status and requeues.
 func (r *BackupRepositoryReconciler) ensurePlatformDEK(ctx context.Context, br *cbv1.BackupRepository, cbl *cbv1.ClusterBackupLocation) (string, bool) {
-	kekName := cbl.Spec.Encryption.ClusterKEKSecretRef.Name
-
-	identity, err := r.Secrets.GetValue(ctx, r.OperatorNamespace, kekName, kekIdentityDataKey)
+	dek, reason, err := resolvePlatformDEK(ctx, r.Client, r.Secrets, r.OperatorNamespace, cbl)
 	if err != nil {
-		r.setInitBlocked(br, "KEKUnavailable",
-			fmt.Sprintf("read cluster KEK secret %s/%s: %v", r.OperatorNamespace, kekName, err))
-		return "", false
-	}
-	wrapper, err := keys.NewAgeWrapper(string(identity))
-	if err != nil {
-		r.setInitBlocked(br, "KEKInvalid",
-			fmt.Sprintf("parse cluster KEK secret %s/%s: %v", r.OperatorNamespace, kekName, err))
-		return "", false
-	}
-	dek, err := keys.NewDEKManager(r.Client, wrapper, r.OperatorNamespace).EnsureDEK(ctx, cbl.Name)
-	if err != nil {
-		r.setInitBlocked(br, "DEKUnavailable",
-			fmt.Sprintf("ensure platform DEK for location %s: %v", cbl.Name, err))
+		r.setInitBlocked(br, reason, err.Error())
 		return "", false
 	}
 	return dek, true
+}
+
+// resolvePlatformDEK is the key path itself, shared by this controller (which turns a failure into
+// an Initialized/Ready=False condition) and the maintenance controller (which turns it into a
+// failed maintenance record). It returns the plaintext DEK, or a short reason plus an error whose
+// message names the SECRET involved and never the key material.
+//
+// Kept as one function rather than two similar ones on purpose: it is the only place the cluster
+// KEK is unwrapped, and a second copy that drifted — reading a differently-named data key, or
+// minting instead of reusing a DEK — would encrypt part of a repository under a key nothing else
+// can open. keys.DEKManager.EnsureDEK mints once and reuses forever, so calling this from two
+// controllers is safe by construction.
+func resolvePlatformDEK(ctx context.Context, c client.Client, secretsReader *secrets.ByNameReader,
+	operatorNamespace string, cbl *cbv1.ClusterBackupLocation,
+) (dek string, reason string, err error) {
+	kekName := cbl.Spec.Encryption.ClusterKEKSecretRef.Name
+
+	identity, err := secretsReader.GetValue(ctx, operatorNamespace, kekName, kekIdentityDataKey)
+	if err != nil {
+		return "", "KEKUnavailable", fmt.Errorf("read cluster KEK secret %s/%s: %w", operatorNamespace, kekName, err)
+	}
+	wrapper, err := keys.NewAgeWrapper(string(identity))
+	if err != nil {
+		return "", "KEKInvalid", fmt.Errorf("parse cluster KEK secret %s/%s: %w", operatorNamespace, kekName, err)
+	}
+	dek, err = keys.NewDEKManager(c, wrapper, operatorNamespace).EnsureDEK(ctx, cbl.Name)
+	if err != nil {
+		return "", "DEKUnavailable", fmt.Errorf("ensure platform DEK for location %s: %w", cbl.Name, err)
+	}
+	return dek, "", nil
 }
 
 // setInitBlocked records a pre-init blocker (missing KEK, unminted DEK) on both the Initialized

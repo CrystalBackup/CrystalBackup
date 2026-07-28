@@ -69,22 +69,31 @@ spec:
                 description: hooks are exec hooks around snapshotting (R16).
                 properties:
                   honorAnnotations:
-                    description: honorAnnotations enables crystalbackup.io/pre-backup-*
-                      pod annotations.
+                    description: |-
+                      honorAnnotations enables the crystalbackup.io/pre-backup-* and post-backup-* pod
+                      annotations. It is opt-in because it delegates WHAT the operator execs to whoever can
+                      annotate a pod in the backed-up namespace. When a pod carries them they take precedence and
+                      the hooks below are skipped for that pod — never merged (the same rule Velero applies).
                     type: boolean
                   post:
                     description: post hooks run after snapshotting.
                     items:
-                      description: Hook is an exec hook run in a selected pod around
-                        snapshotting (R16).
+                      description: |-
+                        Hook is an exec hook run in a selected pod around snapshotting (R16). Candidate pods are those
+                        MOUNTING the volumes being snapshotted, always in the CR's own namespace; podSelector narrows
+                        that set further, and an empty selector means "every pod holding this data".
                       properties:
                         command:
-                          description: command to run.
+                          description: |-
+                            command to run, as an argv. It is exec'd directly, NOT through a shell, so pipes and
+                            redirections need an explicit interpreter (e.g. ["sh","-c","..."]).
                           items:
                             type: string
+                          minItems: 1
                           type: array
                         container:
-                          description: container name to exec into.
+                          description: container name to exec into. Empty uses the
+                            pod's FIRST container.
                           type: string
                         onError:
                           default: Fail
@@ -95,7 +104,9 @@ spec:
                           - Continue
                           type: string
                         podSelector:
-                          description: podSelector selects the pod(s) to exec into.
+                          description: |-
+                            podSelector selects the pod(s) to exec into, among those mounting the backed-up volumes.
+                            Empty matches them all.
                           properties:
                             matchExpressions:
                               description: matchExpressions is a list of label selector
@@ -141,7 +152,12 @@ spec:
                           type: object
                           x-kubernetes-map-type: atomic
                         timeout:
-                          description: timeout for the hook.
+                          default: 30s
+                          description: |-
+                            timeout for the hook, bounding how long the application stays quiesced. It defaults to 30s
+                            rather than to the zero value on purpose: this is a non-pointer duration, so an omitted
+                            timeout would arrive as 0s, and a literal zero deadline expires immediately — every hook
+                            that did not set one would fail before it ran.
                           type: string
                       required:
                       - command
@@ -150,16 +166,22 @@ spec:
                   pre:
                     description: pre hooks run before snapshotting.
                     items:
-                      description: Hook is an exec hook run in a selected pod around
-                        snapshotting (R16).
+                      description: |-
+                        Hook is an exec hook run in a selected pod around snapshotting (R16). Candidate pods are those
+                        MOUNTING the volumes being snapshotted, always in the CR's own namespace; podSelector narrows
+                        that set further, and an empty selector means "every pod holding this data".
                       properties:
                         command:
-                          description: command to run.
+                          description: |-
+                            command to run, as an argv. It is exec'd directly, NOT through a shell, so pipes and
+                            redirections need an explicit interpreter (e.g. ["sh","-c","..."]).
                           items:
                             type: string
+                          minItems: 1
                           type: array
                         container:
-                          description: container name to exec into.
+                          description: container name to exec into. Empty uses the
+                            pod's FIRST container.
                           type: string
                         onError:
                           default: Fail
@@ -170,7 +192,9 @@ spec:
                           - Continue
                           type: string
                         podSelector:
-                          description: podSelector selects the pod(s) to exec into.
+                          description: |-
+                            podSelector selects the pod(s) to exec into, among those mounting the backed-up volumes.
+                            Empty matches them all.
                           properties:
                             matchExpressions:
                               description: matchExpressions is a list of label selector
@@ -216,7 +240,12 @@ spec:
                           type: object
                           x-kubernetes-map-type: atomic
                         timeout:
-                          description: timeout for the hook.
+                          default: 30s
+                          description: |-
+                            timeout for the hook, bounding how long the application stays quiesced. It defaults to 30s
+                            rather than to the zero value on purpose: this is a non-pointer duration, so an omitted
+                            timeout would arrive as 0s, and a literal zero deadline expires immediately — every hook
+                            that did not set one would fail before it ran.
                           type: string
                       required:
                       - command

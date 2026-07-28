@@ -30,6 +30,7 @@ import (
 
 	cbv1 "github.com/CrystalBackup/CrystalBackup/api/v1alpha1"
 	"github.com/CrystalBackup/CrystalBackup/internal/client/secrets"
+	"github.com/CrystalBackup/CrystalBackup/internal/metrics"
 	"github.com/CrystalBackup/CrystalBackup/internal/mover"
 	"github.com/CrystalBackup/CrystalBackup/internal/repo/queue"
 	"github.com/CrystalBackup/CrystalBackup/internal/restic"
@@ -58,18 +59,35 @@ const (
 	// awaiting completion.
 	maintenanceJobPollInterval = 2 * time.Second
 
-	// maintenanceJobDeadline bounds one maintenance op: the repository's exclusive lane is held for
-	// at most this long, so a black-holed forget/unlock can never wedge the repository's queue.
+	// maintenanceJobDeadline bounds one SHORT maintenance op (forget/unlock): the repository's
+	// exclusive lane is held for at most this long, so a black-holed op can never wedge the queue.
 	maintenanceJobDeadline = 10 * time.Minute
+
+	// maintenanceLongOpDeadline bounds prune and check, whose cost scales with total repository
+	// size rather than with one backup. See maintenanceOpDeadline for why these get their own,
+	// much larger, backstop.
+	maintenanceLongOpDeadline = 4 * time.Hour
 
 	// maintenanceCleanupTimeout bounds the post-run best-effort delete of the Job + creds Secret. It
 	// uses a context detached from the (possibly already-cancelled) op context so cleanup runs even
 	// when the op hit its deadline or the manager is shutting down.
 	maintenanceCleanupTimeout = 30 * time.Second
 
-	// moverQuiescencePoll is how often the unlock drain-wait re-reads the live data-mover count while
-	// waiting for the repository to go quiet before a lock force-removal.
+	// moverQuiescencePoll is how often the drain-wait re-reads the live data-mover count while
+	// waiting for the repository to go quiet before a lock force-removal or a prune.
 	moverQuiescencePoll = 2 * time.Second
+
+	// moverQuiescenceDeadline caps the DRAIN alone, independently of the op's own deadline.
+	//
+	// While a blocksMovers op is pending or in-flight, mover admission is shut cluster-wide for
+	// that repository (queue.QuiescenceRequired) — so the drain-wait is the window during which no
+	// namespace can start a backup. When unlock was the only such op it inherited the ten-minute op
+	// deadline and that was the whole bound; prune's four-hour backstop would inherit FOUR HOURS of
+	// shut admission if one mover hangs. Thirty minutes is long enough for any healthy mover to
+	// finish and short enough that a wedged one costs a maintenance window, not a day of backups:
+	// the drain gives up, the op fails, the lane and admission are released, and the next scheduled
+	// run tries again against a repository that has meanwhile had a chance to unwedge.
+	moverQuiescenceDeadline = 30 * time.Minute
 )
 
 // maintenanceResourceName is the deterministic name of BOTH a maintenance Job and its job-scoped
@@ -124,9 +142,16 @@ func (r *BackupReconciler) maybeEnqueueRetentionForget(ctx context.Context, back
 	if !ok {
 		return // no keep policy set: never run a forget that would delete everything.
 	}
-	name := maintenanceResourceName(backup.Name, "forget")
-	enqueueRepoMaintenance(ctx, r.Queue, r.maintenanceDeps(), rc.repoName, queue.OpForget, name,
-		mover.OpForget, argv, rc.repoURL, rc.dek, rc.s3CredsSecret)
+	enqueueRepoMaintenance(ctx, r.Queue, r.maintenanceDeps(), repoMaintenanceRequest{
+		RepoName:      rc.repoName,
+		Kind:          queue.OpForget,
+		Name:          maintenanceResourceName(backup.Name, "forget"),
+		Op:            mover.OpForget,
+		ResticArgs:    argv,
+		RepoURL:       rc.repoURL,
+		DEK:           rc.dek,
+		S3CredsSecret: rc.s3CredsSecret,
+	})
 	r.Recorder.Eventf(backup, nil, corev1.EventTypeNormal, "RetentionEnqueued", "EnqueueRetention",
 		"retention forget enqueued on repository %s", rc.repoName)
 }
@@ -148,19 +173,57 @@ func (r *BackupReconciler) maintenanceDeps() repoMaintenanceDeps {
 // removes only locks past its staleness window), so an occasional duplicate — two volumes of one
 // backup crashing, say — is harmless.
 func (r *BackupReconciler) enqueueStaleLockUnlock(ctx context.Context, backup *cbv1.Backup, rc *backupRunContext) {
-	name := maintenanceResourceName(backup.Name, "unlock")
-	enqueueRepoMaintenance(ctx, r.Queue, r.maintenanceDeps(), rc.repoName, queue.OpUnlock, name,
-		mover.OpUnlock, restic.UnlockArgs(), rc.repoURL, rc.dek, rc.s3CredsSecret)
+	enqueueRepoMaintenance(ctx, r.Queue, r.maintenanceDeps(), repoMaintenanceRequest{
+		RepoName:      rc.repoName,
+		Kind:          queue.OpUnlock,
+		Name:          maintenanceResourceName(backup.Name, "unlock"),
+		Op:            mover.OpUnlock,
+		ResticArgs:    restic.UnlockArgs(),
+		RepoURL:       rc.repoURL,
+		DEK:           rc.dek,
+		S3CredsSecret: rc.s3CredsSecret,
+		OnDone: func(err error) {
+			if err == nil {
+				metrics.RecordLockReaped(rc.repoName, rc.clusterID)
+			}
+		},
+	})
 	r.Recorder.Eventf(backup, nil, corev1.EventTypeWarning, "StaleLockUnlockEnqueued", "EnqueueUnlock",
 		"a mover was hard-killed; stale-lock unlock enqueued on repository %s", rc.repoName)
 }
 
-// maintenanceOpBlocksMovers reports whether a maintenance op force-removes repository locks and so
-// must run under mover quiescence — the writer side of the per-repo backup⇄unlock mutex. It is the
-// mover.Operation counterpart of queue.blocksMovers (which gates admission by queue.OpKind): both
-// name OpUnlock in M1, and both gain OpPrune when the maintenance controller lands (M2/M4).
+// maintenanceOpBlocksMovers reports whether a maintenance op must run under mover quiescence — the
+// writer side of the per-repo mutex. It is the mover.Operation counterpart of queue.blocksMovers
+// (which gates ADMISSION by queue.OpKind), and the two MUST agree: adr/0015's forward contract
+// calls marking one without the other "only half the mutex", because admission would hold movers
+// back while the op itself never waits for the ones already running (or vice versa). Both name
+// OpUnlock (M1) and OpPrune (M4); keep them in lockstep when OpErase lands in M5.
 func maintenanceOpBlocksMovers(op mover.Operation) bool {
-	return op == mover.OpUnlock
+	return op == mover.OpUnlock || op == mover.OpPrune
+}
+
+// maintenanceOpDeadline bounds ONE maintenance op, and is deliberately NOT one number.
+//
+// forget and unlock are quick, idempotent, and a black-holed one must never wedge the repository's
+// lane — ten minutes is generous. prune and check are a different animal: a prune of the shared
+// cluster repository repacks real data and a `check --read-data-subset` re-downloads a sample of
+// every pack, both scaling with total cluster data rather than with one backup. Truncating a
+// legitimate multi-hour prune at ten minutes would leave the repository permanently un-pruned —
+// each run killed before it converges, forever.
+//
+// So the long ops get a deadline that is a BACKSTOP against a black hole, not a budget: the real
+// bound on prune's duration is maintenance.pruneMaxRepackSize, and the real bound on check's is
+// checkReadDataSubset. Both are admin knobs, both are documented as the thing to turn down if the
+// window is too long (01-architecture.md §7). Note this window is also how long prune holds movers
+// back cluster-wide (queue.blocksMovers) — which is exactly the "single cluster-wide exclusive
+// prune window" adr/0009 describes, not an accident.
+func maintenanceOpDeadline(op mover.Operation) time.Duration {
+	switch op {
+	case mover.OpPrune, mover.OpCheck:
+		return maintenanceLongOpDeadline
+	default:
+		return maintenanceJobDeadline
+	}
 }
 
 // waitForMoverQuiescence blocks until no data-mover Job is running (or ctx expires), so an
@@ -202,24 +265,59 @@ type repoMaintenanceDeps struct {
 	MoverImage        string
 }
 
-// enqueueRepoMaintenance schedules a maintenance mover op on the repository's exclusive queue and
-// returns immediately. It is FIRE-AND-FORGET: the Handle is intentionally dropped because these ops
-// are best-effort and the queue runs the closure to completion whether or not anyone awaits it.
-// repoKey is repoName (the BackupRepository name == the location name), which is exactly the key
-// the BackupRepository controller uses, so init/forget/unlock all share one serialisation lane per
-// repository. The only enqueue error is ErrStopped (queue shutting down), which is logged and
-// dropped — a best-effort op skipped at shutdown is reapplied by the next trigger. A package
-// function shared by the Backup controller and the restore engine (a crashed restore mover leaves
-// the same un-stale lock a crashed backup mover does — adr/0015).
-func enqueueRepoMaintenance(ctx context.Context, q *queue.Manager, deps repoMaintenanceDeps,
-	repoName string, kind queue.OpKind, name string, op mover.Operation, resticArgs []string,
-	repoURL, dek, s3CredsSecret string,
-) {
-	if _, err := q.Enqueue(repoName, kind, func(opCtx context.Context) error {
-		return runRepoMaintenance(opCtx, deps, name, op, resticArgs, repoURL, dek, s3CredsSecret)
-	}); err != nil {
+// repoMaintenanceRequest fully describes one maintenance op: which repository lane to take
+// (RepoName/Kind), what to name the Job and its creds Secret (Name), and what the mover should run
+// (Op/ResticArgs) against which repository with which credentials. It exists so the growing set of
+// callers — retention forget, stale-lock unlock, and the M4 maintenance controller's prune and
+// check — pass one value instead of ten positional arguments, three of which are same-typed
+// strings that would silently transpose.
+type repoMaintenanceRequest struct {
+	RepoName      string
+	Kind          queue.OpKind
+	Name          string
+	Op            mover.Operation
+	ResticArgs    []string
+	RepoURL       string
+	DEK           string
+	S3CredsSecret string
+	// OnDone, when set, is called with the op's result from the QUEUE WORKER goroutine, just after
+	// the op body returns. It exists for the fire-and-forget paths, which drop the Handle and would
+	// otherwise have no way to know an op succeeded — the stale-lock counter must count locks
+	// actually removed, not unlock attempts submitted. It must not block: it is holding the
+	// repository's exclusive lane while it runs.
+	OnDone func(error)
+}
+
+// submitRepoMaintenance schedules a maintenance mover op on the repository's exclusive queue and
+// returns its Handle without waiting. repoKey is RepoName (the BackupRepository name == the
+// location name), exactly the key the BackupRepository controller uses, so init/forget/unlock/
+// prune/check all share ONE serialisation lane per repository.
+//
+// The Handle matters to callers that must REPORT the outcome — the maintenance controller records
+// lastCheckResult, so it cannot drop the result the way the best-effort paths do. It must also
+// never BLOCK on the returned Handle from a reconcile goroutine: a prune holds the lane for hours
+// (maintenanceOpDeadline), and blocking a reconcile worker on repository I/O is the exact failure
+// M3.1 spent a milestone removing from discovery.
+func submitRepoMaintenance(q *queue.Manager, deps repoMaintenanceDeps, req repoMaintenanceRequest) (*queue.Handle, error) {
+	return q.Enqueue(req.RepoName, req.Kind, func(opCtx context.Context) error {
+		err := runRepoMaintenance(opCtx, deps, req.Name, req.Op, req.ResticArgs, req.RepoURL, req.DEK, req.S3CredsSecret)
+		if req.OnDone != nil {
+			req.OnDone(err)
+		}
+		return err
+	})
+}
+
+// enqueueRepoMaintenance is submitRepoMaintenance's FIRE-AND-FORGET wrapper: the Handle is
+// intentionally dropped because these ops are best-effort and the queue runs the closure to
+// completion whether or not anyone awaits it. The only enqueue error is ErrStopped (queue shutting
+// down), which is logged and dropped — a best-effort op skipped at shutdown is reapplied by the
+// next trigger. Shared by the Backup controller and the restore engine (a crashed restore mover
+// leaves the same un-stale lock a crashed backup mover does — adr/0015).
+func enqueueRepoMaintenance(ctx context.Context, q *queue.Manager, deps repoMaintenanceDeps, req repoMaintenanceRequest) {
+	if _, err := submitRepoMaintenance(q, deps, req); err != nil {
 		logf.FromContext(ctx).Info("repository maintenance op not enqueued (queue stopping); skipping",
-			"op", string(op), "repository", repoName, "err", err.Error())
+			"op", string(req.Op), "repository", req.RepoName, "err", err.Error())
 	}
 }
 
@@ -230,7 +328,7 @@ func enqueueRepoMaintenance(ctx context.Context, q *queue.Manager, deps repoMain
 // (they carry no per-PVC label), so cleanup is this function's own responsibility. It writes no CR
 // status; its error resolves the (dropped) queue Handle and is logged by the worker.
 func runRepoMaintenance(opCtx context.Context, deps repoMaintenanceDeps, name string, op mover.Operation, resticArgs []string, repoURL, dek, s3CredsSecret string) error {
-	ctx, cancel := context.WithTimeout(opCtx, maintenanceJobDeadline)
+	ctx, cancel := context.WithTimeout(opCtx, maintenanceOpDeadline(op))
 	defer cancel()
 	// LIFO defer order: this runs BEFORE cancel(), so ctx is still live for the delete when the op
 	// finished normally; the detached context inside covers the deadline/shutdown case.
@@ -243,7 +341,12 @@ func runRepoMaintenance(opCtx context.Context, deps repoMaintenanceDeps, name st
 	// waits on only drain. Bounded by ctx (maintenanceJobDeadline); a timeout returns an error
 	// and, being best-effort, the op is reapplied by the next trigger.
 	if maintenanceOpBlocksMovers(op) {
-		if err := waitForMoverQuiescence(ctx, deps.Client, deps.OperatorNamespace); err != nil {
+		// Capped by moverQuiescenceDeadline as well as by ctx: the drain is the window during which
+		// mover admission is shut cluster-wide, so it must not inherit prune's multi-hour backstop.
+		drainCtx, cancelDrain := context.WithTimeout(ctx, moverQuiescenceDeadline)
+		err := waitForMoverQuiescence(drainCtx, deps.Client, deps.OperatorNamespace)
+		cancelDrain()
+		if err != nil {
 			return err
 		}
 	}
@@ -268,10 +371,49 @@ func runRepoMaintenance(opCtx context.Context, deps repoMaintenanceDeps, name st
 	// No ownerReference: the Job is in the operator namespace and the triggering CR is in a
 	// tenant namespace (or cluster-scoped), so an ownerRef is illegal/impossible. It is tracked
 	// by its deterministic name and cleaned up explicitly below.
-	if err := deps.Create(ctx, job); err != nil && !apierrors.IsAlreadyExists(err) {
-		return fmt.Errorf("create %s job %s/%s: %w", op, deps.OperatorNamespace, name, err)
+	if err := createMaintenanceJob(ctx, deps, op, job); err != nil {
+		return err
 	}
 	return waitForMaintenanceJob(ctx, deps.Client, deps.OperatorNamespace, name)
+}
+
+// createMaintenanceJob creates the op's Job, disambiguating the deterministic-name collision that
+// AlreadyExists alone cannot: a leftover with that name has two very different faces.
+//
+//   - A LIVE leftover (no deletionTimestamp) is a crashed previous run's Job: adopt it — that
+//     re-adoption is the restart contract deterministic names exist for.
+//   - A TERMINATING one is the PREVIOUS op's foreground delete still collecting its pods, and
+//     adopting it is how a real cluster recorded a prune as Failed with "get maintenance job …:
+//     not found": back-to-back schedules queue op B behind op A on the exclusive queue, A's
+//     deferred cleanup leaves its Job visible-but-dying, B's Create hits AlreadyExists, and the
+//     grave vanishes mid-poll. Worse, a dying SUCCEEDED Job could hand B a success it never
+//     earned. So a terminating grave is waited out (bounded by the op context), then the create
+//     is retried against the emptied name.
+func createMaintenanceJob(ctx context.Context, deps repoMaintenanceDeps, op mover.Operation, job *batchv1.Job) error {
+	for {
+		err := deps.Create(ctx, job)
+		if err == nil {
+			return nil
+		}
+		if !apierrors.IsAlreadyExists(err) {
+			return fmt.Errorf("create %s job %s/%s: %w", op, job.Namespace, job.Name, err)
+		}
+		var existing batchv1.Job
+		switch getErr := deps.Get(ctx, client.ObjectKeyFromObject(job), &existing); {
+		case apierrors.IsNotFound(getErr):
+			continue // the grave emptied between Create and Get: retry the create immediately.
+		case getErr != nil:
+			return fmt.Errorf("inspect existing %s job %s/%s: %w", op, job.Namespace, job.Name, getErr)
+		case existing.DeletionTimestamp.IsZero():
+			return nil // a live leftover from a crashed run: adopt it.
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("waiting for the previous %s job %s/%s to finish deleting: %w",
+				op, job.Namespace, job.Name, ctx.Err())
+		case <-time.After(maintenanceJobPollInterval):
+		}
+	}
 }
 
 // waitForMaintenanceJob polls the maintenance Job until terminal success (Succeeded >= 1 / the

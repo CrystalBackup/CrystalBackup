@@ -71,18 +71,38 @@ type BackupRepositoryStatus struct {
 	// lastDiscoveryTime is when the repository was last inventoried.
 	// +optional
 	LastDiscoveryTime *metav1.Time `json:"lastDiscoveryTime,omitempty"`
-	// lastMaintenanceTime is when prune last ran.
+	// lastMaintenanceTime is when prune last SUCCEEDED. A failed prune deliberately leaves it
+	// alone: the field answers "how long since this repository was actually reclaimed", and the
+	// staleness alert depends on a failure not refreshing it.
 	// +optional
 	LastMaintenanceTime *metav1.Time `json:"lastMaintenanceTime,omitempty"`
-	// lastCheckTime is when restic check last ran.
+	// lastCheckTime is when restic check last ran — success or failure, unlike
+	// lastMaintenanceTime. Paired with lastCheckResult it distinguishes "verified recently and
+	// it was bad" from "not verified in weeks", which are different incidents.
 	// +optional
 	LastCheckTime *metav1.Time `json:"lastCheckTime,omitempty"`
-	// lastCheckResult of the most recent check.
+	// lastCheckResult of the most recent check. Failed means restic found repository damage
+	// (R17) — it is the RepositoryCheckFailed alert, not a transient error.
 	// +optional
+	// +kubebuilder:validation:Enum=Passed;Failed
 	LastCheckResult string `json:"lastCheckResult,omitempty"`
-	// approximateSizeBytes of the deduplicated repository.
+	// approximateSizeBytes is the repository's PHYSICAL size: the sum of the objects actually
+	// stored under its prefix, post-dedup and post-compression. For the shared cluster
+	// repository that is the whole cluster's footprint in that bucket, all namespaces together.
 	// +optional
 	ApproximateSizeBytes int64 `json:"approximateSizeBytes,omitempty"`
+	// staleLocks is the number of repository lock objects older than restic's 30-minute
+	// staleness threshold. Normally zero: a hard-killed mover's lock is cleared by an unlock op.
+	// A persistent non-zero value means locks are accumulating faster than they are reaped, and
+	// every exclusive operation will eventually stall behind them.
+	// +optional
+	StaleLocks int32 `json:"staleLocks,omitempty"`
+	// recentMaintenance is a capped, NEWEST-FIRST history of maintenance attempts. The
+	// maintenance Job and its pod are deleted as soon as an op finishes, so this is the only
+	// durable record of what ran and why it failed.
+	// +optional
+	// +kubebuilder:validation:MaxItems=10
+	RecentMaintenance []MaintenanceRecord `json:"recentMaintenance,omitempty"`
 	// conditions represent the current state.
 	// +listType=map
 	// +listMapKey=type

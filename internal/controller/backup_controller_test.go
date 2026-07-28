@@ -19,6 +19,9 @@ package controller
 import (
 	"context"
 	"fmt"
+	"sync"
+	"testing"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2" //nolint:revive,staticcheck
 	. "github.com/onsi/gomega"    //nolint:revive,staticcheck
@@ -62,6 +65,17 @@ const stubKind = "stub"
 type stubExposerRegistry struct {
 	client            client.Client
 	operatorNamespace string
+
+	// mu guards the teardown instrumentation below — the manager reconciles on its own
+	// goroutine while specs read these.
+	mu sync.Mutex
+	// teardowns records every TeardownExposure call as "<originNamespace>/<namePrefix>", so a
+	// spec can assert the terminal re-entry sweep really swept a given volume.
+	teardowns []string
+	// failTeardown, when non-nil, is consulted on every TeardownExposure call; a non-nil error
+	// fails that call, letting a spec pin that the sweep withholds its marker (and finalize its
+	// finalizer) until teardown succeeds.
+	failTeardown func(originNamespace, namePrefix string) error
 }
 
 var _ ExposerRegistry = (*stubExposerRegistry)(nil)
@@ -72,6 +86,37 @@ func (s *stubExposerRegistry) For(_ context.Context, pvc *corev1.PersistentVolum
 			stubUnsupportedStorageClass, exposer.ErrUnsupported)
 	}
 	return &stubExposer{client: s.client, operatorNamespace: s.operatorNamespace}, nil
+}
+
+// TeardownExposure mirrors the real registry's derive-only teardown on the one object the stub
+// exposer actually creates — the temp clone PVC (with the envtest pvc-protection finalizer
+// strip; see stubExposer.Cleanup) — recording the call and honouring the spec-armed failure.
+func (s *stubExposerRegistry) TeardownExposure(ctx context.Context, originNamespace, namePrefix string, _ map[string]string) error {
+	s.mu.Lock()
+	s.teardowns = append(s.teardowns, originNamespace+"/"+namePrefix)
+	fail := s.failTeardown
+	s.mu.Unlock()
+	if fail != nil {
+		if err := fail(originNamespace, namePrefix); err != nil {
+			return err
+		}
+	}
+	return (&stubExposer{client: s.client, operatorNamespace: s.operatorNamespace}).Cleanup(ctx,
+		&exposer.Exposure{OperatorNamespace: s.operatorNamespace, TempPVCName: namePrefix + "-clone"})
+}
+
+// teardownCalls snapshots the recorded TeardownExposure calls.
+func (s *stubExposerRegistry) teardownCalls() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.teardowns...)
+}
+
+// setFailTeardown arms (or, with nil, disarms) the per-call failure hook.
+func (s *stubExposerRegistry) setFailTeardown(f func(originNamespace, namePrefix string) error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.failTeardown = f
 }
 
 type stubExposer struct {
@@ -155,11 +200,7 @@ func seedInitializedRepo(location, kekSecret, s3Secret string) {
 	registerRepoCleanup(location)
 	createTestLocation(newTestLocation(location, kekSecret, s3Secret, false))
 
-	waitForInitJobCreated(location)
-	patchInitJobStatus(location, func(j *batchv1.Job) { j.Status.Succeeded = 1 })
-	Eventually(func(g Gomega) {
-		g.Expect(getRepositoryG(g, location).Status.Initialized).To(BeTrue())
-	}, initTimeout, initPoll).Should(Succeed())
+	simulateRepositoryInitialized(location)
 }
 
 // createParentClusterBackup creates the (cluster-scoped) ClusterBackup the child Backups link to.
@@ -525,3 +566,37 @@ var _ = Describe("BackupReconciler", func() {
 		}, initTimeout, initPoll).Should(Succeed())
 	})
 })
+
+// TestTeardownSurvivesACancelledReconcileContext is the unit guard for a leak that only appeared
+// on real infrastructure, and only while the operator was being restarted mid-run.
+//
+// teardownVolume runs on the pass that made the volume terminal, AFTER the status write, and the
+// top of Reconcile short-circuits on a terminal Backup — so that pass is the ONLY moment the
+// exposure objects are ever collected. Taking the reconcile context meant that a manager shutting
+// down cancelled every delete; the failures are best-effort and swallowed, the next operator sees
+// a terminal Backup and returns, and a VolumeSnapshotContent survives with no deletionTimestamp
+// and nobody accountable for it.
+//
+// The property this pins is narrow and exact: an ALREADY-CANCELLED reconcile context must not stop
+// the cleanup from issuing its deletes.
+func TestTeardownSurvivesACancelledReconcileContext(t *testing.T) {
+	// A context that is cancelled before teardown even starts — the worst case, and what a
+	// shutdown mid-reconcile actually produces.
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	detached, stop := context.WithTimeout(context.WithoutCancel(cancelled), backupTeardownTimeout)
+	defer stop()
+
+	if err := detached.Err(); err != nil {
+		t.Fatalf("the detached context inherited cancellation (%v) — teardown would still be skipped", err)
+	}
+	if _, ok := detached.Deadline(); !ok {
+		t.Error("the detached context has no deadline; a shutting-down manager could be held open by it")
+	}
+	// And the budget must be short: this runs during shutdown.
+	if backupTeardownTimeout > time.Minute {
+		t.Errorf("backupTeardownTimeout = %v, too long to hold a shutting-down manager open",
+			backupTeardownTimeout)
+	}
+}

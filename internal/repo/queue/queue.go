@@ -117,12 +117,23 @@ const (
 // blocksMovers reports whether an op of this kind requires data-mover QUIESCENCE: no concurrent
 // backup may hold a repository lock while it runs. The queue tracks how many such ops are pending
 // or in-flight per repo (worker.moverBlocking) and exposes it via [Manager.QuiescenceRequired], so
-// the Backup controller's mover admission holds new movers back for the duration. In M1 only
-// OpUnlock qualifies — it force-removes every lock, so a live backup's lock must not exist when it
-// runs. OpPrune and OpErase (repository-rewriting, exclusive by construction) join it in later
-// milestones; init/forget/check do not (forget stays best-effort and simply retries behind a lock).
+// the Backup controller's mover admission holds new movers back for the duration.
+//
+// Two kinds qualify, for two different reasons:
+//
+//   - OpUnlock force-removes EVERY lock (`unlock --remove-all`), so a live backup's lock must not
+//     exist when it runs, or that backup is left mid-transaction (M1).
+//   - OpPrune REPACKS AND DELETES pack files. restic's own exclusive lock would make a concurrent
+//     backup wait, so this is not the corruption gate — it is the throughput one: without
+//     quiescence a prune and a fleet of movers would sit on --retry-lock staring at each other
+//     until one side times out, and on the ONE shared cluster repository that is every namespace's
+//     backup. Prune is therefore a deliberate cluster-wide exclusive window, bounded by
+//     maintenance.pruneMaxRepackSize and scheduled off-peak (adr/0009, M4).
+//
+// OpErase joins them in M5. init/forget/check do not: forget stays best-effort and simply retries
+// behind a lock, and check only reads.
 func blocksMovers(kind OpKind) bool {
-	return kind == OpUnlock
+	return kind == OpUnlock || kind == OpPrune
 }
 
 // ErrStopped is returned by [Manager.Enqueue] once the Manager has been stopped

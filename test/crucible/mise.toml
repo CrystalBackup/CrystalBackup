@@ -40,7 +40,7 @@ run = "scripts/check-env.sh"
 description = "tofu init (download providers)"
 dir = "{{config_root}}"
 shell = "bash -c"
-run = "source scripts/load-env.sh && tofu -chdir=terraform init"
+run = "source scripts/load-env.sh && scripts/tofu-lane.sh init"
 
 [tasks.plan]
 description = "Preview the Hetzner infrastructure changes"
@@ -53,13 +53,13 @@ description = "Provision Hetzner servers, network, volumes, S3 bucket (tofu appl
 dir = "{{config_root}}"
 depends = ["check-env"]
 shell = "bash -c"
-run = "source scripts/load-env.sh && tofu -chdir=terraform init && tofu -chdir=terraform apply -auto-approve"
+run = "source scripts/load-env.sh && scripts/tofu-lane.sh init && scripts/tofu-lane.sh apply -auto-approve"
 
 [tasks.cluster]
 description = "Install RKE2 (ansible) and fetch the kubeconfig"
 dir = "{{config_root}}"
 shell = "bash -c"
-run = "source scripts/load-env.sh && cd ansible && ansible-playbook site.yml"
+run = "source scripts/load-env.sh && cd ansible && ansible-playbook -i \"${CRUCIBLE_INVENTORY}\" -e crucible_artifacts_dir=\"${CRUCIBLE_ARTIFACTS}\" site.yml"
 
 [tasks.components]
 description = "Deploy snapshot-controller, rook-ceph, longhorn, local-path, crystal-backup"
@@ -114,6 +114,18 @@ run = "scripts/ssh-node.sh"
 description = "Destroy ALL crucible infra (guarded: CONFIRM=yes mise run down)"
 dir = "{{config_root}}"
 run = "scripts/down.sh"
+
+[tasks.fanout]
+description = "OPT-IN: run the suite on N independent clusters at once to separate flakes from bugs (costs N× — see scripts/fanout.sh)"
+dir = "{{config_root}}"
+shell = "bash -c"
+run = "scripts/fanout.sh"
+
+[tasks.fanout-down]
+description = "Destroy the N lanes created by `mise run fanout`"
+dir = "{{config_root}}"
+shell = "bash -c"
+run = "scripts/fanout-down.sh"
 
 [tasks.nuke]
 description = "Label-based teardown when the tfstate is lost (typed confirmation)"

@@ -186,6 +186,21 @@ const (
 	// restarted controller) reads RestoredBytes from. The Job itself (Succeeded=1) stays as
 	// the "this volume's mover ran" marker so the volume is never re-restored.
 	AnnotationMoverResult = Domain + "/mover-result"
+
+	// AnnotationExposuresCleaned (=AnnotationExposuresCleanedValue) records, on a TERMINAL
+	// Backup, that the terminal teardown sweep verified every exposure object collected — the
+	// temp PVCs, the mover Jobs and their Secrets, the manifest residue, and above all the
+	// VolumeSnapshot/VolumeSnapshotContent pairs, whose cluster-scoped, Retain-parked origin
+	// content no ownerReference GC can ever collect. Until it is present, the Backup
+	// controller's terminal short-circuit RE-RUNS the idempotent sweep instead of returning —
+	// so a teardown interrupted at ANY instant (process killed mid-deletes, a status write
+	// that committed server-side while erroring client-side) is retried by the next pass or
+	// the next process instead of being sealed forever. That re-entry is the crash-only
+	// guarantee the leak audit demanded: in-flight best effort dies with the process; a
+	// persisted not-yet-done marker cannot.
+	AnnotationExposuresCleaned = Domain + "/exposures-cleaned"
+	// AnnotationExposuresCleanedValue is the truthy value the sweep sets on success.
+	AnnotationExposuresCleanedValue = "true"
 )
 
 // Origin label values (see LabelOrigin).
@@ -194,9 +209,18 @@ const (
 	OriginNamespace = "namespace"
 )
 
-// AnnotationPreBackupPrefix is the prefix for pod annotations honoured as pre-backup
-// hooks when HooksSpec.HonorAnnotations is true (e.g. "crystalbackup.io/pre-backup-command").
-const AnnotationPreBackupPrefix = Domain + "/pre-backup-"
+// AnnotationPreBackupPrefix / AnnotationPostBackupPrefix are the prefixes for pod annotations
+// honoured as consistency hooks when HooksSpec.HonorAnnotations is true — e.g.
+// "crystalbackup.io/pre-backup-command", "-container", "-on-error", "-timeout", and the same four
+// under the post- prefix.
+//
+// Both phases exist because a hook that quiesces without a matching hook to release is an outage:
+// a pre-backup `FLUSH TABLES WITH READ LOCK` needs its `UNLOCK TABLES`, and the pod owner who
+// wrote the first must be able to write the second in the same place.
+const (
+	AnnotationPreBackupPrefix  = Domain + "/pre-backup-"
+	AnnotationPostBackupPrefix = Domain + "/post-backup-"
+)
 
 // AnnotationSecretDataExcluded marks a Secret manifest captured with its data/stringData
 // stripped, under manifestOptions.excludeSecretData (03-security-and-tenancy.md §10). It is
