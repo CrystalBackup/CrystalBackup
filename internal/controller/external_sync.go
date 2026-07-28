@@ -126,6 +126,10 @@ func (e *syncEndpoint) rcloneConfigEnv() []corev1.EnvVar {
 		// Path-style addressing, matching what the s3: spelling of the same repository uses. A
 		// virtual-hosted URL would need per-bucket DNS the on-prem endpoints do not have.
 		{Name: mover.RcloneRemoteEnv(e.Remote, mover.RcloneKeyForcePathStyle), Value: mover.EnvTrue},
+		// The bucket exists; do not probe it and above all do not create it. See the constant —
+		// this is what lets a destination be reached with credentials scoped to that bucket alone,
+		// which is the whole shape of a least-privilege secondary.
+		{Name: mover.RcloneRemoteEnv(e.Remote, mover.RcloneKeyNoCheckBucket), Value: mover.EnvTrue},
 	}
 	if s3.Region != "" {
 		env = append(env, corev1.EnvVar{

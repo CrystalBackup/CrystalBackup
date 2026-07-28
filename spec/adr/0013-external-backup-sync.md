@@ -192,6 +192,12 @@ all. Four findings changed the implementation, so they are recorded rather than 
 4. **`RCLONE_CONFIG=/dev/null`** silences rclone's per-run "config file not found" NOTICE and, more
    usefully, makes "the remotes come from environment" exhaustive: no file in the image or mounted
    later can redefine `src` or `dst`.
+5. **`no_check_bucket` must be on.** rclone probes the bucket before its first upload and CREATES it
+   when absent. The `s3:` spelling of the same repository never does either, so leaving the default
+   would make the two addressings disagree about something visible — and it breaks precisely the
+   configuration a secondary should have: credentials scoped to the destination bucket alone carry
+   no `CreateBucket` right, so the probe fails the copy for a bucket that was there all along.
+   `RCLONE_CONFIG_<REMOTE>_NO_CHECK_BUCKET=true` on **both** remotes.
 
 Tag selectivity and preservation were confirmed at the same time: a filtered copy moved only the
 matching snapshot, and the destination kept `hostname`, `paths` and `tags` unchanged, so discovery

@@ -331,6 +331,17 @@ const (
 	// RcloneKeyForcePathStyle keeps addressing path-style (bucket in the path, not the host),
 	// which is what every non-AWS S3 implementation this project targets expects.
 	RcloneKeyForcePathStyle = "FORCE_PATH_STYLE"
+	// RcloneKeyNoCheckBucket stops rclone probing — and, failing that, CREATING — the bucket
+	// before its first upload.
+	//
+	// CrystalBackup never creates buckets: an S3Spec names one the operator already provisioned,
+	// and the s3: spelling of the very same repository never attempts it either. Letting rclone
+	// behave differently would make the two addressings disagree about something visible, and it
+	// costs exactly where it hurts most — a destination reached with SCOPED credentials (read,
+	// write and list on one bucket, which is the least privilege a secondary should be given) has
+	// no CreateBucket right, so the probe fails and takes the whole copy with it, for a bucket
+	// that was there all along.
+	RcloneKeyNoCheckBucket = "NO_CHECK_BUCKET"
 
 	// RcloneTypeS3 is the rclone backend type both remotes use.
 	RcloneTypeS3 = "s3"

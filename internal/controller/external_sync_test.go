@@ -303,6 +303,32 @@ func TestSyncEndpointConfigKeepsCredentialsOutOfTheEnvValues(t *testing.T) {
 	}
 }
 
+// TestSyncEndpointConfigNeverProbesOrCreatesTheBucket: rclone checks — and if absent, CREATES — a
+// bucket before its first upload unless told not to. CrystalBackup never creates buckets on the s3:
+// path, and a secondary reached with credentials scoped to one bucket has no CreateBucket right at
+// all, so the probe alone would fail the copy for a bucket that was there the whole time.
+func TestSyncEndpointConfigNeverProbesOrCreatesTheBucket(t *testing.T) {
+	for _, remote := range []string{mover.SyncRemoteSource, mover.SyncRemoteDest} {
+		e := &syncEndpoint{
+			Remote:  remote,
+			Binding: &locationBinding{S3: cbv1.S3Spec{Endpoint: "https://s3.example.com", Bucket: "backups"}},
+		}
+		want := mover.RcloneRemoteEnv(remote, mover.RcloneKeyNoCheckBucket)
+		found := false
+		for _, env := range e.rcloneConfigEnv() {
+			if env.Name == want {
+				found = true
+				if env.Value != mover.EnvTrue {
+					t.Fatalf("%s = %q, want %q", env.Name, env.Value, mover.EnvTrue)
+				}
+			}
+		}
+		if !found {
+			t.Fatalf("%s is not set; rclone would probe (and try to create) the bucket", want)
+		}
+	}
+}
+
 // TestSameEndpointComparesRepositoriesNotNames: admission rejects source == destination by NAME,
 // but two differently-named locations can address the same bucket, prefix and cluster ID. restic
 // would then open one repository as both sides of the copy and contend with its own lock.
