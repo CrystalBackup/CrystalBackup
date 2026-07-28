@@ -50,15 +50,23 @@ pipeline:
       expected-sha256: bb9b1a19040744d26d8a79be029d4e6b189c45ccc9d8831d7fe367d3c33df725
       strip-components: 1
 
-  - name: Override x/text past GO-2026-5970 (restic pins the vulnerable v0.37.0)
+  - name: Override x/text and grpc past their reachable advisories
     runs: |
       # GO-2026-5970 / CVE-2026-56852 — infinite loop in x/text/unicode/norm, fixed in
       # 0.39.0 — is reachable through restic, and no restic release bumps past it yet
-      # (0.19.1 is the latest and still pins 0.37.0). Override the module so the shipped
-      # binary is clean. Kept in LOCKSTEP with build/vex/generate-vex.sh, which analyses the
-      # same override so the VEX describes this binary, not the vanilla tarball.
+      # (0.19.1 is the latest and still pins 0.37.0).
+      # GO-2026-6061 / GHSA-hrxh-6v49-42gf — xDS RBAC + HTTP/2 transport server in
+      # google.golang.org/grpc, fixed in 1.82.1 — likewise reachable through restic's
+      # pinned v1.81.1 (call traces via the GCS backend).
+      # Override both modules so the shipped binary is clean. Kept in LOCKSTEP with
+      # build/vex/generate-vex.sh, which analyses the same overrides so the VEX describes
+      # this binary, not the vanilla tarball.
       # The go/build step below runs with -mod=readonly; the module edit needs -mod=mod.
-      GOFLAGS=-mod=mod go get golang.org/x/text@v0.40.0
+      GOFLAGS=-mod=mod go get golang.org/x/text@v0.40.0 google.golang.org/grpc@v1.82.1
+      # tidy completes go.sum for the NEW graph (grpc 1.82.1 pulls x/sync/semaphore into the
+      # build closure); without it the -mod=readonly go/build step below fails on a missing
+      # go.sum entry.
+      GOFLAGS=-mod=mod go mod tidy
 
   - name: Build restic (CLI)
     uses: go/build
