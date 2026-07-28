@@ -4,7 +4,7 @@ All notable changes to Crystal Backup. Versioning follows
 [adr/0014](spec/adr/0014-versioning-and-release.md): milestone `Mn` → minor `0.n.z` on
 major 0; `1.0.0` is a deliberate post-M9 API-stability decision.
 
-## 0.4.0 — M4 "Consistency hooks, verification & maintenance" (unreleased)
+## 0.4.0 — M4 "Consistency hooks, verification & maintenance" (2026-07-27)
 
 Milestone M4 makes a backup **application-consistent** and a repository **maintained**. Backups
 can now quiesce a workload before the snapshot and release it after; repositories prune the space
@@ -12,6 +12,11 @@ their retention policy freed and verify that what they hold is still readable.
 
 Two pieces of the API had been declared since M0 and were dead: `MaintenanceSpec` (nothing ever
 read `pruneSchedule` or `checkSchedule`) and the hook types (nothing ever exec'd). Both are live.
+
+Validated on real infrastructure: **seven independent full-suite crucible lanes, seven times zero
+residual snapshot objects**, including a spec that SIGKILLs the operator at the exact
+terminal-transition window the teardown leak lived in (previous reproduction rate: ~1 run in 3).
+The final sample ran the release image and passed 46/46.
 
 ### Added
 
