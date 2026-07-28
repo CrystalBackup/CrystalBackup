@@ -143,14 +143,15 @@ func (r *BackupReconciler) maybeEnqueueRetentionForget(ctx context.Context, back
 		return // no keep policy set: never run a forget that would delete everything.
 	}
 	enqueueRepoMaintenance(ctx, r.Queue, r.maintenanceDeps(), repoMaintenanceRequest{
-		RepoName:      rc.repoName,
-		Kind:          queue.OpForget,
-		Name:          maintenanceResourceName(backup.Name, "forget"),
-		Op:            mover.OpForget,
-		ResticArgs:    argv,
-		RepoURL:       rc.repoURL,
-		DEK:           rc.dek,
-		S3CredsSecret: rc.s3CredsSecret,
+		RepoName:       rc.repoName,
+		Kind:           queue.OpForget,
+		Name:           maintenanceResourceName(backup.Name, "forget"),
+		Op:             mover.OpForget,
+		ResticArgs:     argv,
+		RepoURL:        rc.repoURL,
+		DEK:            rc.dek,
+		S3CredsSecret:  rc.s3CredsSecret,
+		CredsNamespace: rc.credsNamespace,
 	})
 	r.Recorder.Eventf(backup, nil, corev1.EventTypeNormal, "RetentionEnqueued", "EnqueueRetention",
 		"retention forget enqueued on repository %s", rc.repoName)
@@ -174,14 +175,15 @@ func (r *BackupReconciler) maintenanceDeps() repoMaintenanceDeps {
 // backup crashing, say — is harmless.
 func (r *BackupReconciler) enqueueStaleLockUnlock(ctx context.Context, backup *cbv1.Backup, rc *backupRunContext) {
 	enqueueRepoMaintenance(ctx, r.Queue, r.maintenanceDeps(), repoMaintenanceRequest{
-		RepoName:      rc.repoName,
-		Kind:          queue.OpUnlock,
-		Name:          maintenanceResourceName(backup.Name, "unlock"),
-		Op:            mover.OpUnlock,
-		ResticArgs:    restic.UnlockArgs(),
-		RepoURL:       rc.repoURL,
-		DEK:           rc.dek,
-		S3CredsSecret: rc.s3CredsSecret,
+		RepoName:       rc.repoName,
+		Kind:           queue.OpUnlock,
+		Name:           maintenanceResourceName(backup.Name, "unlock"),
+		Op:             mover.OpUnlock,
+		ResticArgs:     restic.UnlockArgs(),
+		RepoURL:        rc.repoURL,
+		DEK:            rc.dek,
+		S3CredsSecret:  rc.s3CredsSecret,
+		CredsNamespace: rc.credsNamespace,
 		OnDone: func(err error) {
 			if err == nil {
 				metrics.RecordLockReaped(rc.repoName, rc.clusterID)
@@ -280,6 +282,10 @@ type repoMaintenanceRequest struct {
 	RepoURL       string
 	DEK           string
 	S3CredsSecret string
+	// CredsNamespace is where S3CredsSecret is READ from: the operator namespace for a
+	// cluster-plane repository, the tenant's namespace for a namespace-plane one. Empty means
+	// the operator namespace, which keeps every cluster-plane caller unchanged.
+	CredsNamespace string
 	// OnDone, when set, is called with the op's result from the QUEUE WORKER goroutine, just after
 	// the op body returns. It exists for the fire-and-forget paths, which drop the Handle and would
 	// otherwise have no way to know an op succeeded — the stale-lock counter must count locks
@@ -300,7 +306,7 @@ type repoMaintenanceRequest struct {
 // M3.1 spent a milestone removing from discovery.
 func submitRepoMaintenance(q *queue.Manager, deps repoMaintenanceDeps, req repoMaintenanceRequest) (*queue.Handle, error) {
 	return q.Enqueue(req.RepoName, req.Kind, func(opCtx context.Context) error {
-		err := runRepoMaintenance(opCtx, deps, req.Name, req.Op, req.ResticArgs, req.RepoURL, req.DEK, req.S3CredsSecret)
+		err := runRepoMaintenance(opCtx, deps, req.Name, req.Op, req.ResticArgs, req.RepoURL, req.DEK, req.S3CredsSecret, req.CredsNamespace)
 		if req.OnDone != nil {
 			req.OnDone(err)
 		}
@@ -327,7 +333,7 @@ func enqueueRepoMaintenance(ctx context.Context, q *queue.Manager, deps repoMain
 // best-effort deletes the Job + Secret before returning — the orphan reaper never touches these
 // (they carry no per-PVC label), so cleanup is this function's own responsibility. It writes no CR
 // status; its error resolves the (dropped) queue Handle and is logged by the worker.
-func runRepoMaintenance(opCtx context.Context, deps repoMaintenanceDeps, name string, op mover.Operation, resticArgs []string, repoURL, dek, s3CredsSecret string) error {
+func runRepoMaintenance(opCtx context.Context, deps repoMaintenanceDeps, name string, op mover.Operation, resticArgs []string, repoURL, dek, s3CredsSecret, credsNamespace string) error {
 	ctx, cancel := context.WithTimeout(opCtx, maintenanceOpDeadline(op))
 	defer cancel()
 	// LIFO defer order: this runs BEFORE cancel(), so ctx is still live for the delete when the op
@@ -352,7 +358,7 @@ func runRepoMaintenance(opCtx context.Context, deps repoMaintenanceDeps, name st
 	}
 
 	labels := maintenanceJobLabels()
-	if err := ensureMoverCredsSecret(ctx, deps, name, dek, s3CredsSecret, labels); err != nil {
+	if err := ensureMoverCredsSecret(ctx, deps, name, dek, s3CredsSecret, credsNamespace, labels); err != nil {
 		return err
 	}
 	job := mover.BuildJob(mover.JobRequest{

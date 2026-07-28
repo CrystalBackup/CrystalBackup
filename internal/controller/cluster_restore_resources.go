@@ -240,7 +240,7 @@ func (r *ClusterRestoreReconciler) startClusterRestoreJob(
 
 	if err := ensureMoverCredsSecret(ctx, repoMaintenanceDeps{
 		Client: r.Client, Secrets: r.Engine.Secrets, OperatorNamespace: r.OperatorNamespace,
-	}, jobName, rc.dek, rc.s3CredsSecret, labels); err != nil {
+	}, jobName, rc.dek, rc.s3CredsSecret, "", labels); err != nil {
 		return err
 	}
 

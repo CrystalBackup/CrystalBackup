@@ -202,10 +202,16 @@ type backupRunContext struct {
 	run           string // the run == parent ClusterBackup name == Backup.name -> restic "run=" tag
 	clusterID     string // location.spec.clusterID -> restic --host
 	tenant        string // resolved tenant -> restic "tenant=" tag (security-load-bearing)
-	repoName      string // BackupRepository name (== location name) -> the exclusive queue's repoKey
+	repoName      string // BackupRepository name -> the exclusive queue's repoKey
 	repoURL       string // BackupRepository.status.repositoryURL -> RESTIC_REPOSITORY
-	dek           string // the platform DEK == the restic repository password
-	s3CredsSecret string // location.spec.s3.credentialsSecretRef.name (operator ns)
+	dek           string // the restic repository password: platform DEK, or the tenant's own key
+	s3CredsSecret string // location.spec.s3.credentialsSecretRef.name
+	// credsNamespace is where s3CredsSecret lives: the operator namespace for a cluster-plane
+	// run, the BACKUP'S OWN namespace for a namespace-plane one. Carried explicitly rather than
+	// defaulted, because the failure mode of getting it wrong is silent: a tenant credentials
+	// Secret whose name collides with a platform one would send the tenant's data to whatever
+	// bucket the platform credentials reach.
+	credsNamespace string
 	// retention is the LOCATION's per-PVC keep policy (R24), read from the resolved
 	// ClusterBackupLocation — not from the run — because one shared repository has one
 	// authoritative policy (adr/0009). A `restic forget` applying it is enqueued once, on the
@@ -303,31 +309,33 @@ func (r *BackupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 				apiconst.LabelClusterBackup)
 	}
 
-	// (7) Resolve the location and its repository; gate on the repository being initialized.
-	var loc cbv1.ClusterBackupLocation
-	if err := r.Get(ctx, client.ObjectKey{Name: backup.Spec.LocationRef.Name}, &loc); err != nil {
-		if apierrors.IsNotFound(err) {
-			return r.gate(ctx, &backup, "LocationNotFound",
-				fmt.Sprintf("ClusterBackupLocation %q not found", backup.Spec.LocationRef.Name))
-		}
-		return ctrl.Result{}, fmt.Errorf("get ClusterBackupLocation %s: %w", backup.Spec.LocationRef.Name, err)
+	// (7) Resolve the location — from EITHER plane — and its repository; gate on the repository
+	// being initialized.
+	binding, reason, message, ok := r.resolveBackupLocation(ctx, &backup)
+	if !ok {
+		return r.gate(ctx, &backup, reason, message)
+	}
+	repoName := binding.Name
+	if binding.Namespaced() {
+		repoName = namespacedRepositoryName(binding.Namespace, binding.Name)
 	}
 
 	var repo cbv1.BackupRepository
-	if err := r.Get(ctx, client.ObjectKey{Name: loc.Name}, &repo); err != nil {
+	if err := r.Get(ctx, client.ObjectKey{Name: repoName}, &repo); err != nil {
 		if apierrors.IsNotFound(err) {
 			return r.gate(ctx, &backup, "RepositoryNotReady",
-				fmt.Sprintf("BackupRepository %q does not exist yet", loc.Name))
+				fmt.Sprintf("BackupRepository %q does not exist yet", repoName))
 		}
-		return ctrl.Result{}, fmt.Errorf("get BackupRepository %s: %w", loc.Name, err)
+		return ctrl.Result{}, fmt.Errorf("get BackupRepository %s: %w", repoName, err)
 	}
 	if !repo.Status.Initialized {
 		return r.gate(ctx, &backup, "RepositoryNotReady",
-			fmt.Sprintf("BackupRepository %q is not initialized yet", loc.Name))
+			fmt.Sprintf("BackupRepository %q is not initialized yet", repoName))
 	}
 
-	// The platform DEK is the restic repository password the mover needs.
-	dek, reason, message, ok := r.ensureDEK(ctx, &loc)
+	// The restic repository password the mover needs: the platform DEK on the cluster plane, the
+	// tenant's own key on the namespace plane.
+	password, reason, message, ok := r.ensureRepositoryPassword(ctx, binding)
 	if !ok {
 		return r.gate(ctx, &backup, reason, message)
 	}
@@ -335,14 +343,15 @@ func (r *BackupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	rc := &backupRunContext{
 		scheduleRef:         backup.Spec.ScheduleRef,
 		run:                 backup.Name,
-		clusterID:           loc.Spec.ClusterID,
+		clusterID:           binding.ClusterID,
 		tenant:              r.tenantFor(ctx, backup.Namespace),
-		repoName:            loc.Name,
+		repoName:            repoName,
 		repoURL:             repo.Status.RepositoryURL,
-		dek:                 dek,
-		s3CredsSecret:       loc.Spec.S3.CredentialsSecretRef.Name,
-		retention:           loc.Spec.Retention,
-		mode:                loc.Spec.Mode,
+		dek:                 password,
+		s3CredsSecret:       binding.S3.CredentialsSecretRef.Name,
+		credsNamespace:      binding.CredsNamespace,
+		retention:           binding.Retention,
+		mode:                binding.Mode,
 		backoffLimit:        run.BackoffLimit,
 		maxConcurrentMovers: run.MaxConcurrentMovers,
 	}
@@ -599,12 +608,67 @@ func (r *BackupReconciler) resolveRun(ctx context.Context, backup *cbv1.Backup) 
 	return &cb.Spec.BackupRunSpec, true, nil
 }
 
-// ensureDEK reads the cluster KEK and returns the plaintext platform DEK (the restic repository
-// password) for loc, minting-and-wrapping it once via keys.DEKManager and reusing it forever
-// after. On any failure it returns ok=false with a Secret-naming reason/message (never key
-// material) for the caller to fold into the Ready condition.
-func (r *BackupReconciler) ensureDEK(ctx context.Context, loc *cbv1.ClusterBackupLocation) (dek, reason, message string, ok bool) {
-	return resolvePlatformDEKCommon(ctx, r.Client, r.Secrets, r.OperatorNamespace, loc)
+// reasonLocationUnreadable is the gate reason for a location that exists as a reference but
+// cannot be read — an API error rather than a NotFound. Distinct from LocationNotFound because
+// the operator action differs: one is "create it", the other is "look at RBAC or the API server".
+const reasonLocationUnreadable = "LocationUnreadable"
+
+// resolveBackupLocation resolves the location a Backup names, from either plane, and reduces it
+// to a locationBinding. ok=false carries a reason/message for the caller's gate.
+//
+// The namespace-plane lookup is deliberately scoped to the BACKUP'S OWN namespace and nothing
+// else. That is the structural confinement the whole plane rests on (02-api.md): a Backup can
+// only ever reach a location sitting beside it, so no reference — however it was written — can
+// point at another tenant's storage or key. It is a property of the lookup, not a check that
+// could be skipped.
+func (r *BackupReconciler) resolveBackupLocation(ctx context.Context, backup *cbv1.Backup) (binding *locationBinding, reason, message string, ok bool) {
+	name := backup.Spec.LocationRef.Name
+
+	if backup.Spec.LocationRef.Kind == kindBackupLocation {
+		var loc cbv1.BackupLocation
+		if err := r.Get(ctx, client.ObjectKey{Namespace: backup.Namespace, Name: name}, &loc); err != nil {
+			if apierrors.IsNotFound(err) {
+				return nil, "LocationNotFound", fmt.Sprintf("BackupLocation %s/%s not found", backup.Namespace, name), false
+			}
+			return nil, reasonLocationUnreadable, fmt.Sprintf("get BackupLocation %s/%s: %v", backup.Namespace, name, err), false
+		}
+		// The effective cluster ID is pinned by the location controller and composes the
+		// repository path; without it there is no repository to write to yet.
+		if loc.Status.ClusterID == "" {
+			return nil, "LocationNotReady",
+				fmt.Sprintf("BackupLocation %s/%s has not resolved its cluster ID yet", backup.Namespace, name), false
+		}
+		return bindingFromNamespacedLocation(&loc), "", "", true
+	}
+
+	var cbl cbv1.ClusterBackupLocation
+	if err := r.Get(ctx, client.ObjectKey{Name: name}, &cbl); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, "LocationNotFound", fmt.Sprintf("ClusterBackupLocation %q not found", name), false
+		}
+		return nil, reasonLocationUnreadable, fmt.Sprintf("get ClusterBackupLocation %s: %v", name, err), false
+	}
+	return bindingFromClusterLocation(&cbl, r.OperatorNamespace), "", "", true
+}
+
+// ensureRepositoryPassword returns the plaintext restic repository password for the run: the
+// platform DEK on the cluster plane, the tenant's own key on the namespace plane. On any failure
+// it returns ok=false with a Secret-naming reason/message (never key material) for the caller to
+// fold into the Ready condition.
+func (r *BackupReconciler) ensureRepositoryPassword(ctx context.Context, binding *locationBinding) (password, reason, message string, ok bool) {
+	if binding.Namespaced() {
+		p, err := keys.NewUserKeyManager(r.Client).
+			EnsureUserPassword(ctx, binding.Namespace, binding.Name, binding.PasswordSecretRef)
+		if err != nil {
+			return "", "PasswordUnavailable", err.Error(), false
+		}
+		return p, "", "", true
+	}
+	var loc cbv1.ClusterBackupLocation
+	if err := r.Get(ctx, client.ObjectKey{Name: binding.Name}, &loc); err != nil {
+		return "", reasonLocationUnreadable, fmt.Sprintf("get ClusterBackupLocation %s: %v", binding.Name, err), false
+	}
+	return resolvePlatformDEKCommon(ctx, r.Client, r.Secrets, r.OperatorNamespace, &loc)
 }
 
 // resolvePlatformDEKCommon is the shared platform-DEK resolution: KEK Secret → age wrapper →
@@ -788,7 +852,7 @@ func (r *BackupReconciler) advanceSnapshotting(ctx context.Context, backup *cbv1
 		return nil
 	}
 
-	if err := ensureMoverCredsSecret(ctx, r.maintenanceDeps(), moverName, rc.dek, rc.s3CredsSecret, labels); err != nil {
+	if err := ensureMoverCredsSecret(ctx, r.maintenanceDeps(), moverName, rc.dek, rc.s3CredsSecret, rc.credsNamespace, labels); err != nil {
 		return err
 	}
 
@@ -1211,20 +1275,29 @@ func (r *BackupReconciler) cleanupVolumeExposure(ctx context.Context, backup *cb
 		moverNamePrefix(backup.Namespace, backup.Name, pvcName), exposureLabels(backup, pvcName))
 }
 
-// ensureMoverCredsSecret creates the per-Job Secret the mover consumes: the DEK as the restic
-// password (mounted file) and the two S3 credentials as env (secretKeyRef). It reads the S3
-// credentials from the location's credentials Secret through the uncached reader (I3) and
-// tolerates AlreadyExists so a re-reconcile re-adopts. The exposure labels are stamped so the
-// reaper can find it. A package function shared by the Backup controller, the maintenance ops
-// and the restore engine — one definition of the per-Job credential shape.
-func ensureMoverCredsSecret(ctx context.Context, deps repoMaintenanceDeps, name, dek, s3CredsSecret string, labels map[string]string) error {
-	accessKey, err := deps.Secrets.GetValue(ctx, deps.OperatorNamespace, s3CredsSecret, mover.SecretKeyAWSAccessKeyID)
-	if err != nil {
-		return fmt.Errorf("read S3 access key from secret %s/%s: %w", deps.OperatorNamespace, s3CredsSecret, err)
+// ensureMoverCredsSecret creates the per-Job Secret the mover consumes: the repository password
+// as a mounted file and the two S3 credentials as env (secretKeyRef). It reads the S3 credentials
+// from the location's credentials Secret through the uncached reader (I3) and tolerates
+// AlreadyExists so a re-reconcile re-adopts. The exposure labels are stamped so the reaper can
+// find it. A package function shared by the Backup controller, the maintenance ops and the
+// restore engine — one definition of the per-Job credential shape.
+//
+// credsNamespace is where the SOURCE credentials Secret is read from — the operator namespace on
+// the cluster plane, the tenant's own namespace on the namespace plane. The Secret this function
+// WRITES always lands in the operator namespace, beside the Job that mounts it; only the read
+// side varies. Passing the wrong read namespace fails silently rather than loudly, which is why
+// it is an explicit parameter at every call site instead of a default.
+func ensureMoverCredsSecret(ctx context.Context, deps repoMaintenanceDeps, name, dek, s3CredsSecret, credsNamespace string, labels map[string]string) error {
+	if credsNamespace == "" {
+		credsNamespace = deps.OperatorNamespace
 	}
-	secretKey, err := deps.Secrets.GetValue(ctx, deps.OperatorNamespace, s3CredsSecret, mover.SecretKeyAWSSecretAccessKey)
+	accessKey, err := deps.Secrets.GetValue(ctx, credsNamespace, s3CredsSecret, mover.SecretKeyAWSAccessKeyID)
 	if err != nil {
-		return fmt.Errorf("read S3 secret key from secret %s/%s: %w", deps.OperatorNamespace, s3CredsSecret, err)
+		return fmt.Errorf("read S3 access key from secret %s/%s: %w", credsNamespace, s3CredsSecret, err)
+	}
+	secretKey, err := deps.Secrets.GetValue(ctx, credsNamespace, s3CredsSecret, mover.SecretKeyAWSSecretAccessKey)
+	if err != nil {
+		return fmt.Errorf("read S3 secret key from secret %s/%s: %w", credsNamespace, s3CredsSecret, err)
 	}
 	creds := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: deps.OperatorNamespace, Labels: labels},

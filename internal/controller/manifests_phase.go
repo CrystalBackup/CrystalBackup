@@ -186,7 +186,7 @@ func (r *BackupReconciler) startManifestsJob(
 
 	if err := ensureMoverCredsSecret(ctx, repoMaintenanceDeps{
 		Client: r.Client, Secrets: r.Secrets, OperatorNamespace: r.OperatorNamespace,
-	}, jobName, rc.dek, rc.s3CredsSecret, labels); err != nil {
+	}, jobName, rc.dek, rc.s3CredsSecret, rc.credsNamespace, labels); err != nil {
 		return err
 	}
 

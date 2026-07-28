@@ -100,6 +100,9 @@ type locationBinding struct {
 	PasswordSecretRef string
 	// PlatformAccess mirrors the namespace plane's spec.encryption.platformAccess.
 	PlatformAccess bool
+	// Retention is the location's per-PVC keep policy (R24). It lives on the LOCATION on both
+	// planes — one repository, one authoritative policy (adr/0009) — never on a schedule.
+	Retention cbv1.RetentionSpec
 }
 
 // Namespaced reports whether this binding is a namespace-plane one.
@@ -141,6 +144,7 @@ func bindingFromClusterLocation(cbl *cbv1.ClusterBackupLocation, operatorNamespa
 		Mode:           cbl.Spec.Mode,
 		ClusterID:      cbl.Spec.ClusterID,
 		CredsNamespace: operatorNamespace,
+		Retention:      cbl.Spec.Retention,
 	}
 }
 
@@ -159,6 +163,7 @@ func bindingFromNamespacedLocation(loc *cbv1.BackupLocation) *locationBinding {
 		CredsNamespace:    loc.Namespace,
 		PasswordSecretRef: passwordSecretRefName(loc),
 		PlatformAccess:    loc.Spec.Encryption.PlatformAccess,
+		Retention:         loc.Spec.Retention,
 	}
 }
 

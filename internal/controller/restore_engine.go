@@ -716,7 +716,7 @@ func (e *restoreEngine) startVolume(ctx context.Context, rc *restoreExecContext,
 		return volumeOutcome{}, nil
 	}
 
-	if err := ensureMoverCredsSecret(ctx, e.maintenanceDeps(), jobName, rc.dek, rc.s3CredsSecret, labels); err != nil {
+	if err := ensureMoverCredsSecret(ctx, e.maintenanceDeps(), jobName, rc.dek, rc.s3CredsSecret, "", labels); err != nil {
 		return volumeOutcome{}, err
 	}
 
