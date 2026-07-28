@@ -219,6 +219,8 @@ const description =
               <span class="sep"></span>
               <span class="chip">ClusterBackup</span>
               <span class="sep"></span>
+              <span class="chip">N × Backup<small>per namespace</small></span>
+              <span class="sep"></span>
               <span class="chip accent">mover Job<small>crystal-backup-system</small></span>
               <span class="sep"></span>
               <span class="chip repo">Shared DR repo<small>server-side <code>namespace=</code> filter</small></span>
@@ -242,8 +244,10 @@ const description =
         <p class="flow-note">
           A snapshot taken in a tenant namespace is mounted <strong>centrally</strong> — the
           cluster-scoped <code>VolumeSnapshotContent</code> is re-bound into the operator namespace,
-          so tenant data is never exposed to a neighbour. Every repository is standard restic; a
-          second location can be kept in sync, re-encrypted to its <strong>own</strong> key.
+          so tenant data is never exposed to a neighbour. The fan-out covers namespaced data only:
+          resources that live outside any namespace — CRDs, ClusterRoles, PersistentVolumes — are
+          captured by the cluster run itself, into the same repository. Every repository is standard
+          restic; a second location can be kept in sync, re-encrypted to its <strong>own</strong> key.
         </p>
       </section>
 
