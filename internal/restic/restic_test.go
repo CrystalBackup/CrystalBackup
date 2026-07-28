@@ -19,6 +19,7 @@ package restic
 import (
 	"math/rand"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -870,5 +871,84 @@ func TestErasureTargetPrecedence(t *testing.T) {
 	}
 	if filter != "crystalbackup,namespace=team-x,pvc=data" {
 		t.Fatalf("filter = %q; the narrowest scope must win", filter)
+	}
+}
+
+// TestSyncArgsCarriesNoRepository is the guard against the single worst outcome external sync
+// can produce: a copy running backwards.
+//
+// restic's two repositories are spelled asymmetrically — the unqualified -r/--repo is the
+// DESTINATION and --from-repo is the SOURCE. Anyone reading -r as "the repository I am working
+// on" will place the source there, and the result is not a failed sync: it is the SECONDARY
+// overwriting the PRIMARY, i.e. the DR copy destroying the thing it exists to protect. The
+// defence is that this builder cannot name a repository at all; both travel as environment,
+// assembled once in the Job. If a future change adds a repo flag here, this test fails.
+func TestSyncArgsCarriesNoRepository(t *testing.T) {
+	for _, argv := range [][]string{SyncArgs(nil), SyncArgs([]string{"team-x"})} {
+		if argv[0] != "copy" {
+			t.Fatalf("argv[0] = %q, want the copy subcommand: %v", argv[0], argv)
+		}
+		for i, a := range argv {
+			switch a {
+			case "-r", "--repo", "--from-repo", "--repository-file", "--from-repository-file":
+				t.Fatalf("argv names a repository at index %d (%q): the direction must be set by "+
+					"environment alone, or half of it can be built wrong: %v", i, a, argv)
+			}
+		}
+	}
+}
+
+// TestSyncArgsScopesToOurSnapshots: a whole-repository sync must still be filtered.
+//
+// A bucket can hold snapshots another tool wrote, and "sync everything" meaning "sync everything
+// in the bucket" would copy a stranger's data into the destination — under our key, into a
+// repository whose owner never asked for it. TagBase alone is the floor.
+func TestSyncArgsScopesToOurSnapshots(t *testing.T) {
+	argv := SyncArgs(nil)
+	want := []string{"copy", "--tag", TagBase}
+	if !slices.Equal(argv, want) {
+		t.Fatalf("SyncArgs(nil) = %v, want %v", argv, want)
+	}
+}
+
+// TestSyncArgsRepeatsTagPerNamespace pins the OR spelling, which is the opposite of the erasure
+// filter's and for the opposite reason.
+//
+// restic ANDs a comma-joined --tag and ORs repeated ones. Selecting two namespaces as one value
+// ("crystalbackup,namespace=a,namespace=b") asks for snapshots that are in BOTH namespaces at
+// once — nothing matches, and a sync that silently copies zero snapshots reports success while
+// leaving the secondary empty. That is a backup that does not exist, discovered at restore time.
+func TestSyncArgsRepeatsTagPerNamespace(t *testing.T) {
+	argv := SyncArgs([]string{"team-x", "team-y"})
+	want := []string{
+		"copy",
+		"--tag", "crystalbackup,namespace=team-x",
+		"--tag", "crystalbackup,namespace=team-y",
+	}
+	if !slices.Equal(argv, want) {
+		t.Fatalf("SyncArgs = %v, want %v", argv, want)
+	}
+}
+
+// TestSnapshotOriginalIsDecoded: `original` is what makes a re-sync a no-op and what Mirror
+// reconciles on, so the decoder must not drop it. restic emits it ONLY on copied snapshots —
+// a natively-taken one must decode to the empty string, not to its own ID.
+func TestSnapshotOriginalIsDecoded(t *testing.T) {
+	snaps, err := ParseSnapshots([]byte(`[
+	  {"id":"aa","short_id":"aa","time":"2026-07-28T10:00:00Z","hostname":"c1","paths":["/data"],
+	   "tags":["crystalbackup"],"original":"bb"},
+	  {"id":"cc","short_id":"cc","time":"2026-07-28T10:00:00Z","hostname":"c1","paths":["/data"],
+	   "tags":["crystalbackup"]}
+	]`))
+	if err != nil {
+		t.Fatalf("ParseSnapshots: %v", err)
+	}
+	if snaps[0].Original != "bb" {
+		t.Errorf("copied snapshot Original = %q, want %q — Mirror would re-copy it every run",
+			snaps[0].Original, "bb")
+	}
+	if snaps[1].Original != "" {
+		t.Errorf("native snapshot Original = %q, want empty — a non-empty value would make it look "+
+			"like a copy of something", snaps[1].Original)
 	}
 }

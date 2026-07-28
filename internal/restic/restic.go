@@ -107,6 +107,8 @@ const (
 	groupByHostPaths = "host,paths"
 	forgetCmd        = "forget"
 	snapshotsCmd     = "snapshots"
+	// copyCmd is restic's cross-repository copy subcommand, the engine of external sync.
+	copyCmd = "copy"
 	// flagNoLock skips taking a repository lock. Only ever valid on a pure READ (see SnapshotsArgs);
 	// putting it on anything that mutates would defeat the locking the whole queue exists to respect.
 	flagNoLock = "--no-lock"
@@ -444,6 +446,40 @@ func ForgetCommand(r v1alpha1.RetentionSpec) (argv []string, ok bool) {
 		return nil, false
 	}
 	return append([]string{forgetCmd}, flags...), true
+}
+
+// SyncArgs is the complete restic argv for one external-sync run (adr/0013): `copy`, scoped by
+// tag. It carries NO repository flags, and that omission is the design, not an oversight.
+//
+// A copy names two repositories, and restic's spelling for them is asymmetric in a way that is
+// easy to get backwards: the UNQUALIFIED -r/--repo (RESTIC_REPOSITORY) is the DESTINATION, and
+// --from-repo (RESTIC_FROM_REPOSITORY) is the SOURCE. Reading -r as "the repository I am working
+// on" inverts the copy — it would overwrite the primary with the secondary, which for a DR
+// secondary means destroying the thing being protected. Both therefore travel as ENVIRONMENT,
+// built once in the Job (mover.EnvFromRepository and the ordinary JobRequest.RepoURL), so no
+// caller can construct half a direction here. TestSyncArgs pins that argv stays repository-free.
+//
+// The tag filter is always present, even for a whole-repository sync: TagBase alone still
+// excludes a foreign tool's snapshots sharing the bucket. Each namespace becomes its OWN --tag
+// occurrence because restic ORs repeated --tag and ANDs within one comma-joined value — so
+// "crystalbackup,namespace=a" plus "crystalbackup,namespace=b" means (base AND a) OR (base AND b),
+// while the one-value spelling would mean a snapshot in BOTH namespaces at once, i.e. nothing.
+//
+// There is no --retry-lock: restic reports an already-locked repository as exit 11, and a sync is
+// periodic and idempotent (verified against restic: re-copying an already-copied snapshot is a
+// no-op, because the destination records the source's ID in the snapshot's `original` field). One
+// skipped window that retries on the next tick is a better failure than a Job blocking for hours
+// on a prune it cannot see the end of.
+func SyncArgs(namespaces []string) []string {
+	if len(namespaces) == 0 {
+		return []string{copyCmd, flagTag, TagBase}
+	}
+	args := make([]string, 0, 1+2*len(namespaces))
+	args = append(args, copyCmd)
+	for _, ns := range namespaces {
+		args = append(args, flagTag, strings.Join([]string{TagBase, Tag(TagKeyNamespace, ns)}, ","))
+	}
+	return args
 }
 
 // UnlockArgs is the complete restic argv that clears a hard-killed mover's repository lock:

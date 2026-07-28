@@ -51,6 +51,10 @@ spec:
             # digest-pinned via the moverImage helper. The operator reads no default for this — a
             # cluster that never sets it can init/inspect CRs but cannot move data.
             - --mover-image={{ include "crystal-backup.moverImage" . }}
+            # The image external-sync Jobs run (crystal-mover + restic + rclone). A separate
+            # image so rclone stays off the backup/restore path (adr/0013); needed only when an
+            # ExternalSync exists, so a cluster that never syncs never pulls it.
+            - --sync-image={{ include "crystal-backup.syncImage" . }}
             {{- if .Values.rbac.create }}
             # The manifest mover's identity and the ClusterRole the operator binds transiently
             # into a tenant namespace for a capture. Passed rather than derived: these names are

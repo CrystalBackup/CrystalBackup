@@ -57,8 +57,10 @@ command -v jq >/dev/null          || { echo "jq not on PATH" >&2; exit 2; }
 
 case "$COMPONENT" in
   operator) MAIN_PKG="./cmd" ;;
-  mover)    MAIN_PKG="./cmd/crystal-mover" ;;
-  *) echo "--component must be 'operator' or 'mover', got: $COMPONENT" >&2; exit 2 ;;
+  # sync ships the SAME binary as mover, plus rclone; see the note by the restic block below
+  # for why rclone gets no govulncheck analysis of its own.
+  mover|sync) MAIN_PKG="./cmd/crystal-mover" ;;
+  *) echo "--component must be 'operator', 'mover' or 'sync', got: $COMPONENT" >&2; exit 2 ;;
 esac
 
 WORK="$(mktemp -d)"
@@ -70,13 +72,21 @@ echo "govulncheck: ${COMPONENT} (${MAIN_PKG})" >&2
 
 DOCS=("${WORK}/component.json")
 
-# --- 2. restic, for the mover image only --------------------------------------------------
-# The mover image ships a restic built by melange from a pinned source tarball
+# --- 2. restic, for the images that ship it (mover, sync) ---------------------------------
+# Those images ship a restic built by melange from a pinned source tarball
 # (build/melange/restic.yaml). Analyse exactly that tarball, at exactly that version and
 # checksum, so the VEX statements describe the restic that actually ships rather than
 # whatever restic HEAD happens to be. The version and digest are read from the melange
 # recipe so there is ONE source of truth for the pin; a drift fails the build loudly.
-if [ "$COMPONENT" = "mover" ]; then
+#
+# rclone — which only the sync image carries — deliberately gets NO analysis here, and the
+# asymmetry is the point. restic is special-cased because WE build it: no upstream tracks the
+# binary that ships, so if we do not analyse the pinned source, nobody does. rclone comes from
+# Wolfi as a maintained apk with its own CVE feed and rebuilds, so trivy's image scan already
+# covers it against a source of truth better than ours. The consequence is stated plainly in
+# adr/0013: a reachable rclone advisory FAILS the sync image's gate until Wolfi ships the fix
+# (or we pin past it) — there is no VEX suppression path for it, by design.
+if [ "$COMPONENT" = "mover" ] || [ "$COMPONENT" = "sync" ]; then
   RECIPE="${REPO_ROOT}/build/melange/restic.yaml"
   RESTIC_VERSION="$(sed -n 's/^  version: *"\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' "$RECIPE" | head -n1)"
   RESTIC_SHA256="$(sed -n 's/^ *expected-sha256: *\([0-9a-f]*\).*$/\1/p' "$RECIPE" | head -n1)"

@@ -132,6 +132,46 @@ The snapshot-level, re-encrypting model, the two CRDs, `Mirror`/`AppendOnly`, ta
 the queue/lock behaviour are all unaffected. rclone changes only HOW a repository is addressed, not
 what the copy means.
 
+### Verified end to end before implementing (2026-07-28)
+
+Two local repositories with **different passwords**, copied through **two independent rclone
+remotes defined purely from `RCLONE_CONFIG_<REMOTE>_*` environment** — no config file present at
+all. Four findings changed the implementation, so they are recorded rather than left as folklore:
+
+1. **`restic copy` is natively idempotent.** Re-running an identical copy transferred nothing and
+   created no second snapshot. The destination records the SOURCE snapshot's full ID in the
+   snapshot's `original` field, and restic uses it to skip work. The sync controller therefore
+   needs **no diffing of its own** to be incremental, and `Mirror`'s "copy what is missing" half is
+   free. `original` is also the only sound key for the other half — forgetting destination
+   snapshots whose source is gone — because tags and timestamps do not distinguish two runs of the
+   same schedule. Decoded into `restic.Snapshot.Original`.
+2. **`restic copy --json` emits no JSON summary** — it prints the same human-readable progress as
+   without the flag. So sync is NOT a summary-parsed operation: its outcome is the exit code, and
+   what it moved is counted by inventorying the destination. Adding it to the shim's parsed set
+   would have failed every sync on an unparseable stdout.
+3. **`RESTIC_FROM_REPOSITORY` in the environment breaks `restic init`**, which refuses with
+   *"Secondary repository must only be specified when copying the chunker parameters"*. The sync
+   Job is dedicated, so nothing leaks today; the flip side is the mechanism for the chunker-params
+   caveat in Consequences — `restic init --from-repo <src> --copy-chunker-params` is how a
+   destination that will ALSO receive native backups gets initialized so the two blob sets dedup.
+4. **`RCLONE_CONFIG=/dev/null`** silences rclone's per-run "config file not found" NOTICE and, more
+   usefully, makes "the remotes come from environment" exhaustive: no file in the image or mounted
+   later can redefine `src` or `dst`.
+
+Tag selectivity and preservation were confirmed at the same time: a filtered copy moved only the
+matching snapshot, and the destination kept `hostname`, `paths` and `tags` unchanged, so discovery
+projects a copied snapshot exactly as it projects a native one.
+
+### An honest note on the child process
+
+The amendment worried that restic spawns `rclone serve restic` as a child and that the shim must
+propagate its death honestly. Looking at it concretely, the structure already handles it: the shim
+is the image entrypoint (PID 1), restic is its child and rclone is restic's. An rclone that
+outlives restic re-parents to the shim, and the container's teardown reaps whatever outlives the
+shim. rclone also only moves bytes in response to restic's requests, so a dead restic cannot leave
+a write in flight. No process-group machinery was added, because none is load-bearing here — this
+is recorded so the absence reads as a decision rather than an oversight.
+
 ## Consequences
 
 ### Positive
@@ -139,7 +179,9 @@ what the copy means.
   upstream `restic` under its **own** key (reversibility, R8), and a client secondary is opaque
   to the platform's cluster key.
 - **Per-namespace selectivity** and **blob-incremental** cost; works to **any** S3, including
-  cross-provider, because it is client-side.
+  cross-provider — but *because both repositories are addressed through independently-credentialed
+  rclone remotes*, **not** merely because the copy is client-side. See the amendment: being
+  client-side is necessary and was not sufficient.
 - Reuses the exclusive-queue, discovery and tag machinery: copied snapshots keep their
   `host`/`paths`/tags, so discovery projects them at the destination like any other.
 

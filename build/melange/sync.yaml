@@ -1,0 +1,43 @@
+# melange recipe — package the Crystal Backup mover binary into a signed apk for the SYNC image.
+#
+# Same binary as build/melange/mover.yaml, and that is deliberate: external sync is one more
+# --operation on the same shim, not a second program. What differs is the runtime dependency set,
+# and that is the whole reason this is a separate package rather than a reuse of
+# crystal-backup-mover — declaring `rclone` here makes the coupling explicit and, more to the
+# point, keeps it OUT of the data-path image, where it would add a vulnerability surface to every
+# backup and restore for the benefit of an operation they never run (adr/0013 amendment).
+#
+# spec/adr/0012 (apko/Wolfi/melange supply chain), spec/adr/0014 (versioning).
+package:
+  name: crystal-backup-sync
+  version: "0.0.0" # CI stamps the release version (adr/0014).
+  epoch: 0
+  description: "Crystal Backup external sync (crystal-mover) binary"
+  url: https://github.com/CrystalBackup/CrystalBackup
+  copyright:
+    - license: Apache-2.0
+  dependencies:
+    runtime:
+      # The pinned restic engine the shim invokes as /usr/bin/restic.
+      - restic
+      # restic spawns `rclone serve restic` to reach a repository addressed as rclone:<remote>:.
+      # It is what lets ONE restic process open a source and a destination that authenticate with
+      # DIFFERENT credentials — the limitation that made this image necessary.
+      - rclone
+
+environment:
+  contents:
+    keyring:
+      - https://packages.wolfi.dev/os/wolfi-signing.rsa.pub
+    repositories:
+      - https://packages.wolfi.dev/os
+    packages:
+      - busybox # /bin/sh + coreutils for the pipeline
+
+pipeline:
+  - name: Install the pre-built crystal-mover binary
+    runs: |
+      set -e
+      mkdir -p "${{targets.destdir}}/usr/bin"
+      cp crystal-mover "${{targets.destdir}}/usr/bin/crystal-mover"
+      chmod 0755 "${{targets.destdir}}/usr/bin/crystal-mover"

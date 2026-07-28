@@ -48,6 +48,18 @@ type Snapshot struct {
 	// lack it, so consumers (the restore capacity fallback) treat a nil Summary as
 	// "size unknown".
 	Summary *SnapshotSummary `json:"summary,omitempty"`
+	// Original is the SOURCE snapshot's full ID, present only on snapshots restic produced by
+	// `restic copy` (adr/0013). A copy re-encrypts, so the destination snapshot is a different
+	// object with a different content-addressed ID; this field is what still ties it back.
+	//
+	// It is the identity external sync reconciles on. restic uses it to make a re-copy a no-op
+	// (verified: running the same copy twice moves nothing), which is why the sync Job needs no
+	// controller-side diffing to be incremental; and Mirror's other half — forgetting snapshots
+	// at the destination whose source is gone — is only well-defined because of it. Matching on
+	// tags or timestamps instead would confuse two runs of the same schedule.
+	//
+	// Empty on any natively-taken snapshot, which is the common case.
+	Original string `json:"original,omitempty"`
 }
 
 // SnapshotSummary is the subset of a snapshot's statistics the operator consumes.

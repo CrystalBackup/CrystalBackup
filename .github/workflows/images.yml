@@ -1,14 +1,15 @@
 # Supply-chain image build for Crystal Backup (spec/adr/0012, spec/adr/0014).
 #
-# For BOTH images (operator, mover):
+# For ALL THREE images (operator, mover, sync — the last two share one binary and differ
+# only in what they assemble around it, see build/apko/sync.yaml):
 #   * cross-compile the Go binary for linux/amd64 + linux/arm64 (`go build`, no QEMU);
-#   * melange-build the pinned restic engine from source (mover) + wrap each binary into a
-#     signed local apk (build/melange/*.yaml) — the "context" apko assembles from;
+#   * melange-build the pinned restic engine from source (mover, sync) + wrap each binary into
+#     a signed local apk (build/melange/*.yaml) — the "context" apko assembles from;
 #   * apko assembles a multi-arch INDEX on a Wolfi (glibc) base — one build, no emulation;
 #   * generate an SPDX SBOM, run a trivy 0-known-CVE release gate (scan BEFORE push);
 #   * cosign keyless-sign the index (Fulcio/Rekor) + attest the SBOM;
 #   * attach SLSA build provenance (GitHub OIDC identity → SLSA L3);
-#   * push to ghcr.io/crystalbackup/{operator,mover} by digest;
+#   * push to ghcr.io/crystalbackup/{operator,mover,sync} by digest;
 #   * generate an OpenVEX document from govulncheck and attest it AFTER publish — the
 #     day-N answer for advisories that land on an already-immutable image. Kept refreshed
 #     without rebuilding by .github/workflows/vex-refresh.yml (adr/0012).
@@ -81,6 +82,16 @@ jobs:
             source: ./cmd/crystal-mover
             apko: build/apko/mover.yaml
             melange: build/melange/mover.yaml
+            with_restic: "true"
+          # Same binary as the mover, a different apko assembly: sync additionally carries
+          # rclone, which is what lets one restic process open a source and a destination that
+          # authenticate with different credentials (adr/0013 amendment). It is a separate image
+          # so that dependency stays off the backup/restore path.
+          - component: sync
+            binary: crystal-mover
+            source: ./cmd/crystal-mover
+            apko: build/apko/sync.yaml
+            melange: build/melange/sync.yaml
             with_restic: "true"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -224,6 +235,16 @@ jobs:
             source: ./cmd/crystal-mover
             apko: build/apko/mover.yaml
             melange: build/melange/mover.yaml
+            with_restic: "true"
+          # Same binary as the mover, a different apko assembly: sync additionally carries
+          # rclone, which is what lets one restic process open a source and a destination that
+          # authenticate with different credentials (adr/0013 amendment). It is a separate image
+          # so that dependency stays off the backup/restore path.
+          - component: sync
+            binary: crystal-mover
+            source: ./cmd/crystal-mover
+            apko: build/apko/sync.yaml
+            melange: build/melange/sync.yaml
             with_restic: "true"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -517,10 +538,12 @@ jobs:
           set -euo pipefail
           op="$(docker buildx imagetools inspect "${REGISTRY}/${IMAGE_NAMESPACE}/operator:${VERSION}" --format '{{.Manifest.Digest}}')"
           mv="$(docker buildx imagetools inspect "${REGISTRY}/${IMAGE_NAMESPACE}/mover:${VERSION}" --format '{{.Manifest.Digest}}')"
-          [ -n "$op" ] && [ -n "$mv" ] || { echo "could not resolve operator/mover digests for ${VERSION}" >&2; exit 1; }
+          sy="$(docker buildx imagetools inspect "${REGISTRY}/${IMAGE_NAMESPACE}/sync:${VERSION}" --format '{{.Manifest.Digest}}')"
+          [ -n "$op" ] && [ -n "$mv" ] && [ -n "$sy" ] || { echo "could not resolve operator/mover/sync digests for ${VERSION}" >&2; exit 1; }
           echo "OPERATOR_DIGEST=${op}" >> "$GITHUB_ENV"
           echo "MOVER_DIGEST=${mv}" >> "$GITHUB_ENV"
-          echo "pinning operator@${op}  mover@${mv}"
+          echo "SYNC_DIGEST=${sy}" >> "$GITHUB_ENV"
+          echo "pinning operator@${op}  mover@${mv}  sync@${sy}"
 
       - name: Stamp the chart (appVersion + immutable image digests) and sync CRDs
         run: |
@@ -530,6 +553,7 @@ jobs:
           VERSION="${VERSION}" yq -i '.appVersion = strenv(VERSION)' charts/crystal-backup/Chart.yaml
           OPERATOR_DIGEST="${OPERATOR_DIGEST}" yq -i '.image.digest = strenv(OPERATOR_DIGEST)' charts/crystal-backup/values.yaml
           MOVER_DIGEST="${MOVER_DIGEST}" yq -i '.mover.image.digest = strenv(MOVER_DIGEST)' charts/crystal-backup/values.yaml
+          SYNC_DIGEST="${SYNC_DIGEST}" yq -i '.sync.image.digest = strenv(SYNC_DIGEST)' charts/crystal-backup/values.yaml
           # Helm installs crds/ on first install; sync the generated CRDs into the chart (the chart
           # keeps crds/ git-ignored, same as deploy/deploy.sh does for the crucible).
           mkdir -p charts/crystal-backup/crds

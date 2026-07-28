@@ -82,6 +82,7 @@ func main() {
 	var tlsOpts []func(*tls.Config)
 	var operatorNamespace string
 	var moverImage string
+	var syncImage string
 	var manifestMoverSA string
 	var manifestReaderRole string
 	var manifestWriterRole string
@@ -126,6 +127,12 @@ func main() {
 		"Container image for the mover Jobs (repository init and, later, backup/restore/maintenance). "+
 			"REQUIRED for real backups — the Helm chart and the crucible set it; an empty value is tolerated "+
 			"only because envtest never runs a mover Job.")
+	flag.StringVar(&syncImage, "sync-image", "",
+		"Container image for external-sync Jobs (crystal-mover + restic + rclone). A DIFFERENT image "+
+			"from --mover-image on purpose: sync is the one operation that must open two repositories "+
+			"with two different sets of object-storage credentials, which restic can only do through "+
+			"rclone remotes (adr/0013) — and rclone has no business on the backup/restore path. Empty "+
+			"disables external sync; nothing else is affected.")
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")

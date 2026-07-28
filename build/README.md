@@ -12,17 +12,30 @@ melange only **wraps that pre-built binary into a signed apk**; apko assembles t
 Wolfi/glibc base into an OCI image. So every build is three steps: `go build` → `melange build`
 (wrap) → `apko publish` (assemble + push).
 
-Two images:
+Three images:
 
 | Image | melange wraps | extra |
 |-------|---------------|-------|
 | **operator** (`build/{melange,apko}/operator.yaml`) | the `manager` binary (`./cmd`) | — |
 | **mover** (`build/{melange,apko}/mover.yaml`) | the `crystal-mover` binary (`./cmd/crystal-mover`) | **also needs `restic` built from source** (`build/melange/restic.yaml`), which apko pins as `restic=0.19.1-r0` |
+| **sync** (`build/{melange,apko}/sync.yaml`) | the **same** `crystal-mover` binary | the same pinned `restic`, **plus `rclone`** (a Wolfi apk, no melange build) |
 
-> **The mover is the slow one** (it compiles restic from source under emulation). It changes rarely
-> — the operator computes the restic arguments, the mover just runs `restic`. **Build the mover once,
-> reuse its digest across operator iterations.** Only rebuild it when `cmd/crystal-mover` or
-> `internal/mover` changes.
+> **The mover and sync are the slow ones** (they compile restic from source under emulation). They
+> change rarely — the operator computes the restic arguments, the mover just runs `restic`. **Build
+> them once, reuse their digests across operator iterations.** Only rebuild when
+> `cmd/crystal-mover` or `internal/mover` changes.
+
+**Why sync is a separate image and not a bigger mover.** External sync is the one operation that
+opens two repositories with two different sets of object-storage credentials, and restic cannot do
+that through its own s3 backend — one process, one credential set — so both repositories are
+addressed as `rclone:<remote>:…` ([adr/0013](../spec/adr/0013-external-backup-sync.md)). That makes
+rclone a hard requirement of sync and of nothing else. Folding it into the mover would put its
+vulnerability surface in front of every backup and restore; this project's release gate has already
+blocked once on a transitive dependency of restic. The two images share a binary and a recipe
+shape, so the third leg costs one apko file and one melange file.
+
+Since sync and mover carry the same binary, a change to `cmd/crystal-mover` or `internal/mover`
+invalidates **both** digests. A change to *only* rclone or the sync assembly invalidates just sync.
 
 ## Prerequisites (macOS, Apple Silicon / arm64)
 

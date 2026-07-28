@@ -123,6 +123,25 @@ type JobRequest struct {
 	// ExtraEnv is appended AFTER the fixed env (e.g. AWS_DEFAULT_REGION, RESTIC_COMPRESSION),
 	// so a caller can add knobs without displacing the protocol variables.
 	ExtraEnv []corev1.EnvVar
+	// CredentialKeys are the per-Job Secret keys projected as environment variables of the SAME
+	// name (one constant naming both sides, as SecretKeyAWS* already does). Empty means the
+	// default S3 pair — AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY — which is what every
+	// restic-over-s3 operation needs, so every existing caller keeps its behaviour unchanged.
+	//
+	// Only the sync Job overrides it (mover.SyncCredentialKeys): its two repositories are
+	// addressed through rclone remotes, whose credentials arrive as RCLONE_CONFIG_<REMOTE>_*.
+	// Overriding rather than adding is deliberate — these are REQUIRED secretKeyRefs, so leaving
+	// the AWS pair in place would keep the sync pod from ever starting on a Secret that has no
+	// reason to carry those keys, and carrying them anyway would advertise a credential path
+	// nothing beneath restic reads once the repository URL says rclone:.
+	CredentialKeys []string
+	// FromPasswordFile mounts the SOURCE repository's password for a two-repository operation:
+	// it sets RESTIC_FROM_PASSWORD_FILE, and the file itself is the SecretKeyResticFromPassword
+	// key of the same per-Job Secret, projected by the mount that is already there.
+	//
+	// A bool rather than a path: the path is fixed by the Secret projection, so a caller that
+	// could choose it could only choose it wrong.
+	FromPasswordFile bool
 	// Resources are the container's requests/limits, passed through as-is.
 	Resources corev1.ResourceRequirements
 	// SpreadOverLabels, when non-empty, adds a SOFT topology-spread constraint (maxSkew 1 over
@@ -277,9 +296,9 @@ func spreadConstraints(labels map[string]string) []corev1.TopologySpreadConstrai
 }
 
 // moverEnv builds the container environment in a fixed order: the restic repo/password/
-// cache/tmp variables, then the two AWS credentials by secretKeyRef, then the optional
-// GOMEMLIMIT, then the caller's ExtraEnv. Order is stable so the produced Job is
-// byte-reproducible across releases and in tests.
+// cache/tmp variables, the optional source-repository password, then the backend credentials
+// by secretKeyRef, then the optional GOMEMLIMIT, then the caller's ExtraEnv. Order is stable
+// so the produced Job is byte-reproducible across releases and in tests.
 func moverEnv(req JobRequest) []corev1.EnvVar {
 	env := []corev1.EnvVar{
 		{Name: envRepository, Value: req.RepoURL},
@@ -288,10 +307,16 @@ func moverEnv(req JobRequest) []corev1.EnvVar {
 		{Name: envPasswordFile, Value: ResticPasswordFilePath},
 		{Name: envCacheDir, Value: CacheDir},
 		{Name: envTMPDIR, Value: tmpDir},
-		// AWS creds are injected by reference: the env var name the AWS SDK inside restic reads
-		// is identical to the Secret data key it comes from, so one constant names both sides.
-		awsCredEnv(SecretKeyAWSAccessKeyID, req.SecretName),
-		awsCredEnv(SecretKeyAWSSecretAccessKey, req.SecretName),
+	}
+	// The SOURCE repository's password, for the one operation that opens two repositories. Placed
+	// before the credentials so the two password variables read together.
+	if req.FromPasswordFile {
+		env = append(env, corev1.EnvVar{Name: EnvFromPasswordFile, Value: ResticFromPasswordFilePath})
+	}
+	// Backend credentials are injected by reference: the env var name the backend reads is
+	// identical to the Secret data key it comes from, so one constant names both sides.
+	for _, key := range credentialKeys(req) {
+		env = append(env, secretEnv(key, req.SecretName))
 	}
 	if req.GoMemLimit != "" {
 		env = append(env, corev1.EnvVar{Name: envGoMemLimit, Value: req.GoMemLimit})
@@ -299,10 +324,24 @@ func moverEnv(req JobRequest) []corev1.EnvVar {
 	return append(env, req.ExtraEnv...)
 }
 
-// awsCredEnv builds an env var whose value is pulled from a required key of the per-Job
-// Secret. key is used for both the env var Name and the secretKeyRef Key because the AWS
-// SDK's env var name and the Secret data key are the same string by design.
-func awsCredEnv(key, secretName string) corev1.EnvVar {
+// credentialKeys resolves JobRequest.CredentialKeys, defaulting to the S3 pair. The default
+// lives here rather than at each call site so an operation that says nothing about credentials
+// gets the ones restic-over-s3 actually needs.
+func credentialKeys(req JobRequest) []string {
+	if len(req.CredentialKeys) > 0 {
+		return req.CredentialKeys
+	}
+	return []string{SecretKeyAWSAccessKeyID, SecretKeyAWSSecretAccessKey}
+}
+
+// secretEnv builds an env var whose value is pulled from a required key of the per-Job
+// Secret. key is used for both the env var Name and the secretKeyRef Key because the backend's
+// env var name and the Secret data key are the same string by design — true of the AWS SDK
+// inside restic (AWS_ACCESS_KEY_ID) and of rclone's per-remote form alike.
+//
+// The reference is REQUIRED (no Optional): a missing key must keep the pod from starting, not
+// let restic run against a repository it will fail to authenticate to and report as unreachable.
+func secretEnv(key, secretName string) corev1.EnvVar {
 	return corev1.EnvVar{
 		Name: key,
 		ValueFrom: &corev1.EnvVarSource{
