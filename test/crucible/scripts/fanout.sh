@@ -48,6 +48,9 @@ fi
 if [[ -n "${MOVER_IMAGE_DIGEST:-}" ]]; then
   echo "fanout: mover    ${MOVER_IMAGE_DIGEST}"
 fi
+if [[ -n "${SYNC_IMAGE_DIGEST:-}" ]]; then
+  echo "fanout: sync     ${SYNC_IMAGE_DIGEST}"
+fi
 
 # LANE_PREFIX lets a rerun sidestep a poisoned lane name: a Hetzner-side volume lock from a
 # wedged backend action blocks BOTH the destroy and any re-create under the same name, and the
@@ -79,7 +82,8 @@ echo "==> bringing up ${N} lanes"
 pids=()
 for lane in "${lanes[@]}"; do
   ( CRUCIBLE_LANE="${lane}" OPERATOR_IMAGE_DIGEST="${OPERATOR_IMAGE_DIGEST:-}" \
-      MOVER_IMAGE_DIGEST="${MOVER_IMAGE_DIGEST:-}" mise run up \
+      MOVER_IMAGE_DIGEST="${MOVER_IMAGE_DIGEST:-}" SYNC_IMAGE_DIGEST="${SYNC_IMAGE_DIGEST:-}" \
+      mise run up \
     && CRUCIBLE_LANE="${lane}" mise run seed ) \
     > "${log_dir}/${lane}-up.log" 2>&1 &
   pids+=("$!")

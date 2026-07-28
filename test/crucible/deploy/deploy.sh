@@ -33,6 +33,13 @@ OPERATOR_IMAGE_TAG="${OPERATOR_IMAGE_TAG:-}"
 # leaves this empty falls back to the chart's placeholder and every mover Job ImagePullBackOffs.
 MOVER_IMAGE_DIGEST="${MOVER_IMAGE_DIGEST:-}"
 MOVER_IMAGE_TAG="${MOVER_IMAGE_TAG:-}"
+# Sync image override — the THIRD image (crystal-mover + restic + rclone), run only by external-sync
+# Jobs (M5, adr/0013). Same requirement as the mover for the M5 label and no requirement at all for
+# anything else: an operator with no ExternalSync never pulls it, which is exactly why leaving it at
+# the chart placeholder goes unnoticed until a sync Job sits in ImagePullBackOff for twenty minutes.
+# The m5 suite fails fast on the placeholder digest rather than waiting for that.
+SYNC_IMAGE_DIGEST="${SYNC_IMAGE_DIGEST:-}"
+SYNC_IMAGE_TAG="${SYNC_IMAGE_TAG:-}"
 
 export KUBECONFIG="${KUBECONFIG:-${CRUCIBLE_DIR}/artifacts/kubeconfig}"
 
@@ -132,6 +139,8 @@ helm upgrade --install crystal-backup "${REPO_ROOT}/charts/crystal-backup" \
   --set image.tag="${OPERATOR_IMAGE_TAG}" \
   --set mover.image.digest="${MOVER_IMAGE_DIGEST}" \
   --set mover.image.tag="${MOVER_IMAGE_TAG}" \
+  --set sync.image.digest="${SYNC_IMAGE_DIGEST}" \
+  --set sync.image.tag="${SYNC_IMAGE_TAG}" \
   --set networkPolicy.apiServerPort=6443
   # apiServerPort=6443: RKE2's kube-apiserver Service (10.43.0.1:443) DNATs to the master
   # nodes on 6443, and Canal (the crucible CNI) evaluates NetworkPolicy egress POST-DNAT, so

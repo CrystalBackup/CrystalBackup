@@ -1,4 +1,4 @@
-# Building the operator & mover images
+# Building the operator, mover & sync images
 
 The authoritative, multi-arch, signed build is CI: [`.github/workflows/images.yml`](../.github/workflows/images.yml)
 (apko/Wolfi/SLSA, [adr/0012](../spec/adr/0012-container-images-apko-wolfi-slsa.md)). **This page is the
@@ -140,16 +140,43 @@ MOVER_DIGEST="$(docker buildx imagetools inspect "$REG/mover:dev" --format '{{.M
 echo "mover@$MOVER_DIGEST"
 ```
 
+## Build the sync image (only when the mover binary or rclone changed)
+
+Steps 1–3 of the mover build produce everything this one needs — the same `crystal-mover` binary and
+the same restic apk — so if you have just built the mover, **skip straight to the lock+publish
+below**. rclone needs no melange build: it is a Wolfi apk, pinned in `build/apko/sync.yaml`.
+
+```bash
+# Steps 1–3 are the mover's, unchanged. Then:
+apko lock build/apko/sync.yaml \
+  --arch x86_64 -r ./packages -k "$PWD/melange.rsa.pub" --output apko.lock.json
+apko publish build/apko/sync.yaml "$REG/sync:dev" \
+  --arch x86_64 --lockfile apko.lock.json \
+  -r ./packages -k "$PWD/melange.rsa.pub" \
+  --sbom-path ./sbom --image-refs image-refs.txt
+
+SYNC_DIGEST="$(docker buildx imagetools inspect "$REG/sync:dev" --format '{{.Manifest.Digest}}')"
+echo "sync@$SYNC_DIGEST"
+```
+
 ## Deploy onto the crucible
 
-`test/crucible/deploy/deploy.sh` reads both digests from the environment and passes them to the chart
-(`--set image.digest`, `--set mover.image.digest`; the chart's `_helpers.tpl` prefers digest over tag):
+`test/crucible/deploy/deploy.sh` reads all three digests from the environment and passes them to the
+chart (`--set image.digest`, `--set mover.image.digest`, `--set sync.image.digest`; the chart's
+`_helpers.tpl` prefers digest over tag):
 
 ```bash
 OPERATOR_IMAGE_DIGEST="$OPERATOR_DIGEST" \
 MOVER_IMAGE_DIGEST="$MOVER_DIGEST" \
+SYNC_IMAGE_DIGEST="$SYNC_DIGEST" \
   test/crucible/deploy/deploy.sh
 ```
+
+Leaving `SYNC_IMAGE_DIGEST` empty is only safe when nothing on the cluster syncs: the chart falls
+back to a **placeholder digest**, and because a sync image is pulled by nothing until an
+`ExternalSync` exists, the mistake is silent right up to the moment a copy Job sits in
+`ImagePullBackOff`. The crucible's `m5` suite fails fast on the placeholder rather than waiting it
+out.
 
 **Shortened loop for an operator-only change** (mover unchanged): rebuild the operator (steps above),
 then just re-point the running deployment and re-test — no full redeploy:
