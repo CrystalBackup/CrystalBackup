@@ -288,6 +288,14 @@ func (r *DiscoveryReconciler) projectGroup(ctx context.Context, repo *cbv1.Backu
 				apiconst.AnnotationProjected: apiconst.AnnotationProjectedValue,
 			},
 		},
+		// spec.run is deliberately ABSENT, and must stay that way (adr/0017 §2). This apply runs
+		// with ForceOwnership, so every field named here is claimed by discovery's field manager —
+		// and a manager that owns a field has to be able to reproduce it on the next pass.
+		// Discovery's only input is the repository, and no pvcSelector, manifestOptions or hook
+		// command was ever written to a restic snapshot: naming spec.run here would mean forcing it
+		// empty on every discovery pass, permanently fighting whoever materialized it. Omitting it
+		// also means an ADOPTION (a terminal execution Backup turning into a projection) leaves the
+		// materialized run untouched — SSA only removes fields the applier previously owned.
 		Spec: cbv1.BackupSpec{
 			LocationRef: cbv1.LocationReference{Kind: kindClusterBackupLocation, Name: repo.Name},
 		},

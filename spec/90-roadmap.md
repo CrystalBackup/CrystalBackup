@@ -261,24 +261,31 @@ alone) and answered the question by finding **two** bugs, not one.
 
 ## M4 — Consistency hooks, verification & maintenance (R16, R17)
 
-- [ ] Pre/post exec hooks (pod selector, container, timeout, onError), freeze window =
+- [x] Pre/post exec hooks (pod selector, container, timeout, onError), freeze window =
       snapshot phase only; **timeout truly honored** (context deadline, dedicated unit test)
       and **unconditional unfreeze** — post-hooks run even if the snapshot fails, with retries
       + critical alert (delta 8).
-- [ ] Maintenance controller on the per-`BackupRepository` exclusive queue: `prune` (Standard
+- [x] Maintenance controller on the per-`BackupRepository` exclusive queue: `prune` (Standard
       mode; one cluster-wide window for the shared repo), `check` schedules, jitter;
       **operator-driven `restic unlock`** of stale locks before each exclusive op (delta 3);
       `RecentMaintenance` history + consecutive-failure alert.
-- [ ] Repository integrity verification (R17): `restic check` (structure) + scheduled
+- [x] Repository integrity verification (R17): `restic check` (structure) + scheduled
       `check --read-data-subset` (sampled data read to catch silent bucket / bit-rot corruption);
       result in `BackupRepository.status` + metrics + `RepositoryCheckFailed` alert.
       **Restore-testing stays the administrator's job** (restore drills via the normal restore
       path); no automated per-backup canary and no offloadable/verification-index in v1 (deferred
       — [00-requirements.md §6](00-requirements.md)).
-- [ ] e2e: hook failure policies; controller crash between pre and post hook → **unfreeze
+- [x] e2e: hook failure policies; controller crash between pre and post hook → **unfreeze
       still happens** (the feature's most important test); prune under concurrent backups;
       kill a prune mid-flight → the next run purges the stale lock and succeeds;
       `check --read-data-subset` catches an intentionally corrupted repo (S3 object tampering).
+
+**Shipped as `0.4.0`**, with one addition the milestone did not plan: an intermittent
+`VolumeSnapshotContent` leak, audited and fixed as **crash-only teardown by re-entry** (the pass
+that wrote the terminal status used to be the only one that ever deleted the VS/VSC pair). The
+window predated 0.4.0; M4 made it more probable, not possible. Validated over seven independent
+crucible lanes, all with zero residual snapshot objects
+([crucible M4 report](https://crystalbackup.github.io/CrystalBackup/reports/crucible-m4.html)).
 
 ## M5 — Namespace plane, external sync & right-to-erasure (R3, R5, R21, R28)
 

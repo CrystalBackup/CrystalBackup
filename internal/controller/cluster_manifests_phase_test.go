@@ -55,9 +55,9 @@ var _ = Describe("ClusterBackup cluster-scoped capture", func() {
 			ObjectMeta: metav1.ObjectMeta{Name: run},
 			Spec: cbv1.ClusterBackupSpec{
 				ClusterBackupRunSpec: cbv1.ClusterBackupRunSpec{
-					LocationRef:      cbv1.LocalObjectReference{Name: location},
-					Namespaces:       cbv1.NamespaceSelector{MatchLabels: lbl},
-					IncludeManifests: &off,
+					LocationRef:   cbv1.LocalObjectReference{Name: location},
+					Namespaces:    cbv1.NamespaceSelector{MatchLabels: lbl},
+					BackupRunSpec: cbv1.BackupRunSpec{IncludeManifests: &off},
 				},
 			},
 		}

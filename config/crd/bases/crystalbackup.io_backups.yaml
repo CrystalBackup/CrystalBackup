@@ -74,6 +74,266 @@ spec:
                 required:
                 - name
                 type: object
+              run:
+                description: |-
+                  run is the run configuration MATERIALIZED by whatever created this Backup — a
+                  ClusterBackup fan-out or a BackupSchedule stamp (adr/0017 §5). Identity still lives in
+                  the fields above; this is the intent, copied down once at creation rather than pulled
+                  from a parent at every reconcile.
+
+                  It is a POINTER because absent and empty must stay distinguishable. Absent means "this
+                  object predates materialization, or was projected" — the controller falls back to
+                  pulling the parent ClusterBackup, which is the only way an object created before this
+                  field existed still executes. An empty struct means "materialized, and every knob was
+                  left at its default", which must NOT trigger the fallback.
+
+                  DISCOVERY MUST NEVER SET OR OWN THIS FIELD. A projection is reconstructed from restic
+                  snapshots alone, and no selector, manifest option or hook command was ever written to
+                  the repository; an SSA field manager that owns a field it cannot reproduce would fight
+                  the execution controller over the object forever (adr/0017 §2). Projections leave it
+                  absent, and the crystalbackup.io/projected annotation stops them executing anyway.
+                properties:
+                  backoffLimit:
+                    description: backoffLimit for mover Jobs.
+                    format: int32
+                    type: integer
+                  hooks:
+                    description: hooks are exec hooks around snapshotting (R16).
+                    properties:
+                      honorAnnotations:
+                        description: |-
+                          honorAnnotations enables the crystalbackup.io/pre-backup-* and post-backup-* pod
+                          annotations. It is opt-in because it delegates WHAT the operator execs to whoever can
+                          annotate a pod in the backed-up namespace. When a pod carries them they take precedence and
+                          the hooks below are skipped for that pod — never merged (the same rule Velero applies).
+                        type: boolean
+                      post:
+                        description: post hooks run after snapshotting.
+                        items:
+                          description: |-
+                            Hook is an exec hook run in a selected pod around snapshotting (R16). Candidate pods are those
+                            MOUNTING the volumes being snapshotted, always in the CR's own namespace; podSelector narrows
+                            that set further, and an empty selector means "every pod holding this data".
+                          properties:
+                            command:
+                              description: |-
+                                command to run, as an argv. It is exec'd directly, NOT through a shell, so pipes and
+                                redirections need an explicit interpreter (e.g. ["sh","-c","..."]).
+                              items:
+                                type: string
+                              minItems: 1
+                              type: array
+                            container:
+                              description: container name to exec into. Empty uses
+                                the pod's FIRST container.
+                              type: string
+                            onError:
+                              default: Fail
+                              description: onError governs whether a failure fails
+                                the backup or is tolerated.
+                              enum:
+                              - Fail
+                              - Continue
+                              type: string
+                            podSelector:
+                              description: |-
+                                podSelector selects the pod(s) to exec into, among those mounting the backed-up volumes.
+                                Empty matches them all.
+                              properties:
+                                matchExpressions:
+                                  description: matchExpressions is a list of label
+                                    selector requirements. The requirements are ANDed.
+                                  items:
+                                    description: |-
+                                      A label selector requirement is a selector that contains values, a key, and an operator that
+                                      relates the key and values.
+                                    properties:
+                                      key:
+                                        description: key is the label key that the
+                                          selector applies to.
+                                        type: string
+                                      operator:
+                                        description: |-
+                                          operator represents a key's relationship to a set of values.
+                                          Valid operators are In, NotIn, Exists and DoesNotExist.
+                                        type: string
+                                      values:
+                                        description: |-
+                                          values is an array of string values. If the operator is In or NotIn,
+                                          the values array must be non-empty. If the operator is Exists or DoesNotExist,
+                                          the values array must be empty. This array is replaced during a strategic
+                                          merge patch.
+                                        items:
+                                          type: string
+                                        type: array
+                                        x-kubernetes-list-type: atomic
+                                    required:
+                                    - key
+                                    - operator
+                                    type: object
+                                  type: array
+                                  x-kubernetes-list-type: atomic
+                                matchLabels:
+                                  additionalProperties:
+                                    type: string
+                                  description: |-
+                                    matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+                                    map is equivalent to an element of matchExpressions, whose key field is "key", the
+                                    operator is "In", and the values array contains only "value". The requirements are ANDed.
+                                  type: object
+                              type: object
+                              x-kubernetes-map-type: atomic
+                            timeout:
+                              default: 30s
+                              description: |-
+                                timeout for the hook, bounding how long the application stays quiesced. It defaults to 30s
+                                rather than to the zero value on purpose: this is a non-pointer duration, so an omitted
+                                timeout would arrive as 0s, and a literal zero deadline expires immediately — every hook
+                                that did not set one would fail before it ran.
+                              type: string
+                          required:
+                          - command
+                          type: object
+                        type: array
+                      pre:
+                        description: pre hooks run before snapshotting.
+                        items:
+                          description: |-
+                            Hook is an exec hook run in a selected pod around snapshotting (R16). Candidate pods are those
+                            MOUNTING the volumes being snapshotted, always in the CR's own namespace; podSelector narrows
+                            that set further, and an empty selector means "every pod holding this data".
+                          properties:
+                            command:
+                              description: |-
+                                command to run, as an argv. It is exec'd directly, NOT through a shell, so pipes and
+                                redirections need an explicit interpreter (e.g. ["sh","-c","..."]).
+                              items:
+                                type: string
+                              minItems: 1
+                              type: array
+                            container:
+                              description: container name to exec into. Empty uses
+                                the pod's FIRST container.
+                              type: string
+                            onError:
+                              default: Fail
+                              description: onError governs whether a failure fails
+                                the backup or is tolerated.
+                              enum:
+                              - Fail
+                              - Continue
+                              type: string
+                            podSelector:
+                              description: |-
+                                podSelector selects the pod(s) to exec into, among those mounting the backed-up volumes.
+                                Empty matches them all.
+                              properties:
+                                matchExpressions:
+                                  description: matchExpressions is a list of label
+                                    selector requirements. The requirements are ANDed.
+                                  items:
+                                    description: |-
+                                      A label selector requirement is a selector that contains values, a key, and an operator that
+                                      relates the key and values.
+                                    properties:
+                                      key:
+                                        description: key is the label key that the
+                                          selector applies to.
+                                        type: string
+                                      operator:
+                                        description: |-
+                                          operator represents a key's relationship to a set of values.
+                                          Valid operators are In, NotIn, Exists and DoesNotExist.
+                                        type: string
+                                      values:
+                                        description: |-
+                                          values is an array of string values. If the operator is In or NotIn,
+                                          the values array must be non-empty. If the operator is Exists or DoesNotExist,
+                                          the values array must be empty. This array is replaced during a strategic
+                                          merge patch.
+                                        items:
+                                          type: string
+                                        type: array
+                                        x-kubernetes-list-type: atomic
+                                    required:
+                                    - key
+                                    - operator
+                                    type: object
+                                  type: array
+                                  x-kubernetes-list-type: atomic
+                                matchLabels:
+                                  additionalProperties:
+                                    type: string
+                                  description: |-
+                                    matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+                                    map is equivalent to an element of matchExpressions, whose key field is "key", the
+                                    operator is "In", and the values array contains only "value". The requirements are ANDed.
+                                  type: object
+                              type: object
+                              x-kubernetes-map-type: atomic
+                            timeout:
+                              default: 30s
+                              description: |-
+                                timeout for the hook, bounding how long the application stays quiesced. It defaults to 30s
+                                rather than to the zero value on purpose: this is a non-pointer duration, so an omitted
+                                timeout would arrive as 0s, and a literal zero deadline expires immediately — every hook
+                                that did not set one would fail before it ran.
+                              type: string
+                          required:
+                          - command
+                          type: object
+                        type: array
+                    type: object
+                  includeManifests:
+                    default: true
+                    description: includeManifests also captures namespace manifests
+                      (default true).
+                    type: boolean
+                  manifestOptions:
+                    description: manifestOptions tunes what the manifest dump captures
+                      (03-security-and-tenancy.md §10).
+                    properties:
+                      excludeSecretData:
+                        description: |-
+                          excludeSecretData stores Secret manifests with data/stringData stripped and the
+                          annotation crystalbackup.io/secret-data-excluded: "true". Restore recreates them
+                          empty, carrying the same annotation, so a workload that needs the values fails
+                          visibly instead of silently coming back with wrong ones.
+
+                          This is an opt-out from a deliberate default: a full namespace recovery (R15) needs
+                          the Secrets, and the control on them is the repository key — admin-only on the shared
+                          DR repo, the user's own on a user location. Excluding the data trades recoverability
+                          for a smaller blast radius if that key is ever compromised.
+                        type: boolean
+                    type: object
+                  maxConcurrentMovers:
+                    description: |-
+                      maxConcurrentMovers caps parallel mover Jobs. The cap is CLUSTER-WIDE (it is checked
+                      against every mover Job in the operator namespace, not just this run's), which is why it
+                      stays off the tenant-facing BackupSchedule surface: a namespace user setting it would be
+                      setting a platform-wide limit.
+                    format: int32
+                    type: integer
+                  pvcSelector:
+                    description: pvcSelector selects PVCs per namespace (default all).
+                    properties:
+                      exclude:
+                        description: exclude is a list of PVC-name globs to remove.
+                        items:
+                          type: string
+                        type: array
+                      include:
+                        description: include is a list of PVC-name globs to add.
+                        items:
+                          type: string
+                        type: array
+                      matchLabels:
+                        additionalProperties:
+                          type: string
+                        description: matchLabels selects PVCs by label.
+                        type: object
+                    type: object
+                type: object
               scheduleRef:
                 description: scheduleRef names the originating schedule (empty for
                   manual/ad-hoc).

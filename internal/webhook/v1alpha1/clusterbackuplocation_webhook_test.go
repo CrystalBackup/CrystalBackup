@@ -18,6 +18,7 @@ package v1alpha1
 
 import (
 	"context"
+	"strings"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -50,19 +51,56 @@ func location(name string, isDefault bool) *crystalbackupiov1alpha1.ClusterBacku
 	}
 }
 
+// createDefault creates a location whose spec.default is true, retrying while the denial is
+// rule 4 firing on a location the PREVIOUS spec deleted.
+//
+// The webhook enforces single-default by LISTING siblings through the manager's cache
+// (mgr.GetClient()), so "the object is gone from the API server" and "the webhook can no longer
+// see it" are two different instants. Waiting for the API-server list to drain — which AfterEach
+// does — closes most of that window but not the informer's own lag. Retrying the operation is
+// what actually closes it, and it is the same technique the step-down spec below already relies
+// on. Only rule-4 denials are retried: any other error fails immediately, so a genuine
+// regression in the rule still fails the spec instead of spinning until timeout.
+func createDefault(name string) *crystalbackupiov1alpha1.ClusterBackupLocation {
+	GinkgoHelper()
+	loc := location(name, true)
+	Eventually(func(g Gomega) {
+		err := k8sClient.Create(ctx, loc)
+		if err != nil && apierrors.IsInvalid(err) && strings.Contains(err.Error(), "may be the default") {
+			// Rebuild: a denied Create can still have stamped fields onto the object.
+			loc = location(name, true)
+			g.Expect(err).NotTo(HaveOccurred())
+			return
+		}
+		g.Expect(err).NotTo(HaveOccurred())
+	}).Should(Succeed(), "the webhook's cached list must observe the previous spec's cleanup")
+	return loc
+}
+
 var _ = Describe("ClusterBackupLocation Webhook", func() {
 	AfterEach(func() {
-		// Best-effort sweep so specs stay independent (cluster-scoped objects persist).
+		// Sweep so specs stay independent (cluster-scoped objects persist), and WAIT for the
+		// sweep to land. Issuing the deletes without waiting was a real race, not a tidiness
+		// question: rule 4 is enforced by LISTING sibling locations, so a leftover default from
+		// the previous spec makes the next spec's perfectly legal update get denied. It reproduced
+		// on CI ("secondary" already is the default) while passing locally, because the whole
+		// thing turns on whether a delete propagates before the next Create — which is exactly
+		// what a loaded runner changes.
 		var list crystalbackupiov1alpha1.ClusterBackupLocationList
 		Expect(k8sClient.List(ctx, &list)).To(Succeed())
 		for i := range list.Items {
 			_ = k8sClient.Delete(context.Background(), &list.Items[i])
 		}
+		Eventually(func(g Gomega) {
+			var remaining crystalbackupiov1alpha1.ClusterBackupLocationList
+			g.Expect(k8sClient.List(context.Background(), &remaining)).To(Succeed())
+			g.Expect(remaining.Items).To(BeEmpty())
+		}).Should(Succeed(), "the next spec must not inherit this one's locations")
 	})
 
 	Context("single-default uniqueness (admission rule 4, adr/0010)", func() {
 		It("admits the first default and denies a competing second one", func() {
-			Expect(k8sClient.Create(ctx, location("primary", true))).To(Succeed())
+			createDefault("primary")
 
 			err := k8sClient.Create(ctx, location("pretender", true))
 			Expect(err).To(HaveOccurred(), "a second default must be denied")
@@ -71,13 +109,13 @@ var _ = Describe("ClusterBackupLocation Webhook", func() {
 		})
 
 		It("admits any number of non-default locations alongside the default", func() {
-			Expect(k8sClient.Create(ctx, location("primary", true))).To(Succeed())
+			createDefault("primary")
 			Expect(k8sClient.Create(ctx, location("secondary", false))).To(Succeed())
 			Expect(k8sClient.Create(ctx, location("tertiary", false))).To(Succeed())
 		})
 
 		It("denies flipping a non-default location to default while another default exists", func() {
-			Expect(k8sClient.Create(ctx, location("primary", true))).To(Succeed())
+			createDefault("primary")
 			secondary := location("secondary", false)
 			Expect(k8sClient.Create(ctx, secondary)).To(Succeed())
 
@@ -102,8 +140,7 @@ var _ = Describe("ClusterBackupLocation Webhook", func() {
 		})
 
 		It("admits an update that keeps an existing default the default", func() {
-			primary := location("primary", true)
-			Expect(k8sClient.Create(ctx, primary)).To(Succeed())
+			primary := createDefault("primary")
 			// Mutate a MUTABLE field: the repository identity (clusterID/s3.*) and mode are pinned by
 			// CEL immutability, so a self-update must touch something editable like retention.
 			primary.Spec.Retention = crystalbackupiov1alpha1.RetentionSpec{KeepDaily: 7}

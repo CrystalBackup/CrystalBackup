@@ -103,6 +103,17 @@ before the change. Two constraints must hold, and both come from §2 and §3:
   the platform run commands they can already run themselves") but nothing enforces it. Decide
   it in M5, with a `SubjectAccessReview` on the CR's creator as the candidate mitigation.
 
+**Implemented (M5, 0.5.0).** `BackupRunSpec` carries the six shared fields and is **inlined**
+into `ClusterBackupRunSpec` alongside the cluster-only remainder, so the serialized shape of
+`ClusterBackup`/`ClusterBackupSchedule` is unchanged by the split. `ClusterBackup` fan-out
+materializes it into `Backup.spec.run` (a pointer: absent ≠ empty, so "predates the field"
+stays distinguishable from "every knob left at its default"), and `resolveRun` prefers the
+materialized copy, falling back to the parent pull only when it is absent. The `NoParent` gate
+became `NoRunSpec`. Two constraints held as written: discovery never names `spec.run` in its
+apply, and the tenant-submittable surface is why `maxConcurrentMovers` — a **cluster-wide** cap
+— stays off `BackupScheduleSpec` even though it is part of `BackupRunSpec`. The
+`SubjectAccessReview` on hooks is the remaining half, in the namespace-plane admission lot.
+
 ## Alternatives considered
 
 - **Materialize the full run spec into `Backup` now (M4).** Rejected on §2, not on effort:

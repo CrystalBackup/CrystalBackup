@@ -39,10 +39,12 @@ func createHookedParent(name, location string, sel cbv1.PVCSelector, hooksSpec c
 		ObjectMeta: metav1.ObjectMeta{Name: name},
 		Spec: cbv1.ClusterBackupSpec{
 			ClusterBackupRunSpec: cbv1.ClusterBackupRunSpec{
-				LocationRef:      cbv1.LocalObjectReference{Name: location},
-				PVCSelector:      sel,
-				IncludeManifests: &off,
-				Hooks:            hooksSpec,
+				LocationRef: cbv1.LocalObjectReference{Name: location},
+				BackupRunSpec: cbv1.BackupRunSpec{
+					PVCSelector:      sel,
+					IncludeManifests: &off,
+					Hooks:            hooksSpec,
+				},
 			},
 		},
 	}

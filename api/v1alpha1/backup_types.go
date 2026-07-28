@@ -33,6 +33,25 @@ type BackupSpec struct {
 	// a cluster-origin Backup references a ClusterBackupLocation.
 	// +required
 	LocationRef LocationReference `json:"locationRef"`
+
+	// run is the run configuration MATERIALIZED by whatever created this Backup — a
+	// ClusterBackup fan-out or a BackupSchedule stamp (adr/0017 §5). Identity still lives in
+	// the fields above; this is the intent, copied down once at creation rather than pulled
+	// from a parent at every reconcile.
+	//
+	// It is a POINTER because absent and empty must stay distinguishable. Absent means "this
+	// object predates materialization, or was projected" — the controller falls back to
+	// pulling the parent ClusterBackup, which is the only way an object created before this
+	// field existed still executes. An empty struct means "materialized, and every knob was
+	// left at its default", which must NOT trigger the fallback.
+	//
+	// DISCOVERY MUST NEVER SET OR OWN THIS FIELD. A projection is reconstructed from restic
+	// snapshots alone, and no selector, manifest option or hook command was ever written to
+	// the repository; an SSA field manager that owns a field it cannot reproduce would fight
+	// the execution controller over the object forever (adr/0017 §2). Projections leave it
+	// absent, and the crystalbackup.io/projected annotation stops them executing anyway.
+	// +optional
+	Run *BackupRunSpec `json:"run,omitempty"`
 }
 
 // BackupStatus is the observed state and the projected restore point.
