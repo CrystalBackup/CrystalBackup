@@ -41,6 +41,7 @@ import (
 
 	cbv1 "github.com/CrystalBackup/CrystalBackup/api/v1alpha1"
 	"github.com/CrystalBackup/CrystalBackup/internal/client/secrets"
+	"github.com/CrystalBackup/CrystalBackup/internal/keys"
 	"github.com/CrystalBackup/CrystalBackup/internal/repo/queue"
 	"github.com/CrystalBackup/CrystalBackup/internal/rexposer"
 )
@@ -176,6 +177,17 @@ var _ = BeforeSuite(func() {
 		Prober:            stubS3Prober{},
 		OperatorNamespace: suiteOperatorNamespace,
 		Recorder:          mgr.GetEventRecorder("clusterbackuplocation"),
+	}).SetupWithManager(mgr)).To(Succeed())
+
+	// The namespace plane's location controller (M5). Same stub prober; no KEK, no escrow — a
+	// tenant repository is protected by the tenant's own key, which UserKeyManager resolves or
+	// generates in their namespace.
+	Expect((&BackupLocationReconciler{
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		Prober:   stubS3Prober{},
+		UserKeys: keys.NewUserKeyManager(mgr.GetClient()),
+		Recorder: mgr.GetEventRecorder("backuplocation"),
 	}).SetupWithManager(mgr)).To(Succeed())
 
 	// The per-repository exclusive queue, bound to the suite ctx (cancel() also stops it) and

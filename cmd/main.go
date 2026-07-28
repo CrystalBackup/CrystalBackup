@@ -49,6 +49,7 @@ import (
 	"github.com/CrystalBackup/CrystalBackup/internal/escrow"
 	"github.com/CrystalBackup/CrystalBackup/internal/exposer"
 	"github.com/CrystalBackup/CrystalBackup/internal/hooks"
+	"github.com/CrystalBackup/CrystalBackup/internal/keys"
 	"github.com/CrystalBackup/CrystalBackup/internal/metrics"
 	"github.com/CrystalBackup/CrystalBackup/internal/repo/queue"
 	"github.com/CrystalBackup/CrystalBackup/internal/repo/s3stat"
@@ -297,6 +298,21 @@ func main() {
 		Recorder:          mgr.GetEventRecorder("clusterbackuplocation"),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Unable to create controller", "controller", "ClusterBackupLocation")
+		os.Exit(1)
+	}
+	// The namespace plane's location controller (M5). It needs no KEK and no escrow: a tenant
+	// repository is protected by the tenant's OWN key, held in their namespace (adr/0004 §2).
+	// mgr.GetClient() is the right client for UserKeyManager despite it writing Secrets — the
+	// manager bypasses its cache for Secrets (see the Client options above), so this starts no
+	// Secret informer.
+	if err := (&controller.BackupLocationReconciler{
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		Prober:   controller.NewHTTPS3Prober(),
+		UserKeys: keys.NewUserKeyManager(mgr.GetClient()),
+		Recorder: mgr.GetEventRecorder("backuplocation"),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Unable to create controller", "controller", "BackupLocation")
 		os.Exit(1)
 	}
 	if err := controller.NewBackupRepositoryReconciler(

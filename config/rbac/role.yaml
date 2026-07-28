@@ -89,19 +89,11 @@ rules:
   - crystalbackup.io
   resources:
   - backuplocations
+  - clusterbackuplocations
+  - clusterbackupschedules
+  - clusterrestores
+  - restores
   verbs:
-  - get
-  - list
-  - watch
-- apiGroups:
-  - crystalbackup.io
-  resources:
-  - backuprepositories
-  - backups
-  - clusterbackups
-  verbs:
-  - create
-  - delete
   - get
   - list
   - patch
@@ -110,6 +102,7 @@ rules:
 - apiGroups:
   - crystalbackup.io
   resources:
+  - backuplocations/finalizers
   - backuprepositories/finalizers
   - backups/finalizers
   - clusterbackuplocations/finalizers
@@ -120,6 +113,7 @@ rules:
 - apiGroups:
   - crystalbackup.io
   resources:
+  - backuplocations/status
   - backuprepositories/status
   - backups/status
   - clusterbackuplocations/status
@@ -134,11 +128,12 @@ rules:
 - apiGroups:
   - crystalbackup.io
   resources:
-  - clusterbackuplocations
-  - clusterbackupschedules
-  - clusterrestores
-  - restores
+  - backuprepositories
+  - backups
+  - clusterbackups
   verbs:
+  - create
+  - delete
   - get
   - list
   - patch

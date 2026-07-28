@@ -70,6 +70,18 @@ const (
 	// `crystalbackup.io/protect: "true"`). The operator reads it; it never sets it.
 	LabelProtect = Domain + "/protect"
 
+	// LabelLocation records the name of the location a cluster-scoped BackupRepository backs,
+	// and — together with LabelNamespace — is the BACK-LINK that stands in for an
+	// ownerReference on the namespace plane.
+	//
+	// A cluster-scoped object cannot be owned by a namespaced one: Kubernetes treats such an
+	// ownerReference as dangling and garbage-collects the dependent. So a BackupRepository
+	// behind a ClusterBackupLocation carries a real controller reference, while one behind a
+	// namespaced BackupLocation carries these two labels instead, and its lifecycle is driven
+	// explicitly by the BackupLocation controller rather than by GC. Both labels present means
+	// "namespace plane"; the repository controller resolves its owner from them.
+	LabelLocation = Domain + "/location"
+
 	// LabelPVC records the source PersistentVolumeClaim a per-PVC exposure (its dynamic
 	// VolumeSnapshot, the static VS/VSC re-bind pair, and the temp clone PVC) and its mover
 	// Job belong to. Together with LabelClusterBackup and LabelNamespace it is the selector

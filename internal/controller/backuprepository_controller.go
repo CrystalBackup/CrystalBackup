@@ -214,15 +214,17 @@ func (r *BackupRepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return ctrl.Result{Requeue: true}, nil
 	}
 
-	// Resolve the owning ClusterBackupLocation from the controller ownerReference the
-	// ClusterBackupLocation controller set. Without it there is nothing to initialize.
-	cbl, err := r.resolveOwningLocation(ctx, &br)
+	// Resolve the owning location, from EITHER plane: a cluster-scoped ClusterBackupLocation via
+	// the controller ownerReference, or a namespaced BackupLocation via the back-link labels
+	// (which is what a namespaced owner gets, since it cannot own a cluster-scoped object). Both
+	// reduce to the same locationBinding, so nothing below this line is plane-aware.
+	binding, err := resolveLocationBinding(ctx, r.Client, &br, r.OperatorNamespace)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			status.SetCondition(&br.Status.Conditions, ConditionInitialized, metav1.ConditionFalse, "NoOwningLocation",
-				"owning ClusterBackupLocation not found; nothing to initialize", br.Generation)
+				"owning location not found; nothing to initialize", br.Generation)
 			status.SetCondition(&br.Status.Conditions, ConditionReady, metav1.ConditionFalse, "NoOwningLocation",
-				"owning ClusterBackupLocation not found", br.Generation)
+				"owning location not found", br.Generation)
 			if uerr := r.Status().Update(ctx, &br); uerr != nil {
 				return ctrl.Result{}, fmt.Errorf("update status for BackupRepository %s: %w", br.Name, uerr)
 			}
@@ -231,22 +233,38 @@ func (r *BackupRepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return ctrl.Result{}, fmt.Errorf("resolve owning location for BackupRepository %s: %w", br.Name, err)
 	}
 
-	// Populate the repository's identity in status (idempotent — the same inputs every pass).
-	br.Status.Location = cbv1.RepositoryLocationRef{Kind: kindClusterBackupLocation, Name: cbl.Name}
-	br.Status.Scope = scopeCluster
-	br.Status.Mode = cbl.Spec.Mode
-	br.Status.RepositoryURL = restic.RepoURL(cbl.Spec.S3.Endpoint, cbl.Spec.S3.Bucket, cbl.Spec.S3.Prefix, cbl.Spec.ClusterID)
+	// A namespace-plane location whose effective cluster ID has not been pinned yet composes no
+	// repository path at all. Initializing on an empty one would create a repository at the wrong
+	// URL, which nothing afterwards could find.
+	if binding.ClusterID == "" {
+		status.SetCondition(&br.Status.Conditions, ConditionInitialized, metav1.ConditionFalse, "NoClusterID",
+			"the owning location has not resolved its cluster ID yet; waiting", br.Generation)
+		status.SetCondition(&br.Status.Conditions, ConditionReady, metav1.ConditionFalse, "NoClusterID",
+			"the owning location has not resolved its cluster ID yet", br.Generation)
+		if uerr := r.Status().Update(ctx, &br); uerr != nil {
+			return ctrl.Result{}, fmt.Errorf("update status for BackupRepository %s: %w", br.Name, uerr)
+		}
+		return ctrl.Result{RequeueAfter: shortRequeueInterval}, nil
+	}
 
-	// Ensure the platform DEK (the restic repository password) exists and is persisted wrapped.
-	// The plaintext DEK lives only in this local variable and the queue closure that captures it.
-	dek, ok := r.ensurePlatformDEK(ctx, &br, cbl)
+	// Populate the repository's identity in status (idempotent — the same inputs every pass).
+	br.Status.Location = cbv1.RepositoryLocationRef{Kind: binding.Kind, Name: binding.Name}
+	br.Status.Scope = binding.Scope()
+	br.Status.OwnerNamespace = binding.Namespace
+	br.Status.Mode = binding.Mode
+	br.Status.RepositoryURL = restic.RepoURL(binding.S3.Endpoint, binding.S3.Bucket, binding.S3.Prefix, binding.ClusterID)
+
+	// Ensure the repository password exists: the wrapped platform DEK on the cluster plane, the
+	// user's own key on the namespace plane. The plaintext lives only in this local variable and
+	// the queue closure that captures it.
+	password, ok := r.ensureRepositoryPassword(ctx, &br, binding)
 	if !ok {
 		if uerr := r.Status().Update(ctx, &br); uerr != nil {
 			return ctrl.Result{}, fmt.Errorf("update status for BackupRepository %s: %w", br.Name, uerr)
 		}
 		return ctrl.Result{RequeueAfter: shortRequeueInterval}, nil
 	}
-	br.Status.KeySlots = []string{keySlotPlatform}
+	br.Status.KeySlots = binding.KeySlots()
 
 	// Already initialized: re-assert the terminal conditions and re-evaluate periodically.
 	if br.Status.Initialized {
@@ -260,7 +278,7 @@ func (r *BackupRepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return ctrl.Result{RequeueAfter: periodicRequeueInterval}, nil
 	}
 
-	return r.driveInit(ctx, &br, cbl, dek)
+	return r.driveInit(ctx, &br, binding, password)
 }
 
 // finalize handles a BackupRepository with a non-zero DeletionTimestamp. Per adr/0009 delete
@@ -292,29 +310,33 @@ func (r *BackupRepositoryReconciler) finalize(ctx context.Context, br *cbv1.Back
 	return ctrl.Result{}, nil
 }
 
-// resolveOwningLocation returns the ClusterBackupLocation named by br's controller
-// ownerReference. It returns an apierrors NotFound error when there is no controller reference or
-// when the referenced location is gone, so the caller can treat "no owner (yet)" the same as "a
-// transiently missing owner": degrade and requeue, never hard-fail.
-func (r *BackupRepositoryReconciler) resolveOwningLocation(ctx context.Context, br *cbv1.BackupRepository) (*cbv1.ClusterBackupLocation, error) {
-	owner := metav1.GetControllerOf(br)
-	if owner == nil || owner.Kind != kindClusterBackupLocation {
-		return nil, apierrors.NewNotFound(
-			cbv1.GroupVersion.WithResource("clusterbackuplocations").GroupResource(), "<none>")
+// ensureRepositoryPassword returns the plaintext restic password for the repository, resolved
+// per plane, and never logs or stores it.
+//
+//   - CLUSTER: the platform DEK — read the cluster KEK, mint-once/reuse-forever the wrapped DEK
+//     Secret in the operator namespace, unwrap it.
+//   - NAMESPACE: the tenant's own key — the Secret they referenced, or one generated beside their
+//     location (adr/0004 §2). No KEK and no wrapping: it is theirs to read with upstream restic.
+//
+// On any failure it sets ConditionInitialized/Ready=False with a Secret-naming reason (never the
+// key material) and returns ok=false; the caller persists status and requeues.
+func (r *BackupRepositoryReconciler) ensureRepositoryPassword(ctx context.Context, br *cbv1.BackupRepository, binding *locationBinding) (string, bool) {
+	if binding.Namespaced() {
+		password, err := keys.NewUserKeyManager(r.Client).
+			EnsureUserPassword(ctx, binding.Namespace, binding.Name, binding.PasswordSecretRef)
+		if err != nil {
+			r.setInitBlocked(br, "PasswordUnavailable", err.Error())
+			return "", false
+		}
+		return password, true
 	}
-	var cbl cbv1.ClusterBackupLocation
-	if err := r.Get(ctx, client.ObjectKey{Name: owner.Name}, &cbl); err != nil {
-		return nil, err
-	}
-	return &cbl, nil
-}
 
-// ensurePlatformDEK reads the cluster KEK, ensures the wrapped platform DEK Secret exists (via
-// keys.DEKManager, which mints-once and reuses-forever), and returns the plaintext DEK. On any
-// failure it sets ConditionInitialized/Ready=False with a Secret-naming reason (never the key
-// material) and returns ok=false; the caller persists status and requeues.
-func (r *BackupRepositoryReconciler) ensurePlatformDEK(ctx context.Context, br *cbv1.BackupRepository, cbl *cbv1.ClusterBackupLocation) (string, bool) {
-	dek, reason, err := resolvePlatformDEK(ctx, r.Client, r.Secrets, r.OperatorNamespace, cbl)
+	var cbl cbv1.ClusterBackupLocation
+	if err := r.Get(ctx, client.ObjectKey{Name: binding.Name}, &cbl); err != nil {
+		r.setInitBlocked(br, "NoOwningLocation", fmt.Sprintf("get ClusterBackupLocation %s: %v", binding.Name, err))
+		return "", false
+	}
+	dek, reason, err := resolvePlatformDEK(ctx, r.Client, r.Secrets, r.OperatorNamespace, &cbl)
 	if err != nil {
 		r.setInitBlocked(br, reason, err.Error())
 		return "", false
@@ -363,7 +385,7 @@ func (r *BackupRepositoryReconciler) setInitBlocked(br *cbv1.BackupRepository, r
 // most one enqueued init per repository (tracked in r.inflight), polls its Handle without
 // blocking the reconcile goroutine, and translates the op's terminal outcome into status. It is
 // only reached when the repository is not yet initialized.
-func (r *BackupRepositoryReconciler) driveInit(ctx context.Context, br *cbv1.BackupRepository, cbl *cbv1.ClusterBackupLocation, dek string) (ctrl.Result, error) {
+func (r *BackupRepositoryReconciler) driveInit(ctx context.Context, br *cbv1.BackupRepository, binding *locationBinding, password string) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 	repoKey := br.Name
 
@@ -378,9 +400,10 @@ func (r *BackupRepositoryReconciler) driveInit(ctx context.Context, br *cbv1.Bac
 		// init. The op does NOT write BR status — Reconcile owns that.
 		owner := br.DeepCopy()
 		repoURL := br.Status.RepositoryURL
-		s3 := cbl.Spec.S3
+		s3 := binding.S3
+		credsNamespace := binding.CredsNamespace
 		handle, enqErr := r.Queue.Enqueue(repoKey, queue.OpInit, func(opCtx context.Context) error {
-			return r.runInit(opCtx, owner, repoURL, dek, s3)
+			return r.runInit(opCtx, owner, repoURL, password, s3, credsNamespace)
 		})
 		if enqErr != nil {
 			// The queue is shutting down; retry soon rather than treating it as an init failure.
@@ -470,23 +493,29 @@ func (r *BackupRepositoryReconciler) driveInit(ctx context.Context, br *cbv1.Bac
 // Secret already present and adopts them instead of racing a second `restic init`.
 //
 // It (1) reads the S3 credentials from the location's credentialsSecretRef, (2) ensures a
-// job-scoped creds Secret holding the restic password (the DEK) and the two AWS keys, (3)
-// ensures the init Job (a maintenance mover Job running `restic init`), then (4) polls the Job to
-// terminal success or failure, honouring opCtx (Manager.Stop) and an overall deadline.
-func (r *BackupRepositoryReconciler) runInit(opCtx context.Context, owner *cbv1.BackupRepository, repoURL, dek string, s3 cbv1.S3Spec) error {
+// job-scoped creds Secret holding the restic password and the two AWS keys, (3) ensures the init
+// Job (a maintenance mover Job running `restic init`), then (4) polls the Job to terminal success
+// or failure, honouring opCtx (Manager.Stop) and an overall deadline.
+//
+// credsNamespace is where the location's S3 credentials Secret lives — the operator namespace on
+// the cluster plane, the TENANT's namespace on the namespace plane. It is a parameter rather than
+// r.OperatorNamespace because the two planes genuinely differ here, and defaulting it wrong would
+// not fail loudly: a tenant Secret name that happens to match a platform one would back the
+// tenant's data up with platform credentials, into whatever bucket those credentials reach.
+func (r *BackupRepositoryReconciler) runInit(opCtx context.Context, owner *cbv1.BackupRepository, repoURL, password string, s3 cbv1.S3Spec, credsNamespace string) error {
 	ctx, cancel := context.WithTimeout(opCtx, initJobDeadline)
 	defer cancel()
 
 	name := initResourceName(owner.Name)
 	credsName := s3.CredentialsSecretRef.Name
 
-	accessKey, err := r.Secrets.GetValue(ctx, r.OperatorNamespace, credsName, mover.SecretKeyAWSAccessKeyID)
+	accessKey, err := r.Secrets.GetValue(ctx, credsNamespace, credsName, mover.SecretKeyAWSAccessKeyID)
 	if err != nil {
-		return fmt.Errorf("read S3 access key from secret %s/%s: %w", r.OperatorNamespace, credsName, err)
+		return fmt.Errorf("read S3 access key from secret %s/%s: %w", credsNamespace, credsName, err)
 	}
-	secretKey, err := r.Secrets.GetValue(ctx, r.OperatorNamespace, credsName, mover.SecretKeyAWSSecretAccessKey)
+	secretKey, err := r.Secrets.GetValue(ctx, credsNamespace, credsName, mover.SecretKeyAWSSecretAccessKey)
 	if err != nil {
-		return fmt.Errorf("read S3 secret key from secret %s/%s: %w", r.OperatorNamespace, credsName, err)
+		return fmt.Errorf("read S3 secret key from secret %s/%s: %w", credsNamespace, credsName, err)
 	}
 
 	// The job-scoped creds Secret: the restic password (DEK) is consumed as a mounted file, the
@@ -500,7 +529,7 @@ func (r *BackupRepositoryReconciler) runInit(opCtx context.Context, owner *cbv1.
 		},
 		Type: corev1.SecretTypeOpaque,
 		Data: map[string][]byte{
-			mover.SecretKeyResticPassword:     []byte(dek),
+			mover.SecretKeyResticPassword:     []byte(password),
 			mover.SecretKeyAWSAccessKeyID:     accessKey,
 			mover.SecretKeyAWSSecretAccessKey: secretKey,
 		},
