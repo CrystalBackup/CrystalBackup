@@ -432,10 +432,29 @@ func syncEndpointReady(e *syncEndpoint, side string) (string, string, bool) {
 //
 // Admission rule 9 rejects source == destination by name, but names are not the identity that
 // matters: two differently-named locations can point at the same bucket, prefix and cluster ID, and
-// then the "copy" would be restic reading and writing one repository through two locks. Comparing
-// the resolved repository is the check that actually holds.
+// then the "copy" would be restic reading and writing one repository through two locks.
+//
+// So this compares BOTH, and the second comparison is the one that earns its keep. A repository
+// object's NAME is derived from its location's on either plane (the location name for a cluster
+// one, "<namespace>--<location>" for a namespaced one), so name equality only ever reproduces the
+// same-name case admission already denies — a useful backstop for a cluster running with the policy
+// set disabled, and blind to the aliased case on its own. The repository URL is the actual
+// identity: it is the bucket, prefix and cluster ID the location resolved to, which is what restic
+// would open. Two locations that differ in every field except those three are one repository, and a
+// Mirror between them would copy a repository into itself.
+//
+// An endpoint whose repository has no URL yet is not compared on it: unresolved is not "the same",
+// and reporting SameRepository there would send an operator looking for a configuration error that
+// does not exist.
 func sameEndpoint(source, dest *syncEndpoint) bool {
-	return source.Repo != nil && dest.Repo != nil && source.Repo.Name == dest.Repo.Name
+	if source.Repo == nil || dest.Repo == nil {
+		return false
+	}
+	if source.Repo.Name == dest.Repo.Name {
+		return true
+	}
+	return source.Repo.Status.RepositoryURL != "" &&
+		source.Repo.Status.RepositoryURL == dest.Repo.Status.RepositoryURL
 }
 
 // syncScopeDescription renders the copy's scope for status and events.

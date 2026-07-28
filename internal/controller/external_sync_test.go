@@ -306,25 +306,48 @@ func TestSyncEndpointConfigKeepsCredentialsOutOfTheEnvValues(t *testing.T) {
 // TestSameEndpointComparesRepositoriesNotNames: admission rejects source == destination by NAME,
 // but two differently-named locations can address the same bucket, prefix and cluster ID. restic
 // would then open one repository as both sides of the copy and contend with its own lock.
+//
+// The ALIASED case below is the one that matters, and it is written with two DISTINCT
+// BackupRepository objects on purpose. An earlier version of this test handed both endpoints the
+// same *BackupRepository, which no reconcile can produce: a repository's name is derived from its
+// location's on either plane, so two locations always own two objects. Comparing names alone
+// therefore only reproduced admission rule 9, and the alias — the very case this test is named
+// after — went straight through. The identity that decides is the resolved repository URL.
 func TestSameEndpointComparesRepositoriesNotNames(t *testing.T) {
-	shared := &cbv1.BackupRepository{}
-	shared.Name = "one-repo"
-	a := &syncEndpoint{Binding: &locationBinding{Name: "primary"}, Repo: shared}
-	b := &syncEndpoint{Binding: &locationBinding{Name: "also-primary"}, Repo: shared}
+	const oneRepoURL = "s3:https://s3.example/bucket/crystal/cid-1"
 
-	if !sameEndpoint(a, b) {
-		t.Fatal("two differently-named locations resolving to one repository were accepted as a sync pair")
+	withRepo := func(locName, repoName, url string) *syncEndpoint {
+		repo := &cbv1.BackupRepository{}
+		repo.Name = repoName
+		repo.Status.RepositoryURL = url
+		return &syncEndpoint{Binding: &locationBinding{Name: locName}, Repo: repo}
 	}
 
-	other := &cbv1.BackupRepository{}
-	other.Name = "second-repo"
-	if sameEndpoint(a, &syncEndpoint{Binding: &locationBinding{Name: "secondary"}, Repo: other}) {
+	// Two locations, two repository objects, ONE repository in the bucket.
+	if !sameEndpoint(withRepo("primary", "primary", oneRepoURL), withRepo("also-primary", "also-primary", oneRepoURL)) {
+		t.Fatal("two differently-named locations addressing one repository were accepted as a sync pair")
+	}
+
+	// The same-name backstop still holds when neither side has resolved a URL yet — that is what
+	// keeps a cluster running with the admission policies disabled from self-copying.
+	if !sameEndpoint(withRepo("primary", "primary", ""), withRepo("primary", "primary", "")) {
+		t.Fatal("one repository named on both sides was accepted as a sync pair")
+	}
+
+	if sameEndpoint(withRepo("primary", "primary", oneRepoURL),
+		withRepo("secondary", "secondary", "s3:https://s3.example/other/crystal/cid-1")) {
 		t.Fatal("two distinct repositories were rejected as the same")
 	}
+
 	// An unresolved side is not "the same" — it is not yet anything, and reporting SameRepository
-	// there would send an operator looking for a configuration error that does not exist.
-	if sameEndpoint(a, &syncEndpoint{Binding: &locationBinding{Name: "pending"}}) {
+	// there would send an operator looking for a configuration error that does not exist. Neither a
+	// missing repository object nor a repository whose URL is still empty may match by URL.
+	if sameEndpoint(withRepo("primary", "primary", oneRepoURL),
+		&syncEndpoint{Binding: &locationBinding{Name: "pending"}}) {
 		t.Fatal("an endpoint whose repository does not exist yet was reported as identical")
+	}
+	if sameEndpoint(withRepo("primary", "primary", ""), withRepo("pending", "pending", "")) {
+		t.Fatal("two repositories that have not resolved a URL yet were reported as identical")
 	}
 }
 
