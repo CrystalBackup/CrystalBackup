@@ -165,6 +165,7 @@ func m3DeployOperatorViaHelm() {
 
 	opRepo, opTag := splitImageRef(managerImage)
 	mvRepo, mvTag := splitImageRef(moverImage)
+	syRepo, syTag := splitImageRef(syncImage)
 
 	By("helm upgrade --install the operator from charts/crystal-backup (data path wired)")
 	helmArgs := []string{
@@ -184,6 +185,13 @@ func m3DeployOperatorViaHelm() {
 		"--set", "mover.image.digest=",
 		"--set", "mover.image.repository=" + mvRepo,
 		"--set", "mover.image.tag=" + mvTag,
+		// The external-sync image (M5). Set for every container, not just M5's: it costs
+		// nothing where no sync runs (the image is never pulled), and the alternative — a
+		// per-container Helm argument list — is how one container ends up silently deploying an
+		// operator whose --sync-image still points at the unbuildable placeholder digest.
+		"--set", "sync.image.digest=",
+		"--set", "sync.image.repository=" + syRepo,
+		"--set", "sync.image.tag=" + syTag,
 		// M3 does not test admission (M2 does) and kindnet ignores NetworkPolicy — disabling both
 		// keeps this container's cluster-scoped footprint from colliding with the M2 container's
 		// VAP set and avoids a webhook serving-cert dependency.
