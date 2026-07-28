@@ -75,6 +75,17 @@ TEST_TIMEOUT ?= 20m
 # deploy cycles — the whole suite now legitimately needs ~35m, so 45m leaves headroom.
 E2E_TIMEOUT ?= 45m
 
+# GINKGO_E2E_TIMEOUT is what actually bounds the suite, and it is deliberately SHORTER than the
+# go test deadline above. Ginkgo enforces its own suite timeout independently of `go test
+# -timeout`, and its default is one hour — so with only the go-test guard set, go test always
+# panicked FIRST, and a go-test panic prints a goroutine dump with no indication of which spec was
+# running. Two consecutive CI failures were diagnosed as far as "43 minutes of silence after this
+# STEP line" and no further, because the signal simply was not there. Letting Ginkgo interrupt
+# first turns the same hang into a report naming the spec, the step, and its progress. The
+# crucible harness learned this in M4 (test/crucible/scripts/run-tests.sh); the e2e suite never
+# got the same treatment.
+GINKGO_E2E_TIMEOUT ?= 40m
+
 .PHONY: test
 test: manifests generate fmt vet setup-envtest ## Run tests.
 	KUBEBUILDER_ASSETS="$(shell "$(ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(LOCALBIN)" -p path)" go test $$(go list ./... | grep -v /e2e) -timeout $(TEST_TIMEOUT) -coverprofile cover.out
@@ -138,7 +149,8 @@ test-e2e: install-test-e2e-infra manifests generate fmt vet ## Create the Kind c
 	$(MAKE) docker-build-mover E2E_MOVER_IMG=$(E2E_MOVER_IMG)
 	$(KIND) load docker-image $(E2E_MOVER_IMG) --name $(KIND_CLUSTER)
 	E2E_IMG=$(E2E_IMG) E2E_MOVER_IMG=$(E2E_MOVER_IMG) E2E_BUILD_IMAGE=false KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) \
-		go test -tags=e2e ./test/e2e/ -timeout $(E2E_TIMEOUT) -v -ginkgo.v
+		go test -tags=e2e ./test/e2e/ -timeout $(E2E_TIMEOUT) -v -ginkgo.v \
+			--ginkgo.timeout=$(GINKGO_E2E_TIMEOUT)
 	$(MAKE) cleanup-test-e2e
 
 # Alias for the milestone exit-criteria wording in spec/90-roadmap.md ("make e2e").
