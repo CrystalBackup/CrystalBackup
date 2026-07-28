@@ -69,8 +69,8 @@ const milestones = [
   ['M3', 'Manifests & cluster-scoped DR', 'done', `${base}/reports/crucible-m3.html`],
   ['0.3.1', 'Hardening — operator throughput audit & fixes', 'patch', [['Audit report', `${base}/reports/audit-m3.1.html`]]],
   ['0.3.2', 'Hardening — restore safety (Recreate data loss, finalizer leak)', 'patch', [['Report', `${base}/reports/audit-m3.2.html`]]],
-  ['M4', 'Consistency hooks, verification & maintenance', 'here'],
-  ['M5', 'Namespace plane, external sync & right-to-erasure', ''],
+  ['M4', 'Consistency hooks, verification & maintenance', 'done', `${base}/reports/crucible-m4.html`],
+  ['M5', 'Namespace plane, external sync & right-to-erasure', 'here'],
   ['M6', 'Observability hardening & production beta', ''],
   ['M7', 'CLI & browse UI', ''],
   ['M8', 'Immutable locations', ''],
@@ -124,7 +124,7 @@ const description =
       <section class="hero">
         <div class="hero-copy">
           <span class="pill">
-            <span class="dot"></span> Building M4 · M3 shipped (v0.3.0)
+            <span class="dot"></span> Building M5 · M4 shipped (v0.4.0)
           </span>
           <h1>
             Every namespace gets <span class="grad">its own backups.</span>
@@ -300,10 +300,11 @@ const description =
         <p class="eyebrow">Roadmap</p>
         <h2>Releasable, core-first, in the open</h2>
         <p class="section-lead">
-          Each milestone ships something usable. <strong>M0 through M3 have shipped</strong> — CRDs,
-          CI, the core engine, cluster disaster recovery, self-service &amp; admin restore and
-          manifest &amp; cluster-scoped DR are live (v0.3.0); we’re now building
-          <strong>M4 — Consistency hooks, verification &amp; maintenance</strong>.
+          Each milestone ships something usable. <strong>M0 through M4 have shipped</strong> — CRDs,
+          CI, the core engine, cluster disaster recovery, self-service &amp; admin restore,
+          manifest &amp; cluster-scoped DR, consistency hooks and repository maintenance are live
+          (v0.4.0); we’re now building
+          <strong>M5 — Namespace plane, external sync &amp; right-to-erasure</strong>.
         </p>
         <ol class="timeline">
           {
@@ -346,7 +347,7 @@ const description =
           <aside class="note">
             <h3>You’re early — and that’s the point</h3>
             <p>
-              M0 through M3 have shipped (v0.3.0) — real, tested code — but it’s still early: most
+              M0 through M4 have shipped (v0.4.0) — real, tested code — but it’s still early: most
               milestones are ahead and it isn’t production-ready yet, so try it in a sandbox, keep
               your existing backups, and use it at your own risk. It’s
               provided <strong>as-is under Apache-2.0</strong>, without warranty. If the direction
