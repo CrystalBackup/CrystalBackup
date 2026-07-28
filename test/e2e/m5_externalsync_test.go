@@ -143,6 +143,30 @@ func m5UninstallOtherReleases() {
 	}
 }
 
+// m5ClearUnownedChartObjects removes chart-rendered objects that no Helm release owns.
+//
+// The M2 admission container installs the SAME admission objects with `helm template | kubectl
+// apply`, so they carry no meta.helm.sh ownership annotations, and its AfterAll reaps the policies
+// and bindings BY LABEL — which misses rule 7's paramRef ConfigMap, the one chart object in that
+// template that is not a policy. A later `helm install` then refuses to adopt it and the whole
+// container dies at setup with "invalid ownership metadata".
+//
+// The M3 container never met this because it installs with admission DISABLED, so the chart renders
+// none of these; this container is the first to install WITH it. Called after
+// m5UninstallOtherReleases, so by construction any chart object still standing in the namespace is
+// owned by nothing and safe to remove — the install below recreates all of it.
+func m5ClearUnownedChartObjects() {
+	GinkgoHelper()
+	_, _ = kubectl("delete", "configmap", "crystal-backup-denied-namespaces",
+		"-n", m5OperatorNS, "--ignore-not-found")
+	// Belt and braces for a container that died before its own AfterAll: same label the M2
+	// container reaps by, so this is a no-op on a clean cluster.
+	_, _ = kubectl("delete", "validatingadmissionpolicybinding",
+		"-l", "app.kubernetes.io/name=crystal-backup", "--ignore-not-found")
+	_, _ = kubectl("delete", "validatingadmissionpolicy",
+		"-l", "app.kubernetes.io/name=crystal-backup", "--ignore-not-found")
+}
+
 // m5DeployOperatorViaHelm installs the operator from the packaged chart with the data path wired
 // AND admission enabled.
 //
@@ -490,6 +514,7 @@ var _ = Describe("Crystal Backup external sync (M5)", Ordered, func() {
 
 		m3RemoveForeignOperators()
 		m5UninstallOtherReleases()
+		m5ClearUnownedChartObjects()
 		m5DeployOperatorViaHelm()
 		m5SeedTenant()
 		m5CreateLocations()
