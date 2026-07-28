@@ -102,17 +102,20 @@ type ClusterEncryptionSpec struct {
 }
 
 // NamespaceEncryptionSpec configures the user key for a BackupLocation.
+//
+// One field, and that is the design. A namespace-plane repository has exactly ONE key slot —
+// the user's — and there is deliberately no way to ask for a second (adr/0004, 2026-07-28
+// amendment). An operator slot would be a password held in crystal-backup-system that keeps
+// working after the user rotates their key or deletes their Secret, and because removing a
+// restic key slot does not rotate the master key, one they could never take back. The guarantee
+// that platform access ends when the user's key does is bought by the mechanism not existing,
+// rather than by a webhook that a flag or a future maintainer could switch off.
 type NamespaceEncryptionSpec struct {
 	// repositoryPasswordSecretRef references the user-owned restic password Secret
 	// (same namespace). If omitted the operator generates one and stores it in the
 	// user's namespace (their key, their reversibility).
 	// +optional
 	RepositoryPasswordSecretRef *LocalObjectReference `json:"repositoryPasswordSecretRef,omitempty"`
-
-	// platformAccess, when true, also gives the operator a key slot for mediated
-	// restore/verify; false (default) keeps the off-platform backups private.
-	// +optional
-	PlatformAccess bool `json:"platformAccess,omitempty"`
 }
 
 // DiscoverySpec configures repository→Backup projection.

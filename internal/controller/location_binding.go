@@ -98,8 +98,6 @@ type locationBinding struct {
 	// PasswordSecretRef is the namespace plane's spec.encryption.repositoryPasswordSecretRef
 	// name; empty means "generate one". Unused on the cluster plane.
 	PasswordSecretRef string
-	// PlatformAccess mirrors the namespace plane's spec.encryption.platformAccess.
-	PlatformAccess bool
 	// Retention is the location's per-PVC keep policy (R24). It lives on the LOCATION on both
 	// planes — one repository, one authoritative policy (adr/0009) — never on a schedule.
 	Retention cbv1.RetentionSpec
@@ -117,12 +115,13 @@ func (b *locationBinding) Scope() string {
 }
 
 // KeySlots returns the BackupRepository.status.keySlots this binding implies.
+// A namespace-plane repository reports [tenant] and nothing else, always. The operator has no
+// mechanism to add a slot of its own (adr/0004, 2026-07-28 amendment), so any other value here
+// would be a status describing a key that does not exist — which is exactly the bug that
+// prompted dropping spec.encryption.platformAccess.
 func (b *locationBinding) KeySlots() []string {
 	if !b.Namespaced() {
 		return []string{keySlotPlatform}
-	}
-	if b.PlatformAccess {
-		return []string{keySlotTenant, keySlotPlatform}
 	}
 	return []string{keySlotTenant}
 }
@@ -162,7 +161,6 @@ func bindingFromNamespacedLocation(loc *cbv1.BackupLocation) *locationBinding {
 		ClusterID:         loc.Status.ClusterID,
 		CredsNamespace:    loc.Namespace,
 		PasswordSecretRef: passwordSecretRefName(loc),
-		PlatformAccess:    loc.Spec.Encryption.PlatformAccess,
 		Retention:         loc.Spec.Retention,
 	}
 }

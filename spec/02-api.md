@@ -378,7 +378,6 @@ spec:
     credentialsSecretRef: { name: offsite-s3 }         # Secret in c-team-x
   encryption:
     repositoryPasswordSecretRef: { name: offsite-key } # user-owned restic password (Secret in c-team-x)
-    platformAccess: false            # true → operator also holds a key slot (mediated restore/verify)
   discovery: { enabled: true }       # project Backups from this repo into this namespace
   retention: { keepLast: 5, keepDaily: 10, keepWeekly: 4, keepMonthly: 6 }  # R24; on the location, not the schedule (Standard only)
 status:
@@ -387,8 +386,12 @@ status:
 ```
 
 If `repositoryPasswordSecretRef` is omitted the operator generates a password and stores it
-as a Secret **in the user's namespace** (their key, their reversibility). `platformAccess:
-false` (default) keeps off-platform backups private to the user.
+as a Secret **in the user's namespace** (their key, their reversibility). There is **no field
+that grants the operator a key slot** on a user repository, and there will not be: such a slot
+would keep working after the user rotates their key or deletes their Secret, and restic's slot
+removal does not rotate the master key, so they could never take it back
+([adr/0004](adr/0004-encryption-key-management.md) amendment). Platform access to a user's
+backups ends when the user's key does.
 
 ### BackupSchedule (namespaced, user) — ≈ CronJob
 
@@ -615,7 +618,7 @@ status:
   repositoryURL: "s3:…/prod/prod-eu-1"
   initialized: true
   mode: Standard
-  keySlots: [platform]                       # cluster: [platform]; tenant repo: [tenant] (+platform if platformAccess)
+  keySlots: [platform]                       # cluster: [platform]; tenant repo: ALWAYS [tenant], no operator slot exists
   snapshotCount: 4123
   namespacesPresent: 42                      # distinct namespace tags found in the repo
   lastDiscoveryTime: "2026-07-12T02:55:00Z"

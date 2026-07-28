@@ -294,8 +294,9 @@ crucible lanes, all with zero residual snapshot objects
       the same execution path (no fan-out).
 - [ ] Keys ([adr/0004](adr/0004-encryption-key-management.md)): the **user's own** restic
       password (their Secret), or an operator-generated password stored **in the user's
-      namespace**; optional `platformAccess` slot (default `false`) via `restic key add` for
-      mediated restore/verify. **No** cluster→client→namespace hierarchy.
+      namespace**. **No operator key slot on a user repository** — `platformAccess` was
+      specified, never implemented, and dropped during M5 so that platform access ends when the
+      user's key does (adr/0004 amendment). **No** cluster→client→namespace hierarchy.
 - [ ] Right-to-erasure `ClusterErasure` (R21): `restic forget --tag`
       (`tenant=` | `namespace=` | `namespace=+pvc=`) then `prune` — **physical** deletion on
       the exclusive queue; typed confirmation (R23); `Blocked` + `blockedUntil` on Immutable
@@ -315,7 +316,7 @@ crucible lanes, all with zero residual snapshot objects
       destinations; full rotation-window handling for an Immutable destination lands with **M8**);
       sync metrics + `ExternalSyncStale` alert.
 - [ ] e2e: a user backs up to their own S3 (SeaweedFS) with their own key; the platform cannot read it
-      unless `platformAccess: true`; `ClusterErasure` of a tenant/namespace/PVC physically
+      once they delete their password Secret; `ClusterErasure` of a tenant/namespace/PVC physically
       removes the data (repo re-scan confirms); erasure on an Immutable location reports
       `Blocked`; **external sync** copies to a second location whose repo opens only with **its
       own** key (siloing) and per-namespace selection holds (08-testing case 18).

@@ -82,11 +82,6 @@ spec:
                 description: encryption configures the user-owned key (generated in
                   the namespace if unset).
                 properties:
-                  platformAccess:
-                    description: |-
-                      platformAccess, when true, also gives the operator a key slot for mediated
-                      restore/verify; false (default) keeps the off-platform backups private.
-                    type: boolean
                   repositoryPasswordSecretRef:
                     description: |-
                       repositoryPasswordSecretRef references the user-owned restic password Secret

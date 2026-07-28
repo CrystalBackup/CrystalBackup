@@ -361,7 +361,12 @@ var _ = Describe("BackupLocationReconciler", func() {
 		DeferCleanup(func() { _ = k8sClient.Delete(context.Background(), &sec) })
 	})
 
-	It("advertises both key slots, tenant first, when platformAccess is on", func() {
+	// The inverse of the spec this replaces. A user repository advertised [tenant, platform] when
+	// spec.encryption.platformAccess was set — while nothing ever ran `restic key add`, so the
+	// status described a key that did not exist. The field is gone (adr/0004, 2026-07-28
+	// amendment): the platform has no mechanism to hold a slot on a user's repository, so the
+	// only honest value is [tenant], and it must stay the only reachable one.
+	It("never advertises a platform key slot on a user repository", func() {
 		const (
 			ns       = "bl-slots-ns"
 			name     = "shared-access"
@@ -370,15 +375,12 @@ var _ = Describe("BackupLocationReconciler", func() {
 		createTenantNamespace(ns)
 		createTenantS3CredsSecret(ns, "slots-s3")
 		createTenantPasswordSecret(ns, "slots-key", "pw")
-		loc := newTenantLocation(ns, name, "slots-s3", "slots-key", "envtest-cluster")
-		loc.Spec.Encryption.PlatformAccess = true
-		createTenantLocation(loc)
+		createTenantLocation(newTenantLocation(ns, name, "slots-s3", "slots-key", "envtest-cluster"))
 
-		// Order is contract, not cosmetics (02-api.md): the TENANT slot is the primary one, and
-		// the platform slot is the addition they opted into.
 		Eventually(func(g Gomega) {
 			g.Expect(getRepositoryG(g, repoName).Status.KeySlots).
-				To(Equal([]string{keySlotTenant, keySlotPlatform}))
+				To(Equal([]string{keySlotTenant}),
+					"a platform slot here would be a status describing a key nobody ever created")
 		}, initTimeout, initPoll).Should(Succeed())
 	})
 })

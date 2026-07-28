@@ -94,7 +94,7 @@ Full requirements (R1–R28) and rationale: [spec/00-requirements.md](spec/00-re
 - **Server-side tenant isolation** (R2/R14) — a namespaced `Restore` is structurally confined to
   its own namespace; access to the shared DR repo is mediated by a **non-forgeable server-side
   `namespace=` tag filter**. On the namespace plane, isolation is by construction (the user's own
-  bucket, credentials and key; `platformAccess: false` by default).
+  bucket, credentials and key — the platform holds no key slot on it, by design).
 - **Least-data-movement, Ceph-aware snapshots** (R11) — back up from a read-only snapshot with the
   cheapest path per CSI driver (CephFS shallow `backingSnapshot`, RBD copy-on-write clone); a CSI
   that cannot snapshot is **skipped with a reason in status**, never silently dropped.

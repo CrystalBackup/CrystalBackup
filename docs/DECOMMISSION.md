@@ -228,11 +228,20 @@ key is destroyed" costs you storage; closing it early costs you the ability to g
 
 ## 3. What is deliberately not automated
 
-There is no `ClusterDecommission` CRD, and adding one is not on the roadmap. A CRD is a **desired
-state a controller converges to**, and it converges again after a restore of your cluster's etcd, a
-GitOps re-apply, or a stray `kubectl apply -f` from a directory someone forgot to prune. For an
-operation whose entire content is "destroy the key that reads everything", that reconciliation
-property is the defect, not the feature.
+There is no `ClusterDecommission` CRD, and adding one is not on the roadmap.
+
+The reason is not that the operation is too dangerous for a controller — it is that **a gate can
+only promise what the mechanism can deliver**. A typed confirmation is worth having when the
+deletion it guards has no alternative: `ClusterErasure` removes snapshots from a repository, and
+once the prune completes there is no other copy to fall back on. A decommission is not like that.
+It destroys *CrystalBackup's* copy of the key. If an admin kept one in a password manager, an
+escrow, or an old backup of the operator namespace, the objects stay readable and nothing has
+actually been destroyed — §1.4 says exactly this. Wrapping that in a confirmation dialog would
+dress a best-effort act up as a guarantee.
+
+A CRD would add a second problem on top: it is a **desired state a controller converges to**, so it
+re-fires after an etcd restore, a GitOps re-apply, or a stray `kubectl apply -f` from a directory
+nobody pruned. But that is the lesser objection. The first one stands even for a one-shot action.
 
 `ClusterErasure` is a CRD precisely because it is **bounded**: a typed confirmation naming a scope
 that must match, a count recorded before the deletion, and a target that selects nothing rather

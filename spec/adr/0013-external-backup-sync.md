@@ -64,7 +64,7 @@ key**, never a byte-clone. Two CRDs express it — one per plane.**
 **transiently handles both keys** in `crystal-backup-system`. This is the **same trust model
 already in force**: the namespace-plane backup mover already uses the user's key *by name* to
 write their backups ([03-security-and-tenancy.md §4](../03-security-and-tenancy.md)). The
-`platformAccess: false` guarantee is about **no durable / standing** operator key slot; a
+no-operator-key-slot guarantee (adr/0004 amendment) is about **no durable / standing** slot; a
 **transient** use on an operation the principal **requested** (their own sync) does not change it.
 What siloing preserves here is **where the data ends up** — the client's copy under the
 **client's** key, holding **only their** snapshots — not a claim that the operator never touches
