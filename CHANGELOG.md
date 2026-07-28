@@ -75,6 +75,16 @@ The final sample ran the release image and passed 46/46.
   an exclusive op can queue behind a dead lock. What it fixes is that the signal was a dead end —
   `CrystalbackupStaleLocks` fired and nothing ever drove the gauge back down.
 
+### Security
+
+- **`google.golang.org/grpc` bumped past GO-2026-6061** (GHSA-hrxh-6v49-42gf: xDS RBAC engine +
+  HTTP/2 transport server; fixed in 1.82.1) in **both** places it ships: the operator/mover
+  module (1.79.3 → 1.82.1) and the restic binary the mover image builds from source (restic
+  0.19.1 pins 1.81.1; the melange override now bumps it, in lockstep with the VEX analysis, so
+  the shipped binary is what the signed statements describe). The advisory was reachable in all
+  three binaries per `govulncheck`'s symbol-level analysis — the release gate that blocks on
+  exactly this is what caught it, on the first `v0.4.0` tag attempt.
+
 ### Fixed
 
 - **A backup's exposure teardown is now crash-only: re-entrant until verified, never one-shot.**

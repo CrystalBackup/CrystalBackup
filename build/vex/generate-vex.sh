@@ -108,8 +108,12 @@ if [ "$COMPONENT" = "mover" ]; then
   # builds restic with that module overridden past the fix (build/melange/restic.yaml); analyse
   # the SAME override here so the VEX describes the restic that actually ships, not the vanilla
   # tarball. Keep the x/text version in lockstep with the melange recipe.
+  # grpc: GO-2026-6061 (xDS RBAC + HTTP/2 transport server, fixed in 1.82.1) is REACHABLE
+  # through restic 0.19.1's pinned v1.81.1 (traces via the GCS backend) — same treatment,
+  # same lockstep.
   ( cd "${WORK}/restic-src" \
-      && GOFLAGS=-mod=mod go get golang.org/x/text@v0.40.0 \
+      && GOFLAGS=-mod=mod go get golang.org/x/text@v0.40.0 google.golang.org/grpc@v1.82.1 \
+      && GOFLAGS=-mod=mod go mod tidy \
       && govulncheck -format openvex ./cmd/restic ) > "${WORK}/restic.json"
   DOCS+=("${WORK}/restic.json")
 fi
