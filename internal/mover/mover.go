@@ -221,7 +221,12 @@ const (
 	EnvManifestsRestoreDir = "CRYSTAL_MANIFESTS_RESTORE_DIR"
 	// EnvManifestsMode is the Restore's spec.mode ("Overwrite" or "Recreate").
 	EnvManifestsMode = "CRYSTAL_MANIFESTS_MODE"
-	// EnvManifestsDryRun is "true" for a spec.dryRun restore: the full pipeline runs against
+	// EnvTrue is the value every boolean mover env var carries when set. Named because the
+	// variable and its truthy spelling are one contract: a caller that writes "1" or "yes"
+	// instead would be silently ignored by the shim's strconv.ParseBool-free comparison.
+	EnvTrue = "true"
+
+	// EnvManifestsDryRun is EnvTrue for a spec.dryRun restore: the full pipeline runs against
 	// the API server with dryRun=All and nothing is persisted.
 	EnvManifestsDryRun = "CRYSTAL_MANIFESTS_DRY_RUN"
 	// EnvManifestsSelection is the JSON-encoded manifests.Selection resolved from the

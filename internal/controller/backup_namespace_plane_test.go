@@ -178,6 +178,105 @@ var _ = Describe("Backup on the namespace plane", func() {
 		}, initTimeout, initPoll).Should(Succeed())
 	})
 
+	It("refuses to run tenant-authored hooks with no identity to run them as", func() {
+		const (
+			ns      = "bnp-hooksid-ns"
+			locName = "hooks-storage"
+			run     = "bnp-hooksid-run"
+			pvcName = "hooks-data"
+		)
+		createTenantNamespace(ns)
+		createTenantS3CredsSecret(ns, "hooksid-s3")
+		createSourcePVC(ns, pvcName, "ceph-block")
+		seedTenantRepo(ns, locName, "hooksid-s3")
+
+		// Hooks declared, no serviceAccountName. Running these would mean the operator execs with
+		// its OWN cluster-wide pods/exec on behalf of whoever wrote the schedule — the escalation
+		// adr/0018 closes.
+		off := false
+		b := &cbv1.Backup{
+			ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: run,
+				Labels: map[string]string{apiconst.LabelOrigin: apiconst.OriginNamespace}},
+			Spec: cbv1.BackupSpec{
+				LocationRef: cbv1.LocationReference{Kind: kindBackupLocation, Name: locName},
+				Run: &cbv1.BackupRunSpec{
+					IncludeManifests: &off,
+					Hooks: cbv1.HooksSpec{
+						Pre: []cbv1.Hook{{Command: []string{"/bin/true"}}},
+					},
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, b)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(context.Background(), b) })
+
+		Eventually(func(g Gomega) {
+			cond := apimeta.FindStatusCondition(getBackupG(g, ns, run).Status.Conditions, ConditionReady)
+			g.Expect(cond).NotTo(BeNil())
+			g.Expect(cond.Reason).To(Equal("HooksNeedServiceAccount"))
+		}, initTimeout, initPoll).Should(Succeed())
+
+		// And it stops BEFORE snapshotting: a gated run must not have quiesced anything.
+		//
+		// Scoped to THIS namespace rather than asserting the recorder is globally empty — the stub
+		// executor is shared by every spec in the suite, so a global assertion would be measuring
+		// spec ordering, not this behaviour.
+		Consistently(func(g Gomega) {
+			for _, call := range hookExecutor.recorded() {
+				g.Expect(call.Pod.Namespace).NotTo(Equal(ns), "a gated run must not have exec'd anything")
+			}
+		}, consistentlyWindow, initPoll).Should(Succeed())
+	})
+
+	It("execs tenant hooks AS the ServiceAccount the schedule named", func() {
+		const (
+			ns      = "bnp-asid-ns"
+			locName = "asid-storage"
+			run     = "bnp-asid-run"
+			pvcName = "asid-data"
+			podName = "asid-pod"
+			saName  = "team-x-hooks"
+		)
+		createTenantNamespace(ns)
+		createTenantS3CredsSecret(ns, "asid-s3")
+		createSourcePVC(ns, pvcName, "ceph-block")
+		createMountingPod(ns, podName, pvcName, nil)
+		seedTenantRepo(ns, locName, "asid-s3")
+
+		off := false
+		b := &cbv1.Backup{
+			ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: run,
+				Labels: map[string]string{apiconst.LabelOrigin: apiconst.OriginNamespace}},
+			Spec: cbv1.BackupSpec{
+				LocationRef: cbv1.LocationReference{Kind: kindBackupLocation, Name: locName},
+				Run: &cbv1.BackupRunSpec{
+					IncludeManifests: &off,
+					Hooks: cbv1.HooksSpec{
+						ServiceAccountName: saName,
+						Pre:                []cbv1.Hook{{Command: []string{"psql", "-c", "CHECKPOINT"}}},
+					},
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, b)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(context.Background(), b) })
+
+		// The assertion that matters is not "a command ran" — it is "it ran as the tenant's
+		// identity". A spec checking only the former would pass just as happily if the operator
+		// had exec'd with its own privileges.
+		Eventually(func(g Gomega) {
+			var mine []hookCall
+			for _, call := range hookExecutor.recorded() {
+				if call.Pod.Namespace == ns {
+					mine = append(mine, call)
+				}
+			}
+			g.Expect(mine).NotTo(BeEmpty())
+			g.Expect(mine[0].Pod.Name).To(Equal(podName))
+			g.Expect(mine[0].ServiceAccountName).To(Equal(saName))
+		}, initTimeout, initPoll).Should(Succeed())
+	})
+
 	It("waits for the location to pin its cluster ID before writing anything", func() {
 		const (
 			ns      = "bnp-noid-ns"

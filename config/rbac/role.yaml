@@ -67,6 +67,12 @@ rules:
   - get
 - apiGroups:
   - ""
+  resources:
+  - serviceaccounts
+  verbs:
+  - impersonate
+- apiGroups:
+  - ""
   - events.k8s.io
   resources:
   - events

@@ -356,7 +356,7 @@ func resourcesJobEnv(targetNamespace string, plan *resourcesPlan) ([]corev1.EnvV
 		{Name: mover.EnvManifestsSelection, Value: selection},
 	}
 	if plan.dryRun {
-		env = append(env, corev1.EnvVar{Name: mover.EnvManifestsDryRun, Value: "true"})
+		env = append(env, corev1.EnvVar{Name: mover.EnvManifestsDryRun, Value: mover.EnvTrue})
 	}
 	if len(plan.storageClassMapping) > 0 {
 		encoded, err := json.Marshal(plan.storageClassMapping)

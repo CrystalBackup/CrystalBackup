@@ -234,8 +234,21 @@ type backupRunContext struct {
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;delete
 // +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
+// serviceaccounts/impersonate is how a hook runs as a TENANT identity instead of as the operator
+// (M5). It is what makes the confinement invariant enforceable: the operator asks the API server
+// to authorise the exec against system:serviceaccount:<backed-up-namespace>:<name>, and a
+// ServiceAccount the namespace never granted pods/exec simply cannot run the command.
+//
+// The grant is broad on purpose — the ServiceAccount NAME is a user-chosen field, so it cannot be
+// pinned with resourceNames without dictating a naming convention to every tenant. What bounds it
+// is the code, not the RBAC: the namespace is always derived from the target pod and is not a
+// field anywhere in the API. Administrators who prefer a convention can narrow this rule in their
+// own overlay.
+// +kubebuilder:rbac:groups="",resources=serviceaccounts,verbs=impersonate
+//
 // pods/exec is the consistency-hook grant (R16) — the ability to run arbitrary commands inside a
-// tenant's containers, and the largest privilege in the backup path. It is bounded by the
+// tenant's containers, and the largest privilege in the backup path. It remains needed for
+// admin-authored CLUSTER-plane hooks, which name no ServiceAccount and run as the operator. It is bounded by the
 // controller invariant that a hook only ever execs into pods MOUNTING the volumes being
 // snapshotted, in the CR's own namespace (03-security-and-tenancy.md §5).
 //
@@ -309,51 +322,12 @@ func (r *BackupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 				apiconst.LabelClusterBackup)
 	}
 
-	// (7) Resolve the location — from EITHER plane — and its repository; gate on the repository
-	// being initialized.
-	binding, reason, message, ok := r.resolveBackupLocation(ctx, &backup)
-	if !ok {
-		return r.gate(ctx, &backup, reason, message)
-	}
-	repoName := binding.Name
-	if binding.Namespaced() {
-		repoName = namespacedRepositoryName(binding.Namespace, binding.Name)
-	}
-
-	var repo cbv1.BackupRepository
-	if err := r.Get(ctx, client.ObjectKey{Name: repoName}, &repo); err != nil {
-		if apierrors.IsNotFound(err) {
-			return r.gate(ctx, &backup, "RepositoryNotReady",
-				fmt.Sprintf("BackupRepository %q does not exist yet", repoName))
-		}
-		return ctrl.Result{}, fmt.Errorf("get BackupRepository %s: %w", repoName, err)
-	}
-	if !repo.Status.Initialized {
-		return r.gate(ctx, &backup, "RepositoryNotReady",
-			fmt.Sprintf("BackupRepository %q is not initialized yet", repoName))
-	}
-
-	// The restic repository password the mover needs: the platform DEK on the cluster plane, the
-	// tenant's own key on the namespace plane.
-	password, reason, message, ok := r.ensureRepositoryPassword(ctx, binding)
-	if !ok {
-		return r.gate(ctx, &backup, reason, message)
-	}
-
-	rc := &backupRunContext{
-		scheduleRef:         backup.Spec.ScheduleRef,
-		run:                 backup.Name,
-		clusterID:           binding.ClusterID,
-		tenant:              r.tenantFor(ctx, backup.Namespace),
-		repoName:            repoName,
-		repoURL:             repo.Status.RepositoryURL,
-		dek:                 password,
-		s3CredsSecret:       binding.S3.CredentialsSecretRef.Name,
-		credsNamespace:      binding.CredsNamespace,
-		retention:           binding.Retention,
-		mode:                binding.Mode,
-		backoffLimit:        run.BackoffLimit,
-		maxConcurrentMovers: run.MaxConcurrentMovers,
+	// (7) Resolve the location, its repository, its key and — on the namespace plane — the
+	// identity its hooks run as, into the one value the per-PVC state machine reads from. Every
+	// "not ready yet" answer in there is a gate, so done=true means the result is already decided.
+	rc, gateRes, gated, err := r.resolveRunContext(ctx, &backup, run)
+	if gated {
+		return gateRes, err
 	}
 
 	// (9) Enumerate matching PVCs and (idempotently) seed one VolumeStatus each.
@@ -439,6 +413,14 @@ func (r *BackupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		r.maybeEnqueueRetentionForget(ctx, &backup, rc)
 	}
 	return res, nil
+}
+
+// hooksDeclared reports whether a run asks for any hook execution at all. honorAnnotations counts:
+// it is a standing instruction to exec whatever pods in the namespace declare, which needs an
+// identity exactly as much as a spec-declared command does — more, arguably, since the command is
+// chosen by whoever can annotate a pod.
+func hooksDeclared(spec cbv1.HooksSpec) bool {
+	return len(spec.Pre) > 0 || len(spec.Post) > 0 || spec.HonorAnnotations
 }
 
 // includeManifests resolves the run's includeManifests, which defaults to TRUE: a namespace
@@ -612,6 +594,77 @@ func (r *BackupReconciler) resolveRun(ctx context.Context, backup *cbv1.Backup) 
 // cannot be read — an API error rather than a NotFound. Distinct from LocationNotFound because
 // the operator action differs: one is "create it", the other is "look at RBAC or the API server".
 const reasonLocationUnreadable = "LocationUnreadable"
+
+// resolveRunContext resolves everything a run needs before any volume moves: the location (either
+// plane), its BackupRepository, the repository password, and — on the namespace plane — the
+// identity its hooks will run as. done=true means the caller must return immediately, which covers
+// every gate and every hard error; done=false means rc is usable.
+//
+// Extracted from Reconcile rather than inlined because each of these is a separate "is this run
+// allowed to start" question with its own failure message, and Reconcile's job is to sequence the
+// phases, not to enumerate preconditions.
+func (r *BackupReconciler) resolveRunContext(ctx context.Context, backup *cbv1.Backup, run *cbv1.BackupRunSpec,
+) (rc *backupRunContext, res ctrl.Result, done bool, err error) {
+	binding, reason, message, ok := r.resolveBackupLocation(ctx, backup)
+	if !ok {
+		res, err = r.gate(ctx, backup, reason, message)
+		return nil, res, true, err
+	}
+
+	repoName := binding.Name
+	if binding.Namespaced() {
+		repoName = namespacedRepositoryName(binding.Namespace, binding.Name)
+	}
+	var repo cbv1.BackupRepository
+	if getErr := r.Get(ctx, client.ObjectKey{Name: repoName}, &repo); getErr != nil {
+		if apierrors.IsNotFound(getErr) {
+			res, err = r.gate(ctx, backup, "RepositoryNotReady",
+				fmt.Sprintf("BackupRepository %q does not exist yet", repoName))
+			return nil, res, true, err
+		}
+		return nil, ctrl.Result{}, true, fmt.Errorf("get BackupRepository %s: %w", repoName, getErr)
+	}
+	if !repo.Status.Initialized {
+		res, err = r.gate(ctx, backup, "RepositoryNotReady",
+			fmt.Sprintf("BackupRepository %q is not initialized yet", repoName))
+		return nil, res, true, err
+	}
+
+	// Hooks on the NAMESPACE plane must name the ServiceAccount they run as (adr/0018). Without an
+	// identity the exec would fall back to the operator's own, which is precisely the escalation:
+	// a tenant who can write a BackupSchedule would be making the platform run commands with
+	// privileges they do not hold. Gate rather than execute; the fix is one field.
+	if binding.Namespaced() && hooksDeclared(run.Hooks) && run.Hooks.ServiceAccountName == "" {
+		res, err = r.gate(ctx, backup, "HooksNeedServiceAccount",
+			"hooks on a namespaced BackupLocation must set hooks.serviceAccountName — a ServiceAccount "+
+				"in this namespace, granted `create pods/exec`, that the operator impersonates to run them")
+		return nil, res, true, err
+	}
+
+	// The restic repository password the mover needs: the platform DEK on the cluster plane, the
+	// tenant's own key on the namespace plane.
+	password, reason, message, ok := r.ensureRepositoryPassword(ctx, binding)
+	if !ok {
+		res, err = r.gate(ctx, backup, reason, message)
+		return nil, res, true, err
+	}
+
+	return &backupRunContext{
+		scheduleRef:         backup.Spec.ScheduleRef,
+		run:                 backup.Name,
+		clusterID:           binding.ClusterID,
+		tenant:              r.tenantFor(ctx, backup.Namespace),
+		repoName:            repoName,
+		repoURL:             repo.Status.RepositoryURL,
+		dek:                 password,
+		s3CredsSecret:       binding.S3.CredentialsSecretRef.Name,
+		credsNamespace:      binding.CredsNamespace,
+		retention:           binding.Retention,
+		mode:                binding.Mode,
+		backoffLimit:        run.BackoffLimit,
+		maxConcurrentMovers: run.MaxConcurrentMovers,
+	}, ctrl.Result{}, false, nil
+}
 
 // resolveBackupLocation resolves the location a Backup names, from either plane, and reduces it
 // to a locationBinding. ok=false carries a reason/message for the caller's gate.

@@ -307,7 +307,7 @@ func clusterRestoreJobEnv(plan *clusterRestoreResourcesPlan) ([]corev1.EnvVar, e
 		{Name: mover.EnvManifestsSelection, Value: selection},
 	}
 	if plan.dryRun {
-		env = append(env, corev1.EnvVar{Name: mover.EnvManifestsDryRun, Value: "true"})
+		env = append(env, corev1.EnvVar{Name: mover.EnvManifestsDryRun, Value: mover.EnvTrue})
 	}
 	return env, nil
 }

@@ -228,10 +228,26 @@ per-namespace user roles (02-api RBAC section):
   hook cannot smuggle a second command through an unquoted value.
 
   Note the grant is **cluster-wide `pods/exec` `create`**, the operator's single most powerful
-  verb: anyone who can write a hook into a `ClusterBackup`/`BackupSchedule` directs it. That is why
-  the namespace confinement above is a code invariant with a test, and why M5's cascade work
-  ([adr/0017](adr/0017-cascade-materialization-backup-carries-identity.md)) treats a
-  `SubjectAccessReview` on the writer as the escalation mitigation.
+  verb. It is now used only for **admin-authored cluster-plane hooks**.
+- `serviceaccounts`: `impersonate` (**M5**, [adr/0018](adr/0018-hook-execution-identity.md)). On the
+  namespace plane the operator does NOT exec as itself: `hooks.serviceAccountName` names a
+  ServiceAccount in the backed-up namespace, and the operator impersonates it, so the API server
+  authorises the exec against **that** identity's rights. This is what turns the confinement
+  sentence above from an assertion into an enforced property — and it is checked at **every exec**,
+  not once at admission, so revoking the ServiceAccount's `pods/exec` takes effect immediately.
+
+  A namespace-plane run declaring hooks without an identity is **gated**
+  (`HooksNeedServiceAccount`), never silently escalated to the operator's own privileges. The rule
+  covers annotation-sourced hooks too: an annotation supplies the *command*, never the *identity*.
+
+  The impersonated **namespace** is always the target pod's and is not a field anywhere in the API;
+  only the ServiceAccount *name* is configurable. The RBAC rule is therefore unrestricted by name
+  (pinning `resourceNames` would impose a naming convention on every tenant) and bounded by code
+  instead. Setup: [docs/HOOKS.md](../docs/HOOKS.md).
+
+  adr/0017 §5 had named a `SubjectAccessReview` on the writer as the candidate mitigation;
+  adr/0018 supersedes it — a SAR authorises the CR once, impersonation authorises each call, and it
+  needs no blocking webhook.
 - `secrets`: `get` **only** — no `list`/`watch`; the operator reads Secrets by name via a
   direct API client (cache bypass), so no cluster-wide Secret cache ever exists in its
   memory. Namespace-scoped Secret `list` exists only in the manifest mover's transient

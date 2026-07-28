@@ -37,11 +37,23 @@ const outputLimit = 2048
 
 // PodExecutor runs hook commands through the pods/exec subresource.
 //
-// This is the operator's ONLY exec path, and the only place it needs `pods/exec: create` — a grant
-// worth naming plainly, because it is the ability to run arbitrary commands inside a tenant's
-// containers. Two things bound it: the caller only ever supplies pods from the backed-up namespace
-// (03-security-and-tenancy.md §5), and the commands come from that namespace's own workloads or
-// from an admin-authored schedule, never from a field a tenant can point elsewhere.
+// This is the operator's ONLY exec path, and it can run under two identities.
+//
+// AS A TENANT ServiceAccount (the namespace plane, and any cluster run that names one). The call
+// is made with rest impersonation of system:serviceaccount:<pod-namespace>:<name>, so the API
+// server authorises it against THAT identity's rights, not the operator's. This is what turns the
+// confinement invariant of 03-security-and-tenancy.md §5 — "users can only make the platform run
+// commands they can already run themselves" — from prose into something enforced, and enforced at
+// the moment of each exec rather than once at admission. A hook whose ServiceAccount was never
+// granted pods/exec simply fails, with the identity named.
+//
+// AS THE OPERATOR ITSELF (empty name; the cluster plane's admin-authored default). Here the grant
+// is worth naming plainly: it is the ability to run arbitrary commands inside a tenant's
+// containers. Two things bound it — the caller only ever supplies pods from the backed-up
+// namespace, and the commands come from an admin-authored schedule.
+//
+// The impersonated NAMESPACE is always the target pod's, never a field: a configurable namespace
+// would be a cross-tenant hole by construction.
 type PodExecutor struct {
 	cfg       *rest.Config
 	clientset kubernetes.Interface
@@ -70,7 +82,9 @@ func NewPodExecutor(cfg *rest.Config) (*PodExecutor, error) {
 //
 // Stdin is never attached and TTY is never requested: a hook is a non-interactive command, and a
 // TTY would merge stderr into stdout and lose the distinction the error message depends on.
-func (e *PodExecutor) Exec(ctx context.Context, pod types.NamespacedName, container string, command []string) (string, string, error) {
+func (e *PodExecutor) Exec(ctx context.Context, pod types.NamespacedName, container string, command []string,
+	serviceAccountName string,
+) (string, string, error) {
 	req := e.clientset.CoreV1().RESTClient().
 		Post().
 		Resource("pods").
@@ -86,19 +100,42 @@ func (e *PodExecutor) Exec(ctx context.Context, pod types.NamespacedName, contai
 			TTY:       false,
 		}, scheme.ParameterCodec)
 
-	executor, err := remotecommand.NewSPDYExecutor(e.cfg, "POST", req.URL())
+	// The clientset above only builds the request URL, which is identity-independent; the identity
+	// rides on the config the SPDY executor dials with.
+	cfg := e.cfg
+	as := ""
+	if serviceAccountName != "" {
+		as = "system:serviceaccount:" + pod.Namespace + ":" + serviceAccountName
+		impersonated := rest.CopyConfig(e.cfg)
+		impersonated.Impersonate = rest.ImpersonationConfig{UserName: as}
+		cfg = impersonated
+	}
+
+	executor, err := remotecommand.NewSPDYExecutor(cfg, "POST", req.URL())
 	if err != nil {
-		return "", "", fmt.Errorf("prepare exec in %s/%s [%s]: %w", pod.Namespace, pod.Name, container, err)
+		return "", "", fmt.Errorf("prepare exec in %s/%s [%s]%s: %w", pod.Namespace, pod.Name, container, asSuffix(as), err)
 	}
 
 	var stdout, stderr bytes.Buffer
 	err = executor.StreamWithContext(ctx, remotecommand.StreamOptions{Stdout: &stdout, Stderr: &stderr})
 	outStr, errStr := truncateOutput(stdout.String()), truncateOutput(stderr.String())
 	if err != nil {
-		return outStr, errStr, fmt.Errorf("exec %v in %s/%s [%s]: %w%s",
-			command, pod.Namespace, pod.Name, container, err, stderrSuffix(errStr))
+		// Naming the impersonated identity is the whole diagnosis when the API server refuses:
+		// "forbidden" alone sends an operator to the operator's RBAC, which is not where the
+		// missing grant is — it is on the ServiceAccount the hook asked to run as.
+		return outStr, errStr, fmt.Errorf("exec %v in %s/%s [%s]%s: %w%s",
+			command, pod.Namespace, pod.Name, container, asSuffix(as), err, stderrSuffix(errStr))
 	}
 	return outStr, errStr, nil
+}
+
+// asSuffix renders the impersonated identity for an error message, or nothing when the exec ran
+// as the operator itself.
+func asSuffix(as string) string {
+	if as == "" {
+		return ""
+	}
+	return " as " + as
 }
 
 // stderrSuffix appends the command's stderr to an error message when there is any. A hook failure

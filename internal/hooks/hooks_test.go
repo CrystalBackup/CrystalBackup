@@ -37,10 +37,15 @@ type fakeExec struct {
 	calls  []string
 	fail   map[string]error
 	blockD time.Duration
+	// impersonated records the ServiceAccount name each call was made as, parallel to calls.
+	impersonated []string
 }
 
-func (f *fakeExec) Exec(ctx context.Context, pod types.NamespacedName, container string, command []string) (string, string, error) {
+func (f *fakeExec) Exec(ctx context.Context, pod types.NamespacedName, container string, command []string,
+	serviceAccountName string,
+) (string, string, error) {
 	f.calls = append(f.calls, pod.Name+"/"+container)
+	f.impersonated = append(f.impersonated, serviceAccountName)
 	if f.blockD > 0 {
 		select {
 		case <-time.After(f.blockD):
@@ -327,5 +332,61 @@ func TestAnnotationTimeoutAndPolicy(t *testing.T) {
 	got = Resolve([]corev1.Pod{pod}, cbv1.HooksSpec{HonorAnnotations: true}, PhasePre)
 	if len(got) != 1 || got[0].Timeout != DefaultTimeout {
 		t.Fatalf("resolved %+v, want the default timeout for an unparseable value", got)
+	}
+}
+
+// TestResolveStampsTheImpersonatedIdentityOnEverySource is the load-bearing assertion of
+// adr/0018. A hook that reaches the executor with an empty ServiceAccountName runs as the
+// OPERATOR — which is the escalation the field exists to close — so the identity has to be
+// present on hooks from both sources, and the annotation source is the one that would plausibly
+// be forgotten.
+func TestResolveStampsTheImpersonatedIdentityOnEverySource(t *testing.T) {
+	spec := cbv1.HooksSpec{
+		ServiceAccountName: "tenant-hooks",
+		HonorAnnotations:   true,
+		Pre: []cbv1.Hook{{
+			PodSelector: metav1.LabelSelector{MatchLabels: map[string]string{"app": "plain"}},
+			Command:     []string{"true"},
+		}},
+	}
+	pods := []corev1.Pod{
+		runningPod("plain-pod", map[string]string{"app": "plain"}, nil),
+		runningPod("annotated-pod", map[string]string{"app": "other"}, map[string]string{
+			"crystalbackup.io/pre-backup-command": `["echo","hi"]`,
+		}),
+	}
+
+	resolved := Resolve(pods, spec, PhasePre)
+	if len(resolved) != 2 {
+		t.Fatalf("resolved %d hooks, want 2 (one per source)", len(resolved))
+	}
+	sawAnnotation := false
+	for _, h := range resolved {
+		if h.ServiceAccountName != "tenant-hooks" {
+			t.Fatalf("hook from source %q carries ServiceAccountName %q, want %q — it would run as the operator",
+				h.Source, h.ServiceAccountName, "tenant-hooks")
+		}
+		if h.Source == SourceAnnotation {
+			sawAnnotation = true
+		}
+	}
+	if !sawAnnotation {
+		t.Fatal("no annotation-sourced hook resolved; the case this test exists for was not exercised")
+	}
+}
+
+// TestRunPassesTheIdentityToTheExecutor pins the plumbing between the resolved hook and the exec
+// call: the identity must survive Run, or the impersonation never happens.
+func TestRunPassesTheIdentityToTheExecutor(t *testing.T) {
+	exec := &fakeExec{}
+	hooks := []Resolved{
+		{Pod: types.NamespacedName{Namespace: "team-x", Name: "p1"}, Container: "c",
+			Command: []string{"true"}, ServiceAccountName: "tenant-hooks"},
+	}
+	if results := Run(context.Background(), exec, hooks); results[0].Failed() {
+		t.Fatalf("hook failed unexpectedly: %v", results[0].Err)
+	}
+	if len(exec.impersonated) != 1 || exec.impersonated[0] != "tenant-hooks" {
+		t.Fatalf("executor saw impersonation %v, want [tenant-hooks]", exec.impersonated)
 	}
 }

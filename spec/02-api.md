@@ -406,6 +406,8 @@ spec:
   pvcSelector: { matchLabels: {}, include: [], exclude: [] }   # default all
   includeManifests: true
   hooks:                             # R16
+    serviceAccountName: crystal-backup-hooks  # REQUIRED here: the identity the operator
+                                     # impersonates to exec, in THIS namespace (adr/0018)
     honorAnnotations: true           # OPT-IN (default false); see "Hook resolution" below
     pre:
       - podSelector: { matchLabels: { app: postgres } }
@@ -440,8 +442,27 @@ precedence, deliberately matched so an operator's mental model carries over):
 | none | either | the spec's matching `pre` hooks whose `podSelector` matches |
 
 `honorAnnotations` is **opt-in**, not on by default, and that is deliberate: turning it on delegates
-*what the operator execs* to anyone who can annotate a pod in the backed-up namespace. Given the
-operator holds cluster-wide `pods/exec`, that is a decision an admin makes explicitly.
+*what the operator execs* to anyone who can annotate a pod in the backed-up namespace.
+
+#### Hook execution identity (adr/0018)
+
+The operator does not exec as itself for a namespace-plane hook. `hooks.serviceAccountName` names a
+ServiceAccount **in the backed-up namespace**, and the operator *impersonates* it — so the API
+server authorises the exec against that identity's rights. The confinement invariant of
+[03-security-and-tenancy.md §5](03-security-and-tenancy.md) ("users can only make the platform run
+commands they can already run themselves") is therefore enforced by the API server, at every exec,
+rather than asserted.
+
+- The **name** is the tenant's choice; the **namespace** is not a field and never will be (it is
+  the target pod's, so no reference can reach another tenant).
+- **Required on the namespace plane.** A run declaring hooks without it is gated
+  (`HooksNeedServiceAccount`) — falling back to the operator's identity is the escalation.
+- **Optional on the cluster plane**, where hooks are admin-authored; empty keeps the M4 behaviour
+  of running as the operator.
+- It governs annotation-sourced hooks too: an annotation supplies the *command*, never the
+  *identity*.
+
+Setup and troubleshooting: [docs/HOOKS.md](../docs/HOOKS.md).
 
 `command` is an **argv**: a JSON array (`'["psql","-c","CHECKPOINT"]'`) or a single bare command.
 The operator never wraps it in `sh -c`, so shell metacharacters are inert. A malformed
