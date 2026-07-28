@@ -107,6 +107,12 @@ E2E_IMG ?= example.com/crystalbackup-operator:v0.0.0-e2e
 # plain-Docker equivalent the kind e2e uses so real mover Jobs can run without the melange/apko
 # toolchain. The M3 Helm install points --mover-image at this loaded tag.
 E2E_MOVER_IMG ?= example.com/crystalbackup-mover:v0.0.0-e2e
+# Sync image (crystal-mover + pinned restic + rclone) for the M5 external-sync suite. A THIRD
+# image, not a bigger mover: rclone is a hard requirement of sync and of nothing else, and the
+# production split exists so its dependency surface stays off the backup/restore path
+# (spec/adr/0013). Dockerfile.sync mirrors that split for kind. The M5 Helm install points
+# --sync-image at this loaded tag.
+E2E_SYNC_IMG ?= example.com/crystalbackup-sync:v0.0.0-e2e
 # Pinned versions of the e2e data-path infrastructure, installed by
 # test/e2e/manifests/install-csi-snapshot.sh (external-snapshotter + csi-driver-host-path).
 EXTERNAL_SNAPSHOTTER_VERSION ?= v8.2.0
@@ -148,7 +154,9 @@ test-e2e: install-test-e2e-infra manifests generate fmt vet ## Create the Kind c
 	$(KIND) load docker-image $(E2E_IMG) --name $(KIND_CLUSTER)
 	$(MAKE) docker-build-mover E2E_MOVER_IMG=$(E2E_MOVER_IMG)
 	$(KIND) load docker-image $(E2E_MOVER_IMG) --name $(KIND_CLUSTER)
-	E2E_IMG=$(E2E_IMG) E2E_MOVER_IMG=$(E2E_MOVER_IMG) E2E_BUILD_IMAGE=false KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) \
+	$(MAKE) docker-build-sync E2E_SYNC_IMG=$(E2E_SYNC_IMG)
+	$(KIND) load docker-image $(E2E_SYNC_IMG) --name $(KIND_CLUSTER)
+	E2E_IMG=$(E2E_IMG) E2E_MOVER_IMG=$(E2E_MOVER_IMG) E2E_SYNC_IMG=$(E2E_SYNC_IMG) E2E_BUILD_IMAGE=false KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) \
 		go test -tags=e2e ./test/e2e/ -timeout $(E2E_TIMEOUT) -v -ginkgo.v \
 			--ginkgo.timeout=$(GINKGO_E2E_TIMEOUT)
 	$(MAKE) cleanup-test-e2e
@@ -193,6 +201,10 @@ docker-build: ## Build docker image with the manager.
 .PHONY: docker-build-mover
 docker-build-mover: ## Build the mover image (crystal-mover + pinned restic) for the kind e2e data path.
 	$(CONTAINER_TOOL) build -f Dockerfile.mover -t ${E2E_MOVER_IMG} .
+
+.PHONY: docker-build-sync
+docker-build-sync: ## Build the sync image (crystal-mover + pinned restic + rclone) for the kind e2e external-sync path.
+	$(CONTAINER_TOOL) build -f Dockerfile.sync -t ${E2E_SYNC_IMG} .
 
 .PHONY: docker-push
 docker-push: ## Push docker image with the manager.
