@@ -214,7 +214,14 @@ func (r *ClusterErasureReconciler) drive(ctx context.Context, er *cbv1.ClusterEr
 		if err != nil {
 			return r.fail(ctx, er, "InvalidTarget", err.Error())
 		}
-		pruneArgs, err := restic.PruneCommand(loc.Spec.Maintenance.PruneMaxRepackSize)
+		// spec.maintenance is OPTIONAL and a POINTER, and erasure is the one caller that reaches
+		// prune without it. The maintenance controller dereferences the same field safely only
+		// because it gets there from a SCHEDULE, which cannot exist without the block; an erasure
+		// arrives from a ClusterErasure and knows nothing about the location's maintenance
+		// configuration. Dereferencing unconditionally panicked the reconciler — and a panic
+		// retries, so it panicked again, on every requeue, on the most destructive path in the
+		// system. An absent block simply means no repack cap.
+		pruneArgs, err := restic.PruneCommand(erasurePruneMaxRepackSize(loc))
 		if err != nil {
 			return r.fail(ctx, er, "InvalidPruneOptions", err.Error())
 		}
@@ -327,6 +334,16 @@ func erasureConfirmationFor(t cbv1.ErasureTarget) string {
 	default:
 		return t.Tenant
 	}
+}
+
+// erasurePruneMaxRepackSize reads the location's prune repack cap, tolerating an absent
+// spec.maintenance block — which is the DEFAULT, not an edge case: nothing about running an
+// erasure requires the location to have configured scheduled maintenance at all.
+func erasurePruneMaxRepackSize(loc *cbv1.ClusterBackupLocation) string {
+	if loc.Spec.Maintenance == nil {
+		return ""
+	}
+	return loc.Spec.Maintenance.PruneMaxRepackSize
 }
 
 // erasureResourceName names the per-step mover Job and its creds Secret.

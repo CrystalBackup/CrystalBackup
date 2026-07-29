@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"testing"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -183,3 +184,27 @@ var _ = Describe("ClusterErasureReconciler", func() {
 		}, initTimeout, initPoll).Should(Succeed())
 	})
 })
+
+// TestErasurePruneMaxRepackSizeToleratesNoMaintenanceBlock: spec.maintenance is optional and a
+// POINTER, and erasure is the only caller that reaches prune without one.
+//
+// The controller dereferenced it unconditionally, so a ClusterErasure against a location that had
+// simply not configured scheduled maintenance — the default — PANICKED the reconciler. A panic
+// requeues, so it panicked again on every retry, on the most destructive path in the system, with
+// the object frozen at Running and 2 snapshots already counted.
+//
+// The maintenance controller dereferences the same field and is safe only by construction: it
+// arrives from a prune/check SCHEDULE, which cannot exist without the block. Erasure arrives from a
+// ClusterErasure and knows nothing about maintenance, which is why this needs its own accessor.
+func TestErasurePruneMaxRepackSizeToleratesNoMaintenanceBlock(t *testing.T) {
+	none := &cbv1.ClusterBackupLocation{}
+	if got := erasurePruneMaxRepackSize(none); got != "" {
+		t.Fatalf("erasurePruneMaxRepackSize on a location with no maintenance block = %q, want empty", got)
+	}
+	// And the value is still honoured when the block IS there.
+	withCap := &cbv1.ClusterBackupLocation{}
+	withCap.Spec.Maintenance = &cbv1.MaintenanceSpec{PruneMaxRepackSize: "2G"}
+	if got := erasurePruneMaxRepackSize(withCap); got != "2G" {
+		t.Fatalf("erasurePruneMaxRepackSize = %q, want 2G", got)
+	}
+}
