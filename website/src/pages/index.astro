@@ -70,8 +70,8 @@ const milestones = [
   ['0.3.1', 'Hardening — operator throughput audit & fixes', 'patch', [['Audit report', `${base}/reports/audit-m3.1.html`]]],
   ['0.3.2', 'Hardening — restore safety (Recreate data loss, finalizer leak)', 'patch', [['Report', `${base}/reports/audit-m3.2.html`]]],
   ['M4', 'Consistency hooks, verification & maintenance', 'done', `${base}/reports/crucible-m4.html`],
-  ['M5', 'Namespace plane, external sync & right-to-erasure', 'here', `${base}/reports/crucible-m5.html`],
-  ['M6', 'Observability hardening & production beta', ''],
+  ['M5', 'Namespace plane, external sync & right-to-erasure', 'done', `${base}/reports/crucible-m5.html`],
+  ['M6', 'Observability hardening & production beta', 'here'],
   ['M7', 'CLI & browse UI', ''],
   ['M8', 'Immutable locations', ''],
   ['M9', 'Coexistence hardening & DR drills', ''],
@@ -124,7 +124,7 @@ const description =
       <section class="hero">
         <div class="hero-copy">
           <span class="pill">
-            <span class="dot"></span> Building M6 · M5 shipped (v0.5.0)
+            <span class="dot"></span> Building M6 · M5 shipped (v0.5.1)
           </span>
           <h1>
             Every namespace gets <span class="grad">its own backups.</span>
@@ -307,7 +307,7 @@ const description =
           Each milestone ships something usable. <strong>M0 through M5 have shipped</strong> — CRDs,
           CI, the core engine, cluster disaster recovery, self-service &amp; admin restore,
           manifest &amp; cluster-scoped DR, consistency hooks, repository maintenance, the
-          namespace plane, external sync and the right to erasure are live (v0.5.0); we’re now
+          namespace plane, external sync and the right to erasure are live (v0.5.1); we’re now
           building <strong>M6 — Observability hardening &amp; production beta</strong>.
         </p>
         <ol class="timeline">
@@ -351,7 +351,7 @@ const description =
           <aside class="note">
             <h3>You’re early — and that’s the point</h3>
             <p>
-              M0 through M5 have shipped (v0.5.0) — real, tested code — but it’s still early: most
+              M0 through M5 have shipped (v0.5.1) — real, tested code — but it’s still early: most
               milestones are ahead and it isn’t production-ready yet, so try it in a sandbox, keep
               your existing backups, and use it at your own risk. It’s
               provided <strong>as-is under Apache-2.0</strong>, without warranty. If the direction

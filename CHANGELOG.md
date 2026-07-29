@@ -4,6 +4,47 @@ All notable changes to Crystal Backup. Versioning follows
 [adr/0014](spec/adr/0014-versioning-and-release.md): milestone `Mn` → minor `0.n.z` on
 major 0; `1.0.0` is a deliberate post-M9 API-stability decision.
 
+## 0.5.1 — Supply-chain: the signed artefact was the wrong one (2026-07-29)
+
+A patch release with no functional change. It exists because verifying 0.5.0's artefacts — rather
+than its pipeline's green ticks — turned up a defect that had been shipping since signing was
+introduced.
+
+**`cosign verify ghcr.io/crystalbackup/<image>:<version>` failed for every consumer, on every
+signed release, v0.4.0 included.** The signatures were real; they were attached to the wrong
+artefact. The digest handed to cosign came from `head -n1 image-refs.txt`, which for a multi-arch
+publish is whichever ref apko wrote first — a **per-arch child manifest**. So the amd64 child was
+signed, the SBOM attestation and the SLSA provenance were bound to it, and the multi-arch index the
+tag actually resolves to carried none of them. [adr/0012](spec/adr/0012-container-images-apko-wolfi-slsa.md)
+promises a signed index; the artefacts did not deliver one.
+
+The line had a comment asserting it was the index. It was not — and `build/README.md`'s own
+troubleshooting table already warned readers off exactly that construct. The release workflow was
+doing the thing the documentation tells people not to do.
+
+### Fixed
+
+- **The signed subject is now the multi-arch index**, resolved from the registry — the same
+  question a consumer's `cosign verify` asks — and the job **refuses to sign anything that is not
+  an index**. The failure it guards against is silent: signing succeeds and verification fails
+  months later, which is how this survived four releases.
+- **The chart's image pinning is hardened the same way.** It resolved digests with
+  `--format '{{.Manifest.Digest}}'` and checked them with `[ -n "$x" ]` — but that template is
+  ignored by some buildx versions, which print the entire inspect instead: non-empty, so it passes
+  that check and pins the chart to a blob of text. It happened to work, and 0.5.0's chart does pin
+  the three correct indexes (verified by pulling it), but the guard could not have caught the
+  failure it was written for. A chart pinned to a per-arch child would deploy an amd64-only image
+  onto arm64 nodes.
+- **The documentation stopped recommending the fragile form.** `build/README.md` and both delivery
+  skills gave `--format '{{.Manifest.Digest}}'` as the *fix* for deploying a child digest. They now
+  give the plain-output form, and say why.
+
+### Note on 0.5.0
+
+0.5.0's images, chart and Release are correct and stay published — the code is identical to this
+release's. What 0.5.0 lacks is a verifiable signature on the index. Anyone who needs one should use
+0.5.1; anyone already running 0.5.0 has the same bits.
+
 ## 0.5.0 — M5 "Namespace plane, external sync & right to erasure" (2026-07-29)
 
 Milestone M5 opens a second plane. Until now every backup was the platform's: an admin's

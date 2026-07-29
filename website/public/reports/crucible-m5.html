@@ -224,11 +224,20 @@
   </section>
 
   <p class="context">
-    This is the <b>M5 acceptance gate</b> — the fourteen new criteria run under the <code>m5</code> label against a live cluster, with an <b>independent restic oracle</b> (a throwaway Job running the plain <code>restic</code> CLI against the same repositories) so a controller that both writes and reports the same wrong thing cannot make a check pass. The <b>47 skipped</b> lines are the platform / M0&ndash;M4 checks that belong to other labels; they ran green in the same session&rsquo;s full-suite non-regression pass (<b>60 passed, 0 failed, 1h23m</b>).
+    This is the <b>M5 acceptance gate</b> — the fourteen new criteria run under the <code>m5</code> label against a live cluster, with an <b>independent restic oracle</b> (a throwaway Job running the plain <code>restic</code> CLI against the same repositories) so a controller that both writes and reports the same wrong thing cannot make a check pass. The <b>47 skipped</b> lines are the platform / M0&ndash;M4 checks that belong to other labels; they ran green in the same session&rsquo;s full-suite non-regression pass on the very build that
+    shipped (<b>60 passed, 0 failed, 1h01m</b>).
   </p>
 
   <p class="context">
-    <b>Writing and running this suite found six defects</b>, and three of them left an advertised M5 feature completely inert: a namespace-plane external sync could <b>never</b> reach Completed, <code>mode: Mirror</code> <b>never</b> pruned anything, and the right to erasure <b>never</b> removed a snapshot. None was reachable without a real repository &mdash; in every case the visible step succeeded and the step after it failed, which is exactly why unit tests and a green CI had not noticed. The other three: a location alias slipped past the self-copy guard, rclone probed and would have created the destination bucket (fatal with the bucket-scoped credentials a least-privilege secondary should have), and a <code>ClusterErasure</code> panicked the reconciler on any location without a <code>maintenance</code> block &mdash; which is the default. All six are fixed, each with the regression test that would have caught it; the results below are the run after.
+    <b>Writing and running this suite found six defects</b>, and three of them left an advertised M5 feature completely inert: a namespace-plane external sync could <b>never</b> reach Completed, <code>mode: Mirror</code> <b>never</b> pruned anything, and the right to erasure <b>never</b> removed a snapshot. None was reachable without a real repository &mdash; in every case the visible step succeeded and the step after it failed, which is exactly why unit tests and a green CI had not noticed. The other three: a location alias slipped past the self-copy guard, rclone probed and would have created the destination bucket (fatal with the bucket-scoped credentials a least-privilege secondary should have), and a <code>ClusterErasure</code> panicked the reconciler on any location without a <code>maintenance</code> block &mdash; which is the default. A seventh followed in CI (the workflow never built the pinned rclone apk, so the sync image could
+    not assemble) and an eighth in shared maintenance code: a just-created Job was read back through
+    a CACHED client, and any <code>NotFound</code> in that read-after-write window was treated as
+    terminal &mdash; which failed an M4 <code>check</code> whose identical twin had passed on the
+    previous run of the same code, and an external-sync copy, with the same message. All are fixed,
+    each with the regression test that would have caught it; the results below are the run after.
+    The M4 bit-rot spec is the tell: it now completes in <b>3m2s</b> where it previously took
+    <code>20m0.3s</code> &mdash; exactly its timeout budget, because what that run was measuring was
+    the operator failing on the cache and retrying until it happened to land.
   </p>
   <section class="group">
     <div class="group-head"><h2>M5 · External sync — the second copy, under a second key</h2><span class="count">6 / 6</span></div>
