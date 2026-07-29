@@ -59,6 +59,12 @@ const (
 	// awaiting completion.
 	maintenanceJobPollInterval = 2 * time.Second
 
+	// maintenanceJobVisibilityGrace is how long a just-created maintenance Job may be absent from
+	// the cached client's view before that absence is believed. Informer lag is milliseconds, so
+	// this is generous by two orders of magnitude — and it is measured against op deadlines of ten
+	// minutes to four hours, which is why erring long costs nothing. See waitForMaintenanceJob.
+	maintenanceJobVisibilityGrace = time.Minute
+
 	// maintenanceJobDeadline bounds one SHORT maintenance op (forget/unlock): the repository's
 	// exclusive lane is held for at most this long, so a black-holed op can never wedge the queue.
 	maintenanceJobDeadline = 10 * time.Minute
@@ -432,11 +438,42 @@ func waitForMaintenanceJob(ctx context.Context, c client.Client, operatorNamespa
 	ticker := time.NewTicker(maintenanceJobPollInterval)
 	defer ticker.Stop()
 
+	// The Job was created by this same goroutine a moment ago — through the CACHED client, whose
+	// informer may not have observed it yet. In that window a Get returns NotFound, and treating
+	// that as terminal turns a few hundred milliseconds of cache lag into a failed maintenance op
+	// with a message that reads like the Job vanished:
+	//
+	//	get maintenance job crystal-backup-system/<name>-check: Job.batch "<name>-check" not found
+	//
+	// Seen on a crucible lane (an M4 check whose identical twin had passed on the previous run of
+	// the same code) and, independently, on an external-sync copy — same message, same function,
+	// two unrelated callers. So NotFound is tolerated for a bounded window and only becomes a
+	// failure if the Job stays absent: a Job that really was deleted still fails, just later.
+	var missingSince time.Time
 	for {
 		var job batchv1.Job
-		if err := c.Get(ctx, key, &job); err != nil {
+		err := c.Get(ctx, key, &job)
+		switch {
+		case apierrors.IsNotFound(err):
+			if missingSince.IsZero() {
+				missingSince = time.Now()
+			}
+			if elapsed := time.Since(missingSince); elapsed > maintenanceJobVisibilityGrace {
+				return fmt.Errorf("get maintenance job %s/%s: absent for %s: %w",
+					operatorNamespace, jobName, elapsed.Round(time.Second), err)
+			}
+			// Not visible yet — fall through to the tick and look again.
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf("maintenance job %s/%s did not complete: %w", operatorNamespace, jobName, ctx.Err())
+			case <-ticker.C:
+			}
+			continue
+		case err != nil:
 			return fmt.Errorf("get maintenance job %s/%s: %w", operatorNamespace, jobName, err)
 		}
+		missingSince = time.Time{}
+
 		if job.Status.Succeeded >= 1 || jobConditionTrue(&job, batchv1.JobComplete) {
 			return nil
 		}
