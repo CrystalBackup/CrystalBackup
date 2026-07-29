@@ -460,3 +460,37 @@ func TestSyncScopeDescriptionSaysWhatWillMove(t *testing.T) {
 		t.Fatalf("narrowed description %q does not name the namespaces", narrowed)
 	}
 }
+
+// TestSyncReconcilersCarryAMoverImageForMirrorsForget: the copy runs the SYNC image and Mirror's
+// trailing forget runs the MOVER one, so an ExternalSync reconciler needs BOTH.
+//
+// It shipped with only the sync image. Nothing failed at build time, nothing failed at reconcile
+// time, and the copy half worked perfectly — the omission only surfaced when Mirror had something
+// to delete, as the API server rejecting a Job whose container declares no image:
+//
+//	Job.batch "cbes-…-mirror-forget" is invalid:
+//	spec.template.spec.containers[0].image: Required value
+//
+// So Mirror copied and never pruned, on both planes, and said so only in an Event. This asserts on
+// the wiring rather than on a rendered Job because the driver is where the two images meet.
+func TestSyncReconcilersCarryAMoverImageForMirrorsForget(t *testing.T) {
+	const moverImage, syncImage = "example.com/mover:test", "example.com/sync:test"
+
+	cluster := NewClusterBackupExternalSyncReconciler(
+		nil, nil, nil, nil, nil, "crystal-backup-system", moverImage, syncImage, nil, nil)
+	if got := cluster.driver.deps.MoverImage; got != moverImage {
+		t.Errorf("cluster-plane driver mover image = %q, want %q — Mirror's forget Job would have no image", got, moverImage)
+	}
+	if got := cluster.driver.SyncImage; got != syncImage {
+		t.Errorf("cluster-plane driver sync image = %q, want %q", got, syncImage)
+	}
+
+	namespaced := NewBackupExternalSyncReconciler(
+		nil, nil, nil, nil, nil, nil, "crystal-backup-system", moverImage, syncImage, nil, nil)
+	if got := namespaced.driver.deps.MoverImage; got != moverImage {
+		t.Errorf("namespace-plane driver mover image = %q, want %q — Mirror's forget Job would have no image", got, moverImage)
+	}
+	if got := namespaced.driver.SyncImage; got != syncImage {
+		t.Errorf("namespace-plane driver sync image = %q, want %q", got, syncImage)
+	}
+}

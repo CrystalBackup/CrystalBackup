@@ -66,13 +66,18 @@ type ClusterBackupExternalSyncReconciler struct {
 }
 
 // NewClusterBackupExternalSyncReconciler builds the reconciler and its shared driver.
+// moverImage is required alongside syncImage, and the pair is not redundant: the COPY runs the sync
+// image (it needs rclone), while Mirror's trailing forget is an ordinary single-repository
+// `restic forget` that runs the MOVER image through runRepoMaintenance. Omitting the mover image
+// left that Job with no image at all, which the API server rejects at creation — so Mirror copied
+// and never pruned.
 func NewClusterBackupExternalSyncReconciler(
 	c client.Client, scheme *runtime.Scheme, secretsReader *secrets.ByNameReader,
-	q *queue.Manager, lister FilteredSnapshotLister, operatorNamespace, syncImage string,
+	q *queue.Manager, lister FilteredSnapshotLister, operatorNamespace, moverImage, syncImage string,
 	cl clock.PassiveClock, recorder events.EventRecorder,
 ) *ClusterBackupExternalSyncReconciler {
 	deps := repoMaintenanceDeps{
-		Client: c, Secrets: secretsReader, OperatorNamespace: operatorNamespace,
+		Client: c, Secrets: secretsReader, OperatorNamespace: operatorNamespace, MoverImage: moverImage,
 	}
 	return &ClusterBackupExternalSyncReconciler{
 		Client: c, Scheme: scheme, Secrets: secretsReader,

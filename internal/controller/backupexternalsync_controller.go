@@ -69,13 +69,15 @@ type BackupExternalSyncReconciler struct {
 }
 
 // NewBackupExternalSyncReconciler builds the reconciler and its shared driver.
+// moverImage is required alongside syncImage; see the cluster-plane constructor for why the pair is
+// not redundant (the copy needs rclone, Mirror's forget does not and runs the mover image).
 func NewBackupExternalSyncReconciler(
 	c client.Client, scheme *runtime.Scheme, secretsReader *secrets.ByNameReader,
 	userKeys *keys.UserKeyManager, q *queue.Manager, lister FilteredSnapshotLister,
-	operatorNamespace, syncImage string, cl clock.PassiveClock, recorder events.EventRecorder,
+	operatorNamespace, moverImage, syncImage string, cl clock.PassiveClock, recorder events.EventRecorder,
 ) *BackupExternalSyncReconciler {
 	deps := repoMaintenanceDeps{
-		Client: c, Secrets: secretsReader, OperatorNamespace: operatorNamespace,
+		Client: c, Secrets: secretsReader, OperatorNamespace: operatorNamespace, MoverImage: moverImage,
 	}
 	return &BackupExternalSyncReconciler{
 		Client: c, Scheme: scheme, Secrets: secretsReader, UserKeys: userKeys,
