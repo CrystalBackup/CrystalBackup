@@ -112,6 +112,11 @@ const (
 	// flagNoLock skips taking a repository lock. Only ever valid on a pure READ (see SnapshotsArgs);
 	// putting it on anything that mutates would defeat the locking the whole queue exists to respect.
 	flagNoLock = "--no-lock"
+	// flagUnsafeAllowRemoveAll is restic's explicit opt-in to a `forget` whose policy keeps NOTHING.
+	// Without it restic refuses the command outright — "Fatal: no policy was specified, no snapshots
+	// will be removed" — which is exactly the shape erasure needs and retention never does. See
+	// ErasureForgetArgs; the name is restic's, and its bluntness is the point.
+	flagUnsafeAllowRemoveAll = "--unsafe-allow-remove-all"
 )
 
 // Tag renders one restic tag as "key=value". Centralising the "="-joined format means the
@@ -403,6 +408,17 @@ func ErasureTagFilter(t v1alpha1.ErasureTarget) (filter string, ok bool) {
 // GDPR erasure into a no-op that reports success — so they are separate functions with separate
 // names, and this one cannot be called without a filter (ErasureTagFilter's ok=false stops it).
 //
+// --unsafe-allow-remove-all is not optional and not a stylistic choice: a `forget` that keeps
+// NOTHING is precisely what restic refuses to do by accident. Verified against the pinned engine —
+// without the flag the command does not thin anything and does not partially succeed, it exits 1:
+//
+//	$ restic forget --tag crystalbackup,namespace=c-empty --retry-lock 5m
+//	Fatal: no policy was specified, no snapshots will be removed
+//
+// So erasure removed nothing at all until this flag existed here; the CR reported Failed, which was
+// at least honest, but R21 was inert. With it, the same command removes exactly the tagged
+// snapshots and leaves every other tenant's untouched.
+//
 // --retry-lock for the same reason retention uses it: the queue serialises erasure against other
 // exclusive ops, not against readers, so a cross-namespace mover's shared lock must be waited out
 // rather than treated as a failure.
@@ -411,7 +427,7 @@ func ErasureForgetArgs(t v1alpha1.ErasureTarget) ([]string, error) {
 	if !ok {
 		return nil, fmt.Errorf("restic: erasure target selects nothing (set tenant, namespace, or namespace+pvc)")
 	}
-	return []string{forgetCmd, flagTag, filter, flagRetryLock, retryLockFor}, nil
+	return []string{forgetCmd, flagUnsafeAllowRemoveAll, flagTag, filter, flagRetryLock, retryLockFor}, nil
 }
 
 // SnapshotsArgs is the complete restic argv (subcommand first) discovery inventories the

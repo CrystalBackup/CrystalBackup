@@ -952,3 +952,37 @@ func TestSnapshotOriginalIsDecoded(t *testing.T) {
 			"like a copy of something", snaps[1].Original)
 	}
 }
+
+// TestErasureForgetOptsIntoRemovingEverythingItMatched: a `forget` whose policy keeps NOTHING is
+// exactly what restic refuses to do by accident, and erasure is the one caller that means it.
+//
+// Verified against the pinned engine rather than assumed. Without the flag:
+//
+//	$ restic forget --tag crystalbackup,namespace=c-empty --retry-lock 5m
+//	Fatal: no policy was specified, no snapshots will be removed
+//	exit 1
+//
+// With it, the same command removed exactly the tagged snapshot and left the neighbouring tenant's
+// alone. Erasure shipped without it, so R21 removed nothing at all — the CR reported Failed, which
+// was honest, but the right to erasure was inert. This pins the flag so it cannot be dropped as
+// "unsafe-looking cleanup".
+func TestErasureForgetOptsIntoRemovingEverythingItMatched(t *testing.T) {
+	argv, err := ErasureForgetArgs(v1alpha1.ErasureTarget{Namespace: "team-x"})
+	if err != nil {
+		t.Fatalf("ErasureForgetArgs: %v", err)
+	}
+	if !slices.Contains(argv, "--unsafe-allow-remove-all") {
+		t.Fatalf("erasure argv %v lacks --unsafe-allow-remove-all; restic refuses a keep-nothing "+
+			"forget outright, so this command would remove no snapshot at all", argv)
+	}
+	// Retention must NOT carry it: there the policy is the whole point, and a stray
+	// remove-all would turn a thinning pass into a wipe.
+	retention, ok := ForgetCommand(v1alpha1.RetentionSpec{KeepLast: 3})
+	if !ok {
+		t.Fatal("a keepLast policy must produce a retention command")
+	}
+	if slices.Contains(retention, "--unsafe-allow-remove-all") {
+		t.Fatalf("retention argv %v carries --unsafe-allow-remove-all; a keep policy must never "+
+			"be allowed to remove everything", retention)
+	}
+}
