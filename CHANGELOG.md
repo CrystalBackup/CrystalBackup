@@ -4,6 +4,121 @@ All notable changes to Crystal Backup. Versioning follows
 [adr/0014](spec/adr/0014-versioning-and-release.md): milestone `Mn` → minor `0.n.z` on
 major 0; `1.0.0` is a deliberate post-M9 API-stability decision.
 
+## 0.5.0 — M5 "Namespace plane, external sync & right to erasure" (2026-07-29)
+
+Milestone M5 opens a second plane. Until now every backup was the platform's: an admin's
+`ClusterBackupLocation`, an admin's key, an admin's schedule. A namespace user can now back their
+own namespace up to their **own** object storage under their **own** key, alongside cluster DR and
+independent of it. Backups can be copied to a **second** location that opens with a **second** key.
+And erasure became a physical operation rather than a promise.
+
+**`spec.encryption.platformAccess` is gone** (breaking, and the only breaking change). It was
+specified in M0, never implemented, and dropped here rather than built: an operator key slot on a
+user repository is a password living in `crystal-backup-system` that keeps working after the user
+rotates their key or deletes their Secret — and because removing a restic key slot does not rotate
+the master key, one they could never take back. The guarantee that platform access ends when the
+user's key does is now bought by the mechanism not existing. The crucible asserts it against the
+artefact: a user repository holds **exactly one key slot**.
+
+Validated on real infrastructure, and this is where the milestone earned its keep. Writing and
+running the acceptance suite found **six defects**, three of which left an advertised M5 feature
+completely inert — in every case the visible step succeeded and the step after it failed, which is
+precisely why unit tests and a green CI had not noticed:
+
+- a namespace-plane external sync could **never** reach `Completed`;
+- `mode: Mirror` **never** pruned anything;
+- the right to erasure **never** removed a snapshot.
+
+None of the three was reachable without a real repository. See **Fixed** below. Final state:
+14/14 on the crucible's `m5` label, 32/32 on the kind e2e.
+
+### Added
+
+- **The namespace plane (R3, R5).** `BackupLocation` and `BackupSchedule`, namespaced: the user's
+  bucket, the user's credentials (read from **their** namespace, never the operator's), and the
+  user's restic password — either a Secret they reference or one the operator generates **in their
+  namespace**. A `Backup` against a namespaced location runs the same execution path as a cluster-DR
+  one, with no fan-out.
+- **External sync (R28, [adr/0013](spec/adr/0013-external-backup-sync.md)).**
+  `ClusterBackupExternalSync` (admin, whole shared repo or a namespace-tagged slice → a secondary
+  `ClusterBackupLocation`) and `BackupExternalSync` (user, their namespace's backups → a second
+  `BackupLocation` **in the same namespace**, structurally confined like `Restore`). The copy is
+  `restic copy`: it decrypts from the source and **re-encrypts to the destination's own key**, so
+  the second copy is an independent repository and never a byte clone carrying the source's key.
+  `mode: Mirror` tracks the source (copy what is missing, forget what is gone) or `AppendOnly`.
+- **A third image, `sync`.** restic holds two repository keys but only ONE set of backend
+  credentials, so both repositories are addressed as `rclone:` remotes, each carrying its own — which
+  makes rclone a hard requirement of sync and of nothing else. It is a separate image so that
+  surface stays off the backup and restore path.
+- **`ClusterErasure` (R21).** Physical right-to-erasure: `restic forget` by `tenant=` /
+  `namespace=` / `namespace=`+`pvc=` followed by `prune`, as ONE queued operation on the
+  repository's exclusive lane — inseparable, because a forget without its prune leaves the tenant's
+  bytes in the packs. Typed confirmation (R23); `Blocked` on Immutable locations rather than a
+  success that did not happen. Per-tenant crypto-shredding stays dropped: one shared repository has
+  one master key ([adr/0009](spec/adr/0009-shared-cluster-repo-tag-tenancy.md)).
+- The external-sync **metric family** — lag, last success, snapshots and bytes copied, both planes
+  ([05-observability.md §2](spec/05-observability.md)). The `ExternalSyncStale` **alert rule itself
+  is specified, not shipped**: §3 of that document is a specification as of this release, and the
+  whole alert bundle lands with M6. What ships here is the series it will read.
+- A repository decommission runbook.
+
+### Changed
+
+- **Consistency hooks (R16) now exec as a tenant ServiceAccount, not as the operator.** The hook
+  path had been running with the operator's own identity, which meant a quiesce command executed
+  with cluster-wide credentials in a namespace the tenant controls. Deployments that restricted the
+  operator's `pods/exec` grant should re-check it against the tenant identity instead.
+
+### Removed
+
+- **`spec.encryption.platformAccess`** — see above ([adr/0004](spec/adr/0004-encryption-key-management.md)
+  amendment). Nothing read it, so no behaviour changes; the field is simply no longer accepted.
+
+### Fixed
+
+Every one of these was found by the M5 acceptance suite before release, and each ships with the
+regression test that would have caught it.
+
+- **A namespace-plane external sync could never complete.** The snapshot inventory knew only the
+  cluster plane: it looked for an ownerReference to a `ClusterBackupLocation` and unwrapped the
+  platform DEK, while a namespaced repository is attached by back-link labels and opens with the
+  user's key. The copy succeeded every time; the accounting after it never could. The S3
+  credentials moved with the fix — read from the location's own namespace, never the operator's,
+  where a same-named admin Secret would have silently been used instead.
+- **`mode: Mirror` never pruned.** Both sync reconcilers built their maintenance dependencies
+  without a mover image, so Mirror's trailing `forget` Job was created with **no container image**
+  and the API server rejected it. The copy half was unaffected — it passes the sync image
+  explicitly — so Mirror copied and never deleted, on both planes.
+- **The right to erasure removed nothing.** The forget argv carried no keep policy, which is the
+  correct intent, and a command restic refuses outright: *"no policy was specified, no snapshots
+  will be removed"*, exit 1. `--unsafe-allow-remove-all` is restic's explicit opt-in to exactly
+  this. Verified against the pinned engine, not assumed.
+- **A `ClusterErasure` panicked the reconciler when the location had no `maintenance` block** —
+  which is the default. `spec.maintenance` is an optional pointer and erasure is the only caller
+  that reaches prune without it. A panic requeues, so it panicked again on every retry, on the most
+  destructive path in the system.
+- **A location alias slipped past the self-copy guard.** It compared resolved repository *names*,
+  and a repository's name derives from its location's on both planes — so it only ever reproduced
+  the admission rule that already denies source == destination by name. Two differently-named
+  locations on one bucket, prefix and cluster ID are one repository, and a Mirror between them
+  would have had restic open it as both ends. It now compares the resolved repository URL.
+- **rclone probed — and would have created — the destination bucket.** The `s3:` spelling of the
+  same repository never does either, and a secondary reached with credentials scoped to its own
+  bucket (the least privilege such a destination should have) has no `CreateBucket` right, so the
+  probe alone failed the copy for a bucket that was there all along.
+- A bookkeeping failure after a successful copy re-enqueued the **whole copy** on every requeue
+  rather than retrying only the accounting.
+
+### Documented
+
+- [adr/0013](spec/adr/0013-external-backup-sync.md) amended twice: rclone as the addressing layer
+  and why sync is a third image, then five empirical findings about `restic copy` and rclone that
+  changed the implementation — including that `--json` emits no summary, so sync is not a
+  summary-parsed operation, and that `no_check_bucket` is mandatory.
+- [adr/0004](spec/adr/0004-encryption-key-management.md) amended for the `platformAccess` removal.
+- The crucible gained an M5 harness and three acceptance containers; `deploy.sh` and the fanout
+  now pass the sync image digest, without which a sync Job silently lands on the chart placeholder.
+
 ## 0.4.0 — M4 "Consistency hooks, verification & maintenance" (2026-07-27)
 
 Milestone M4 makes a backup **application-consistent** and a repository **maintained**. Backups
