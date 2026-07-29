@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Crystal Backup — Crucible M5 Acceptance Report</title>
+<style>
+  :root {
+    --paper: #f6f8f9;
+    --panel: #ffffff;
+    --ink: #0f1620;
+    --muted: #59636e;
+    --faint: #8b96a1;
+    --line: #e2e7ec;
+    --line-strong: #d0d8de;
+    --steel: #35607a;        /* structural accent: infra / k8s / links */
+    --steel-soft: #eaf1f5;
+    --pass: #0f9d63;         /* the one bold place: success / verdict */
+    --pass-soft: #e6f5ed;
+    --skip: #8a97a3;         /* label-gated, not a failure */
+    --skip-soft: #eef1f4;
+    --amber: #b6791f;
+    --tag-product: #2a5db0;
+    --tag-product-soft: #e9eff9;
+    --tag-test: #5f6b78;
+    --tag-test-soft: #edf0f3;
+    --shadow: 0 1px 2px rgba(15,22,32,.04), 0 8px 24px rgba(15,22,32,.05);
+
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper: #0c1116;
+      --panel: #121a22;
+      --ink: #e8eef3;
+      --muted: #97a3ae;
+      --faint: #6c7883;
+      --line: #212c35;
+      --line-strong: #2c3a45;
+      --steel: #74a7c8;
+      --steel-soft: #16242e;
+      --pass: #37d18b;
+      --pass-soft: #10241b;
+      --skip: #6c7883;
+      --skip-soft: #171f27;
+      --amber: #d6a24e;
+      --tag-product: #7aa5e8;
+      --tag-product-soft: #16202f;
+      --tag-test: #97a3ae;
+      --tag-test-soft: #1a222a;
+      --shadow: 0 1px 2px rgba(0,0,0,.3), 0 10px 30px rgba(0,0,0,.35);
+    }
+  }
+  :root[data-theme="light"] {
+    --paper: #f6f8f9; --panel: #ffffff; --ink: #0f1620; --muted: #59636e; --faint: #8b96a1;
+    --line: #e2e7ec; --line-strong: #d0d8de; --steel: #35607a; --steel-soft: #eaf1f5;
+    --pass: #0f9d63; --pass-soft: #e6f5ed; --skip: #8a97a3; --skip-soft: #eef1f4;
+    --tag-product: #2a5db0; --tag-product-soft: #e9eff9; --tag-test: #5f6b78; --tag-test-soft: #edf0f3;
+    --shadow: 0 1px 2px rgba(15,22,32,.04), 0 8px 24px rgba(15,22,32,.05);
+  }
+  :root[data-theme="dark"] {
+    --paper: #0c1116; --panel: #121a22; --ink: #e8eef3; --muted: #97a3ae; --faint: #6c7883;
+    --line: #212c35; --line-strong: #2c3a45; --steel: #74a7c8; --steel-soft: #16242e;
+    --pass: #37d18b; --pass-soft: #10241b; --skip: #6c7883; --skip-soft: #171f27;
+    --tag-product: #7aa5e8; --tag-product-soft: #16202f; --tag-test: #97a3ae; --tag-test-soft: #1a222a;
+    --shadow: 0 1px 2px rgba(0,0,0,.3), 0 10px 30px rgba(0,0,0,.35);
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: var(--sans);
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+  .wrap { max-width: 860px; margin: 0 auto; padding: clamp(28px, 5vw, 64px) clamp(18px, 4vw, 40px) 80px; }
+
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 12px;
+    letter-spacing: .14em;
+    text-transform: uppercase;
+    color: var(--steel);
+    margin: 0;
+  }
+
+  /* ── Masthead ─────────────────────────────────────────── */
+  .masthead { border-bottom: 1px solid var(--line); padding-bottom: 26px; }
+  h1 {
+    font-size: clamp(28px, 4.6vw, 40px);
+    line-height: 1.08;
+    letter-spacing: -.02em;
+    text-wrap: balance;
+    margin: 12px 0 8px;
+    font-weight: 680;
+  }
+  .lede { color: var(--muted); font-size: 17px; margin: 0; max-width: 60ch; }
+  .meta {
+    font-family: var(--mono);
+    font-size: 12.5px;
+    color: var(--faint);
+    margin-top: 18px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 18px;
+  }
+  .meta b { color: var(--muted); font-weight: 500; }
+
+  /* ── Verdict ──────────────────────────────────────────── */
+  .verdict {
+    margin: 30px 0;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-left: 3px solid var(--pass);
+    border-radius: 12px;
+    box-shadow: var(--shadow);
+    padding: 22px clamp(18px, 3vw, 28px);
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 20px 26px;
+    align-items: center;
+  }
+  .verdict-badge {
+    display: inline-flex; align-items: center; gap: 9px;
+    font-family: var(--mono); font-weight: 600; font-size: 15px;
+    color: var(--pass);
+    background: var(--pass-soft);
+    border: 1px solid color-mix(in srgb, var(--pass) 28%, transparent);
+    padding: 8px 14px; border-radius: 999px; white-space: nowrap;
+  }
+  .verdict-badge .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--pass); box-shadow: 0 0 0 4px color-mix(in srgb, var(--pass) 18%, transparent); }
+  .metrics { display: flex; flex-wrap: wrap; gap: 10px 30px; align-items: baseline; }
+  .metric { display: flex; flex-direction: column; }
+  .metric .n { font-family: var(--mono); font-size: 26px; font-weight: 620; letter-spacing: -.02em; font-variant-numeric: tabular-nums; line-height: 1; }
+  .metric .n.pass { color: var(--pass); }
+  .metric .n.zero { color: var(--ink); }
+  .metric .n.skip { color: var(--skip); }
+  .metric .k { font-family: var(--mono); font-size: 11px; text-transform: uppercase; letter-spacing: .1em; color: var(--faint); margin-top: 5px; }
+
+  /* ── Prose ────────────────────────────────────────────── */
+  .context { color: var(--muted); font-size: 15.5px; max-width: 66ch; }
+  .context b { color: var(--ink); font-weight: 600; }
+  code { font-family: var(--mono); font-size: .89em; background: var(--steel-soft); color: var(--ink); padding: .1em .38em; border-radius: 5px; }
+
+  h2 {
+    font-size: 13px; font-family: var(--mono); text-transform: uppercase; letter-spacing: .12em;
+    color: var(--steel); font-weight: 600;
+    margin: 0 0 2px;
+  }
+  .group { margin-top: 40px; }
+  .group-head { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; border-bottom: 1px solid var(--line); padding-bottom: 10px; }
+  .group-head .count { font-family: var(--mono); font-size: 12px; color: var(--faint); }
+  .group-note { color: var(--muted); font-size: 13.5px; margin: 8px 0 4px; }
+
+  /* ── Spec rows ────────────────────────────────────────── */
+  ul.specs { list-style: none; margin: 6px 0 0; padding: 0; }
+  ul.specs > li { display: grid; grid-template-columns: 20px 1fr auto; gap: 3px 14px; padding: 14px 0; border-bottom: 1px solid var(--line); }
+  ul.specs > li:last-child { border-bottom: 0; }
+  .check { grid-row: span 2; margin-top: 3px; color: var(--pass); }
+  .check svg { display: block; }
+  .spec-name { font-weight: 560; font-size: 15px; color: var(--ink); }
+  .spec-time { font-family: var(--mono); font-size: 12.5px; color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; grid-row: span 2; align-self: start; margin-top: 2px; }
+  .spec-proves { grid-column: 2 / 3; color: var(--muted); font-size: 13.5px; margin: 0; max-width: 62ch; }
+  .fixflag {
+    display: inline-block; font-family: var(--mono); font-size: 10.5px; letter-spacing: .04em;
+    color: var(--steel); background: var(--steel-soft);
+    border: 1px solid color-mix(in srgb, var(--steel) 22%, transparent);
+    padding: 1px 7px; border-radius: 999px; margin-left: 8px; vertical-align: 1.5px; white-space: nowrap;
+  }
+
+  /* ── Terse preflight rows (infra / m0): self-evident names, no "proves" subtext ─ */
+  ul.specs.terse > li { grid-template-columns: 20px 1fr auto; align-items: baseline; padding: 11px 0; }
+  ul.specs.terse .check, ul.specs.terse .spec-time, ul.specs.terse .skip-mark { grid-row: auto; margin-top: 0; }
+  ul.specs.terse .spec-name { font-weight: 520; }
+  .skip-mark { color: var(--skip); display: inline-flex; }
+  .skip-mark svg { display: block; }
+  li.skipped .spec-name { color: var(--muted); }
+  .spec-time.skip { color: var(--skip); }
+
+  /* ── Caught / fixes ───────────────────────────────────── */
+  .caught { margin-top: 48px; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: clamp(20px, 3vw, 30px); box-shadow: var(--shadow); }
+  .wave { font-family: var(--mono); font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: var(--faint); margin: 22px 0 2px; }
+  .fixes { display: grid; gap: 12px; margin-top: 12px; }
+  @media (min-width: 620px) { .fixes { grid-template-columns: 1fr 1fr 1fr; } }
+  .fix { border: 1px solid var(--line); border-radius: 10px; padding: 15px 16px; background: var(--paper); }
+  .fix .tag { display: inline-block; font-family: var(--mono); font-size: 10.5px; letter-spacing: .04em; text-transform: uppercase; padding: 2px 8px; border-radius: 999px; margin-bottom: 9px; }
+  .fix.product .tag { color: var(--tag-product); background: var(--tag-product-soft); }
+  .fix.test .tag { color: var(--tag-test); background: var(--tag-test-soft); }
+  .fix h3 { font-size: 14px; margin: 0 0 5px; font-weight: 620; }
+  .fix p { margin: 0; font-size: 13px; color: var(--muted); }
+  .fix .sha { font-family: var(--mono); font-size: 11.5px; color: var(--faint); margin-top: 9px; }
+
+  .foot { margin-top: 40px; padding-top: 20px; border-top: 1px solid var(--line); color: var(--faint); font-size: 13px; }
+  .foot code { background: var(--skip-soft); }
+</style>
+
+</head>
+<body>
+<div class="wrap">
+  <header class="masthead">
+    <p class="eyebrow">Crystal Backup · Crucible acceptance</p>
+    <h1>Milestone&nbsp;M5 — Namespace plane, external sync &amp; right to erasure</h1>
+    <p class="lede">Real-conditions validation of a second backup plane — the user&rsquo;s own repository under the user&rsquo;s own key — of snapshot-level replication that re-encrypts to a second key, and of erasure as a physical operation, against a live RKE2 / Ceph cluster and real object storage.</p>
+    <div class="meta">
+      <span><b>Run</b> acceptance gate · label <code>m5</code></span>
+      <span><b>Date</b> 2026-07-29</span>
+      <span><b>Suite</b> ginkgo · m5</span>
+      <span><b>Duration</b> 9m24s</span>
+    </div>
+  </header>
+
+  <section class="verdict" aria-label="Verdict">
+    <span class="verdict-badge"><span class="dot"></span>PASS · gate met</span>
+    <div class="metrics">
+      <div class="metric"><span class="n pass">14</span><span class="k">Passed</span></div>
+      <div class="metric"><span class="n zero">0</span><span class="k">Failed</span></div>
+      <div class="metric"><span class="n skip">47</span><span class="k">Skipped</span></div>
+      <div class="metric"><span class="n zero" style="font-size:20px">9m24s</span><span class="k">Wall clock</span></div>
+    </div>
+  </section>
+
+  <p class="context">
+    This is the <b>M5 acceptance gate</b> — the fourteen new criteria run under the <code>m5</code> label against a live cluster, with an <b>independent restic oracle</b> (a throwaway Job running the plain <code>restic</code> CLI against the same repositories) so a controller that both writes and reports the same wrong thing cannot make a check pass. The <b>47 skipped</b> lines are the platform / M0&ndash;M4 checks that belong to other labels; they ran green in the same session&rsquo;s full-suite non-regression pass (<b>60 passed, 0 failed, 1h23m</b>).
+  </p>
+
+  <p class="context">
+    <b>Writing and running this suite found six defects</b>, and three of them left an advertised M5 feature completely inert: a namespace-plane external sync could <b>never</b> reach Completed, <code>mode: Mirror</code> <b>never</b> pruned anything, and the right to erasure <b>never</b> removed a snapshot. None was reachable without a real repository &mdash; in every case the visible step succeeded and the step after it failed, which is exactly why unit tests and a green CI had not noticed. The other three: a location alias slipped past the self-copy guard, rclone probed and would have created the destination bucket (fatal with the bucket-scoped credentials a least-privilege secondary should have), and a <code>ClusterErasure</code> panicked the reconciler on any location without a <code>maintenance</code> block &mdash; which is the default. All six are fixed, each with the regression test that would have caught it; the results below are the run after.
+  </p>
+  <section class="group">
+    <div class="group-head"><h2>M5 · External sync — the second copy, under a second key</h2><span class="count">6 / 6</span></div>
+    <p class="group-note">External sync&rsquo;s claim is not that the bytes arrived. It is that the second copy is <b>re-encrypted</b>: <code>restic copy</code> decrypts from the source and re-encrypts to the destination&rsquo;s own key, which is why the feature was chosen over server-side object replication that would have carried the source key into the secondary. A claim about keys can only be tested by trying the wrong one.</p>
+    <ul class="specs">
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">A narrowed sync copies only the selected namespace, and the copies are re-encrypted to the destination's own key</span>
+        <span class="spec-time">2m35.9s</span>
+        <p class="spec-proves">The copy runs through two independently-credentialed rclone remotes and lands only the selected namespace&rsquo;s snapshots. Every copy records the <b>source</b> snapshot it came from (restic&rsquo;s <code>original</code>) and carries a <b>different ID</b> — a content-addressed re-encryption under the destination key, never a byte clone.</p>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">The destination does NOT open with the source's key, nor the source with the destination's</span>
+        <span class="spec-time">20.7s</span>
+        <p class="spec-proves">Case 18&rsquo;s core. The oracle opens each repository with the <b>other</b> repository&rsquo;s DEK and restic refuses both times — then opens each with its own and succeeds, so the refusals are about the KEYS and not about two unreachable buckets. Client siloing holds: a secondary is opaque to the primary&rsquo;s key.</p>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">Mirror propagates a source forget to the destination, and removes nothing else</span>
+        <span class="spec-time">1m10.8s</span>
+        <p class="spec-proves">A snapshot is forgotten at the source by explicit ID; the next Mirror run removes exactly its copy at the destination and leaves the surviving one — matched by <code>original</code>, not by tag or timestamp, which two runs of one schedule would not distinguish. <code>restic check</code> passes afterwards.</p>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">A sync onto its own location is refused at admission (rule 9)</span>
+        <span class="spec-time">0s</span>
+        <p class="spec-proves">A static ValidatingAdmissionPolicy rather than a controller check, so the guard holds even while the operator is down.</p>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">A sync between two DIFFERENTLY-NAMED locations that address one repository is refused by the controller</span>
+        <span class="spec-time">22.6s</span>
+        <p class="spec-proves">The case admission cannot see: an alias — a second location on the same bucket, prefix and cluster ID — passes a name comparison and is one repository. Writing this spec is what found that the controller&rsquo;s own backstop compared repository <b>names</b>, which derive from location names and so only reproduced rule 9. It now compares the resolved repository URL.</p>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">The operator was deployed with a real sync image, not the chart's placeholder digest</span>
+        <span class="spec-time">0s</span>
+        <p class="spec-proves">A deployment check that fails fast. A sync image is pulled by nothing until an ExternalSync exists, so a forgotten digest is silent right up to an ImagePullBackOff inside a Job nobody is watching.</p>
+      </li>
+    </ul>
+  </section>
+
+  <section class="group">
+    <div class="group-head"><h2>M5 · Namespace plane — the user&rsquo;s repository, the user&rsquo;s key</h2><span class="count">4 / 4</span></div>
+    <p class="group-note">The milestone&rsquo;s headline guarantee is <b>negative</b>: platform access ends when the user&rsquo;s key does. <code>platformAccess</code> was specified, never implemented, and dropped — so the guarantee is bought by the mechanism not existing. That cannot be verified by reading the operator&rsquo;s code; it is verified by asking the repository how many keys it holds.</p>
+    <ul class="specs">
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">Backs a tenant volume up to the tenant's own repository, readable with the tenant's own password</span>
+        <span class="spec-time">1m18.1s</span>
+        <p class="spec-proves">A real Ceph PVC reaches the user&rsquo;s own prefix through the same execution path as cluster DR, with the S3 credentials read from <b>their</b> namespace. The oracle opens the repository with the password the test holds and finds the snapshot the Backup reported, tagged with this namespace and no other.</p>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">Holds exactly one key slot, and the platform holds no wrapped key for it (adr/0004 amendment)</span>
+        <span class="spec-time">3.7s</span>
+        <p class="spec-proves"><code>restic key list</code> reports <b>one</b> slot. A second would be a password living in <code>crystal-backup-system</code> that survives the user rotating their key — and because removing a restic key slot does not rotate the master key, one they could never take back. The operator namespace also holds no wrapped DEK for the location.</p>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">Loses platform access the moment the user deletes their password Secret — while the data stays readable to them</span>
+        <span class="spec-time">20.4s</span>
+        <p class="spec-proves">Deleting the Secret takes the platform&rsquo;s access away, generates <b>no</b> replacement password (a dangling reference must be an error, never a new key), and leaves the backups intact and still openable with the key the user kept. Without that last half, &ldquo;the platform lost access&rdquo; would be indistinguishable from having destroyed the repository.</p>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">Left no residual snapshot objects behind</span>
+        <span class="spec-time">50.9s</span>
+        <p class="spec-proves">The namespace plane runs the same exposure machinery as cluster DR — a tenant VolumeSnapshot, a static VS/VSC pair and a clone PVC in the operator namespace — so it inherits the same leak surface and gets the same check. The tenant namespace is then torn down through the strict helper that fails if it never disappears.</p>
+      </li>
+    </ul>
+  </section>
+
+  <section class="group">
+    <div class="group-head"><h2>M5 · Right to erasure — physical, verified by re-scanning</h2><span class="count">4 / 4</span></div>
+    <p class="group-note">&ldquo;The deletion happened&rdquo; is the only thing a GDPR request asks, and a controller reporting Completed only says it ran the commands. So the suite erases for real and re-scans the repository with upstream restic — the evidence a data-protection officer would want.</p>
+    <ul class="specs">
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">Parks an unconfirmed erasure and names what it would remove (R23)</span>
+        <span class="spec-time">1m41.9s</span>
+        <p class="spec-proves">An absent confirmation parks the object rather than rejecting it, so the destructive act is deliberately two steps: create the intent, read what it says it will remove, then type the identity back. Nothing is erased while it waits.</p>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">Refuses a confirmation that does not name the target, at admission</span>
+        <span class="spec-time">0s</span>
+        <p class="spec-proves">A wrong confirmation is denied by the API server, so the guard holds with the operator down.</p>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">Physically removes exactly the confirmed namespace, leaving its neighbour and the repository sound</span>
+        <span class="spec-time">38.8s</span>
+        <p class="spec-proves">The count written before the forget matches what goes; a re-scan finds <b>none</b> of the erased namespace&rsquo;s snapshots and <b>all</b> of its neighbour&rsquo;s — tag scoping is the only thing standing between one tenant&rsquo;s erasure request and another tenant&rsquo;s backups. <code>restic check</code> passes after the prune repacked the repository.</p>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">Is Blocked, not Completed, on an Immutable location</span>
+        <span class="spec-time">400ms</span>
+        <p class="spec-proves">Object Lock forbids the deletion, and reporting success while the objects are still there is the worst possible answer to an erasure request. The erasure parks in Blocked with a zero count.</p>
+      </li>
+    </ul>
+  </section>
+
+  <p class="foot">
+    <b>Label-scoped gate —</b> this run exercises the fourteen M5 criteria under the <code>m5</code> filter; the skipped platform / M0&ndash;M4 lines are covered by their own reports and by the full-suite non-regression run in the same session (60/60). M5 also passed <code>make e2e</code> on kind (<b>32/32</b>, real mover and sync Jobs, including the cross-credential copy the crucible cannot make &mdash; Hetzner Object Storage credentials are project-wide, so the two S3 identities that prove it live in the kind harness) plus the full unit + envtest suite and the custom linter. &middot; Report generated from <code>test/crucible/artifacts/crucible-report.md</code>.
+  </p>
+
+</div>
+</body>
+</html>

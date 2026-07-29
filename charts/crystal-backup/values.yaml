@@ -69,6 +69,25 @@ mover:
     # .Chart.AppVersion when left blank.
     tag: ""
 
+# The sync image carries the same crystal-mover shim and the same pinned restic, PLUS rclone
+# (build/apko/sync.yaml, build/melange/sync.yaml). It is a third image rather than an addition to
+# the mover so that rclone's vulnerability surface stays off the backup and restore path; the
+# reason it is needed at all is that restic can hold two repository KEYS but only one set of
+# object-storage CREDENTIALS, and rclone remotes are the documented way around that
+# (spec/adr/0013). Used only by external-sync Jobs — an operator with no ExternalSync configured
+# never pulls it.
+sync:
+  image:
+    # -- Sync image repository on GHCR.
+    repository: ghcr.io/crystalbackup/sync
+    # -- Sync image digest — the immutable pin (sync Jobs reference the image BY DIGEST, never a
+    # floating tag). PLACEHOLDER for scaffolding; the release pipeline substitutes the real index
+    # digest at publish time.
+    digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    # -- Fallback tag, used ONLY when `sync.image.digest` is empty (e.g. local dev). Defaults to
+    # .Chart.AppVersion when left blank.
+    tag: ""
+
 # -- Pull secrets for private registries. GHCR images are public — none needed.
 imagePullSecrets: []
 

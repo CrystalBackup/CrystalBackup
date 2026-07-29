@@ -107,9 +107,16 @@ const (
 	groupByHostPaths = "host,paths"
 	forgetCmd        = "forget"
 	snapshotsCmd     = "snapshots"
+	// copyCmd is restic's cross-repository copy subcommand, the engine of external sync.
+	copyCmd = "copy"
 	// flagNoLock skips taking a repository lock. Only ever valid on a pure READ (see SnapshotsArgs);
 	// putting it on anything that mutates would defeat the locking the whole queue exists to respect.
 	flagNoLock = "--no-lock"
+	// flagUnsafeAllowRemoveAll is restic's explicit opt-in to a `forget` whose policy keeps NOTHING.
+	// Without it restic refuses the command outright — "Fatal: no policy was specified, no snapshots
+	// will be removed" — which is exactly the shape erasure needs and retention never does. See
+	// ErasureForgetArgs; the name is restic's, and its bluntness is the point.
+	flagUnsafeAllowRemoveAll = "--unsafe-allow-remove-all"
 )
 
 // Tag renders one restic tag as "key=value". Centralising the "="-joined format means the
@@ -348,6 +355,81 @@ func ForgetArgs(r v1alpha1.RetentionSpec) []string {
 	return args
 }
 
+// ErasureTagFilter renders the restic --tag selector for one right-to-erasure scope (R21), and
+// reports ok=false for a target that selects nothing recognisable.
+//
+// The shape carries the whole security property, so it is worth stating exactly. restic's --tag
+// takes a COMMA-SEPARATED list meaning AND, and repeating --tag means OR. Erasure needs AND —
+// "namespace=x AND pvc=y" — so a narrowed target must be ONE --tag with a comma, never two flags:
+// two would erase every snapshot of the namespace plus every snapshot of any PVC by that name in
+// any OTHER namespace. That is the difference between deleting one volume's history and deleting
+// several tenants'.
+//
+// TagBase is always the first element: an erasure must never be able to touch a snapshot some
+// other tool wrote into the same repository.
+//
+// An EMPTY target returns ok=false rather than an unfiltered selector. `forget --tag crystalbackup`
+// with no further narrowing would forget every snapshot CrystalBackup has ever written, which is
+// the single most destructive thing this codebase could emit; a caller that forgot to validate must
+// get nothing back, not everything.
+func ErasureFilterTags(t v1alpha1.ErasureTarget) (tags []string, ok bool) {
+	switch {
+	case t.Namespace != "" && t.PVC != "":
+		return []string{Tag(TagKeyNamespace, t.Namespace), Tag(TagKeyPVC, t.PVC)}, true
+	case t.Namespace != "":
+		return []string{Tag(TagKeyNamespace, t.Namespace)}, true
+	case t.Tenant != "":
+		return []string{Tag(TagKeyTenant, t.Tenant)}, true
+	default:
+		// Includes the pvc-without-namespace case: a bare PVC name is not an identity — the same
+		// name exists in many namespaces — so it selects nothing rather than everything.
+		return nil, false
+	}
+}
+
+// ErasureTagFilter renders those tags as the single comma-joined --tag value, TagBase first. It
+// is what ErasureForgetArgs embeds; the COUNTING path goes through SnapshotsFilterArgs instead,
+// which builds the same shape from the same tags, so the scope a count reports and the scope a
+// forget removes cannot drift.
+func ErasureTagFilter(t v1alpha1.ErasureTarget) (filter string, ok bool) {
+	tags, ok := ErasureFilterTags(t)
+	if !ok {
+		return "", false
+	}
+	return strings.Join(append([]string{TagBase}, tags...), ","), true
+}
+
+// ErasureForgetArgs is the complete restic argv that FORGETS one erasure scope: every snapshot
+// matching the filter, with no keep policy at all.
+//
+// There is deliberately no --keep-* and no --group-by here, and that is the entire difference
+// between this and ForgetArgs. Retention thins a chain and keeps its recent entries; erasure
+// removes the chain. Sharing a code path with retention would mean one stray keep flag turning a
+// GDPR erasure into a no-op that reports success — so they are separate functions with separate
+// names, and this one cannot be called without a filter (ErasureTagFilter's ok=false stops it).
+//
+// --unsafe-allow-remove-all is not optional and not a stylistic choice: a `forget` that keeps
+// NOTHING is precisely what restic refuses to do by accident. Verified against the pinned engine —
+// without the flag the command does not thin anything and does not partially succeed, it exits 1:
+//
+//	$ restic forget --tag crystalbackup,namespace=c-empty --retry-lock 5m
+//	Fatal: no policy was specified, no snapshots will be removed
+//
+// So erasure removed nothing at all until this flag existed here; the CR reported Failed, which was
+// at least honest, but R21 was inert. With it, the same command removes exactly the tagged
+// snapshots and leaves every other tenant's untouched.
+//
+// --retry-lock for the same reason retention uses it: the queue serialises erasure against other
+// exclusive ops, not against readers, so a cross-namespace mover's shared lock must be waited out
+// rather than treated as a failure.
+func ErasureForgetArgs(t v1alpha1.ErasureTarget) ([]string, error) {
+	filter, ok := ErasureTagFilter(t)
+	if !ok {
+		return nil, fmt.Errorf("restic: erasure target selects nothing (set tenant, namespace, or namespace+pvc)")
+	}
+	return []string{forgetCmd, flagUnsafeAllowRemoveAll, flagTag, filter, flagRetryLock, retryLockFor}, nil
+}
+
 // SnapshotsArgs is the complete restic argv (subcommand first) discovery inventories the
 // repository with: `snapshots --json --tag crystalbackup --no-lock`. The --tag filter scopes the
 // listing to CrystalBackup's own snapshots (never a foreign tool's), and --json makes the output
@@ -380,6 +462,40 @@ func ForgetCommand(r v1alpha1.RetentionSpec) (argv []string, ok bool) {
 		return nil, false
 	}
 	return append([]string{forgetCmd}, flags...), true
+}
+
+// SyncArgs is the complete restic argv for one external-sync run (adr/0013): `copy`, scoped by
+// tag. It carries NO repository flags, and that omission is the design, not an oversight.
+//
+// A copy names two repositories, and restic's spelling for them is asymmetric in a way that is
+// easy to get backwards: the UNQUALIFIED -r/--repo (RESTIC_REPOSITORY) is the DESTINATION, and
+// --from-repo (RESTIC_FROM_REPOSITORY) is the SOURCE. Reading -r as "the repository I am working
+// on" inverts the copy — it would overwrite the primary with the secondary, which for a DR
+// secondary means destroying the thing being protected. Both therefore travel as ENVIRONMENT,
+// built once in the Job (mover.EnvFromRepository and the ordinary JobRequest.RepoURL), so no
+// caller can construct half a direction here. TestSyncArgs pins that argv stays repository-free.
+//
+// The tag filter is always present, even for a whole-repository sync: TagBase alone still
+// excludes a foreign tool's snapshots sharing the bucket. Each namespace becomes its OWN --tag
+// occurrence because restic ORs repeated --tag and ANDs within one comma-joined value — so
+// "crystalbackup,namespace=a" plus "crystalbackup,namespace=b" means (base AND a) OR (base AND b),
+// while the one-value spelling would mean a snapshot in BOTH namespaces at once, i.e. nothing.
+//
+// There is no --retry-lock: restic reports an already-locked repository as exit 11, and a sync is
+// periodic and idempotent (verified against restic: re-copying an already-copied snapshot is a
+// no-op, because the destination records the source's ID in the snapshot's `original` field). One
+// skipped window that retries on the next tick is a better failure than a Job blocking for hours
+// on a prune it cannot see the end of.
+func SyncArgs(namespaces []string) []string {
+	if len(namespaces) == 0 {
+		return []string{copyCmd, flagTag, TagBase}
+	}
+	args := make([]string, 0, 1+2*len(namespaces))
+	args = append(args, copyCmd)
+	for _, ns := range namespaces {
+		args = append(args, flagTag, strings.Join([]string{TagBase, Tag(TagKeyNamespace, ns)}, ","))
+	}
+	return args
 }
 
 // UnlockArgs is the complete restic argv that clears a hard-killed mover's repository lock:

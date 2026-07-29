@@ -114,6 +114,19 @@ rules:
   - apiGroups: [""]
     resources: ["pods/log"]
     verbs: ["get"]
+  # ServiceAccounts: impersonate — how a NAMESPACE-plane hook runs as a tenant identity rather
+  # than as the operator (M5, adr/0018). The operator asks the API server to authorise the exec
+  # against system:serviceaccount:<backed-up-namespace>:<name>, so a ServiceAccount the tenant
+  # never granted pods/exec cannot run the command, and the check happens at every exec rather
+  # than once at admission.
+  #
+  # The rule is unrestricted because the ServiceAccount NAME is a user-chosen field; pinning it
+  # with resourceNames would force a naming convention on every tenant. What bounds it is the
+  # code: the impersonated NAMESPACE is always derived from the target pod and is not a field
+  # anywhere in the API. Narrow it in your own overlay if you standardise on one name.
+  - apiGroups: [""]
+    resources: ["serviceaccounts"]
+    verbs: ["impersonate"]
   # Secrets: get ONLY — no list/watch. The operator reads Secrets by name via a
   # cache-bypassing client, so no cluster-wide Secret cache ever exists (spec/03 §5).
   # Secret CREATION is confined to the crystal-backup-system Role below.

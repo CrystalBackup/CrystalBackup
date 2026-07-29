@@ -167,17 +167,12 @@ func (l *JobSnapshotLister) list(ctx context.Context, repo *cbv1.BackupRepositor
 		return nil, fmt.Errorf("BackupRepository %s has no status.repositoryURL yet", repo.Name)
 	}
 
-	cbl, err := l.resolveOwningLocation(ctx, repo)
-	if err != nil {
-		return nil, fmt.Errorf("resolve owning location for repository %s: %w", repo.Name, err)
-	}
-
-	dek, err := l.resolvePlatformDEK(ctx, cbl)
+	binding, password, err := l.resolveAccess(ctx, repo)
 	if err != nil {
 		return nil, err
 	}
 
-	if err := l.ensureCredsSecret(ctx, repo, jobName, dek, cbl.Spec.S3.CredentialsSecretRef.Name); err != nil {
+	if err := l.ensureCredsSecret(ctx, repo, jobName, password, binding); err != nil {
 		return nil, err
 	}
 	if err := l.ensureSnapshotsJob(ctx, repo, jobName, repoURL, resticArgs); err != nil {
@@ -206,17 +201,35 @@ func (l *JobSnapshotLister) list(ctx context.Context, repo *cbv1.BackupRepositor
 
 // resolveOwningLocation mirrors the BackupRepository controller: a repository's controller owner is
 // its ClusterBackupLocation, fetched here for the KEK reference and the S3 credentials Secret name.
-func (l *JobSnapshotLister) resolveOwningLocation(ctx context.Context, repo *cbv1.BackupRepository) (*cbv1.ClusterBackupLocation, error) {
-	owner := metav1.GetControllerOf(repo)
-	if owner == nil || owner.Kind != kindClusterBackupLocation {
-		return nil, apierrors.NewNotFound(
-			cbv1.GroupVersion.WithResource("clusterbackuplocations").GroupResource(), "<none>")
+func (l *JobSnapshotLister) resolveAccess(ctx context.Context, repo *cbv1.BackupRepository) (*locationBinding, string, error) {
+	binding, err := resolveLocationBinding(ctx, l.Client, repo, l.OperatorNamespace)
+	if err != nil {
+		return nil, "", fmt.Errorf("resolve owning location for repository %s: %w", repo.Name, err)
 	}
+
+	// The NAMESPACE plane opens with the tenant's own key, read from their namespace. There is no
+	// platform DEK to fall back on and no operator key slot to fall back to (adr/0004 amendment) —
+	// so a lister that only knew the cluster plane could not inventory a user repository at all.
+	if binding.Namespaced() {
+		password, err := keys.NewUserKeyManager(l.Client).
+			EnsureUserPassword(ctx, binding.Namespace, binding.Name, binding.PasswordSecretRef)
+		if err != nil {
+			return nil, "", fmt.Errorf("resolve the repository password for %s: %w", binding.Describe(), err)
+		}
+		return binding, password, nil
+	}
+
+	// The CLUSTER plane opens with the platform DEK, which needs the location's KEK reference —
+	// the one thing a binding does not carry, so the location itself is re-read here.
 	var cbl cbv1.ClusterBackupLocation
-	if err := l.Get(ctx, client.ObjectKey{Name: owner.Name}, &cbl); err != nil {
-		return nil, err
+	if err := l.Get(ctx, client.ObjectKey{Name: binding.Name}, &cbl); err != nil {
+		return nil, "", fmt.Errorf("get ClusterBackupLocation %s: %w", binding.Name, err)
 	}
-	return &cbl, nil
+	dek, err := l.resolvePlatformDEK(ctx, &cbl)
+	if err != nil {
+		return nil, "", err
+	}
+	return binding, dek, nil
 }
 
 // resolvePlatformDEK reads the cluster KEK and returns the plaintext platform DEK (the restic
@@ -244,20 +257,26 @@ func (l *JobSnapshotLister) resolvePlatformDEK(ctx context.Context, cbl *cbv1.Cl
 // ensureCredsSecret creates the job-scoped creds Secret the snapshots mover consumes: the DEK as the
 // restic password (mounted file) and the two S3 keys as env (secretKeyRef). Owned by the repository
 // so a repository delete GCs it; tolerates AlreadyExists so a re-List re-adopts.
-func (l *JobSnapshotLister) ensureCredsSecret(ctx context.Context, repo *cbv1.BackupRepository, name, dek, credsSecretName string) error {
-	accessKey, err := l.Secrets.GetValue(ctx, l.OperatorNamespace, credsSecretName, mover.SecretKeyAWSAccessKeyID)
+func (l *JobSnapshotLister) ensureCredsSecret(ctx context.Context, repo *cbv1.BackupRepository, name, password string,
+	binding *locationBinding,
+) error {
+	// binding.CredsNamespace, never l.OperatorNamespace: on the namespace plane the S3 credentials
+	// live in the TENANT's namespace, and reading the operator's would not fail — it would find an
+	// admin Secret of the same name and inventory the tenant's repository with platform credentials.
+	credsNamespace, credsSecretName := binding.CredsNamespace, binding.S3.CredentialsSecretRef.Name
+	accessKey, err := l.Secrets.GetValue(ctx, credsNamespace, credsSecretName, mover.SecretKeyAWSAccessKeyID)
 	if err != nil {
-		return fmt.Errorf("read S3 access key from secret %s/%s: %w", l.OperatorNamespace, credsSecretName, err)
+		return fmt.Errorf("read S3 access key from secret %s/%s: %w", credsNamespace, credsSecretName, err)
 	}
-	secretKey, err := l.Secrets.GetValue(ctx, l.OperatorNamespace, credsSecretName, mover.SecretKeyAWSSecretAccessKey)
+	secretKey, err := l.Secrets.GetValue(ctx, credsNamespace, credsSecretName, mover.SecretKeyAWSSecretAccessKey)
 	if err != nil {
-		return fmt.Errorf("read S3 secret key from secret %s/%s: %w", l.OperatorNamespace, credsSecretName, err)
+		return fmt.Errorf("read S3 secret key from secret %s/%s: %w", credsNamespace, credsSecretName, err)
 	}
 	creds := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: l.OperatorNamespace, Labels: discoveryJobLabels()},
 		Type:       corev1.SecretTypeOpaque,
 		Data: map[string][]byte{
-			mover.SecretKeyResticPassword:     []byte(dek),
+			mover.SecretKeyResticPassword:     []byte(password),
 			mover.SecretKeyAWSAccessKeyID:     accessKey,
 			mover.SecretKeyAWSSecretAccessKey: secretKey,
 		},

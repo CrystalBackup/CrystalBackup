@@ -102,17 +102,20 @@ type ClusterEncryptionSpec struct {
 }
 
 // NamespaceEncryptionSpec configures the user key for a BackupLocation.
+//
+// One field, and that is the design. A namespace-plane repository has exactly ONE key slot —
+// the user's — and there is deliberately no way to ask for a second (adr/0004, 2026-07-28
+// amendment). An operator slot would be a password held in crystal-backup-system that keeps
+// working after the user rotates their key or deletes their Secret, and because removing a
+// restic key slot does not rotate the master key, one they could never take back. The guarantee
+// that platform access ends when the user's key does is bought by the mechanism not existing,
+// rather than by a webhook that a flag or a future maintainer could switch off.
 type NamespaceEncryptionSpec struct {
 	// repositoryPasswordSecretRef references the user-owned restic password Secret
 	// (same namespace). If omitted the operator generates one and stores it in the
 	// user's namespace (their key, their reversibility).
 	// +optional
 	RepositoryPasswordSecretRef *LocalObjectReference `json:"repositoryPasswordSecretRef,omitempty"`
-
-	// platformAccess, when true, also gives the operator a key slot for mediated
-	// restore/verify; false (default) keeps the off-platform backups private.
-	// +optional
-	PlatformAccess bool `json:"platformAccess,omitempty"`
 }
 
 // DiscoverySpec configures repository→Backup projection.
@@ -387,6 +390,27 @@ type HooksSpec struct {
 	// post hooks run after snapshotting.
 	// +optional
 	Post []Hook `json:"post,omitempty"`
+
+	// serviceAccountName is a ServiceAccount IN THE BACKED-UP NAMESPACE that the operator
+	// IMPERSONATES to run these hooks. It is how the confinement invariant of
+	// 03-security-and-tenancy.md §5 — "users can only make the platform run commands they can
+	// already run themselves" — stops being prose and becomes something the API server enforces.
+	//
+	// The namespace is NOT a field and never will be: it is always the namespace being backed up,
+	// derived from the pod the hook targets. A settable namespace would be a cross-tenant hole by
+	// construction, so the only degree of freedom is WHICH ServiceAccount inside the tenant's own
+	// namespace — one they (or an admin) created and granted `create pods/exec` on.
+	//
+	// Empty means "run as the operator itself", which is the pre-M5 behaviour and stays available
+	// on the CLUSTER plane, where hooks are admin-authored. On the NAMESPACE plane it is required:
+	// a tenant-authored hook with no identity to run as is rejected rather than silently escalated
+	// to the operator's own privileges.
+	//
+	// It governs annotation-sourced hooks too (honorAnnotations). A pod annotation supplies the
+	// command, never the identity — so even there, the command runs with exactly the rights the
+	// namespace granted this ServiceAccount.
+	// +optional
+	ServiceAccountName string `json:"serviceAccountName,omitempty"`
 }
 
 // ClusterResourceCaptureSpec configures cluster-scoped resource capture on a run (adr/0011).

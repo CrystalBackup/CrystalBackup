@@ -1,4 +1,4 @@
-# Building the operator & mover images
+# Building the operator, mover & sync images
 
 The authoritative, multi-arch, signed build is CI: [`.github/workflows/images.yml`](../.github/workflows/images.yml)
 (apko/Wolfi/SLSA, [adr/0012](../spec/adr/0012-container-images-apko-wolfi-slsa.md)). **This page is the
@@ -12,17 +12,30 @@ melange only **wraps that pre-built binary into a signed apk**; apko assembles t
 Wolfi/glibc base into an OCI image. So every build is three steps: `go build` → `melange build`
 (wrap) → `apko publish` (assemble + push).
 
-Two images:
+Three images:
 
 | Image | melange wraps | extra |
 |-------|---------------|-------|
 | **operator** (`build/{melange,apko}/operator.yaml`) | the `manager` binary (`./cmd`) | — |
 | **mover** (`build/{melange,apko}/mover.yaml`) | the `crystal-mover` binary (`./cmd/crystal-mover`) | **also needs `restic` built from source** (`build/melange/restic.yaml`), which apko pins as `restic=0.19.1-r0` |
+| **sync** (`build/{melange,apko}/sync.yaml`) | the **same** `crystal-mover` binary | the same pinned `restic`, **plus `rclone`** built from source too (`build/melange/rclone.yaml`), which apko pins as `rclone=1.74.4-r2` |
 
-> **The mover is the slow one** (it compiles restic from source under emulation). It changes rarely
-> — the operator computes the restic arguments, the mover just runs `restic`. **Build the mover once,
-> reuse its digest across operator iterations.** Only rebuild it when `cmd/crystal-mover` or
-> `internal/mover` changes.
+> **The mover and sync are the slow ones** (they compile restic from source under emulation). They
+> change rarely — the operator computes the restic arguments, the mover just runs `restic`. **Build
+> them once, reuse their digests across operator iterations.** Only rebuild when
+> `cmd/crystal-mover` or `internal/mover` changes.
+
+**Why sync is a separate image and not a bigger mover.** External sync is the one operation that
+opens two repositories with two different sets of object-storage credentials, and restic cannot do
+that through its own s3 backend — one process, one credential set — so both repositories are
+addressed as `rclone:<remote>:…` ([adr/0013](../spec/adr/0013-external-backup-sync.md)). That makes
+rclone a hard requirement of sync and of nothing else. Folding it into the mover would put its
+vulnerability surface in front of every backup and restore; this project's release gate has already
+blocked once on a transitive dependency of restic. The two images share a binary and a recipe
+shape, so the third leg costs one apko file and one melange file.
+
+Since sync and mover carry the same binary, a change to `cmd/crystal-mover` or `internal/mover`
+invalidates **both** digests. A change to *only* rclone or the sync assembly invalidates just sync.
 
 ## Prerequisites (macOS, Apple Silicon / arm64)
 
@@ -127,16 +140,50 @@ MOVER_DIGEST="$(docker buildx imagetools inspect "$REG/mover:dev" --format '{{.M
 echo "mover@$MOVER_DIGEST"
 ```
 
+## Build the sync image (only when the mover binary or rclone changed)
+
+Steps 1–3 of the mover build produce everything this one needs — the same `crystal-mover` binary and
+the same restic apk — so if you have just built the mover, **skip straight to the lock+publish
+below**, after the rclone step. rclone IS a melange build here — Wolfi's package carried
+advisories with no published fix, so the recipe tracks the newest upstream release and overrides
+what upstream has not fixed yet ([adr/0013](../spec/adr/0013-external-backup-sync.md)).
+
+```bash
+# Steps 1–3 are the mover's, unchanged. Then build rclone from source — same shape as restic, and
+# for the same reason: we ship this binary, so we pin and patch its source (adr/0013).
+melange build build/melange/rclone.yaml \
+  --arch x86_64 --runner docker \
+  --signing-key melange.rsa --out-dir ./packages
+
+apko lock build/apko/sync.yaml \
+  --arch x86_64 -r ./packages -k "$PWD/melange.rsa.pub" --output apko.lock.json
+apko publish build/apko/sync.yaml "$REG/sync:dev" \
+  --arch x86_64 --lockfile apko.lock.json \
+  -r ./packages -k "$PWD/melange.rsa.pub" \
+  --sbom-path ./sbom --image-refs image-refs.txt
+
+SYNC_DIGEST="$(docker buildx imagetools inspect "$REG/sync:dev" --format '{{.Manifest.Digest}}')"
+echo "sync@$SYNC_DIGEST"
+```
+
 ## Deploy onto the crucible
 
-`test/crucible/deploy/deploy.sh` reads both digests from the environment and passes them to the chart
-(`--set image.digest`, `--set mover.image.digest`; the chart's `_helpers.tpl` prefers digest over tag):
+`test/crucible/deploy/deploy.sh` reads all three digests from the environment and passes them to the
+chart (`--set image.digest`, `--set mover.image.digest`, `--set sync.image.digest`; the chart's
+`_helpers.tpl` prefers digest over tag):
 
 ```bash
 OPERATOR_IMAGE_DIGEST="$OPERATOR_DIGEST" \
 MOVER_IMAGE_DIGEST="$MOVER_DIGEST" \
+SYNC_IMAGE_DIGEST="$SYNC_DIGEST" \
   test/crucible/deploy/deploy.sh
 ```
+
+Leaving `SYNC_IMAGE_DIGEST` empty is only safe when nothing on the cluster syncs: the chart falls
+back to a **placeholder digest**, and because a sync image is pulled by nothing until an
+`ExternalSync` exists, the mistake is silent right up to the moment a copy Job sits in
+`ImagePullBackOff`. The crucible's `m5` suite fails fast on the placeholder rather than waiting it
+out.
 
 **Shortened loop for an operator-only change** (mover unchanged): rebuild the operator (steps above),
 then just re-point the running deployment and re-test — no full redeploy:

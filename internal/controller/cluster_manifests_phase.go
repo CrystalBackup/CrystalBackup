@@ -177,7 +177,7 @@ func (r *ClusterBackupReconciler) startClusterManifestsJob(
 
 	if err := ensureMoverCredsSecret(ctx, repoMaintenanceDeps{
 		Client: r.Client, Secrets: r.Secrets, OperatorNamespace: r.OperatorNamespace,
-	}, jobName, cc.dek, cc.s3CredsSecret, labels); err != nil {
+	}, jobName, cc.dek, cc.s3CredsSecret, "", labels); err != nil {
 		return err
 	}
 

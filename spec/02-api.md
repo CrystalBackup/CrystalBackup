@@ -378,7 +378,6 @@ spec:
     credentialsSecretRef: { name: offsite-s3 }         # Secret in c-team-x
   encryption:
     repositoryPasswordSecretRef: { name: offsite-key } # user-owned restic password (Secret in c-team-x)
-    platformAccess: false            # true → operator also holds a key slot (mediated restore/verify)
   discovery: { enabled: true }       # project Backups from this repo into this namespace
   retention: { keepLast: 5, keepDaily: 10, keepWeekly: 4, keepMonthly: 6 }  # R24; on the location, not the schedule (Standard only)
 status:
@@ -387,8 +386,12 @@ status:
 ```
 
 If `repositoryPasswordSecretRef` is omitted the operator generates a password and stores it
-as a Secret **in the user's namespace** (their key, their reversibility). `platformAccess:
-false` (default) keeps off-platform backups private to the user.
+as a Secret **in the user's namespace** (their key, their reversibility). There is **no field
+that grants the operator a key slot** on a user repository, and there will not be: such a slot
+would keep working after the user rotates their key or deletes their Secret, and restic's slot
+removal does not rotate the master key, so they could never take it back
+([adr/0004](adr/0004-encryption-key-management.md) amendment). Platform access to a user's
+backups ends when the user's key does.
 
 ### BackupSchedule (namespaced, user) — ≈ CronJob
 
@@ -406,6 +409,8 @@ spec:
   pvcSelector: { matchLabels: {}, include: [], exclude: [] }   # default all
   includeManifests: true
   hooks:                             # R16
+    serviceAccountName: crystal-backup-hooks  # REQUIRED here: the identity the operator
+                                     # impersonates to exec, in THIS namespace (adr/0018)
     honorAnnotations: true           # OPT-IN (default false); see "Hook resolution" below
     pre:
       - podSelector: { matchLabels: { app: postgres } }
@@ -440,8 +445,27 @@ precedence, deliberately matched so an operator's mental model carries over):
 | none | either | the spec's matching `pre` hooks whose `podSelector` matches |
 
 `honorAnnotations` is **opt-in**, not on by default, and that is deliberate: turning it on delegates
-*what the operator execs* to anyone who can annotate a pod in the backed-up namespace. Given the
-operator holds cluster-wide `pods/exec`, that is a decision an admin makes explicitly.
+*what the operator execs* to anyone who can annotate a pod in the backed-up namespace.
+
+#### Hook execution identity (adr/0018)
+
+The operator does not exec as itself for a namespace-plane hook. `hooks.serviceAccountName` names a
+ServiceAccount **in the backed-up namespace**, and the operator *impersonates* it — so the API
+server authorises the exec against that identity's rights. The confinement invariant of
+[03-security-and-tenancy.md §5](03-security-and-tenancy.md) ("users can only make the platform run
+commands they can already run themselves") is therefore enforced by the API server, at every exec,
+rather than asserted.
+
+- The **name** is the tenant's choice; the **namespace** is not a field and never will be (it is
+  the target pod's, so no reference can reach another tenant).
+- **Required on the namespace plane.** A run declaring hooks without it is gated
+  (`HooksNeedServiceAccount`) — falling back to the operator's identity is the escalation.
+- **Optional on the cluster plane**, where hooks are admin-authored; empty keeps the M4 behaviour
+  of running as the operator.
+- It governs annotation-sourced hooks too: an annotation supplies the *command*, never the
+  *identity*.
+
+Setup and troubleshooting: [docs/HOOKS.md](../docs/HOOKS.md).
 
 `command` is an **argv**: a JSON array (`'["psql","-c","CHECKPOINT"]'`) or a single bare command.
 The operator never wraps it in `sh -c`, so shell metacharacters are inert. A malformed
@@ -594,7 +618,7 @@ status:
   repositoryURL: "s3:…/prod/prod-eu-1"
   initialized: true
   mode: Standard
-  keySlots: [platform]                       # cluster: [platform]; tenant repo: [tenant] (+platform if platformAccess)
+  keySlots: [platform]                       # cluster: [platform]; tenant repo: ALWAYS [tenant], no operator slot exists
   snapshotCount: 4123
   namespacesPresent: 42                      # distinct namespace tags found in the repo
   lastDiscoveryTime: "2026-07-12T02:55:00Z"

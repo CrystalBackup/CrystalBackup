@@ -57,8 +57,9 @@ command -v jq >/dev/null          || { echo "jq not on PATH" >&2; exit 2; }
 
 case "$COMPONENT" in
   operator) MAIN_PKG="./cmd" ;;
-  mover)    MAIN_PKG="./cmd/crystal-mover" ;;
-  *) echo "--component must be 'operator' or 'mover', got: $COMPONENT" >&2; exit 2 ;;
+  # sync ships the SAME binary as mover, plus rclone — which gets its own analysis in step 2b.
+  mover|sync) MAIN_PKG="./cmd/crystal-mover" ;;
+  *) echo "--component must be 'operator', 'mover' or 'sync', got: $COMPONENT" >&2; exit 2 ;;
 esac
 
 WORK="$(mktemp -d)"
@@ -70,13 +71,24 @@ echo "govulncheck: ${COMPONENT} (${MAIN_PKG})" >&2
 
 DOCS=("${WORK}/component.json")
 
-# --- 2. restic, for the mover image only --------------------------------------------------
-# The mover image ships a restic built by melange from a pinned source tarball
+# --- 2. restic, for the images that ship it (mover, sync) ---------------------------------
+# Those images ship a restic built by melange from a pinned source tarball
 # (build/melange/restic.yaml). Analyse exactly that tarball, at exactly that version and
 # checksum, so the VEX statements describe the restic that actually ships rather than
 # whatever restic HEAD happens to be. The version and digest are read from the melange
 # recipe so there is ONE source of truth for the pin; a drift fails the build loudly.
-if [ "$COMPONENT" = "mover" ]; then
+#
+# rclone — which only the sync image carries — used to be excluded here, on the grounds that it
+# came from Wolfi as a maintained apk with its own CVE feed, so trivy's image scan already covered
+# it against a better source of truth than ours. THAT PREMISE NO LONGER HOLDS: since adr/0013's
+# arbitration we build rclone ourselves from a pinned tarball with a module override
+# (build/melange/rclone.yaml), exactly as we do restic. Nobody upstream tracks the binary that
+# ships, so it gets the same analysis, below, for the same reason.
+#
+# What has NOT changed is the no-suppression rule: neither block exists to explain a finding away.
+# They analyse the OVERRIDDEN source so the VEX describes the binary that actually ships instead of
+# the vanilla tarball — a reachable advisory still fails the gate.
+if [ "$COMPONENT" = "mover" ] || [ "$COMPONENT" = "sync" ]; then
   RECIPE="${REPO_ROOT}/build/melange/restic.yaml"
   RESTIC_VERSION="$(sed -n 's/^  version: *"\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' "$RECIPE" | head -n1)"
   RESTIC_SHA256="$(sed -n 's/^ *expected-sha256: *\([0-9a-f]*\).*$/\1/p' "$RECIPE" | head -n1)"
@@ -116,6 +128,45 @@ if [ "$COMPONENT" = "mover" ]; then
       && GOFLAGS=-mod=mod go mod tidy \
       && govulncheck -format openvex ./cmd/restic ) > "${WORK}/restic.json"
   DOCS+=("${WORK}/restic.json")
+fi
+
+# --- 2b. rclone, for the ONE image that ships it (sync) -----------------------------------
+# Same shape as the restic block and for the same reason: we build this binary, so we analyse the
+# source we build. The override matters as much here — rclone ${RCLONE_VERSION} pulls an
+# x/text whose norm.Iter carries CVE-2026-56852 (fixed in 0.39.0). Keep the x/text version in
+# LOCKSTEP with build/melange/rclone.yaml; a drift here would produce a VEX describing a binary
+# nobody runs. x/image needs no override at 1.74.4 — rclone's own pin is already past the two TIFF
+# advisories that started this detour.
+if [ "$COMPONENT" = "sync" ]; then
+  RECIPE="${REPO_ROOT}/build/melange/rclone.yaml"
+  RCLONE_VERSION="$(sed -n 's/^  version: *"\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' "$RECIPE" | head -n1)"
+  RCLONE_SHA256="$(sed -n 's/^ *expected-sha256: *\([0-9a-f]*\).*$/\1/p' "$RECIPE" | head -n1)"
+  [ -n "$RCLONE_VERSION" ] && [ -n "$RCLONE_SHA256" ] || {
+    echo "could not read rclone version/sha256 from ${RECIPE}" >&2; exit 1; }
+
+  echo "govulncheck: rclone ${RCLONE_VERSION} (pinned source from ${RECIPE})" >&2
+  TARBALL="${WORK}/rclone.tar.gz"
+  curl -sSLf -o "$TARBALL" \
+    "https://github.com/rclone/rclone/releases/download/v${RCLONE_VERSION}/rclone-v${RCLONE_VERSION}.tar.gz"
+
+  if command -v sha256sum >/dev/null; then
+    ACTUAL_SHA="$(sha256sum "$TARBALL" | awk '{print $1}')"
+  else
+    ACTUAL_SHA="$(shasum -a 256 "$TARBALL" | awk '{print $1}')"
+  fi
+  [ "$ACTUAL_SHA" = "$RCLONE_SHA256" ] || {
+    echo "rclone tarball checksum mismatch" >&2
+    echo "  expected (melange pin): ${RCLONE_SHA256}" >&2
+    echo "  actual:                 ${ACTUAL_SHA}" >&2
+    exit 1; }
+
+  mkdir -p "${WORK}/rclone-src"
+  tar xzf "$TARBALL" -C "${WORK}/rclone-src" --strip-components=1
+  ( cd "${WORK}/rclone-src" \
+      && GOFLAGS=-mod=mod go get golang.org/x/text@v0.40.0 \
+      && GOFLAGS=-mod=mod go mod tidy \
+      && govulncheck -format openvex . ) > "${WORK}/rclone.json"
+  DOCS+=("${WORK}/rclone.json")
 fi
 
 # --- 3. Merge, re-key, and normalise ------------------------------------------------------

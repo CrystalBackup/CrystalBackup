@@ -15,8 +15,19 @@ metadata:
   labels:
     app.kubernetes.io/part-of: crystal-backup-e2e
 ---
-# SeaweedFS S3 identities/credentials (-s3.config). A single admin identity is enough for a
-# test backend; the per-tenant isolation cases (08-testing case 6, M5) add scoped identities.
+# SeaweedFS S3 identities/credentials (-s3.config).
+#
+# TWO identities, and the second one is not cosmetic. External sync (R28,
+# spec/adr/0013-external-backup-sync.md) exists because restic holds two repository KEYS but only
+# one set of backend CREDENTIALS — which is why both repositories are addressed through rclone
+# remotes, each carrying its own. If both ends of a sync authenticated with the same access key,
+# the e2e suite would exercise the rclone plumbing while proving nothing about the limitation it
+# was built to escape: a bug that collapsed the two remotes onto one credential set would pass.
+#
+# `offsite-2` is therefore a DISTINCT access key, scoped to the destination bucket alone. It is
+# also the strongest assertion available anywhere in this project's gates — the crucible cannot
+# make it (Hetzner Object Storage credentials are project-wide, so a second bucket there shares
+# one account), so kind is where cross-credential sync is actually proven.
 apiVersion: v1
 kind: Secret
 metadata:
@@ -32,6 +43,17 @@ stringData:
             { "accessKey": "crystalbackup", "secretKey": "crystalbackup-secret" }
           ],
           "actions": ["Admin", "Read", "Write", "List", "Tagging"]
+        },
+        {
+          "name": "crystal-e2e-offsite",
+          "credentials": [
+            { "accessKey": "offsite-2", "secretKey": "offsite-2-secret" }
+          ],
+          "actions": [
+            "Read:tenant-a-offsite-2",
+            "Write:tenant-a-offsite-2",
+            "List:tenant-a-offsite-2"
+          ]
         }
       ]
     }
@@ -47,6 +69,22 @@ metadata:
 stringData:
   AWS_ACCESS_KEY_ID: crystalbackup
   AWS_SECRET_ACCESS_KEY: crystalbackup-secret
+---
+# The SECOND credential set, for the external-sync destination. A BackupLocation pointing here
+# authenticates as a different S3 principal from the source location — which is what makes the
+# sync a genuine cross-account copy rather than two prefixes under one key.
+#
+# Scoped to tenant-a-offsite-2 by the identity above: if the sync ever addressed the SOURCE bucket
+# with this key it would fail with AccessDenied rather than silently succeeding, so the scoping is
+# an assertion in itself.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: seaweedfs-s3-credentials-offsite
+  namespace: crystalbackup-e2e
+stringData:
+  AWS_ACCESS_KEY_ID: offsite-2
+  AWS_SECRET_ACCESS_KEY: offsite-2-secret
 ---
 apiVersion: apps/v1
 kind: Deployment

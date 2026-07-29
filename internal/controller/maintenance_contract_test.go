@@ -22,8 +22,11 @@ import (
 	"testing"
 	"time"
 
+	batchv1 "k8s.io/api/batch/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	clocktesting "k8s.io/utils/clock/testing"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	cbv1 "github.com/CrystalBackup/CrystalBackup/api/v1alpha1"
 	"github.com/CrystalBackup/CrystalBackup/internal/mover"
@@ -225,4 +228,70 @@ func TestReapDueRateLimitsAndGivesUp(t *testing.T) {
 			"more often than open on a repository whose drain keeps timing out",
 			unlockRetryCooldown, moverQuiescenceDeadline)
 	}
+}
+
+// TestWaitForMaintenanceJobToleratesCacheLag: the Job is created through the API server and then
+// read back through the CACHED client, so there is a window in which it legitimately does not
+// exist yet from the reader's point of view.
+//
+// Treating that NotFound as terminal turned informer lag into a failed maintenance op. It was
+// observed twice on real infrastructure, in unrelated subsystems that share this function — an M4
+// `check` whose identical twin had passed on the previous run of the same code, and an
+// external-sync copy:
+//
+//	get maintenance job crystal-backup-system/<name>: Job.batch "<name>" not found
+//
+// A Job that is genuinely gone must still fail the op, so the tolerance is bounded rather than
+// unconditional. This pins both halves.
+func TestWaitForMaintenanceJobToleratesCacheLag(t *testing.T) {
+	const ns, name = "crystal-backup-system", "repo-check"
+
+	// (1) Absent at first, then visible and complete: the op must succeed.
+	appearing := &appearingJobClient{ns: ns, name: name, missesLeft: 3}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := waitForMaintenanceJob(ctx, appearing, ns, name); err != nil {
+		t.Fatalf("a Job that was merely not visible yet failed the op: %v", err)
+	}
+	if appearing.gets < 4 {
+		t.Fatalf("expected the wait to retry through the misses, got %d Gets", appearing.gets)
+	}
+
+	// (2) Absent for good: the op must still fail rather than hang until the op deadline. The
+	//     grace window is a minute, so a short context is what proves the failure is bounded by
+	//     SOMETHING — here, the context — and not by an unconditional retry loop.
+	gone := &appearingJobClient{ns: ns, name: name, missesLeft: 1 << 30}
+	shortCtx, cancelShort := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancelShort()
+	if err := waitForMaintenanceJob(shortCtx, gone, ns, name); err == nil {
+		t.Fatal("a Job that never appears must fail the op, not wait forever")
+	}
+}
+
+// appearingJobClient is a client.Client whose Get on a Job returns NotFound for the first
+// `missesLeft` calls and a completed Job afterwards — the cache-lag window, made deterministic.
+// Only Get is exercised by waitForMaintenanceJob; everything else panics so a future caller that
+// needs more cannot silently get a half-working fake.
+type appearingJobClient struct {
+	client.Client
+	ns, name   string
+	missesLeft int
+	gets       int
+}
+
+func (c *appearingJobClient) Get(_ context.Context, key client.ObjectKey, obj client.Object, _ ...client.GetOption) error {
+	c.gets++
+	if key.Namespace != c.ns || key.Name != c.name {
+		return apierrors.NewNotFound(batchv1.Resource("jobs"), key.Name)
+	}
+	if c.missesLeft > 0 {
+		c.missesLeft--
+		return apierrors.NewNotFound(batchv1.Resource("jobs"), key.Name)
+	}
+	job, ok := obj.(*batchv1.Job)
+	if !ok {
+		return errors.New("appearingJobClient: unexpected object type")
+	}
+	job.Status.Succeeded = 1
+	return nil
 }

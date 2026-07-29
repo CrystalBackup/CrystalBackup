@@ -1,0 +1,57 @@
+# apko image config — Crystal Backup sync (crystal-mover shim + restic + rclone).
+#
+# The THIRD image, and it exists to keep a dependency off the data path (adr/0013 amendment).
+# External sync is the one operation that opens two repositories with two different sets of
+# object-storage credentials, which restic cannot do through its own s3 backend — one process,
+# one credential set. Addressing both repositories as `rclone:<remote>:…` is restic's documented
+# way around that, because each rclone remote carries its own credentials.
+#
+# That makes rclone a hard requirement of sync and of nothing else. Putting it in the shared mover
+# image would place its vulnerability surface in front of every backup and every restore; this
+# project's release gate has already blocked once on a transitive dependency of restic
+# (GO-2026-6061), and that was for a binary the data path actually needs. A third image is cheap —
+# same binary, same recipe, one extra package — and the isolation is the point.
+#
+# spec/adr/0012: Wolfi (glibc, NOT musl) base, declarative apk assembly, minimal (no shell /
+# package manager at runtime). Multi-arch index (linux/amd64 + linux/arm64), signed + SBOM'd +
+# digest-pinned in CI, exactly like the other two.
+contents:
+  keyring:
+    - https://packages.wolfi.dev/os/wolfi-signing.rsa.pub
+  repositories:
+    - https://packages.wolfi.dev/os
+  packages:
+    - wolfi-baselayout         # /etc skeleton, os-release, nsswitch
+    - glibc                    # adr/0012: glibc base (NOT musl) — DNS/NSS fidelity for the data path
+    - ca-certificates-bundle   # TLS to S3 / object storage
+    - tzdata                   # IANA zones (consistent time handling)
+    - restic=0.19.1-r0         # pinned engine from build/melange/restic.yaml (local apk); exact pin selects our build
+    - rclone=1.74.4-r2         # pinned backend from build/melange/rclone.yaml (local apk); exact pin selects OUR build, not Wolfi's
+    - crystal-backup-sync      # local apk (build/melange/sync.yaml); CI stages it into ./packages
+
+# No `accounts` block: the image default user is root (uid 0), as in the mover image. The sync
+# Pod's deploy-time securityContext governs privilege, and sync is a MAINTENANCE shape — it mounts
+# no PVC, so it needs no capability at all: drop ALL, runAsUser 0, allowPrivilegeEscalation false,
+# seccompProfile RuntimeDefault, readOnlyRootFilesystem true (restic cache and /tmp are emptyDirs).
+#
+# rclone is invoked by restic as `rclone serve restic` on a pipe, as a CHILD of restic, which is
+# itself a child of the shim running as PID 1. Nothing is left behind if restic dies: an orphaned
+# rclone re-parents to the shim, and the container's teardown reaps whatever outlives it. rclone
+# reads NO config file — the sync Job pins RCLONE_CONFIG=/dev/null and defines both remotes purely
+# from RCLONE_CONFIG_<REMOTE>_* environment — so no file shipped in this image can define a remote.
+
+entrypoint:
+  command: /usr/bin/crystal-mover
+
+work-dir: /
+
+archs:
+  - x86_64
+  - aarch64
+
+annotations:
+  org.opencontainers.image.title: crystal-backup-sync
+  org.opencontainers.image.description: Crystal Backup external sync (crystal-mover + restic + rclone)
+  org.opencontainers.image.vendor: Crystal Backup
+  org.opencontainers.image.source: https://github.com/CrystalBackup/CrystalBackup
+  org.opencontainers.image.licenses: Apache-2.0

@@ -59,6 +59,12 @@ const (
 	// awaiting completion.
 	maintenanceJobPollInterval = 2 * time.Second
 
+	// maintenanceJobVisibilityGrace is how long a just-created maintenance Job may be absent from
+	// the cached client's view before that absence is believed. Informer lag is milliseconds, so
+	// this is generous by two orders of magnitude — and it is measured against op deadlines of ten
+	// minutes to four hours, which is why erring long costs nothing. See waitForMaintenanceJob.
+	maintenanceJobVisibilityGrace = time.Minute
+
 	// maintenanceJobDeadline bounds one SHORT maintenance op (forget/unlock): the repository's
 	// exclusive lane is held for at most this long, so a black-holed op can never wedge the queue.
 	maintenanceJobDeadline = 10 * time.Minute
@@ -143,14 +149,15 @@ func (r *BackupReconciler) maybeEnqueueRetentionForget(ctx context.Context, back
 		return // no keep policy set: never run a forget that would delete everything.
 	}
 	enqueueRepoMaintenance(ctx, r.Queue, r.maintenanceDeps(), repoMaintenanceRequest{
-		RepoName:      rc.repoName,
-		Kind:          queue.OpForget,
-		Name:          maintenanceResourceName(backup.Name, "forget"),
-		Op:            mover.OpForget,
-		ResticArgs:    argv,
-		RepoURL:       rc.repoURL,
-		DEK:           rc.dek,
-		S3CredsSecret: rc.s3CredsSecret,
+		RepoName:       rc.repoName,
+		Kind:           queue.OpForget,
+		Name:           maintenanceResourceName(backup.Name, "forget"),
+		Op:             mover.OpForget,
+		ResticArgs:     argv,
+		RepoURL:        rc.repoURL,
+		DEK:            rc.dek,
+		S3CredsSecret:  rc.s3CredsSecret,
+		CredsNamespace: rc.credsNamespace,
 	})
 	r.Recorder.Eventf(backup, nil, corev1.EventTypeNormal, "RetentionEnqueued", "EnqueueRetention",
 		"retention forget enqueued on repository %s", rc.repoName)
@@ -174,14 +181,15 @@ func (r *BackupReconciler) maintenanceDeps() repoMaintenanceDeps {
 // backup crashing, say — is harmless.
 func (r *BackupReconciler) enqueueStaleLockUnlock(ctx context.Context, backup *cbv1.Backup, rc *backupRunContext) {
 	enqueueRepoMaintenance(ctx, r.Queue, r.maintenanceDeps(), repoMaintenanceRequest{
-		RepoName:      rc.repoName,
-		Kind:          queue.OpUnlock,
-		Name:          maintenanceResourceName(backup.Name, "unlock"),
-		Op:            mover.OpUnlock,
-		ResticArgs:    restic.UnlockArgs(),
-		RepoURL:       rc.repoURL,
-		DEK:           rc.dek,
-		S3CredsSecret: rc.s3CredsSecret,
+		RepoName:       rc.repoName,
+		Kind:           queue.OpUnlock,
+		Name:           maintenanceResourceName(backup.Name, "unlock"),
+		Op:             mover.OpUnlock,
+		ResticArgs:     restic.UnlockArgs(),
+		RepoURL:        rc.repoURL,
+		DEK:            rc.dek,
+		S3CredsSecret:  rc.s3CredsSecret,
+		CredsNamespace: rc.credsNamespace,
 		OnDone: func(err error) {
 			if err == nil {
 				metrics.RecordLockReaped(rc.repoName, rc.clusterID)
@@ -280,6 +288,10 @@ type repoMaintenanceRequest struct {
 	RepoURL       string
 	DEK           string
 	S3CredsSecret string
+	// CredsNamespace is where S3CredsSecret is READ from: the operator namespace for a
+	// cluster-plane repository, the tenant's namespace for a namespace-plane one. Empty means
+	// the operator namespace, which keeps every cluster-plane caller unchanged.
+	CredsNamespace string
 	// OnDone, when set, is called with the op's result from the QUEUE WORKER goroutine, just after
 	// the op body returns. It exists for the fire-and-forget paths, which drop the Handle and would
 	// otherwise have no way to know an op succeeded — the stale-lock counter must count locks
@@ -300,7 +312,7 @@ type repoMaintenanceRequest struct {
 // M3.1 spent a milestone removing from discovery.
 func submitRepoMaintenance(q *queue.Manager, deps repoMaintenanceDeps, req repoMaintenanceRequest) (*queue.Handle, error) {
 	return q.Enqueue(req.RepoName, req.Kind, func(opCtx context.Context) error {
-		err := runRepoMaintenance(opCtx, deps, req.Name, req.Op, req.ResticArgs, req.RepoURL, req.DEK, req.S3CredsSecret)
+		err := runRepoMaintenance(opCtx, deps, req.Name, req.Op, req.ResticArgs, req.RepoURL, req.DEK, req.S3CredsSecret, req.CredsNamespace)
 		if req.OnDone != nil {
 			req.OnDone(err)
 		}
@@ -327,7 +339,7 @@ func enqueueRepoMaintenance(ctx context.Context, q *queue.Manager, deps repoMain
 // best-effort deletes the Job + Secret before returning — the orphan reaper never touches these
 // (they carry no per-PVC label), so cleanup is this function's own responsibility. It writes no CR
 // status; its error resolves the (dropped) queue Handle and is logged by the worker.
-func runRepoMaintenance(opCtx context.Context, deps repoMaintenanceDeps, name string, op mover.Operation, resticArgs []string, repoURL, dek, s3CredsSecret string) error {
+func runRepoMaintenance(opCtx context.Context, deps repoMaintenanceDeps, name string, op mover.Operation, resticArgs []string, repoURL, dek, s3CredsSecret, credsNamespace string) error {
 	ctx, cancel := context.WithTimeout(opCtx, maintenanceOpDeadline(op))
 	defer cancel()
 	// LIFO defer order: this runs BEFORE cancel(), so ctx is still live for the delete when the op
@@ -352,7 +364,7 @@ func runRepoMaintenance(opCtx context.Context, deps repoMaintenanceDeps, name st
 	}
 
 	labels := maintenanceJobLabels()
-	if err := ensureMoverCredsSecret(ctx, deps, name, dek, s3CredsSecret, labels); err != nil {
+	if err := ensureMoverCredsSecret(ctx, deps, name, dek, s3CredsSecret, credsNamespace, labels); err != nil {
 		return err
 	}
 	job := mover.BuildJob(mover.JobRequest{
@@ -426,11 +438,42 @@ func waitForMaintenanceJob(ctx context.Context, c client.Client, operatorNamespa
 	ticker := time.NewTicker(maintenanceJobPollInterval)
 	defer ticker.Stop()
 
+	// The Job was created by this same goroutine a moment ago — through the CACHED client, whose
+	// informer may not have observed it yet. In that window a Get returns NotFound, and treating
+	// that as terminal turns a few hundred milliseconds of cache lag into a failed maintenance op
+	// with a message that reads like the Job vanished:
+	//
+	//	get maintenance job crystal-backup-system/<name>-check: Job.batch "<name>-check" not found
+	//
+	// Seen on a crucible lane (an M4 check whose identical twin had passed on the previous run of
+	// the same code) and, independently, on an external-sync copy — same message, same function,
+	// two unrelated callers. So NotFound is tolerated for a bounded window and only becomes a
+	// failure if the Job stays absent: a Job that really was deleted still fails, just later.
+	var missingSince time.Time
 	for {
 		var job batchv1.Job
-		if err := c.Get(ctx, key, &job); err != nil {
+		err := c.Get(ctx, key, &job)
+		switch {
+		case apierrors.IsNotFound(err):
+			if missingSince.IsZero() {
+				missingSince = time.Now()
+			}
+			if elapsed := time.Since(missingSince); elapsed > maintenanceJobVisibilityGrace {
+				return fmt.Errorf("get maintenance job %s/%s: absent for %s: %w",
+					operatorNamespace, jobName, elapsed.Round(time.Second), err)
+			}
+			// Not visible yet — fall through to the tick and look again.
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf("maintenance job %s/%s did not complete: %w", operatorNamespace, jobName, ctx.Err())
+			case <-ticker.C:
+			}
+			continue
+		case err != nil:
 			return fmt.Errorf("get maintenance job %s/%s: %w", operatorNamespace, jobName, err)
 		}
+		missingSince = time.Time{}
+
 		if job.Status.Succeeded >= 1 || jobConditionTrue(&job, batchv1.JobComplete) {
 			return nil
 		}

@@ -78,6 +78,19 @@ type BackupLocationStatus struct {
 	// repositoryRef names the BackupRepository backing this location.
 	// +optional
 	RepositoryRef string `json:"repositoryRef,omitempty"`
+
+	// clusterID is the EFFECTIVE cluster identifier for this location: spec.clusterID when the
+	// user set one, otherwise the value defaulted from the default ClusterBackupLocation.
+	//
+	// It is recorded here, and never re-resolved once set, because it composes the repository
+	// path (restic host + URL). spec.clusterID is immutable precisely so an edit cannot silently
+	// re-point a location at a different repository — but leaving it UNSET would reopen that same
+	// hole through the back door: the default ClusterBackupLocation can be changed by an admin at
+	// any time, and a location that re-derived its cluster ID on every reconcile would follow it,
+	// abandoning every snapshot written under the old path. Sticky-once makes the defaulted case
+	// as immutable as the explicit one.
+	// +optional
+	ClusterID string `json:"clusterID,omitempty"`
 }
 
 // +kubebuilder:object:root=true

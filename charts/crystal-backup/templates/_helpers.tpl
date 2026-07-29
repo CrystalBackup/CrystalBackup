@@ -110,3 +110,20 @@ crystal-backup.image so the operator and mover images share one resolution rule.
 {{- printf "%s:%s" $repo (.Values.mover.image.tag | default .Chart.AppVersion) -}}
 {{- end -}}
 {{- end -}}
+
+{{/*
+The fully-qualified SYNC image reference, passed via --sync-image and used ONLY by external-sync
+Jobs. Same resolution rule as the mover image; a separate image because sync additionally needs
+rclone, and rclone has no business on the backup/restore path (adr/0013 amendment).
+
+An operator with no external sync configured never pulls it, so leaving it at the placeholder
+digest costs nothing until the first ClusterBackupExternalSync/BackupExternalSync exists.
+*/}}
+{{- define "crystal-backup.syncImage" -}}
+{{- $repo := .Values.sync.image.repository -}}
+{{- if .Values.sync.image.digest -}}
+{{- printf "%s@%s" $repo .Values.sync.image.digest -}}
+{{- else -}}
+{{- printf "%s:%s" $repo (.Values.sync.image.tag | default .Chart.AppVersion) -}}
+{{- end -}}
+{{- end -}}

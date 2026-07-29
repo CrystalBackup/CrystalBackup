@@ -240,7 +240,7 @@ func (r *ClusterRestoreReconciler) startClusterRestoreJob(
 
 	if err := ensureMoverCredsSecret(ctx, repoMaintenanceDeps{
 		Client: r.Client, Secrets: r.Engine.Secrets, OperatorNamespace: r.OperatorNamespace,
-	}, jobName, rc.dek, rc.s3CredsSecret, labels); err != nil {
+	}, jobName, rc.dek, rc.s3CredsSecret, "", labels); err != nil {
 		return err
 	}
 
@@ -307,7 +307,7 @@ func clusterRestoreJobEnv(plan *clusterRestoreResourcesPlan) ([]corev1.EnvVar, e
 		{Name: mover.EnvManifestsSelection, Value: selection},
 	}
 	if plan.dryRun {
-		env = append(env, corev1.EnvVar{Name: mover.EnvManifestsDryRun, Value: "true"})
+		env = append(env, corev1.EnvVar{Name: mover.EnvManifestsDryRun, Value: mover.EnvTrue})
 	}
 	return env, nil
 }

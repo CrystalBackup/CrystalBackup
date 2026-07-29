@@ -46,6 +46,11 @@ var managerImage = getenvDefault("E2E_IMG", "example.com/crystalbackup-operator:
 // agree on the same image.
 var moverImage = getenvDefault("E2E_MOVER_IMG", "example.com/crystalbackup-mover:v0.0.0-e2e")
 
+// syncImage is the external-sync image (crystal-mover + restic + rclone) the M5 suite points
+// --sync-image at. Separate from moverImage on purpose — see Dockerfile.sync and adr/0013: if the
+// two ever became one tag, an e2e asserting a sync Job runs the sync image would pass by accident.
+var syncImage = getenvDefault("E2E_SYNC_IMG", "example.com/crystalbackup-sync:v0.0.0-e2e")
+
 // shouldCleanupCertManager tracks whether CertManager was installed by this suite.
 var shouldCleanupCertManager = false
 
@@ -99,10 +104,23 @@ var _ = BeforeSuite(func() {
 		By("loading the mover image on Kind")
 		err = utils.LoadImageToKindClusterWithName(moverImage)
 		ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to load the mover image into Kind")
+
+		// The M5 external-sync suite needs the sync image (mover + restic + RCLONE). Built here
+		// rather than reusing the mover tag because the whole point of the production split is
+		// that rclone is absent from the data-path image — a suite that ran sync Jobs on the
+		// mover image would prove the opposite of what it claims.
+		By("building the sync image")
+		cmd = exec.Command("docker", "build", "-f", "Dockerfile.sync", "-t", syncImage, ".")
+		_, err = utils.RunWithTimeout(cmd, 20*time.Minute)
+		ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to build the sync image")
+
+		By("loading the sync image on Kind")
+		err = utils.LoadImageToKindClusterWithName(syncImage)
+		ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to load the sync image into Kind")
 	} else {
 		_, _ = fmt.Fprintf(GinkgoWriter,
-			"Skipping in-suite image build/load (E2E_BUILD_IMAGE=false); using operator=%s mover=%s\n",
-			managerImage, moverImage)
+			"Skipping in-suite image build/load (E2E_BUILD_IMAGE=false); using operator=%s mover=%s sync=%s\n",
+			managerImage, moverImage, syncImage)
 	}
 
 	configureKubectlKubeRC()

@@ -64,11 +64,193 @@ key**, never a byte-clone. Two CRDs express it — one per plane.**
 **transiently handles both keys** in `crystal-backup-system`. This is the **same trust model
 already in force**: the namespace-plane backup mover already uses the user's key *by name* to
 write their backups ([03-security-and-tenancy.md §4](../03-security-and-tenancy.md)). The
-`platformAccess: false` guarantee is about **no durable / standing** operator key slot; a
+no-operator-key-slot guarantee (adr/0004 amendment) is about **no durable / standing** slot; a
 **transient** use on an operation the principal **requested** (their own sync) does not change it.
 What siloing preserves here is **where the data ends up** — the client's copy under the
 **client's** key, holding **only their** snapshots — not a claim that the operator never touches
 plaintext (it already does, to back them up).
+
+## Amendment (2026-07-28, M5 implementation) — rclone as the backend, and a dedicated sync image
+
+Implementing this ADR surfaced a limitation that invalidates one of its stated properties. Recorded
+here rather than silently worked around, because the property was load-bearing in the original
+decision.
+
+### The limitation
+
+`restic copy` handles **two keys** but only **one backend configuration**. Verified against the
+pinned restic 0.19.1:
+
+- The two REPOSITORY PASSWORDS are fully independent — `--password-file` / `RESTIC_PASSWORD_FILE`
+  for the destination, `--from-password-file` / `RESTIC_FROM_PASSWORD_FILE` (or
+  `--from-password-command` / `RESTIC_FROM_PASSWORD`) for the source. The whole `--from-*` family
+  is `--from-repo`, `--from-repository-file`, `--from-password-file`, `--from-password-command`,
+  `--from-key-hint`. Re-encryption to the destination's own key therefore works exactly as this
+  ADR describes.
+- The S3 CREDENTIALS are not. There is no `--from-option`, and `AWS_ACCESS_KEY_ID` /
+  `AWS_SECRET_ACCESS_KEY` are consumed by the backend library beneath restic, not by restic, so one
+  process has one set. restic's own documentation states it: *"In case the source and destination
+  repository use the same backend, the configuration options and environment variables used to
+  configure the backend may apply to both repositories – for example it might not be possible to
+  specify different accounts for the source and destination repository."*
+
+So the Decision's claim that sync *"works to **any** S3, including cross-provider, because it is
+client-side"* was **false as written**. Direct `s3:` addressing only works when both repositories
+open with the SAME credentials — the same account, a different bucket — which is the narrow case,
+not the secondary-location case R28 exists for.
+
+### The amendment
+
+**Both repositories are addressed through the `rclone:` backend**, which restic's documentation
+names as the one way around this: *"You can avoid this limitation by using the rclone backend along
+with remotes which are configured in rclone."* Each remote carries its own credentials, so the
+source and destination may be different accounts, different providers, or both.
+
+- Remotes are defined **entirely from environment**, no config file: `RCLONE_CONFIG_<REMOTE>_<KEY>`.
+  The per-remote form is the load-bearing detail — the sibling `RCLONE_S3_*` form is global to the
+  s3 backend and would reinstate exactly the limitation being escaped. `RCLONE_CONFIG_SRC_*` and
+  `RCLONE_CONFIG_DST_*` are independent.
+- Credentials still arrive in the per-Job projected Secret and are consumed as env, so the handling
+  is the one already reviewed under "Not key-blind — and why that is fine". Nothing new is durable.
+- **Direction is counter-intuitive and is pinned by a test**: `--repo`/`-r` is the DESTINATION,
+  `--from-repo` is the SOURCE. Reading `-r` as "the repository I am working on" gets it backwards,
+  and backwards means copying the secondary over the primary.
+
+**A dedicated `sync` image.** rclone is a large Go binary, and this project's release gate has
+already blocked once on a transitive dependency of restic (GO-2026-6061). Adding it to the shared
+mover image would put that surface in front of every backup and restore. apko already builds two
+images; a third is marginal, and it keeps the CVE surface of the sync path off the data path.
+
+Two costs accepted knowingly: the sync image carries rclone's vulnerability surface and must be
+kept current at the same cadence as restic; and restic spawns `rclone serve restic` as a CHILD
+process, so the shim must propagate its death honestly — a mover that is dead while reported alive
+is a failure mode this project has already paid for (M3.2).
+
+### The isolation cost, paid on day one (2026-07-28)
+
+The very first CI run of the sync image failed its trivy 0-CVE gate: rclone `1.74.3-r0` carries
+**CVE-2026-46602** and **CVE-2026-46604**, two HIGH findings in the TIFF decoder of
+`golang.org/x/image/tiff`. Wolfi's advisory names `1.74.3-r5` as the fix; at that moment the index
+offered nothing past `r0` on either architecture, so there was no pin to apply.
+
+Recorded because it settles the "third image or bigger mover" question with evidence rather than
+argument. In the same run:
+
+| image | trivy gate |
+|---|---|
+| operator | pass |
+| **mover** | **pass** |
+| sync | **fail** (2 HIGH, rclone) |
+
+Had rclone been added to the mover image — the simpler option — the red gate would have sat on
+the **data path**, blocking every backup and restore release, for a dependency neither of them
+uses. Instead it sits on an image nothing pulls until an ExternalSync exists.
+
+**Decision: wait for Wolfi.** Re-running CI re-resolves the apko lock, so the gate clears itself
+once `r5` publishes; the release train re-arms both gates anyway. Two alternatives were considered
+and rejected *for now*, not forever:
+
+- **VEX the two CVEs** as `vulnerable_code_not_in_execute_path`. Defensible on the merits — the
+  sync path never decodes an image, rclone is only a pipe to S3 — but it reverses the "no VEX
+  suppression path for rclone" decision recorded above, and reversing it *because a gate is red*
+  is the wrong reason to reverse anything.
+- **Build rclone from source with an `x/image` override**, mirroring what
+  `build/melange/restic.yaml` already does for `x/text` and grpc. The established pattern, and the
+  fallback if Wolfi is slow — at the price of doubling the source-pin maintenance surface and
+  lengthening an already slow build.
+
+Revisit if the wait ever blocks a release; the ordering above is the arbitration to apply.
+
+### The wait did block the release (2026-07-29) — resolution, and one thing it taught
+
+Wolfi still offered nothing past `1.74.3-r0` on either architecture when M5 was otherwise ready:
+code validated, 14/14 on the crucible's `m5` label, 32/32 on the kind e2e. So the arbitration above
+was applied as written — **build rclone from source**, the option it ranked first. VEX stayed
+rejected for the reason already recorded: suppressing a finding *because a gate is red* is the
+wrong reason to reverse the no-suppression decision.
+
+**What the attempt taught, and what the arbitration had not anticipated: building from source does
+not, by itself, clear the gate.** trivy matches Wolfi advisories against the apk's NAME and
+VERSION, not against the module graph actually linked into the binary. The first build — rclone
+`1.74.3` with `x/image` overridden to 0.43.0, genuinely clean bytes — was flagged by the very
+advisory it had fixed, because it still called itself `rclone-1.74.3-r0` and the advisory names
+`1.74.3-r5` as the fix. Verified by building exactly that and scanning it.
+
+That leaves the version string as part of the security claim, which has a right answer and a wrong
+one. The wrong one is picking a number that silences the scanner. The right one is making the
+number true:
+
+- **Track the newest upstream release, not the one Wolfi packages.** rclone `1.74.4` pins
+  `x/image v0.43.0` itself, so both TIFF advisories are cleared **upstream** rather than by our
+  patch — the outcome to prefer whenever it is available.
+- **Override only what upstream has not fixed.** 1.74.4 still pins `x/text v0.38.0`, reachable for
+  CVE-2026-56852; Wolfi names `1.74.4-r2` as the release carrying that fix, and so does ours.
+- **The epoch asserts that equivalence.** `-r2` is a claim that this build carries the r2 fix, and
+  the pipeline establishes it. If the override were ever dropped, the epoch would become exactly
+  the suppression this ADR refused — so the two move together, and the recipe says so in place.
+
+One consequence propagates: `build/vex/generate-vex.sh` excluded rclone on the grounds that it came
+from Wolfi as a maintained apk with its own CVE feed. That premise is now false, so rclone gets the
+same govulncheck analysis as restic, against the same overridden source. Nobody upstream tracks the
+binary we ship; if we do not analyse it, no one does.
+
+Result: the sync image scans **0 HIGH / 0 CRITICAL**. The cost the amendment accepted — rclone's
+surface must be kept current at restic's cadence — is now paid in the same currency as restic's: a
+version, a checksum and an override in one recipe, bumped deliberately and in lockstep with
+`build/apko/sync.yaml`. When Wolfi ships a clean rclone, this recipe can be dropped and the apko
+pin pointed back at the distro package — a deliberate, tested change, not a silent one.
+
+### What did not change
+
+The snapshot-level, re-encrypting model, the two CRDs, `Mirror`/`AppendOnly`, tag selectivity, and
+the queue/lock behaviour are all unaffected. rclone changes only HOW a repository is addressed, not
+what the copy means.
+
+### Verified end to end before implementing (2026-07-28)
+
+Two local repositories with **different passwords**, copied through **two independent rclone
+remotes defined purely from `RCLONE_CONFIG_<REMOTE>_*` environment** — no config file present at
+all. Four findings changed the implementation, so they are recorded rather than left as folklore:
+
+1. **`restic copy` is natively idempotent.** Re-running an identical copy transferred nothing and
+   created no second snapshot. The destination records the SOURCE snapshot's full ID in the
+   snapshot's `original` field, and restic uses it to skip work. The sync controller therefore
+   needs **no diffing of its own** to be incremental, and `Mirror`'s "copy what is missing" half is
+   free. `original` is also the only sound key for the other half — forgetting destination
+   snapshots whose source is gone — because tags and timestamps do not distinguish two runs of the
+   same schedule. Decoded into `restic.Snapshot.Original`.
+2. **`restic copy --json` emits no JSON summary** — it prints the same human-readable progress as
+   without the flag. So sync is NOT a summary-parsed operation: its outcome is the exit code, and
+   what it moved is counted by inventorying the destination. Adding it to the shim's parsed set
+   would have failed every sync on an unparseable stdout.
+3. **`RESTIC_FROM_REPOSITORY` in the environment breaks `restic init`**, which refuses with
+   *"Secondary repository must only be specified when copying the chunker parameters"*. The sync
+   Job is dedicated, so nothing leaks today; the flip side is the mechanism for the chunker-params
+   caveat in Consequences — `restic init --from-repo <src> --copy-chunker-params` is how a
+   destination that will ALSO receive native backups gets initialized so the two blob sets dedup.
+4. **`RCLONE_CONFIG=/dev/null`** silences rclone's per-run "config file not found" NOTICE and, more
+   usefully, makes "the remotes come from environment" exhaustive: no file in the image or mounted
+   later can redefine `src` or `dst`.
+5. **`no_check_bucket` must be on.** rclone probes the bucket before its first upload and CREATES it
+   when absent. The `s3:` spelling of the same repository never does either, so leaving the default
+   would make the two addressings disagree about something visible — and it breaks precisely the
+   configuration a secondary should have: credentials scoped to the destination bucket alone carry
+   no `CreateBucket` right, so the probe fails the copy for a bucket that was there all along.
+   `RCLONE_CONFIG_<REMOTE>_NO_CHECK_BUCKET=true` on **both** remotes.
+
+Tag selectivity and preservation were confirmed at the same time: a filtered copy moved only the
+matching snapshot, and the destination kept `hostname`, `paths` and `tags` unchanged, so discovery
+projects a copied snapshot exactly as it projects a native one.
+
+### An honest note on the child process
+
+The amendment worried that restic spawns `rclone serve restic` as a child and that the shim must
+propagate its death honestly. Looking at it concretely, the structure already handles it: the shim
+is the image entrypoint (PID 1), restic is its child and rclone is restic's. An rclone that
+outlives restic re-parents to the shim, and the container's teardown reaps whatever outlives the
+shim. rclone also only moves bytes in response to restic's requests, so a dead restic cannot leave
+a write in flight. No process-group machinery was added, because none is load-bearing here — this
+is recorded so the absence reads as a decision rather than an oversight.
 
 ## Consequences
 
@@ -77,7 +259,9 @@ plaintext (it already does, to back them up).
   upstream `restic` under its **own** key (reversibility, R8), and a client secondary is opaque
   to the platform's cluster key.
 - **Per-namespace selectivity** and **blob-incremental** cost; works to **any** S3, including
-  cross-provider, because it is client-side.
+  cross-provider — but *because both repositories are addressed through independently-credentialed
+  rclone remotes*, **not** merely because the copy is client-side. See the amendment: being
+  client-side is necessary and was not sufficient.
 - Reuses the exclusive-queue, discovery and tag machinery: copied snapshots keep their
   `host`/`paths`/tags, so discovery projects them at the destination like any other.
 

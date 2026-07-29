@@ -222,18 +222,51 @@ labels: `sync` (CR name), `source`/`destination` (location names), `scope` (`clu
 `namespace` (empty for the cluster sync, the owner namespace for a `BackupExternalSync`),
 `cluster`.
 
-| Metric | Type | Labels | Description |
-|---|---|---|---|
-| `crystalbackup_externalsync_last_success_timestamp_seconds` | gauge | sync, source, destination, scope, namespace, cluster | Unix time of the last `Completed` sync run. Restart-safe from CR status; drives `ExternalSyncStale`. |
-| `crystalbackup_externalsync_duration_seconds` | histogram | sync, source, destination, scope, namespace, cluster | Sync run duration. Same buckets as §2.1. |
-| `crystalbackup_externalsync_snapshots_copied_total` | counter | sync, source, destination, scope, namespace, cluster | Snapshots copied to the destination (`restic copy`). |
-| `crystalbackup_externalsync_bytes_copied_total` | counter | sync, source, destination, scope, namespace, cluster | Bytes streamed to the destination (blob-incremental; S3 egress estimation). |
-| `crystalbackup_externalsync_lag_snapshots` | gauge | sync, source, destination, scope, namespace, cluster | Source snapshots not yet present at the destination (`status.lagSnapshots`). |
-| `crystalbackup_externalsync_failures_total` | counter | sync, source, destination, scope, namespace, cluster | Sync runs ending `Failed` or `PartiallyFailed`. |
+| Metric | Type | Labels | Description | Status |
+|---|---|---|---|---|
+| `crystalbackup_externalsync_last_success_timestamp_seconds` | gauge | sync, source, destination, scope, namespace, cluster | Unix time of the last `Completed` sync run. Restart-safe from CR status; drives `ExternalSyncStale`. | **shipped (M5)** |
+| `crystalbackup_externalsync_snapshots_copied` | gauge | sync, source, destination, scope, namespace, cluster | Snapshots present at the destination as copies of the source, as of the last completed sync (`status.snapshotsCopied`). | **shipped (M5)** |
+| `crystalbackup_externalsync_lag_snapshots` | gauge | sync, source, destination, scope, namespace, cluster | Source snapshots not yet present at the destination (`status.lagSnapshots`). | **shipped (M5)** |
+| `crystalbackup_externalsync_failures` | gauge | sync, source, destination, scope, namespace, cluster | External syncs currently in a failed terminal phase (`Failed` or `PartiallyFailed`). | **shipped (M5)** |
+| `crystalbackup_externalsync_duration_seconds` | histogram | sync, source, destination, scope, namespace, cluster | Sync run duration. Same buckets as §2.1. | M6 |
+| `crystalbackup_externalsync_bytes_copied_total` | counter | sync, source, destination, scope, namespace, cluster | Bytes streamed to the destination (blob-incremental; S3 egress estimation). | M6 |
+
+**Why gauges rather than the `_total` counters this section first specified.** Every shipped
+`crystalbackup_` family is state-derived at scrape time (§1), and this one follows: an operator
+restart resets no value and there is no in-process counter to drift. `snapshots_copied` and
+`failures` are therefore the CURRENT state, not a monotonic total — the M6 catalogue layers the
+counter/histogram variants on top, exactly as it does for the backup and restore families.
+
+**`bytes_copied` is not shipped, and will not be until there is a real number behind it.**
+`restic copy --json` emits no machine-readable summary — verified against the pinned restic, not
+assumed ([adr/0013](adr/0013-external-backup-sync.md) amendment) — so there is nothing to read a
+byte count off. `BackupExternalSync.status.bytesCopied` exists in the API and stays zero rather
+than carrying an estimate: a secondary's whole value rests on its numbers being believable, and a
+fabricated figure is worse than an absent one.
+
+**Lag is the series that matters.** A last-success timestamp answers "did a sync run", which a
+broken sync keeps answering reassuringly right up until it stops running at all. The failure this
+family exists to catch is the quiet one: a sync that keeps completing while falling further behind,
+because the source produces snapshots faster than the copy moves them. Only `lag_snapshots` shows
+that. Note also that a never-completed sync emits `last_success…` as **0, not absent** — unlike the
+repository family (§2.4), and deliberately: `time() - metric` over an absent series produces no
+alert, so a secondary that never worked from day one would be the one case `ExternalSyncStale`
+silently missed.
 
 ## 3. Alert rules
 
-Shipped in the Helm chart as a `PrometheusRule` (optional, `metrics.rules.enabled`).
+> **NOT YET SHIPPED — as of 0.5.0 this whole section is a specification, not a description.**
+> The chart has no `PrometheusRule` template and no `metrics.rules.enabled` value; none of the
+> rules below exist in any released artifact, `CrystalbackupExternalSyncStale` included. The
+> METRICS they alert on do ship (§2), so an operator can paste these expressions into their own
+> rule file today — which is the honest reading of the gap, and also why closing it is a
+> self-contained piece of work rather than a blocker for any of the features here.
+>
+> Tracked for M6 (observability hardening), where it belongs: shipping nine alert rules means
+> owning their thresholds against real fleet behaviour, and every one of them was written before
+> there was a fleet to check them against.
+
+Intended shape: a `PrometheusRule` in the Helm chart (optional, `metrics.rules.enabled`).
 Tenant-facing alerts carry the `namespace` label for per-tenant routing; repository-level
 alerts route to admins for the shared cluster repo (`scope=cluster`) and to the tenant for
 a user repo (`scope=namespace`, non-empty `namespace`).

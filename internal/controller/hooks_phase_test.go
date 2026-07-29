@@ -37,6 +37,10 @@ type hookCall struct {
 	Pod       types.NamespacedName
 	Container string
 	Command   []string
+	// ServiceAccountName is the identity the exec was made AS — empty meaning "as the operator".
+	// Recorded because it is the whole point of the hook-impersonation design: a spec asserting
+	// only that a command ran would pass just as happily if it ran with the operator's own rights.
+	ServiceAccountName string
 }
 
 // stubHookExecutor replaces pods/exec in envtest, which has no kubelet. It is mutex-guarded
@@ -48,10 +52,14 @@ type stubHookExecutor struct {
 	failPod map[string]error
 }
 
-func (s *stubHookExecutor) Exec(_ context.Context, pod types.NamespacedName, container string, command []string) (string, string, error) {
+func (s *stubHookExecutor) Exec(_ context.Context, pod types.NamespacedName, container string, command []string,
+	serviceAccountName string,
+) (string, string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.calls = append(s.calls, hookCall{Pod: pod, Container: container, Command: command})
+	s.calls = append(s.calls, hookCall{
+		Pod: pod, Container: container, Command: command, ServiceAccountName: serviceAccountName,
+	})
 	if err, ok := s.failPod[pod.Name]; ok {
 		return "", "stub failure", err
 	}

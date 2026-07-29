@@ -66,7 +66,8 @@ to rebuild:
 | changed | rebuild |
 | --- | --- |
 | `cmd/`, `internal/controller`, `internal/…`, `api/` | **operator** image |
-| `cmd/crystal-mover`, `internal/mover` | **mover** image too (slow — compiles restic from source; otherwise **reuse its digest**) |
+| `cmd/crystal-mover`, `internal/mover` | **mover** AND **sync** images too — they carry the same binary, so one change invalidates both digests (slow: restic from source; otherwise **reuse their digests**) |
+| only rclone / `build/apko/sync.yaml` | **sync** image only |
 | nothing (config/chart only) | neither — `helm upgrade` is enough |
 
 Non-negotiable prep (details in `build/README.md`): `export
@@ -88,9 +89,13 @@ OPERATOR_DIGEST="$(docker buildx imagetools inspect "$REG/operator:dev" --format
 ## 3 — Deploy onto the crucible (by digest)
 
 ```sh
-# full redeploy (operator + mover):
+# full redeploy (operator + mover + sync):
 OPERATOR_IMAGE_DIGEST="$OPERATOR_DIGEST" MOVER_IMAGE_DIGEST="$MOVER_DIGEST" \
+SYNC_IMAGE_DIGEST="$SYNC_DIGEST" \
   test/crucible/deploy/deploy.sh
+# Omitting SYNC_IMAGE_DIGEST leaves the chart's PLACEHOLDER digest, which nothing pulls
+# until an ExternalSync exists — so the mistake is silent until a copy Job hangs in
+# ImagePullBackOff. The m5 suite's first spec fails fast on it instead.
 
 # operator-only change (mover unchanged) — shortest loop:
 helm upgrade crystal-backup charts/crystal-backup \

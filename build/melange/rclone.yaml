@@ -1,0 +1,123 @@
+# melange recipe — pinned rclone, built from source into a signed apk.
+#
+# Why this exists (spec/adr/0013 amendment + spec/adr/0012): external sync addresses BOTH
+# repositories as `rclone:<remote>:…`, because restic holds two repository keys but only one set
+# of backend credentials. That makes rclone a hard requirement of the sync image — and of nothing
+# else, which is why sync is a third image rather than a bigger mover.
+#
+# It is built from source rather than taken from Wolfi for one reason, recorded in adr/0013's
+# "isolation cost" section: Wolfi's rclone 1.74.3-r0 carries CVE-2026-46602 and CVE-2026-46604,
+# two HIGH findings in the TIFF decoder of golang.org/x/image, and the announced 1.74.3-r5 fix was
+# still unpublished on BOTH architectures days later. The ADR's arbitration ranked the options —
+# wait, VEX, or build from source — and named this one "the established pattern, and the fallback
+# if Wolfi is slow". VEX was rejected on principle: suppressing a finding *because a gate is red*
+# is the wrong reason to reverse the no-suppression decision.
+#
+# The override below is what makes the build worth doing; without it this recipe would reproduce
+# the same vulnerable binary from source.
+#
+# Version pin: bumping rclone = bump `version` + `expected-sha256` here AND the `rclone=` pin in
+# build/apko/sync.yaml, in the same PR — the same lockstep restic.yaml describes. When Wolfi does
+# publish a clean rclone, this recipe can be dropped and the apko pin pointed back at the distro
+# package; that is a deliberate, tested change, not a silent one.
+# THE EPOCH IS LOAD-BEARING, and it is a claim rather than a counter. Read this before changing it.
+#
+# Building from source does NOT on its own clear the image gate: trivy matches Wolfi advisories
+# against the apk's NAME and VERSION, not against the module graph actually linked into the binary.
+# A package calling itself rclone-1.74.3-r0 is flagged by the advisory that names 1.74.3-r5 as the
+# fix, however clean the bytes are. Verified by building exactly that and scanning it.
+#
+# So the version string has to be true in the scanner's own terms. `1.74.4-r2` is chosen because
+# Wolfi names 1.74.4-r2 as the release carrying the x/text fix, and THIS BUILD CARRIES THAT SAME
+# FIX — see the override below. The epoch asserts an equivalence that the pipeline actually
+# establishes. If the override were ever removed, this number would become a lie that silences a
+# scanner, which is precisely the suppression adr/0013 refused; the two must move together.
+package:
+  name: rclone
+  version: "1.74.4"
+  epoch: 2
+  description: "rsync for cloud storage — pinned backend for Crystal Backup external sync"
+  url: https://rclone.org/
+  copyright:
+    - license: MIT
+  dependencies:
+    runtime:
+      # TLS trust store for the object-storage endpoints each remote reaches. glibc is pulled in
+      # automatically by melange's ELF dependency scan.
+      - ca-certificates-bundle
+
+environment:
+  contents:
+    keyring:
+      - https://packages.wolfi.dev/os/wolfi-signing.rsa.pub
+    repositories:
+      - https://packages.wolfi.dev/os
+    packages:
+      # The go toolchain, build-base, busybox and ca-certificates-bundle are added automatically
+      # by the go/build pipeline's `needs.packages`; only the extras go here.
+      - git # module-resolution fallback for any non-proxy dependency
+      - go-1.25 # needed BEFORE go/build too, for the x/image override step below
+  environment:
+    CGO_ENABLED: "0"
+    GOFLAGS: "-trimpath -mod=readonly"
+    # Fail loudly instead of silently network-fetching a toolchain: keeps the build
+    # hermetic/reproducible.
+    GOTOOLCHAIN: local
+
+pipeline:
+  - name: Fetch the rclone source release tarball
+    uses: fetch
+    with:
+      # rclone's OWN release asset (rclone-vX.Y.Z.tar.gz, listed in their PGP-signed SHA256SUMS),
+      # not the GitHub `archive/refs/tags/` URL — that one is generated on demand and is not
+      # guaranteed byte-stable, so a hash pinned against it can start failing with nothing changed.
+      # Same asset and same hash Dockerfile.sync verifies, so the kind e2e and the production image
+      # build the same source.
+      uri: https://github.com/rclone/rclone/releases/download/v${{package.version}}/rclone-v${{package.version}}.tar.gz
+      expected-sha256: 23fb09cd209ac6f4540f75cbcfc913fb1e2a35b90cf1a9d67292e2239b4f3a24
+      strip-components: 1
+
+  - name: Override x/text past its reachable advisory
+    runs: |
+      # GO-2026-5970 / CVE-2026-56852 — infinite loop in x/text/unicode/norm, fixed in 0.39.0.
+      # rclone 1.74.4 still pins 0.38.0, and Wolfi names 1.74.4-r2 as the release that carries the
+      # fix; this build carries it here, which is what makes the epoch above honest.
+      #
+      # x/image needs NO override at this version: the two TIFF advisories that started this whole
+      # detour (GO-2026-5062 / CVE-2026-46602 and GO-2026-5066 / CVE-2026-46604, both fixed in
+      # 0.43.0) are cleared by rclone 1.74.4's own pin of x/image v0.43.0. Upstream got there
+      # first — which is the outcome to prefer, and the reason this recipe tracks the newest
+      # release rather than the one Wolfi happens to package.
+      #
+      # Kept in LOCKSTEP with build/vex/generate-vex.sh, which applies the same override so the
+      # VEX describes this binary rather than the vanilla tarball.
+      #
+      # The go/build step below runs with -mod=readonly; the module edit needs -mod=mod.
+      GOFLAGS=-mod=mod go get golang.org/x/text@v0.40.0
+      # tidy completes go.sum for the NEW graph; without it the -mod=readonly go/build below
+      # fails on a missing go.sum entry.
+      GOFLAGS=-mod=mod go mod tidy
+
+  - name: Build rclone (CLI)
+    uses: go/build
+    with:
+      go-package: go-1.25
+      packages: .
+      output: rclone
+      # rclone reads its version from a LINKER variable, unlike restic which bakes a compile-time
+      # const. Left unset it reports itself as "v1.74.3-DEV" (or worse, a bare dev string), which
+      # would make an SBOM and an incident report disagree about what is running.
+      ldflags: -s -w -X github.com/rclone/rclone/fs.Version=v${{package.version}}
+
+  - uses: strip
+
+# Smoke test — runs in a fresh runtime env with only the built apk + its runtime deps.
+test:
+  pipeline:
+    - name: rclone reports the pinned version and can list its backends
+      runs: |
+        rclone version
+        rclone version | grep -q "v${{package.version}}"
+        # The s3 backend is the only one external sync uses; if it were compiled out the sync
+        # image would be useless in a way `rclone version` alone would not reveal.
+        rclone help backends | grep -q '^  s3 '

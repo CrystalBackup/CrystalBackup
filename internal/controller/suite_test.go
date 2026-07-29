@@ -41,6 +41,7 @@ import (
 
 	cbv1 "github.com/CrystalBackup/CrystalBackup/api/v1alpha1"
 	"github.com/CrystalBackup/CrystalBackup/internal/client/secrets"
+	"github.com/CrystalBackup/CrystalBackup/internal/keys"
 	"github.com/CrystalBackup/CrystalBackup/internal/repo/queue"
 	"github.com/CrystalBackup/CrystalBackup/internal/rexposer"
 )
@@ -110,6 +111,11 @@ var (
 // SIMULATE the Job's outcome by patching its status.
 const suiteMoverImage = "crystal-mover:test"
 
+// suiteSyncImage is the placeholder external-sync image (crystal-mover + restic + rclone). It is
+// DIFFERENT from suiteMoverImage so a spec that asserts a sync Job runs the sync image is actually
+// testing something; identical values would make that assertion pass by accident.
+const suiteSyncImage = "crystal-sync:test"
+
 // The manifest mover identity and grant, as the chart would resolve them. envtest has no
 // kubelet so no Job ever runs, but the RoleBinding IS really created against the API server,
 // which is what exercises the transient-grant path.
@@ -176,6 +182,17 @@ var _ = BeforeSuite(func() {
 		Prober:            stubS3Prober{},
 		OperatorNamespace: suiteOperatorNamespace,
 		Recorder:          mgr.GetEventRecorder("clusterbackuplocation"),
+	}).SetupWithManager(mgr)).To(Succeed())
+
+	// The namespace plane's location controller (M5). Same stub prober; no KEK, no escrow — a
+	// tenant repository is protected by the tenant's own key, which UserKeyManager resolves or
+	// generates in their namespace.
+	Expect((&BackupLocationReconciler{
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		Prober:   stubS3Prober{},
+		UserKeys: keys.NewUserKeyManager(mgr.GetClient()),
+		Recorder: mgr.GetEventRecorder("backuplocation"),
 	}).SetupWithManager(mgr)).To(Succeed())
 
 	// The per-repository exclusive queue, bound to the suite ctx (cancel() also stops it) and
@@ -265,6 +282,15 @@ var _ = BeforeSuite(func() {
 		mgr.GetEventRecorder("clusterbackupschedule"),
 	).SetupWithManager(mgr)).To(Succeed())
 
+	// The namespace plane's cron (M5), on the SAME fake clock so a spec advancing time drives
+	// both planes' activations from one place.
+	Expect(NewBackupScheduleReconciler(
+		mgr.GetClient(),
+		mgr.GetScheme(),
+		scheduleClock,
+		mgr.GetEventRecorder("backupschedule"),
+	).SetupWithManager(mgr)).To(Succeed())
+
 	// The discovery reconciler, reading the repository inventory from a stub lister the specs feed
 	// canned snapshots to (production runs a restic Job — internal/controller's jobSnapshotLister,
 	// wired with the mover image in M1 task #24 — which envtest cannot exercise).
@@ -281,6 +307,51 @@ var _ = BeforeSuite(func() {
 	// play the missing kube controllers (binder, PV lifecycle) by patching status, exactly as
 	// the rexposer unit tests do against the fake client. The mediated lister is the stub.
 	restoreLister = &stubFilteredLister{}
+
+	// The right-to-erasure reconciler (M5, R21), on the SAME exclusive queue so its forget+prune
+	// serialises against init/backup exactly as in production. It counts its scope through the
+	// stub filtered lister the restore specs already feed.
+	Expect(NewClusterErasureReconciler(
+		mgr.GetClient(),
+		mgr.GetScheme(),
+		secrets.NewByNameReader(mgr.GetAPIReader()),
+		repoQueue,
+		restoreLister,
+		suiteOperatorNamespace,
+		suiteMoverImage,
+		mgr.GetEventRecorder("clustererasure"),
+	).SetupWithManager(mgr)).To(Succeed())
+
+	// The two external-sync reconcilers (M5, R28). They share the exclusive queue (their Mirror
+	// forget half runs on it) and read the same stub filtered lister, whose seeded snapshots the
+	// specs use to drive the copied/lag accounting. suiteSyncImage is distinct from the mover
+	// image on purpose: a spec asserting the Job's image would pass either way if they were equal.
+	Expect(NewClusterBackupExternalSyncReconciler(
+		mgr.GetClient(),
+		mgr.GetScheme(),
+		secrets.NewByNameReader(mgr.GetAPIReader()),
+		repoQueue,
+		restoreLister,
+		suiteOperatorNamespace,
+		suiteMoverImage,
+		suiteSyncImage,
+		scheduleClock,
+		mgr.GetEventRecorder("clusterbackupexternalsync"),
+	).SetupWithManager(mgr)).To(Succeed())
+	Expect(NewBackupExternalSyncReconciler(
+		mgr.GetClient(),
+		mgr.GetScheme(),
+		secrets.NewByNameReader(mgr.GetAPIReader()),
+		keys.NewUserKeyManager(mgr.GetClient()),
+		repoQueue,
+		restoreLister,
+		suiteOperatorNamespace,
+		suiteMoverImage,
+		suiteSyncImage,
+		scheduleClock,
+		mgr.GetEventRecorder("backupexternalsync"),
+	).SetupWithManager(mgr)).To(Succeed())
+
 	restoreTargets := rexposer.NewTargetExposer(mgr.GetClient(), suiteOperatorNamespace)
 	Expect(NewRestoreReconciler(
 		mgr.GetClient(),

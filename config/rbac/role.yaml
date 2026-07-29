@@ -67,6 +67,12 @@ rules:
   - get
 - apiGroups:
   - ""
+  resources:
+  - serviceaccounts
+  verbs:
+  - impersonate
+- apiGroups:
+  - ""
   - events.k8s.io
   resources:
   - events
@@ -88,20 +94,16 @@ rules:
 - apiGroups:
   - crystalbackup.io
   resources:
+  - backupexternalsyncs
   - backuplocations
+  - backupschedules
+  - clusterbackupexternalsyncs
+  - clusterbackuplocations
+  - clusterbackupschedules
+  - clustererasures
+  - clusterrestores
+  - restores
   verbs:
-  - get
-  - list
-  - watch
-- apiGroups:
-  - crystalbackup.io
-  resources:
-  - backuprepositories
-  - backups
-  - clusterbackups
-  verbs:
-  - create
-  - delete
   - get
   - list
   - patch
@@ -110,6 +112,26 @@ rules:
 - apiGroups:
   - crystalbackup.io
   resources:
+  - backupexternalsyncs/status
+  - backuplocations/status
+  - backuprepositories/status
+  - backups/status
+  - backupschedules/status
+  - clusterbackupexternalsyncs/status
+  - clusterbackuplocations/status
+  - clusterbackups/status
+  - clusterbackupschedules/status
+  - clustererasures/status
+  - clusterrestores/status
+  - restores/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - crystalbackup.io
+  resources:
+  - backuplocations/finalizers
   - backuprepositories/finalizers
   - backups/finalizers
   - clusterbackuplocations/finalizers
@@ -120,25 +142,12 @@ rules:
 - apiGroups:
   - crystalbackup.io
   resources:
-  - backuprepositories/status
-  - backups/status
-  - clusterbackuplocations/status
-  - clusterbackups/status
-  - clusterbackupschedules/status
-  - clusterrestores/status
-  - restores/status
+  - backuprepositories
+  - backups
+  - clusterbackups
   verbs:
-  - get
-  - patch
-  - update
-- apiGroups:
-  - crystalbackup.io
-  resources:
-  - clusterbackuplocations
-  - clusterbackupschedules
-  - clusterrestores
-  - restores
-  verbs:
+  - create
+  - delete
   - get
   - list
   - patch

@@ -1,9 +1,10 @@
 # Crystal Backup
 
-> **Early, real code** — **M0 through M4 have shipped (v0.4.0)**: the core backup engine,
-> cluster disaster recovery, **restore** and **manifest & cluster-scoped DR** are implemented,
-> tested (envtest + kind e2e + a real-cluster crucible suite) and released; most milestones are
-> still ahead. Built in the open with AI assistance. Background & disclaimer: [Project status & disclaimer](#-project-status--disclaimer).
+> **Early, real code** — **M0 through M5 have shipped (v0.5.0)**: the core backup engine,
+> cluster disaster recovery, **restore**, **manifest & cluster-scoped DR**, and the
+> **namespace plane** (a user's own repository under their own key), **external sync** and the
+> **right to erasure** are implemented, tested (envtest + kind e2e + a real-cluster crucible
+> suite) and released; most milestones are still ahead. Built in the open with AI assistance. Background & disclaimer: [Project status & disclaimer](#-project-status--disclaimer).
 
 **Crystal Backup** is a Kubernetes operator that provides **multi-tenant,
 self-service backup and restore of namespaces** — both **PVC data and Kubernetes manifests** —
@@ -24,8 +25,9 @@ is restorable, with no pre-existing custom resources and no surviving cluster re
 
 ## ⚠️ Project status & disclaimer
 
-**M0 through M4 have shipped (v0.4.0)** — the core engine, cluster disaster recovery, restore
-and manifest & cluster-scoped DR are real, tested code — but most of the [roadmap](#roadmap) is
+**M0 through M5 have shipped (v0.5.0)** — the core engine, cluster disaster recovery, restore,
+manifest & cluster-scoped DR, the namespace plane, external sync and the right to erasure are
+real, tested code — but most of the [roadmap](#roadmap) is
 still ahead, so this is
 **early and experimental**. Specs, Architecture Decision Records (ADRs) and the roadmap remain
 public and lead the code. It's built in the open, so you can follow — and shape — it as it happens.
@@ -94,7 +96,7 @@ Full requirements (R1–R28) and rationale: [spec/00-requirements.md](spec/00-re
 - **Server-side tenant isolation** (R2/R14) — a namespaced `Restore` is structurally confined to
   its own namespace; access to the shared DR repo is mediated by a **non-forgeable server-side
   `namespace=` tag filter**. On the namespace plane, isolation is by construction (the user's own
-  bucket, credentials and key; `platformAccess: false` by default).
+  bucket, credentials and key — the platform holds no key slot on it, by design).
 - **Least-data-movement, Ceph-aware snapshots** (R11) — back up from a read-only snapshot with the
   cheapest path per CSI driver (CephFS shallow `backingSnapshot`, RBD copy-on-write clone); a CSI
   that cannot snapshot is **skipped with a reason in status**, never silently dropped.
@@ -192,6 +194,8 @@ Start with the specification index: **[spec/README.md](spec/README.md)**.
 | Doc | Content |
 |---|---|
 | [docs/RESTORE.md](docs/RESTORE.md) | Restore guide: self-service, cluster DR, bare-cluster runbook |
+| [docs/HOOKS.md](docs/HOOKS.md) | Consistency hooks: the tenant ServiceAccount the operator impersonates, and how to grant it |
+| [docs/DECOMMISSION.md](docs/DECOMMISSION.md) | Runbook: retiring a repository by destroying its key, and re-encrypting one after a key leak |
 | [spec/00-requirements.md](spec/00-requirements.md) | Requirements R1–R28, personas, scope, priorities |
 | [spec/01-architecture.md](spec/01-architecture.md) | Components, two-plane model, cascade, flows, concurrency |
 | [spec/02-api.md](spec/02-api.md) | CRD naming & field contract, validation, RBAC |

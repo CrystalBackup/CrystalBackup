@@ -78,7 +78,9 @@ jobs:
           ENTRIES=""
           for tag in $TAGS; do
             version="${tag#v}"
-            for component in operator mover; do
+            # sync joins in 0.5.0; older tags simply resolve no digest for it and are skipped
+            # by the guard below, so enumerating it here is safe for the whole support window.
+            for component in operator mover sync; do
               ref="${REGISTRY}/${IMAGE_NAMESPACE}/${component}:${version}"
               # The INDEX digest, read from the human-readable output. Not
               # --format '{{.Manifest.Digest}}' (unreliable across buildx versions) and not

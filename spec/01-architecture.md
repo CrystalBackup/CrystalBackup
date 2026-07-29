@@ -87,8 +87,9 @@ with upstream `restic` (reversibility).
   stored as `crystal-dek-*` Secrets in `crystal-backup-system` only. No per-namespace DEK
   and no multi-tier KEK hierarchy.
 - User repo: the **user's own** restic password (a Secret in their namespace), or an
-  operator-generated password stored **in the user's namespace**; `platformAccess` (default
-  false) optionally adds an operator key slot for mediated restore/verification.
+  operator-generated password stored **in the user's namespace** — and **no operator key slot**,
+  which the API gives no way to request. Platform access to a user's backups therefore ends when
+  the user's key does ([adr/0004](adr/0004-encryption-key-management.md) amendment).
 
 **Snapshot layout** — identical for both planes (one mover/restore/CLI codebase):
 

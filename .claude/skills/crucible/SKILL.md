@@ -58,8 +58,15 @@ restic-from-source mover build you should **build once and reuse**) — is in
 `build/README.md` at the repo root. In short: rebuild → `apko publish …:dev` →
 resolve the digest (`docker buildx imagetools inspect …:dev --format
 '{{.Manifest.Digest}}'`) → `OPERATOR_IMAGE_DIGEST=… MOVER_IMAGE_DIGEST=…
-test/crucible/deploy/deploy.sh` (or `helm upgrade --reuse-values --set
-image.digest=…` for an operator-only change) → `mise run test m1`.
+SYNC_IMAGE_DIGEST=… test/crucible/deploy/deploy.sh` (or `helm upgrade
+--reuse-values --set image.digest=…` for an operator-only change) → `mise run
+test m1`.
+
+`SYNC_IMAGE_DIGEST` is the third image (crystal-mover + restic + **rclone**),
+used only by external-sync Jobs (M5). Nothing pulls it until an `ExternalSync`
+exists, so omitting it leaves the chart placeholder in place unnoticed — the
+`m5` label's first spec fails fast on that rather than letting a copy Job hang
+in `ImagePullBackOff`.
 
 ## Interpreting results
 

@@ -49,6 +49,7 @@ import (
 	"github.com/CrystalBackup/CrystalBackup/internal/escrow"
 	"github.com/CrystalBackup/CrystalBackup/internal/exposer"
 	"github.com/CrystalBackup/CrystalBackup/internal/hooks"
+	"github.com/CrystalBackup/CrystalBackup/internal/keys"
 	"github.com/CrystalBackup/CrystalBackup/internal/metrics"
 	"github.com/CrystalBackup/CrystalBackup/internal/repo/queue"
 	"github.com/CrystalBackup/CrystalBackup/internal/repo/s3stat"
@@ -81,6 +82,7 @@ func main() {
 	var tlsOpts []func(*tls.Config)
 	var operatorNamespace string
 	var moverImage string
+	var syncImage string
 	var manifestMoverSA string
 	var manifestReaderRole string
 	var manifestWriterRole string
@@ -125,6 +127,12 @@ func main() {
 		"Container image for the mover Jobs (repository init and, later, backup/restore/maintenance). "+
 			"REQUIRED for real backups — the Helm chart and the crucible set it; an empty value is tolerated "+
 			"only because envtest never runs a mover Job.")
+	flag.StringVar(&syncImage, "sync-image", "",
+		"Container image for external-sync Jobs (crystal-mover + restic + rclone). A DIFFERENT image "+
+			"from --mover-image on purpose: sync is the one operation that must open two repositories "+
+			"with two different sets of object-storage credentials, which restic can only do through "+
+			"rclone remotes (adr/0013) — and rclone has no business on the backup/restore path. Empty "+
+			"disables external sync; nothing else is affected.")
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
@@ -299,6 +307,21 @@ func main() {
 		setupLog.Error(err, "Unable to create controller", "controller", "ClusterBackupLocation")
 		os.Exit(1)
 	}
+	// The namespace plane's location controller (M5). It needs no KEK and no escrow: a tenant
+	// repository is protected by the tenant's OWN key, held in their namespace (adr/0004 §2).
+	// mgr.GetClient() is the right client for UserKeyManager despite it writing Secrets — the
+	// manager bypasses its cache for Secrets (see the Client options above), so this starts no
+	// Secret informer.
+	if err := (&controller.BackupLocationReconciler{
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		Prober:   controller.NewHTTPS3Prober(),
+		UserKeys: keys.NewUserKeyManager(mgr.GetClient()),
+		Recorder: mgr.GetEventRecorder("backuplocation"),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Unable to create controller", "controller", "BackupLocation")
+		os.Exit(1)
+	}
 	if err := controller.NewBackupRepositoryReconciler(
 		mgr.GetClient(),
 		mgr.GetScheme(),
@@ -396,6 +419,17 @@ func main() {
 		setupLog.Error(err, "Unable to create controller", "controller", "ClusterBackupSchedule")
 		os.Exit(1)
 	}
+	// The namespace plane's cron (M5). Same mechanics, but it stamps Backups — restore points —
+	// directly into the user's namespace, so it neither owns nor garbage-collects them.
+	if err := controller.NewBackupScheduleReconciler(
+		mgr.GetClient(),
+		mgr.GetScheme(),
+		clock.RealClock{},
+		mgr.GetEventRecorder("backupschedule"),
+	).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Unable to create controller", "controller", "BackupSchedule")
+		os.Exit(1)
+	}
 
 	// The discovery reconciler projects a shared repository's snapshots back into read-only Backup
 	// CRs so a DR repository is restorable with no pre-existing objects. Its production lister runs a
@@ -462,6 +496,56 @@ func main() {
 		repoQueue,
 	).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Unable to create controller", "controller", "ClusterRestore")
+		os.Exit(1)
+	}
+	// The right-to-erasure controller (M5, R21): forget+prune on the repository's exclusive queue,
+	// behind a typed confirmation, blocked on Immutable locations.
+	if err := controller.NewClusterErasureReconciler(
+		mgr.GetClient(),
+		mgr.GetScheme(),
+		secrets.NewByNameReader(mgr.GetAPIReader()),
+		repoQueue,
+		snapshotLister,
+		operatorNamespace,
+		moverImage,
+		mgr.GetEventRecorder("clustererasure"),
+	).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Unable to create controller", "controller", "ClusterErasure")
+		os.Exit(1)
+	}
+	// External sync (M5, R28, adr/0013): `restic copy` from one location to another, re-encrypting
+	// to the destination's own key. Both planes run the same driver and differ only in how they
+	// resolve their two endpoints — admin cluster locations and platform DEKs on one side, the
+	// user's own same-namespace locations and their own keys on the other.
+	if err := controller.NewClusterBackupExternalSyncReconciler(
+		mgr.GetClient(),
+		mgr.GetScheme(),
+		secrets.NewByNameReader(mgr.GetAPIReader()),
+		repoQueue,
+		snapshotLister,
+		operatorNamespace,
+		moverImage,
+		syncImage,
+		clock.RealClock{},
+		mgr.GetEventRecorder("clusterbackupexternalsync"),
+	).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Unable to create controller", "controller", "ClusterBackupExternalSync")
+		os.Exit(1)
+	}
+	if err := controller.NewBackupExternalSyncReconciler(
+		mgr.GetClient(),
+		mgr.GetScheme(),
+		secrets.NewByNameReader(mgr.GetAPIReader()),
+		keys.NewUserKeyManager(mgr.GetClient()),
+		repoQueue,
+		snapshotLister,
+		operatorNamespace,
+		moverImage,
+		syncImage,
+		clock.RealClock{},
+		mgr.GetEventRecorder("backupexternalsync"),
+	).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Unable to create controller", "controller", "BackupExternalSync")
 		os.Exit(1)
 	}
 

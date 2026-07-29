@@ -50,7 +50,7 @@ const jsonFlag = "--json"
 func knownOperation(op string) bool {
 	switch mover.Operation(op) {
 	case mover.OpBackup, mover.OpRestore, mover.OpInit, mover.OpForget, mover.OpPrune,
-		mover.OpCheck, mover.OpSnapshots, mover.OpUnlock,
+		mover.OpCheck, mover.OpSnapshots, mover.OpUnlock, mover.OpSync,
 		mover.OpManifestsBackup, mover.OpManifestsRestore,
 		mover.OpClusterManifestsBackup, mover.OpClusterManifestsRestore:
 		return true
@@ -71,6 +71,13 @@ func parsesJSONSummary(op string) bool {
 	// actually landed before the apply reads a single file from it.
 	// cluster-manifests-restore, like manifests-restore, BEGINS with a `restic restore`, whose
 	// summary proves the tree landed before the apply reads a file from it.
+	//
+	// sync is deliberately absent, and it was checked rather than assumed: `restic copy --json`
+	// prints the same human-readable progress it prints without the flag — there is no summary
+	// object to parse. Listing it here would make every sync fail on an unparseable stdout. Its
+	// outcome is therefore the exit code alone, and the snapshots it moved are counted by
+	// inventorying the DESTINATION (whose copied snapshots carry the source ID in `original`),
+	// not by reading anything off this process.
 	return op == string(mover.OpBackup) || op == string(mover.OpRestore) ||
 		op == string(mover.OpManifestsBackup) || op == string(mover.OpManifestsRestore) ||
 		op == string(mover.OpClusterManifestsBackup) || op == string(mover.OpClusterManifestsRestore)

@@ -77,10 +77,9 @@ management**, with a **two-tier envelope** — and **no per-namespace DEK hierar
 - If `repositoryPasswordSecretRef` is omitted the operator **generates** a random password
   and stores it as a Secret **in the user's namespace** — still the user's key, never held
   in `crystal-backup-system`.
-- `spec.encryption.platformAccess` (default `false`) registers an **optional operator key
-  slot** (`restic key add`) so the operator can mediate restore/verification. Default `false`
-  keeps off-platform backups **private to the user**; `keySlots` is `[tenant]`, or
-  `[tenant, platform]` when `platformAccess: true`.
+- There is **no operator key slot on a user repository, ever**. `keySlots` is `[tenant]`, and
+  that is the only value it can take. See the 2026-07-28 amendment: `platformAccess` was
+  specified here, never implemented, and then **dropped on purpose**.
 
 ### 3. restic native encryption and multi-key slots
 
@@ -90,9 +89,9 @@ per repo): several passwords unlock the same master key. Two uses in this model:
 - **Cluster plane** — the platform DEK is the single slot; a user never gets it and reaches
   cluster-DR data only through an operator-mediated `Restore` with a non-forgeable
   `namespace=` tag filter ([adr/0009](0009-shared-cluster-repo-tag-tenancy.md)).
-- **Namespace plane** — the user's password is the primary slot (upstream-restic
-  reversibility, R8); the optional `platformAccess` slot is a second password over the same
-  repo.
+- **Namespace plane** — the user's password is the **only** slot (upstream-restic
+  reversibility, R8). restic's multi-key capability is deliberately left unused here; the
+  amendment below explains why a second slot is the one thing this plane must not have.
 
 ### 4. Right-to-erasure (R21), not per-tenant crypto-shredding
 
@@ -152,7 +151,7 @@ per repo): several passwords unlock the same master key. Two uses in this model:
 | Loss of the wrapped platform DEK Secret = loss of all platform access to the cluster repo | Wrapped-DEK Secret included in platform DR (Velero today, `ClusterBackupSchedule` at M9); cluster KEK escrowed offline (sealed, two-person) |
 | Loss of the cluster KEK | Re-wrap needs the old KEK: KEK escrow above; re-wrap promptly on rotation |
 | Mover compromise leaks the platform DEK (shared repo → all namespaces) | Movers confined to `crystal-backup-system`, short-lived projected Secret, NetworkPolicies; leaked DEK → repo-copy reencrypt runbook |
-| User loses their own `BackupLocation` password | Their responsibility (documented); with `platformAccess: true` the operator slot can re-add a user key |
+| User loses their own `BackupLocation` password | **Their data is gone, and this is the accepted consequence of the amendment below.** Documented in `docs/DECOMMISSION.md`; the operator has no slot to re-add a key from, by design |
 | Erasure requested on an Immutable location | `ClusterErasure` reports `Blocked` + `blockedUntil`; completes after object-lock expiry (adr/0005) |
 
 ## Alternatives considered
@@ -203,9 +202,69 @@ per repo): several passwords unlock the same master key. Two uses in this model:
 - Volume of `reencrypt` operations becomes significant (frequent DEK compromises) →
   prioritize `crystalctl admin reencrypt` automation from backlog to milestone.
 
+
+## Amendment (2026-07-28, M5 implementation) — `platformAccess` is dropped
+
+`spec.encryption.platformAccess` is **removed from the API**. A namespace-plane repository has
+exactly one key slot, the user's, and the operator has no mechanism to add a second.
+
+### How it came up
+
+M5 implemented the namespace plane and the field went in half-way: it was read from the spec and
+reflected in `BackupRepository.status.keySlots` as `[tenant, platform]`, but **no `restic key add`
+was ever written**. So a location with `platformAccess: true` advertised a key slot that did not
+exist in the repository — an admin trusting that status to perform a mediated restore would have
+discovered the gap at the moment they needed it. Closing that hole forced the question of whether
+the field should exist at all.
+
+### Why it is dropped rather than implemented
+
+The first framing was that the field encodes a real and carefully-worded distinction: with
+`platformAccess: false` the operator holds no **durable, independent** way in — it must reach into
+the user's namespace and read their Secret, which is visible in the audit log and stops working if
+the user rotates their password. That framing is accurate, and it is not the one that decides this.
+
+The deciding frame is **revocability**, which is the right frame for access to someone else's data:
+
+- A namespace-plane `BackupLocation` is a backup the user takes **in addition to** cluster DR. It
+  is theirs. If they delete their password Secret, platform access should end. Full stop.
+- A `platformAccess` slot breaks exactly that. It is a password held in `crystal-backup-system`
+  that keeps working after the user rotates their key, deletes their Secret, or changes their
+  mind — and §3 of this ADR is what makes it permanent: **removing a key slot does not rotate the
+  master key.** Once the platform has held that password, the user can never take it back. Not by
+  revoking the slot, not by rotating their own key, not by anything.
+- Which means the shape of the feature, from the position of the person whose data it is, is: *the
+  platform had access once, so it minted itself permanent access the customer cannot revoke.* That
+  the customer opted in once does not fix it, because opting in was a one-way door they were not
+  told was one-way.
+
+### Trust by construction, not by policy
+
+The alternative considered was to keep the field and gate it — reject `platformAccess: true` at
+admission until the feature is properly designed. Rejected: a guarantee enforced by a webhook is a
+guarantee that a flag, a bypass or a future maintainer can switch off. A guarantee that rests on
+the mechanism **not existing** cannot be switched off. For access to a customer's data, that
+difference is the whole product claim, so it is bought at the API level rather than the policy
+level.
+
+### Consequences accepted
+
+- **Mediated restore and operator-side verification are off the table on the namespace plane.**
+  A user who wants help gives their password, deliberately, in the moment — and can change it
+  afterwards. That is the point.
+- **A user who loses their password loses their backups.** There is no platform copy of the key
+  and no recovery path. `docs/DECOMMISSION.md` and the user docs must say so plainly rather than
+  leaving it to be discovered.
+- **If mediated restore is ever revisited**, it needs a mechanism the user can genuinely revoke —
+  which, given that slot removal does not rotate the master key, means a re-encrypting copy
+  (adr/0013), not a second slot. Reintroducing `platformAccess` is not the answer to a future
+  customer request; this paragraph exists so that is not rediscovered the hard way.
+
 ## Open questions
 
 - `crystalctl admin decommission` on **Standard** locations: destroy the wrapped DEK/KEK only
   (objects age out via bucket lifecycle) or also `restic`-delete the repository objects?
 - Whether the operator-generated namespace password (when `repositoryPasswordSecretRef` is
-  omitted) needs any escrow option beyond the explicit `platformAccess` slot.
+  omitted) needs an escrow option at all. Note it must NOT be an operator key slot — the
+  amendment forecloses that — so any answer here is a mechanism the USER holds and can destroy,
+  not one the platform holds on their behalf.

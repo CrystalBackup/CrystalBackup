@@ -55,6 +55,8 @@ limitations under the License.
 // Job and reads the result) share this one definition without a cycle.
 package mover
 
+import "strings"
+
 // Operation is the mover's single verb, passed as `--operation <op>`. It tells the shim
 // which restic operation this Job runs and is echoed back in MoverResult.Operation. The
 // value doubles as the leading restic subcommand for every operation except forget/prune
@@ -109,6 +111,18 @@ const (
 	// It is the mirror in a second way that matters to the shim: the API work runs AFTER
 	// restic here, not before. restic writes the tree, then the shim applies it.
 	OpManifestsRestore Operation = "manifests-restore"
+	// OpSync copies snapshots from one repository to ANOTHER, re-encrypting them to the
+	// destination's own key (`restic copy`, adr/0013). The only operation that opens two
+	// repositories at once, and the only one that runs in a DIFFERENT IMAGE: both repositories
+	// are addressed through rclone remotes, so the pod needs the `sync` image (restic + rclone),
+	// not the data-path mover image.
+	//
+	// The name is deliberately NOT the restic subcommand (which is `copy`), breaking the
+	// convention the other maintenance ops follow. Calling it "copy" would suggest the plain
+	// mover image can run it; it cannot — there is no rclone in there, and the failure would be
+	// a runtime "unable to open repository" rather than a compile-time or scheduling error.
+	// The operation name is the one place that distinction is visible, so it carries it.
+	OpSync Operation = "sync"
 	// OpClusterManifestsBackup captures the cluster's CLUSTER-SCOPED objects (CRDs,
 	// StorageClasses, PersistentVolumes, ClusterRoles/Bindings, IngressClasses, …) and backs the
 	// tree up as ONE kind=cluster-manifests snapshot (adr/0011 §1). It is the cluster-plane
@@ -155,6 +169,19 @@ const (
 	// projection of ResticPasswordFileName under SecretMountPath. restic reads the password
 	// from this file so it never appears in the environment listing or on argv.
 	ResticPasswordFilePath = SecretMountPath + "/" + ResticPasswordFileName
+
+	// ResticFromPasswordFileName is the SOURCE repository's password key, used only by OpSync.
+	// It needs no second volume: a mounted Secret projects EVERY key to a same-named file, so
+	// adding this key to the per-Job Secret is what makes the file appear next to the
+	// destination's password under SecretMountPath.
+	//
+	// "from" mirrors restic's own vocabulary (--from-repo, --from-password-file): in a copy the
+	// unqualified names are the DESTINATION and the --from-* family is the SOURCE. Naming the
+	// key anything else would leave the reader to re-derive that mapping at every call site.
+	ResticFromPasswordFileName = "restic-from-password"
+
+	// ResticFromPasswordFilePath is the absolute path RESTIC_FROM_PASSWORD_FILE is set to.
+	ResticFromPasswordFilePath = SecretMountPath + "/" + ResticFromPasswordFileName
 
 	// CacheDir is restic's cache directory (RESTIC_CACHE_DIR), backed by an emptyDir. It is
 	// one of the only two writable paths in the container (the root filesystem is
@@ -221,7 +248,12 @@ const (
 	EnvManifestsRestoreDir = "CRYSTAL_MANIFESTS_RESTORE_DIR"
 	// EnvManifestsMode is the Restore's spec.mode ("Overwrite" or "Recreate").
 	EnvManifestsMode = "CRYSTAL_MANIFESTS_MODE"
-	// EnvManifestsDryRun is "true" for a spec.dryRun restore: the full pipeline runs against
+	// EnvTrue is the value every boolean mover env var carries when set. Named because the
+	// variable and its truthy spelling are one contract: a caller that writes "1" or "yes"
+	// instead would be silently ignored by the shim's strconv.ParseBool-free comparison.
+	EnvTrue = "true"
+
+	// EnvManifestsDryRun is EnvTrue for a spec.dryRun restore: the full pipeline runs against
 	// the API server with dryRun=All and nothing is persisted.
 	EnvManifestsDryRun = "CRYSTAL_MANIFESTS_DRY_RUN"
 	// EnvManifestsSelection is the JSON-encoded manifests.Selection resolved from the
@@ -254,6 +286,105 @@ const (
 	EnvClusterManifestsSelection = "CRYSTAL_CLUSTER_MANIFESTS_SELECTION"
 )
 
+// Environment the SYNC job reads (OpSync). A copy opens two repositories at once, and the
+// asymmetry restic uses to tell them apart is the whole reason this block exists: the
+// UNQUALIFIED names are the DESTINATION, the RESTIC_FROM_* family is the SOURCE.
+//
+// Reading -r / RESTIC_REPOSITORY as "the repository I am working on" gets it backwards, and
+// backwards here means copying the secondary over the primary. That is why the destination
+// travels through the ordinary JobRequest.RepoURL (so it is the same field, meaning the same
+// thing, as in every other operation) and only the source needs naming below.
+const (
+	// EnvFromRepository is the SOURCE repository (restic's --from-repo default).
+	EnvFromRepository = "RESTIC_FROM_REPOSITORY"
+	// EnvFromPasswordFile points restic at the SOURCE repository's password file — the
+	// projection of ResticFromPasswordFileName in the same read-only Secret mount.
+	//
+	// Two independent passwords is exactly what adr/0013 needs and what restic supports:
+	// re-encrypting to the destination's own key is a property of the copy, not a workaround.
+	EnvFromPasswordFile = "RESTIC_FROM_PASSWORD_FILE"
+
+	// EnvRcloneConfig pins rclone's config FILE. RcloneConfigNone is the only value we set: the
+	// remotes come from RCLONE_CONFIG_<REMOTE>_* env alone, and pinning the file to /dev/null
+	// makes that exhaustive rather than merely usual — no file in the image, mounted by a future
+	// change, or inherited from $HOME can silently redefine a remote. It also silences rclone's
+	// "config file not found — using defaults" NOTICE on every single run.
+	EnvRcloneConfig  = "RCLONE_CONFIG"
+	RcloneConfigNone = "/dev/null"
+
+	// SyncRemoteSource and SyncRemoteDest are the two rclone remote names a sync Job defines.
+	// They are short and fixed because they are internal to one pod: the repository URLs
+	// ("rclone:src:bucket/prefix") and the env keys (RCLONE_CONFIG_SRC_*) must agree, and a
+	// caller-chosen name would only create a way for them to disagree.
+	SyncRemoteSource = "src"
+	SyncRemoteDest   = "dst"
+
+	// RcloneKeyType and friends are the rclone remote config keys this project sets, in rclone's
+	// env spelling (RCLONE_CONFIG_<REMOTE>_<KEY>, uppercased). Only the two credential keys are
+	// secret; the rest is plain configuration.
+	RcloneKeyType            = "TYPE"
+	RcloneKeyProvider        = "PROVIDER"
+	RcloneKeyEndpoint        = "ENDPOINT"
+	RcloneKeyRegion          = "REGION"
+	RcloneKeyAccessKeyID     = "ACCESS_KEY_ID"
+	RcloneKeySecretAccessKey = "SECRET_ACCESS_KEY"
+	// RcloneKeyForcePathStyle keeps addressing path-style (bucket in the path, not the host),
+	// which is what every non-AWS S3 implementation this project targets expects.
+	RcloneKeyForcePathStyle = "FORCE_PATH_STYLE"
+	// RcloneKeyNoCheckBucket stops rclone probing — and, failing that, CREATING — the bucket
+	// before its first upload.
+	//
+	// CrystalBackup never creates buckets: an S3Spec names one the operator already provisioned,
+	// and the s3: spelling of the very same repository never attempts it either. Letting rclone
+	// behave differently would make the two addressings disagree about something visible, and it
+	// costs exactly where it hurts most — a destination reached with SCOPED credentials (read,
+	// write and list on one bucket, which is the least privilege a secondary should be given) has
+	// no CreateBucket right, so the probe fails and takes the whole copy with it, for a bucket
+	// that was there all along.
+	RcloneKeyNoCheckBucket = "NO_CHECK_BUCKET"
+
+	// RcloneTypeS3 is the rclone backend type both remotes use.
+	RcloneTypeS3 = "s3"
+	// RcloneProviderOther is rclone's provider value for "an S3 API that is not one of the
+	// vendors rclone special-cases". It is the honest answer for MinIO/Ceph/Garage/Scaleway and
+	// friends, and it disables the AWS-specific behaviours a wrong guess would enable.
+	RcloneProviderOther = "Other"
+)
+
+// RcloneRemoteEnv builds the environment variable name that configures one key of one rclone
+// remote: RCLONE_CONFIG_<REMOTE>_<KEY>, with the remote upper-cased.
+//
+// The PER-REMOTE form is load-bearing, and its sibling is a trap: RCLONE_S3_ACCESS_KEY_ID
+// configures the s3 backend GLOBALLY, so setting it for the source would also apply it to the
+// destination — reinstating exactly the one-credential-set limitation that pushed adr/0013 to
+// rclone in the first place. Building the name here, from a remote, makes the global form
+// unreachable by accident.
+func RcloneRemoteEnv(remote, key string) string {
+	return "RCLONE_CONFIG_" + strings.ToUpper(remote) + "_" + key
+}
+
+// RcloneRepoURL is the restic repository URL for a repo reached through an rclone remote:
+//
+//	rclone:<remote>:<bucket>/<prefix>/<clusterID>
+//
+// It differs from RepoURL in one way that matters: there is NO endpoint in the path. An rclone
+// remote carries its own endpoint, region and credentials in its RCLONE_CONFIG_<REMOTE>_*
+// block, so repeating the endpoint here would either be ignored or be read as a bucket name.
+// The path portion is otherwise identical, which is what keeps a repository addressable both
+// ways — the same bytes, reached by two spellings.
+func RcloneRepoURL(remote, bucket, prefix, clusterID string) string {
+	segments := []string{bucket}
+	if prefix != "" {
+		segments = append(segments, prefix)
+	}
+	segments = append(segments, clusterID)
+	path := strings.Join(segments, "/")
+	for strings.Contains(path, "//") {
+		path = strings.ReplaceAll(path, "//", "/")
+	}
+	return "rclone:" + remote + ":" + strings.Trim(path, "/")
+}
+
 // Secret data keys the per-Job Secret must carry. The restic password is consumed as a
 // FILE (mounted, RESTIC_PASSWORD_FILE); the two AWS keys are consumed as ENV via
 // secretKeyRef. All three live in one Secret named per Job (JobRequest.SecretName).
@@ -270,7 +401,28 @@ const (
 	// Key — the two sides of each AWS credential are named by one constant.
 	SecretKeyAWSAccessKeyID     = "AWS_ACCESS_KEY_ID"
 	SecretKeyAWSSecretAccessKey = "AWS_SECRET_ACCESS_KEY"
+
+	// SecretKeyResticFromPassword is the SOURCE repository password key for OpSync. Like
+	// SecretKeyResticPassword it equals its file name, because the mount projects the key to a
+	// same-named file and EnvFromPasswordFile points at that file.
+	SecretKeyResticFromPassword = ResticFromPasswordFileName
 )
+
+// SyncCredentialKeys are the per-Job Secret keys a sync Job projects as environment, in place
+// of the AWS_* pair every other operation uses. Each is both the Secret data key and the env
+// var name — the same one-constant-names-both-sides property SecretKeyAWS* relies on.
+//
+// The AWS_* pair is not merely unnecessary here, it is wrong: nothing beneath restic reads it
+// when the repository is addressed as rclone:, so a sync Job carrying it would look configured
+// while being configured by something else entirely.
+func SyncCredentialKeys() []string {
+	return []string{
+		RcloneRemoteEnv(SyncRemoteSource, RcloneKeyAccessKeyID),
+		RcloneRemoteEnv(SyncRemoteSource, RcloneKeySecretAccessKey),
+		RcloneRemoteEnv(SyncRemoteDest, RcloneKeyAccessKeyID),
+		RcloneRemoteEnv(SyncRemoteDest, RcloneKeySecretAccessKey),
+	}
+}
 
 // ptrTo returns a pointer to v. The k8s Job/Pod specs express optional scalars
 // (backoffLimit, ttlSecondsAfterFinished, runAsUser, the *bool toggles) as pointers to

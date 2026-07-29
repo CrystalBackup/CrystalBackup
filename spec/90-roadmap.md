@@ -289,33 +289,36 @@ crucible lanes, all with zero residual snapshot objects
 
 ## M5 — Namespace plane, external sync & right-to-erasure (R3, R5, R21, R28)
 
-- [ ] `BackupLocation` + `BackupSchedule` (namespaced): a user backs up their **own** namespace
+- [x] `BackupLocation` + `BackupSchedule` (namespaced): a user backs up their **own** namespace
       to their **own** object storage, **in addition to** cluster DR; `Backup` in-namespace via
       the same execution path (no fan-out).
-- [ ] Keys ([adr/0004](adr/0004-encryption-key-management.md)): the **user's own** restic
+- [x] Keys ([adr/0004](adr/0004-encryption-key-management.md)): the **user's own** restic
       password (their Secret), or an operator-generated password stored **in the user's
-      namespace**; optional `platformAccess` slot (default `false`) via `restic key add` for
-      mediated restore/verify. **No** cluster→client→namespace hierarchy.
-- [ ] Right-to-erasure `ClusterErasure` (R21): `restic forget --tag`
+      namespace**. **No operator key slot on a user repository** — `platformAccess` was
+      specified, never implemented, and dropped during M5 so that platform access ends when the
+      user's key does (adr/0004 amendment). **No** cluster→client→namespace hierarchy.
+- [x] Right-to-erasure `ClusterErasure` (R21): `restic forget --tag`
       (`tenant=` | `namespace=` | `namespace=+pvc=`) then `prune` — **physical** deletion on
       the exclusive queue; typed confirmation (R23); `Blocked` + `blockedUntil` on Immutable
       locations. Per-tenant crypto-shredding is **dropped** — impossible in a single-key
       shared repo ([adr/0009](adr/0009-shared-cluster-repo-tag-tenancy.md)).
-- [ ] Repository **decommission** mechanism (destroy the wrapped platform DEK/KEK —
+- [x] Repository **decommission** mechanism (destroy the wrapped platform DEK/KEK —
       repo-granularity retirement, **not** GDPR erasure) + re-encryption-via-repo-copy runbook
       for a compromised DEK. Erasure/decommission are driven via the `ClusterErasure` CR / a
       **confirmation-gated, audited** admin action in M5 (not a raw Secret delete); the
       `crystalctl admin erase|decommission|reencrypt` **wrappers** ship in M7 with the CLI
       (`reencrypt` automation stays backlog).
-- [ ] **External sync** (R28, [adr/0013](adr/0013-external-backup-sync.md)):
+- [x] **External sync** (R28, [adr/0013](adr/0013-external-backup-sync.md)):
       `ClusterBackupExternalSync` (admin, whole shared repo → secondary `ClusterBackupLocation`)
       and `BackupExternalSync` (user, namespace's backups → secondary `BackupLocation` in the
       same ns) via a `restic copy` mover Job — re-encrypt to the destination's own key,
       blob-incremental, tag-selective; `mode: Mirror|AppendOnly` (forced AppendOnly on Immutable
       destinations; full rotation-window handling for an Immutable destination lands with **M8**);
-      sync metrics + `ExternalSyncStale` alert.
-- [ ] e2e: a user backs up to their own S3 (SeaweedFS) with their own key; the platform cannot read it
-      unless `platformAccess: true`; `ClusterErasure` of a tenant/namespace/PVC physically
+      sync **metrics** ([05-observability.md §2](05-observability.md)). The `ExternalSyncStale`
+      **alert rule** ships with M6's alert bundle — §3 of that document is a specification as of
+      0.5.0, so what M5 delivers is the series the alert will read, not the rule.
+- [x] e2e: a user backs up to their own S3 (SeaweedFS) with their own key; the platform cannot read it
+      once they delete their password Secret; `ClusterErasure` of a tenant/namespace/PVC physically
       removes the data (repo re-scan confirms); erasure on an Immutable location reports
       `Blocked`; **external sync** copies to a second location whose repo opens only with **its
       own** key (siloing) and per-namespace selection holds (08-testing case 18).

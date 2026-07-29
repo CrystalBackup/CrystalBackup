@@ -23,7 +23,8 @@ Key management: [adr/0004](adr/0004-encryption-key-management.md). Immutability:
 4. **The platform is trusted for the cluster DR repository; users can stay off-platform.**
    Cluster disaster recovery uses one shared, admin-owned repository the platform can read
    by design. A namespace user who wants zero platform readability backs up through their
-   **own** `BackupLocation` + key with `platformAccess: false` (R3, R5).
+   **own** `BackupLocation` + key — the operator has no key slot on it and no way to obtain
+   one (R3, R5, [adr/0004](adr/0004-encryption-key-management.md) amendment).
 
 ## 2. Threat model
 
@@ -33,7 +34,7 @@ Key management: [adr/0004](adr/0004-encryption-key-management.md). Immutability:
 | Compromised namespace user K8s credentials | Attacker creates `Restore`/`BackupSchedule` in the victim namespace | Blast radius = that namespace's own data (I1); a cluster-origin `Backup` is served only through the mediated `namespace=<that namespace>` filter, so it restores the namespace's **own** history back into itself; R23 confirmation gates accidents, not attackers; exfiltration via a user `BackupLocation` adds nothing the namespace's pod egress didn't already allow | Attacker can destroy in-namespace data via a `Recreate` restore — same power as their existing PVC access; off-platform copies (user location) survive |
 | Compromised mover | Container escape attempt, credential/DEK theft from the Job | Unprivileged pod, `seccompProfile: RuntimeDefault`, caps dropped (§6); **no ServiceAccount token** (`crystal-mover`, `automountServiceAccountToken: false`, zero RBAC); short-lived repo-scoped S3 credentials (I4); NetworkPolicy egress = S3 only (§7); snapshot mounted `readOnly` — source data cannot be tampered | A leaked **cluster-repo** mover credential or DEK reads/writes the **whole shared repo** (all namespaces) — the shared-repo cost ([adr/0009](adr/0009-shared-cluster-repo-tag-tenancy.md)); bounded by TTL, confinement and Immutable mode; a leaked DEK → repo-copy reencrypt ([adr/0004](adr/0004-encryption-key-management.md)). On a **user** location the mover holds only that user's key; a **sync mover** transiently holds the **source + destination** keys and egresses to two S3 endpoints, under the same TTL/confinement (R28, I9) |
 | Ransomware / deletion on S3 | Stolen S3 credentials encrypt or delete backup objects | Cluster-repo root creds exist only in `crystal-backup-system` (I3); `Immutable` location mode = S3 Object Lock / append-only (R18) — note: object-locked buckets break `restic prune` **and** lock-file deletion, hence the no-prune + rotation design in [adr/0005](adr/0005-immutability-mode.md) | In `Standard` mode a mover credential can delete objects of the **shared** cluster repo (restic needs delete for lock files and prune) — blast radius is the whole DR repo, not one namespace; `Immutable` mode (R18, M8) removes even that. Until M8, the platform Velero safety net and off-platform user locations are the fallback |
-| Insider (platform administrator) | Admin reads every namespace via the platform key, or erases data via `ClusterErasure` | Cluster KEK access restricted to the operator SA + break-glass group; `ClusterRestore`/`ClusterErasure` are cluster-scoped, audited objects (§12) with typed `confirmation` (R23); two-person review on key/erasure code (roadmap DoD) | The platform can read the shared cluster DR repo **by design** (one key, same trust level as existing etcd/node access); users opt out with their own location + key, `platformAccess: false` — data the platform cannot read |
+| Insider (platform administrator) | Admin reads every namespace via the platform key, or erases data via `ClusterErasure` | Cluster KEK access restricted to the operator SA + break-glass group; `ClusterRestore`/`ClusterErasure` are cluster-scoped, audited objects (§12) with typed `confirmation` (R23); two-person review on key/erasure code (roadmap DoD) | The platform can read the shared cluster DR repo **by design** (one key, same trust level as existing etcd/node access); users opt out with their own location + key — no operator slot exists on it, and an admin reaching for their password Secret is visible in the audit log and revocable by the user |
 
 ## 3. Isolation invariants
 
@@ -107,8 +108,8 @@ logic checks against this list (cf. roadmap DoD).
   destination's **user key**, so a client's secondary copy is under the **client's** key,
   distinct from the platform key, and holds **only that namespace's** snapshots — client siloing
   is preserved. The sync Job handles both keys **transiently** in `crystal-backup-system` (never
-  persisted), the same model as the namespace-plane backup mover (§4); `platformAccess: false`
-  (no durable operator key slot) is unchanged. See [adr/0013](adr/0013-external-backup-sync.md).
+  persisted), the same model as the namespace-plane backup mover (§4); the no-durable-operator-slot
+  property is unchanged. See [adr/0013](adr/0013-external-backup-sync.md).
 
 ## 4. Secrets and key management (ADR 0004)
 
@@ -124,8 +125,8 @@ rejected — it would break R8 reversibility with upstream restic and R13 dedupl
 - **Namespace plane** — the repository is protected by the **user's own** restic password
   (`repositoryPasswordSecretRef`, a Secret in their namespace), or an operator-generated
   password stored **in the user's namespace** if that ref is omitted (their key, their
-  reversibility). `platformAccess` (default `false`) optionally registers a second,
-  operator-owned key slot for mediated restore/verification.
+  reversibility). There is **no operator-owned key slot**, and no API field that could request
+  one — see §5.1 below for why that is a structural property rather than a policy.
 
 What lives where:
 
@@ -137,8 +138,8 @@ What lives where:
 | Per-mover S3 creds + unwrapped DEK | Job-owned Secret, TTL-bounded | `crystal-backup-system` | the one mover Job (volume projection) |
 | User location creds / user repo password | user-named Secrets (`offsite-s3`, `offsite-key`) | user namespace | user; operator by name (to run the user's movers) |
 
-`BackupRepository.status.keySlots` reports `[platform]` for a cluster repo, `[tenant]` for
-a user repo, or `[tenant, platform]` when `platformAccess: true`.
+`BackupRepository.status.keySlots` reports `[platform]` for a cluster repo and `[tenant]` for a
+user repo. A user repo has no other reachable value.
 
 A **sync mover** (external sync, R28) is the one Job that projects **two** key/cred sets — the
 source and destination repositories' — held only for its lifetime; there is still no durable
@@ -228,10 +229,26 @@ per-namespace user roles (02-api RBAC section):
   hook cannot smuggle a second command through an unquoted value.
 
   Note the grant is **cluster-wide `pods/exec` `create`**, the operator's single most powerful
-  verb: anyone who can write a hook into a `ClusterBackup`/`BackupSchedule` directs it. That is why
-  the namespace confinement above is a code invariant with a test, and why M5's cascade work
-  ([adr/0017](adr/0017-cascade-materialization-backup-carries-identity.md)) treats a
-  `SubjectAccessReview` on the writer as the escalation mitigation.
+  verb. It is now used only for **admin-authored cluster-plane hooks**.
+- `serviceaccounts`: `impersonate` (**M5**, [adr/0018](adr/0018-hook-execution-identity.md)). On the
+  namespace plane the operator does NOT exec as itself: `hooks.serviceAccountName` names a
+  ServiceAccount in the backed-up namespace, and the operator impersonates it, so the API server
+  authorises the exec against **that** identity's rights. This is what turns the confinement
+  sentence above from an assertion into an enforced property — and it is checked at **every exec**,
+  not once at admission, so revoking the ServiceAccount's `pods/exec` takes effect immediately.
+
+  A namespace-plane run declaring hooks without an identity is **gated**
+  (`HooksNeedServiceAccount`), never silently escalated to the operator's own privileges. The rule
+  covers annotation-sourced hooks too: an annotation supplies the *command*, never the *identity*.
+
+  The impersonated **namespace** is always the target pod's and is not a field anywhere in the API;
+  only the ServiceAccount *name* is configurable. The RBAC rule is therefore unrestricted by name
+  (pinning `resourceNames` would impose a naming convention on every tenant) and bounded by code
+  instead. Setup: [docs/HOOKS.md](../docs/HOOKS.md).
+
+  adr/0017 §5 had named a `SubjectAccessReview` on the writer as the candidate mitigation;
+  adr/0018 supersedes it — a SAR authorises the CR once, impersonation authorises each call, and it
+  needs no blocking webhook.
 - `secrets`: `get` **only** — no `list`/`watch`; the operator reads Secrets by name via a
   direct API client (cache bypass), so no cluster-wide Secret cache ever exists in its
   memory. Namespace-scoped Secret `list` exists only in the manifest mover's transient
@@ -415,11 +432,20 @@ full namespace recovery (R15). Implications, stated plainly:
   a more portable ciphertext; KEK custody keeps it safe at rest. Users never hold the
   cluster key; their access is the mediated `namespace=` filter, which restores their own
   Secrets back into their own namespace where those Secrets already live.
-- On a user `BackupLocation`, the control is the user's own key. With `platformAccess:
-  false` (default) the operator registers **no durable key slot** of its own on that repo,
-  so the platform has no standing, independent way to open the user's off-platform backups
-  (e.g. to read their Secrets) — the user's key governs access, and they may hold or rotate
-  it themselves.
+- On a user `BackupLocation`, the control is the user's own key. The operator registers **no
+  key slot** of its own on that repo, and the API offers no way to ask for one, so the platform
+  has no standing, independent way to open the user's off-platform backups (e.g. to read their
+  Secrets). To help a user, an admin must read that user's password Secret out of their
+  namespace — a **visible** act in the API audit log that **stops working** the moment the user
+  rotates their key or deletes the Secret.
+
+  That revocability is the whole point, and it is why the planned `platformAccess` opt-in was
+  dropped rather than implemented ([adr/0004](adr/0004-encryption-key-management.md)
+  amendment): an operator slot would be a password held in `crystal-backup-system` that survives
+  the user rotating their key, and — because removing a restic key slot does not rotate the
+  master key — one the user could never take back. Opting in once would have been a one-way
+  door. The guarantee is bought by the mechanism not existing, so no flag, bypass or future
+  maintainer can switch it off.
 - Opt-out: `BackupSchedule`/`ClusterBackupSchedule` `manifestOptions.excludeSecretData:
   true` stores Secret manifests with `data`/`stringData` stripped and annotation
   `crystalbackup.io/secret-data-excluded: "true"`; restore recreates them empty with the

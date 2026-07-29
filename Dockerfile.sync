@@ -1,0 +1,71 @@
+# Sync image for the kind e2e external-sync path: crystal-mover + pinned restic + rclone.
+#
+# The AUTHORITATIVE, production sync image is apko/Wolfi/SLSA (build/apko/sync.yaml +
+# build/melange/{sync,restic}.yaml, adr/0012). This Dockerfile is the throwaway, plain-Docker
+# equivalent used ONLY by the kind e2e, exactly as Dockerfile.mover is for the data path.
+#
+# It is a copy of Dockerfile.mover plus rclone, and that duplication is deliberate rather than a
+# shared base: the two images must be able to drift (the whole point of a separate sync image is
+# that rclone's dependency surface stays off the backup/restore path — adr/0013 amendment), and a
+# common base layer would quietly reunite them.
+#
+# The operator contract it honours (internal/mover) is the mover's, plus one line:
+#   * entrypoint /usr/bin/crystal-mover   (mover.MoverBinaryPath — same shim, --operation sync)
+#   * `restic` on PATH                    (the shim execs `restic`)
+#   * `rclone` on PATH                    (restic spawns `rclone serve restic` for an
+#                                          rclone:<remote>: repository — WITHOUT it, a sync Job
+#                                          fails with "unable to open repository", which reads
+#                                          like a network fault rather than a missing binary)
+#   * restic pinned to 0.19.1             (build/melange/restic.yaml)
+FROM golang:1.26 AS builder
+ARG TARGETOS
+ARG TARGETARCH
+
+WORKDIR /workspace
+COPY go.mod go.mod
+COPY go.sum go.sum
+RUN go mod download
+COPY . .
+
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
+    go build -trimpath -ldflags="-s -w" -o /out/crystal-mover ./cmd/crystal-mover
+
+ARG RESTIC_VERSION=0.19.1
+ARG RESTIC_SHA256=bb9b1a19040744d26d8a79be029d4e6b189c45ccc9d8831d7fe367d3c33df725
+ADD https://github.com/restic/restic/releases/download/v${RESTIC_VERSION}/restic-${RESTIC_VERSION}.tar.gz /tmp/restic.tar.gz
+RUN echo "${RESTIC_SHA256}  /tmp/restic.tar.gz" | sha256sum -c - \
+    && mkdir -p /tmp/restic \
+    && tar -xzf /tmp/restic.tar.gz -C /tmp/restic --strip-components=1 \
+    && cd /tmp/restic \
+    && CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
+       go build -trimpath -ldflags="-s -w" -o /out/restic ./cmd/restic
+
+# rclone from its upstream source release, checksum-pinned like restic. Built from source rather
+# than pulled as a binary so this image needs no package manager, and so the e2e proves the same
+# integration the production image does: one restic process reaching two repositories through two
+# independently-credentialed remotes.
+#
+# The tarball is rclone's OWN release asset (rclone-vX.Y.Z.tar.gz, listed in their PGP-signed
+# SHA256SUMS), not the GitHub `archive/refs/tags/` URL — that one is generated on demand and is not
+# guaranteed byte-stable, so a hash pinned against it can start failing without anything changing.
+# Hash below verified against the published SHA256SUMS on 2026-07-28.
+#
+# The version tracks build/melange/rclone.yaml — which is now also a from-source build, since Wolfi
+# carried advisories with no published fix (adr/0013). It does NOT have to match exactly (this image
+# never ships), but keeping it in step is what makes an e2e failure informative about the production
+# image rather than about a version nobody runs.
+ARG RCLONE_VERSION=1.74.4
+ARG RCLONE_SHA256=23fb09cd209ac6f4540f75cbcfc913fb1e2a35b90cf1a9d67292e2239b4f3a24
+ADD https://github.com/rclone/rclone/releases/download/v${RCLONE_VERSION}/rclone-v${RCLONE_VERSION}.tar.gz /tmp/rclone.tar.gz
+RUN echo "${RCLONE_SHA256}  /tmp/rclone.tar.gz" | sha256sum -c - \
+    && mkdir -p /tmp/rclone \
+    && tar -xzf /tmp/rclone.tar.gz -C /tmp/rclone --strip-components=1 \
+    && cd /tmp/rclone \
+    && CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
+       go build -trimpath -ldflags="-s -w" -o /out/rclone .
+
+FROM gcr.io/distroless/base-debian12:latest
+COPY --from=builder /out/crystal-mover /usr/bin/crystal-mover
+COPY --from=builder /out/restic /usr/bin/restic
+COPY --from=builder /out/rclone /usr/bin/rclone
+ENTRYPOINT ["/usr/bin/crystal-mover"]

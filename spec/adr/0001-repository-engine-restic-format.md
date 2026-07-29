@@ -57,7 +57,7 @@ The decision powers the requirements as follows:
 
 | Requirement | How the restic format serves it |
 |---|---|
-| R3 / R5 | **restic multi-key**: one repository accepts several passwords, each wrapping (scrypt) the same master key (`restic key add/remove`). The shared cluster repo carries a **single platform slot**; a namespace-plane repo carries the **user's own key** plus, when `platformAccess` is set, an **optional operator slot** for mediated restore/verification — no duplicated data, no cross-repo key hierarchy ([adr/0004](0004-encryption-key-management.md)). |
+| R3 / R5 | **restic multi-key**: one repository accepts several passwords, each wrapping (scrypt) the same master key (`restic key add/remove`). The shared cluster repo carries a **single platform slot**; a namespace-plane repo carries the **user's own key and nothing else** — the multi-key capability is deliberately left unused there, so platform access ends when the user's key does ([adr/0004](0004-encryption-key-management.md) amendment) — no duplicated data, no cross-repo key hierarchy ([adr/0004](0004-encryption-key-management.md)). |
 | R7 | `restic restore --include`, `restic dump <snap> <path>` streams a single file to stdout reading only the needed blobs. |
 | R8 | Free by construction: `restic -r s3:… dump latest --archive tar` produces a tar with only S3 credentials + key. `crystalctl repo export --tar` is a thin wrapper; the upstream equivalent is documented as the reversibility guarantee. |
 | R10 | Complete: xattrs (including ACLs as `system.posix_acl_*` xattrs) are stored unconditionally at backup; restores pass **no** `--include-xattr`/`--exclude-xattr` filter so all xattrs travel, hardlinks preserved, sparse files via `restore --sparse`. Verified by the metadata-fidelity e2e suite (M1). |
@@ -76,8 +76,8 @@ The decision powers the requirements as follows:
   argument available in this space, a strong sovereignty guarantee.
 - **Multi-key enables the two-plane key model**: several restic passwords over one master
   key let the operator add a slot without duplicating data — a **single platform slot** on
-  the shared cluster repo, and the **user's key plus an optional operator slot**
-  (`platformAccess`) on a namespace repo. With the envelope of
+  the shared cluster repo, and the **user's key alone** on a namespace repo, where the ability
+  to add a second slot is deliberately not exposed (adr/0004 amendment). With the envelope of
   [adr/0004](0004-encryption-key-management.md) (the platform DEK is a restic password
   wrapped by an age KEK, O(1) re-wrap) this delivers R3/R5 with **zero custom
   cryptography** and without breaking R8.

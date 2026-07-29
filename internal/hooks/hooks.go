@@ -110,6 +110,17 @@ type Resolved struct {
 	OnError   cbv1.HookErrorPolicy
 	Source    Source
 	Phase     Phase
+	// ServiceAccountName is the ServiceAccount the operator impersonates to run this command. It
+	// is resolved IN Pod.Namespace and nowhere else — the namespace is derived from the target
+	// pod, never configured, so no value in any spec can point this at another tenant.
+	//
+	// It is carried on the resolved hook rather than passed alongside the batch because it must
+	// hold for ANNOTATION-sourced hooks too: an annotation supplies the command, never the
+	// identity. That is the one place this design differs from Velero's, whose pod annotations
+	// let anyone able to annotate a pod choose what the backup controller execs as itself.
+	//
+	// Empty means "as the operator", which is the cluster plane's admin-authored default.
+	ServiceAccountName string
 }
 
 // Result is one hook's outcome.
@@ -132,7 +143,11 @@ func (r Result) Aborts() bool {
 // Executor runs one command in one container. The seam that keeps this package testable without a
 // cluster, and the only thing in it that performs I/O.
 type Executor interface {
-	Exec(ctx context.Context, pod types.NamespacedName, container string, command []string) (stdout, stderr string, err error)
+	// Exec runs command in one container. serviceAccountName, when non-empty, is a ServiceAccount
+	// in pod.Namespace that the call must be made AS — the API server then authorises the exec
+	// against that identity's rights, not the operator's.
+	Exec(ctx context.Context, pod types.NamespacedName, container string, command []string,
+		serviceAccountName string) (stdout, stderr string, err error)
 }
 
 // Resolve computes the hooks to run for one phase against the given pods, applying the
@@ -156,6 +171,13 @@ func Resolve(pods []corev1.Pod, spec cbv1.HooksSpec, phase Phase) []Resolved {
 			}
 		}
 		out = append(out, fromSpec(pod, spec, phase)...)
+	}
+	// The impersonated identity is stamped HERE, once, on every hook from either source, rather
+	// than inside each builder. An annotation-sourced hook that missed it would run as the
+	// operator — the exact escalation this field exists to close — and a single assignment site
+	// is one that cannot be half-applied.
+	for i := range out {
+		out[i].ServiceAccountName = spec.ServiceAccountName
 	}
 	return out
 }
@@ -321,7 +343,7 @@ func runOne(ctx context.Context, exec Executor, h Resolved) Result {
 	hookCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	stdout, stderr, err := exec.Exec(hookCtx, h.Pod, h.Container, h.Command)
+	stdout, stderr, err := exec.Exec(hookCtx, h.Pod, h.Container, h.Command, h.ServiceAccountName)
 	if err != nil {
 		// Name the deadline explicitly. "context deadline exceeded" on its own sends an operator
 		// looking at the network; "hook timed out after 30s" sends them to their own command.

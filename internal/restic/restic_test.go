@@ -19,6 +19,7 @@ package restic
 import (
 	"math/rand"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -801,5 +802,187 @@ func TestCheckCommand(t *testing.T) {
 		if _, err := CheckCommand(bad); err == nil {
 			t.Errorf("CheckCommand(%q) accepted a value restic would reject at flag-parse time", bad)
 		}
+	}
+}
+
+// TestErasureTagFilterUsesOneANDedTag is the assertion that keeps a right-to-erasure from
+// deleting other tenants' data.
+//
+// restic reads a comma-separated --tag as AND and a REPEATED --tag as OR. A namespace+pvc erasure
+// emitted as two flags would therefore match "every snapshot of that namespace" OR "every snapshot
+// of any PVC by that name, in any namespace" — a scope that spans tenants. One flag, one comma.
+func TestErasureTagFilterUsesOneANDedTag(t *testing.T) {
+	filter, ok := ErasureTagFilter(v1alpha1.ErasureTarget{Namespace: "team-x", PVC: "data"})
+	if !ok {
+		t.Fatal("namespace+pvc must select something")
+	}
+	want := "crystalbackup,namespace=team-x,pvc=data"
+	if filter != want {
+		t.Fatalf("filter = %q, want %q", filter, want)
+	}
+
+	argv, err := ErasureForgetArgs(v1alpha1.ErasureTarget{Namespace: "team-x", PVC: "data"})
+	if err != nil {
+		t.Fatalf("ErasureForgetArgs: %v", err)
+	}
+	tagFlags := 0
+	for _, a := range argv {
+		if a == "--tag" {
+			tagFlags++
+		}
+		if strings.HasPrefix(a, "--keep-") {
+			t.Fatalf("erasure argv carries a keep flag (%q); a retention flag would turn a GDPR "+
+				"erasure into a partial no-op that still reports success", a)
+		}
+	}
+	if tagFlags != 1 {
+		t.Fatalf("argv has %d --tag flags, want exactly 1 (repeating --tag means OR, which widens "+
+			"the erasure across tenants): %v", tagFlags, argv)
+	}
+}
+
+// TestErasureRefusesAnEmptyOrAmbiguousTarget: the failure mode of getting this wrong is erasing
+// every snapshot CrystalBackup has ever written, so an under-specified target must yield NOTHING
+// rather than an unfiltered command.
+func TestErasureRefusesAnEmptyOrAmbiguousTarget(t *testing.T) {
+	for name, target := range map[string]v1alpha1.ErasureTarget{
+		"empty":                 {},
+		"pvc without namespace": {PVC: "data"}, // a bare PVC name is not an identity
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, ok := ErasureTagFilter(target); ok {
+				t.Fatal("target was accepted; an unfiltered erasure would remove every snapshot")
+			}
+			if _, err := ErasureForgetArgs(target); err == nil {
+				t.Fatal("ErasureForgetArgs built a command for a target that selects nothing")
+			}
+		})
+	}
+}
+
+// TestErasureTargetPrecedence pins which field wins when several are set: the NARROWEST scope.
+// Widening on ambiguity would be the wrong direction for a destructive operation.
+func TestErasureTargetPrecedence(t *testing.T) {
+	filter, ok := ErasureTagFilter(v1alpha1.ErasureTarget{
+		Tenant: "acme", Namespace: "team-x", PVC: "data",
+	})
+	if !ok {
+		t.Fatal("fully-specified target must select something")
+	}
+	if filter != "crystalbackup,namespace=team-x,pvc=data" {
+		t.Fatalf("filter = %q; the narrowest scope must win", filter)
+	}
+}
+
+// TestSyncArgsCarriesNoRepository is the guard against the single worst outcome external sync
+// can produce: a copy running backwards.
+//
+// restic's two repositories are spelled asymmetrically — the unqualified -r/--repo is the
+// DESTINATION and --from-repo is the SOURCE. Anyone reading -r as "the repository I am working
+// on" will place the source there, and the result is not a failed sync: it is the SECONDARY
+// overwriting the PRIMARY, i.e. the DR copy destroying the thing it exists to protect. The
+// defence is that this builder cannot name a repository at all; both travel as environment,
+// assembled once in the Job. If a future change adds a repo flag here, this test fails.
+func TestSyncArgsCarriesNoRepository(t *testing.T) {
+	for _, argv := range [][]string{SyncArgs(nil), SyncArgs([]string{"team-x"})} {
+		if argv[0] != "copy" {
+			t.Fatalf("argv[0] = %q, want the copy subcommand: %v", argv[0], argv)
+		}
+		for i, a := range argv {
+			switch a {
+			case "-r", "--repo", "--from-repo", "--repository-file", "--from-repository-file":
+				t.Fatalf("argv names a repository at index %d (%q): the direction must be set by "+
+					"environment alone, or half of it can be built wrong: %v", i, a, argv)
+			}
+		}
+	}
+}
+
+// TestSyncArgsScopesToOurSnapshots: a whole-repository sync must still be filtered.
+//
+// A bucket can hold snapshots another tool wrote, and "sync everything" meaning "sync everything
+// in the bucket" would copy a stranger's data into the destination — under our key, into a
+// repository whose owner never asked for it. TagBase alone is the floor.
+func TestSyncArgsScopesToOurSnapshots(t *testing.T) {
+	argv := SyncArgs(nil)
+	want := []string{"copy", "--tag", TagBase}
+	if !slices.Equal(argv, want) {
+		t.Fatalf("SyncArgs(nil) = %v, want %v", argv, want)
+	}
+}
+
+// TestSyncArgsRepeatsTagPerNamespace pins the OR spelling, which is the opposite of the erasure
+// filter's and for the opposite reason.
+//
+// restic ANDs a comma-joined --tag and ORs repeated ones. Selecting two namespaces as one value
+// ("crystalbackup,namespace=a,namespace=b") asks for snapshots that are in BOTH namespaces at
+// once — nothing matches, and a sync that silently copies zero snapshots reports success while
+// leaving the secondary empty. That is a backup that does not exist, discovered at restore time.
+func TestSyncArgsRepeatsTagPerNamespace(t *testing.T) {
+	argv := SyncArgs([]string{"team-x", "team-y"})
+	want := []string{
+		"copy",
+		"--tag", "crystalbackup,namespace=team-x",
+		"--tag", "crystalbackup,namespace=team-y",
+	}
+	if !slices.Equal(argv, want) {
+		t.Fatalf("SyncArgs = %v, want %v", argv, want)
+	}
+}
+
+// TestSnapshotOriginalIsDecoded: `original` is what makes a re-sync a no-op and what Mirror
+// reconciles on, so the decoder must not drop it. restic emits it ONLY on copied snapshots —
+// a natively-taken one must decode to the empty string, not to its own ID.
+func TestSnapshotOriginalIsDecoded(t *testing.T) {
+	snaps, err := ParseSnapshots([]byte(`[
+	  {"id":"aa","short_id":"aa","time":"2026-07-28T10:00:00Z","hostname":"c1","paths":["/data"],
+	   "tags":["crystalbackup"],"original":"bb"},
+	  {"id":"cc","short_id":"cc","time":"2026-07-28T10:00:00Z","hostname":"c1","paths":["/data"],
+	   "tags":["crystalbackup"]}
+	]`))
+	if err != nil {
+		t.Fatalf("ParseSnapshots: %v", err)
+	}
+	if snaps[0].Original != "bb" {
+		t.Errorf("copied snapshot Original = %q, want %q — Mirror would re-copy it every run",
+			snaps[0].Original, "bb")
+	}
+	if snaps[1].Original != "" {
+		t.Errorf("native snapshot Original = %q, want empty — a non-empty value would make it look "+
+			"like a copy of something", snaps[1].Original)
+	}
+}
+
+// TestErasureForgetOptsIntoRemovingEverythingItMatched: a `forget` whose policy keeps NOTHING is
+// exactly what restic refuses to do by accident, and erasure is the one caller that means it.
+//
+// Verified against the pinned engine rather than assumed. Without the flag:
+//
+//	$ restic forget --tag crystalbackup,namespace=c-empty --retry-lock 5m
+//	Fatal: no policy was specified, no snapshots will be removed
+//	exit 1
+//
+// With it, the same command removed exactly the tagged snapshot and left the neighbouring tenant's
+// alone. Erasure shipped without it, so R21 removed nothing at all — the CR reported Failed, which
+// was honest, but the right to erasure was inert. This pins the flag so it cannot be dropped as
+// "unsafe-looking cleanup".
+func TestErasureForgetOptsIntoRemovingEverythingItMatched(t *testing.T) {
+	argv, err := ErasureForgetArgs(v1alpha1.ErasureTarget{Namespace: "team-x"})
+	if err != nil {
+		t.Fatalf("ErasureForgetArgs: %v", err)
+	}
+	if !slices.Contains(argv, "--unsafe-allow-remove-all") {
+		t.Fatalf("erasure argv %v lacks --unsafe-allow-remove-all; restic refuses a keep-nothing "+
+			"forget outright, so this command would remove no snapshot at all", argv)
+	}
+	// Retention must NOT carry it: there the policy is the whole point, and a stray
+	// remove-all would turn a thinning pass into a wipe.
+	retention, ok := ForgetCommand(v1alpha1.RetentionSpec{KeepLast: 3})
+	if !ok {
+		t.Fatal("a keepLast policy must produce a retention command")
+	}
+	if slices.Contains(retention, "--unsafe-allow-remove-all") {
+		t.Fatalf("retention argv %v carries --unsafe-allow-remove-all; a keep policy must never "+
+			"be allowed to remove everything", retention)
 	}
 }

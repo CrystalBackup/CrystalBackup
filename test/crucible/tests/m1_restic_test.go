@@ -71,7 +71,21 @@ func m1ResticExecOn(clusterID, locationName string, args ...string) string {
 	GinkgoHelper()
 
 	repoURL := restic.RepoURL(os.Getenv("S3_ENDPOINT"), os.Getenv("S3_BUCKET"), m1S3Prefix, clusterID)
-	password := m1UnwrapDEK(locationName)
+	out, _ := m1ResticRun(repoURL, m1UnwrapDEK(locationName), args...)
+	return out
+}
+
+// m1ResticRun is the oracle's engine: `restic <args...>` against an EXPLICIT repository URL and an
+// EXPLICIT password, returning the pod log AND whether restic exited zero.
+//
+// The two callers above derive both from a location, which is right for "what does this repository
+// contain". M5 needs the other question — "does this password open this repository AT ALL" — and
+// that one only has an answer if the exit status is reported rather than swallowed: the whole point
+// of `restic copy` re-encrypting to the destination's own key is that opening the destination with
+// the SOURCE's key must FAIL, and a helper that returns a log either way would read that failure as
+// an answer (the same trap m1ResticExecOn's comment describes, one level down).
+func m1ResticRun(repoURL, password string, args ...string) (string, bool) {
+	GinkgoHelper()
 
 	backoff, deadline := int32(0), int64(300)
 	job := &batchv1.Job{
@@ -114,14 +128,16 @@ func m1ResticExecOn(clusterID, locationName string, args ...string) string {
 		_ = k8s.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationBackground))
 	}()
 
+	var succeeded bool
 	Eventually(func(g Gomega) {
 		var got batchv1.Job
 		g.Expect(k8s.Get(ctx, client.ObjectKeyFromObject(job), &got)).To(Succeed())
 		g.Expect(got.Status.Succeeded+got.Status.Failed).To(BeNumerically(">", 0),
 			"restic Job %s/%s has not finished (active=%d)", operatorNS, job.Name, got.Status.Active)
+		succeeded = got.Status.Succeeded > 0
 	}, 5*time.Minute, 3*time.Second).Should(Succeed())
 
-	return m1PodLogs(job.Name)
+	return m1PodLogs(job.Name), succeeded
 }
 
 // m1PodLogs returns the merged container log of a finished Job's pod via `kubectl logs`
