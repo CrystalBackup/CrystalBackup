@@ -557,6 +557,14 @@ type syncDriver struct {
 type syncInflight struct {
 	handle *queue.Handle
 	run    *syncRun
+	// copied records that the COPY finished successfully and only the accounting after it is
+	// outstanding.
+	//
+	// Without it, a settle() failure dropped the entry, the next reconcile saw nothing in flight,
+	// found the sync due (an on-demand sync is due whenever it has never SUCCEEDED) and enqueued a
+	// whole new copy — a Job every requeue interval, forever, for a bookkeeping error. Keeping the
+	// entry makes the retry what it should always have been: re-inventory, do not re-copy.
+	copied bool
 }
 
 // newSyncDriver builds the driver with its in-flight map initialised.
@@ -656,22 +664,47 @@ func (d *syncDriver) drive(ctx context.Context, key string, run *syncRun, view s
 		return ctrl.Result{RequeueAfter: syncRequeueInterval}, nil
 	}
 
+	// The copy is already done and only its accounting is outstanding: retry THAT, and nothing else.
+	if f.copied {
+		return d.finish(ctx, key, f.run, view, jobPrefix, name, rec)
+	}
+
 	select {
 	case <-f.handle.Done():
-		d.mu.Lock()
-		delete(d.inflight, key)
-		d.mu.Unlock()
 		if err := f.handle.Err(); err != nil {
+			d.mu.Lock()
+			delete(d.inflight, key)
+			d.mu.Unlock()
 			*view.Phase = syncPhaseFailed
 			setSyncCondition(view, metav1.ConditionFalse, "SyncFailed", err.Error())
 			rec.event(corev1.EventTypeWarning, "SyncFailed", "%s", err.Error())
 			return ctrl.Result{RequeueAfter: syncRequeueInterval}, nil
 		}
+		d.mu.Lock()
+		f.copied = true
+		d.mu.Unlock()
 		// f.run, not the caller's run: the accounting must describe the copy that ran.
-		return d.settle(ctx, f.run, view, jobPrefix, name, rec)
+		return d.finish(ctx, key, f.run, view, jobPrefix, name, rec)
 	default:
 		return ctrl.Result{RequeueAfter: syncRequeueInterval}, nil
 	}
+}
+
+// finish runs the post-copy accounting and releases the in-flight entry ONLY when it completed.
+//
+// The entry is what stops a retry from re-copying, so it must outlive a partial failure and must
+// not outlive a success — a retained entry after Completed would make the NEXT scheduled tick
+// think a copy it never started is still running.
+func (d *syncDriver) finish(ctx context.Context, key string, run *syncRun, view syncStatusView,
+	jobPrefix, name string, rec syncRecorder,
+) (ctrl.Result, error) {
+	res, err := d.settle(ctx, run, view, jobPrefix, name, rec)
+	if err == nil && *view.Phase == syncPhaseCompleted {
+		d.mu.Lock()
+		delete(d.inflight, key)
+		d.mu.Unlock()
+	}
+	return res, err
 }
 
 // settle measures both sides after a successful copy and, in Mirror mode, forgets the destination
