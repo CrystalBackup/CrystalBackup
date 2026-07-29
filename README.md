@@ -1,9 +1,10 @@
 # Crystal Backup
 
-> **Early, real code** — **M0 through M4 have shipped (v0.4.0)**: the core backup engine,
-> cluster disaster recovery, **restore** and **manifest & cluster-scoped DR** are implemented,
-> tested (envtest + kind e2e + a real-cluster crucible suite) and released; most milestones are
-> still ahead. Built in the open with AI assistance. Background & disclaimer: [Project status & disclaimer](#-project-status--disclaimer).
+> **Early, real code** — **M0 through M5 have shipped (v0.5.0)**: the core backup engine,
+> cluster disaster recovery, **restore**, **manifest & cluster-scoped DR**, and the
+> **namespace plane** (a user's own repository under their own key), **external sync** and the
+> **right to erasure** are implemented, tested (envtest + kind e2e + a real-cluster crucible
+> suite) and released; most milestones are still ahead. Built in the open with AI assistance. Background & disclaimer: [Project status & disclaimer](#-project-status--disclaimer).
 
 **Crystal Backup** is a Kubernetes operator that provides **multi-tenant,
 self-service backup and restore of namespaces** — both **PVC data and Kubernetes manifests** —
@@ -24,8 +25,9 @@ is restorable, with no pre-existing custom resources and no surviving cluster re
 
 ## ⚠️ Project status & disclaimer
 
-**M0 through M4 have shipped (v0.4.0)** — the core engine, cluster disaster recovery, restore
-and manifest & cluster-scoped DR are real, tested code — but most of the [roadmap](#roadmap) is
+**M0 through M5 have shipped (v0.5.0)** — the core engine, cluster disaster recovery, restore,
+manifest & cluster-scoped DR, the namespace plane, external sync and the right to erasure are
+real, tested code — but most of the [roadmap](#roadmap) is
 still ahead, so this is
 **early and experimental**. Specs, Architecture Decision Records (ADRs) and the roadmap remain
 public and lead the code. It's built in the open, so you can follow — and shape — it as it happens.
