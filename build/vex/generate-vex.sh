@@ -135,8 +135,10 @@ fi
 # source we build. The override matters as much here — rclone ${RCLONE_VERSION} pulls an
 # x/text whose norm.Iter carries CVE-2026-56852 (fixed in 0.39.0). Keep the x/text version in
 # LOCKSTEP with build/melange/rclone.yaml; a drift here would produce a VEX describing a binary
-# nobody runs. x/image needs no override at 1.74.4 — rclone's own pin is already past the two TIFF
-# advisories that started this detour.
+# nobody runs. grpc gets the same override for the same reason it does in the restic block:
+# GO-2026-6061 is reachable through rclone's Google Cloud Storage backend. x/image needs no
+# override at 1.74.4 — rclone's own pin is already past the two TIFF advisories that started
+# this detour.
 if [ "$COMPONENT" = "sync" ]; then
   RECIPE="${REPO_ROOT}/build/melange/rclone.yaml"
   RCLONE_VERSION="$(sed -n 's/^  version: *"\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' "$RECIPE" | head -n1)"
@@ -163,7 +165,7 @@ if [ "$COMPONENT" = "sync" ]; then
   mkdir -p "${WORK}/rclone-src"
   tar xzf "$TARBALL" -C "${WORK}/rclone-src" --strip-components=1
   ( cd "${WORK}/rclone-src" \
-      && GOFLAGS=-mod=mod go get golang.org/x/text@v0.40.0 \
+      && GOFLAGS=-mod=mod go get golang.org/x/text@v0.40.0 google.golang.org/grpc@v1.82.1 \
       && GOFLAGS=-mod=mod go mod tidy \
       && govulncheck -format openvex . ) > "${WORK}/rclone.json"
   DOCS+=("${WORK}/rclone.json")

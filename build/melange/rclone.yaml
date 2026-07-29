@@ -77,7 +77,7 @@ pipeline:
       expected-sha256: 23fb09cd209ac6f4540f75cbcfc913fb1e2a35b90cf1a9d67292e2239b4f3a24
       strip-components: 1
 
-  - name: Override x/text past its reachable advisory
+  - name: Override x/text and grpc past their reachable advisories
     runs: |
       # GO-2026-5970 / CVE-2026-56852 — infinite loop in x/text/unicode/norm, fixed in 0.39.0.
       # rclone 1.74.4 still pins 0.38.0, and Wolfi names 1.74.4-r2 as the release that carries the
@@ -92,8 +92,17 @@ pipeline:
       # Kept in LOCKSTEP with build/vex/generate-vex.sh, which applies the same override so the
       # VEX describes this binary rather than the vanilla tarball.
       #
+      # GO-2026-6061 / GHSA-hrxh-6v49-42gf — xDS RBAC authorization engine and HTTP/2 transport
+      # server in google.golang.org/grpc, fixed in 1.82.1. rclone reaches it through its Google
+      # Cloud Storage backend, exactly as restic reaches it through its own GCS backend — so this
+      # gets the treatment restic.yaml has carried since GO-2026-6061 was published.
+      #
+      # It was missed when this recipe was written, and the release gate caught it: govulncheck
+      # refused to publish the sync image with a REACHABLE advisory, which is precisely the job
+      # that gate exists to do. The mover passed the same gate because restic already had it.
+      #
       # The go/build step below runs with -mod=readonly; the module edit needs -mod=mod.
-      GOFLAGS=-mod=mod go get golang.org/x/text@v0.40.0
+      GOFLAGS=-mod=mod go get golang.org/x/text@v0.40.0 google.golang.org/grpc@v1.82.1
       # tidy completes go.sum for the NEW graph; without it the -mod=readonly go/build below
       # fails on a missing go.sum entry.
       GOFLAGS=-mod=mod go mod tidy
