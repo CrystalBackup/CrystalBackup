@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Crystal Backup — Crucible M3 Acceptance Report</title>
+<style>
+  :root {
+    --paper: #f6f8f9;
+    --panel: #ffffff;
+    --ink: #0f1620;
+    --muted: #59636e;
+    --faint: #8b96a1;
+    --line: #e2e7ec;
+    --line-strong: #d0d8de;
+    --steel: #35607a;        /* structural accent: infra / k8s / links */
+    --steel-soft: #eaf1f5;
+    --pass: #0f9d63;         /* the one bold place: success / verdict */
+    --pass-soft: #e6f5ed;
+    --skip: #8a97a3;         /* label-gated, not a failure */
+    --skip-soft: #eef1f4;
+    --amber: #b6791f;
+    --tag-product: #2a5db0;
+    --tag-product-soft: #e9eff9;
+    --tag-test: #5f6b78;
+    --tag-test-soft: #edf0f3;
+    --shadow: 0 1px 2px rgba(15,22,32,.04), 0 8px 24px rgba(15,22,32,.05);
+
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper: #0c1116;
+      --panel: #121a22;
+      --ink: #e8eef3;
+      --muted: #97a3ae;
+      --faint: #6c7883;
+      --line: #212c35;
+      --line-strong: #2c3a45;
+      --steel: #74a7c8;
+      --steel-soft: #16242e;
+      --pass: #37d18b;
+      --pass-soft: #10241b;
+      --skip: #6c7883;
+      --skip-soft: #171f27;
+      --amber: #d6a24e;
+      --tag-product: #7aa5e8;
+      --tag-product-soft: #16202f;
+      --tag-test: #97a3ae;
+      --tag-test-soft: #1a222a;
+      --shadow: 0 1px 2px rgba(0,0,0,.3), 0 10px 30px rgba(0,0,0,.35);
+    }
+  }
+  :root[data-theme="light"] {
+    --paper: #f6f8f9; --panel: #ffffff; --ink: #0f1620; --muted: #59636e; --faint: #8b96a1;
+    --line: #e2e7ec; --line-strong: #d0d8de; --steel: #35607a; --steel-soft: #eaf1f5;
+    --pass: #0f9d63; --pass-soft: #e6f5ed; --skip: #8a97a3; --skip-soft: #eef1f4;
+    --tag-product: #2a5db0; --tag-product-soft: #e9eff9; --tag-test: #5f6b78; --tag-test-soft: #edf0f3;
+    --shadow: 0 1px 2px rgba(15,22,32,.04), 0 8px 24px rgba(15,22,32,.05);
+  }
+  :root[data-theme="dark"] {
+    --paper: #0c1116; --panel: #121a22; --ink: #e8eef3; --muted: #97a3ae; --faint: #6c7883;
+    --line: #212c35; --line-strong: #2c3a45; --steel: #74a7c8; --steel-soft: #16242e;
+    --pass: #37d18b; --pass-soft: #10241b; --skip: #6c7883; --skip-soft: #171f27;
+    --tag-product: #7aa5e8; --tag-product-soft: #16202f; --tag-test: #97a3ae; --tag-test-soft: #1a222a;
+    --shadow: 0 1px 2px rgba(0,0,0,.3), 0 10px 30px rgba(0,0,0,.35);
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: var(--sans);
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+  .wrap { max-width: 860px; margin: 0 auto; padding: clamp(28px, 5vw, 64px) clamp(18px, 4vw, 40px) 80px; }
+
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 12px;
+    letter-spacing: .14em;
+    text-transform: uppercase;
+    color: var(--steel);
+    margin: 0;
+  }
+
+  /* ── Masthead ─────────────────────────────────────────── */
+  .masthead { border-bottom: 1px solid var(--line); padding-bottom: 26px; }
+  h1 {
+    font-size: clamp(28px, 4.6vw, 40px);
+    line-height: 1.08;
+    letter-spacing: -.02em;
+    text-wrap: balance;
+    margin: 12px 0 8px;
+    font-weight: 680;
+  }
+  .lede { color: var(--muted); font-size: 17px; margin: 0; max-width: 60ch; }
+  .meta {
+    font-family: var(--mono);
+    font-size: 12.5px;
+    color: var(--faint);
+    margin-top: 18px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 18px;
+  }
+  .meta b { color: var(--muted); font-weight: 500; }
+
+  /* ── Verdict ──────────────────────────────────────────── */
+  .verdict {
+    margin: 30px 0;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-left: 3px solid var(--pass);
+    border-radius: 12px;
+    box-shadow: var(--shadow);
+    padding: 22px clamp(18px, 3vw, 28px);
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 20px 26px;
+    align-items: center;
+  }
+  .verdict-badge {
+    display: inline-flex; align-items: center; gap: 9px;
+    font-family: var(--mono); font-weight: 600; font-size: 15px;
+    color: var(--pass);
+    background: var(--pass-soft);
+    border: 1px solid color-mix(in srgb, var(--pass) 28%, transparent);
+    padding: 8px 14px; border-radius: 999px; white-space: nowrap;
+  }
+  .verdict-badge .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--pass); box-shadow: 0 0 0 4px color-mix(in srgb, var(--pass) 18%, transparent); }
+  .metrics { display: flex; flex-wrap: wrap; gap: 10px 30px; align-items: baseline; }
+  .metric { display: flex; flex-direction: column; }
+  .metric .n { font-family: var(--mono); font-size: 26px; font-weight: 620; letter-spacing: -.02em; font-variant-numeric: tabular-nums; line-height: 1; }
+  .metric .n.pass { color: var(--pass); }
+  .metric .n.zero { color: var(--ink); }
+  .metric .n.skip { color: var(--skip); }
+  .metric .k { font-family: var(--mono); font-size: 11px; text-transform: uppercase; letter-spacing: .1em; color: var(--faint); margin-top: 5px; }
+
+  /* ── Prose ────────────────────────────────────────────── */
+  .context { color: var(--muted); font-size: 15.5px; max-width: 66ch; }
+  .context b { color: var(--ink); font-weight: 600; }
+  code { font-family: var(--mono); font-size: .89em; background: var(--steel-soft); color: var(--ink); padding: .1em .38em; border-radius: 5px; }
+
+  h2 {
+    font-size: 13px; font-family: var(--mono); text-transform: uppercase; letter-spacing: .12em;
+    color: var(--steel); font-weight: 600;
+    margin: 0 0 2px;
+  }
+  .group { margin-top: 40px; }
+  .group-head { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; border-bottom: 1px solid var(--line); padding-bottom: 10px; }
+  .group-head .count { font-family: var(--mono); font-size: 12px; color: var(--faint); }
+  .group-note { color: var(--muted); font-size: 13.5px; margin: 8px 0 4px; }
+
+  /* ── Spec rows ────────────────────────────────────────── */
+  ul.specs { list-style: none; margin: 6px 0 0; padding: 0; }
+  ul.specs > li { display: grid; grid-template-columns: 20px 1fr auto; gap: 3px 14px; padding: 14px 0; border-bottom: 1px solid var(--line); }
+  ul.specs > li:last-child { border-bottom: 0; }
+  .check { grid-row: span 2; margin-top: 3px; color: var(--pass); }
+  .check svg { display: block; }
+  .spec-name { font-weight: 560; font-size: 15px; color: var(--ink); }
+  .spec-time { font-family: var(--mono); font-size: 12.5px; color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; grid-row: span 2; align-self: start; margin-top: 2px; }
+  .spec-proves { grid-column: 2 / 3; color: var(--muted); font-size: 13.5px; margin: 0; max-width: 62ch; }
+  .fixflag {
+    display: inline-block; font-family: var(--mono); font-size: 10.5px; letter-spacing: .04em;
+    color: var(--steel); background: var(--steel-soft);
+    border: 1px solid color-mix(in srgb, var(--steel) 22%, transparent);
+    padding: 1px 7px; border-radius: 999px; margin-left: 8px; vertical-align: 1.5px; white-space: nowrap;
+  }
+
+  /* ── Terse preflight rows (infra / m0): self-evident names, no "proves" subtext ─ */
+  ul.specs.terse > li { grid-template-columns: 20px 1fr auto; align-items: baseline; padding: 11px 0; }
+  ul.specs.terse .check, ul.specs.terse .spec-time, ul.specs.terse .skip-mark { grid-row: auto; margin-top: 0; }
+  ul.specs.terse .spec-name { font-weight: 520; }
+  .skip-mark { color: var(--skip); display: inline-flex; }
+  .skip-mark svg { display: block; }
+  li.skipped .spec-name { color: var(--muted); }
+  .spec-time.skip { color: var(--skip); }
+
+  /* ── Caught / fixes ───────────────────────────────────── */
+  .caught { margin-top: 48px; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: clamp(20px, 3vw, 30px); box-shadow: var(--shadow); }
+  .wave { font-family: var(--mono); font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: var(--faint); margin: 22px 0 2px; }
+  .fixes { display: grid; gap: 12px; margin-top: 12px; }
+  @media (min-width: 620px) { .fixes { grid-template-columns: 1fr 1fr 1fr; } }
+  .fix { border: 1px solid var(--line); border-radius: 10px; padding: 15px 16px; background: var(--paper); }
+  .fix .tag { display: inline-block; font-family: var(--mono); font-size: 10.5px; letter-spacing: .04em; text-transform: uppercase; padding: 2px 8px; border-radius: 999px; margin-bottom: 9px; }
+  .fix.product .tag { color: var(--tag-product); background: var(--tag-product-soft); }
+  .fix.test .tag { color: var(--tag-test); background: var(--tag-test-soft); }
+  .fix h3 { font-size: 14px; margin: 0 0 5px; font-weight: 620; }
+  .fix p { margin: 0; font-size: 13px; color: var(--muted); }
+  .fix .sha { font-family: var(--mono); font-size: 11.5px; color: var(--faint); margin-top: 9px; }
+
+  .foot { margin-top: 40px; padding-top: 20px; border-top: 1px solid var(--line); color: var(--faint); font-size: 13px; }
+  .foot code { background: var(--skip-soft); }
+</style>
+
+</head>
+<body>
+<div class="wrap">
+  <header class="masthead">
+    <p class="eyebrow">Crystal Backup · Crucible acceptance</p>
+    <h1>Milestone&nbsp;M4 — Consistency hooks, verification &amp; maintenance</h1>
+    <p class="lede">Real-conditions validation of scheduled repository maintenance (prune &amp; verify) and of the crash-only exposure teardown, run as the <b>full suite</b> — every M0&ndash;M3 criterion as non-regression plus the M4 gate — against live RKE2 / Ceph clusters, seven independent times.</p>
+    <div class="meta">
+      <span><b>Run</b> full-suite gate · all labels</span>
+      <span><b>Date</b> 2026-07-27</span>
+      <span><b>Campaign</b> 7 independent lanes</span>
+      <span><b>Residual snapshot objects</b> 0 &times; 7</span>
+    </div>
+  </header>
+
+  <section class="verdict" aria-label="Verdict">
+    <span class="verdict-badge"><span class="dot"></span>PASS · gate met</span>
+    <div class="metrics">
+      <div class="metric"><span class="n pass">46</span><span class="k">Passed</span></div>
+      <div class="metric"><span class="n zero">0</span><span class="k">Failed</span></div>
+      <div class="metric"><span class="n skip">1</span><span class="k">Skipped (conditional)</span></div>
+      <div class="metric"><span class="n zero" style="font-size:20px">7&times;0</span><span class="k">Residuals / lane</span></div>
+    </div>
+  </section>
+
+  <p class="context">
+    This release was validated differently, because M4&rsquo;s hardest bug demanded it. A three-lane fanout kept reproducing (~1 run in 3) a leaked <code>VolumeSnapshotContent</code> &mdash; <code>deletionPolicy: Retain</code>, no owner, invisible to every GC &mdash; and the audit that followed proved the teardown was structurally <b>one-shot</b>: the reconcile pass that persisted a Backup&rsquo;s terminal status was the only pass that ever deleted its snapshot pair, and nothing, orphan reaper included, ever retried. The fix is crash-only re-entry (a terminal Backup is re-swept until <b>nothing remains</b>, then stamped <code>exposures-cleaned</code>), and the acceptance for it is statistical: <b>seven independent full-suite lanes, seven times zero residual snapshot objects</b>, including a new spec that SIGKILLs the operator at the exact terminal-transition instant the leak lived in. The verdict above is the final lane, run on the released image. As always, every repository check goes through an <b>independent restic oracle</b>, so a controller that both writes and reports the same wrong thing cannot make a check pass.
+  </p>
+
+  <section class="group">
+    <div class="group-head"><h2>M4 · Repository maintenance &amp; verification (R17)</h2><span class="count">3 / 3</span></div>
+    <p class="group-note">Scheduled <code>prune</code> and <code>check</code> on the per-repository exclusive queue &mdash; reclaiming what retention freed, and verifying that what the repository holds is still readable, without ever racing the backup plane.</p>
+    <ul class="specs">
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">Holds the prune until the backup's movers have drained, then runs it exclusively</span>
+        <span class="spec-time">7m4.3s</span>
+        <p class="spec-proves">A prune due while a backup is running never starts alongside a live data mover: admission holds new movers back, the drain waits the in-flight ones out on its own short deadline, then the prune runs alone and succeeds &mdash; and <code>restic check</code> is happy afterwards (adr/0015).</p>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">A killed prune is absorbed by the Job retry: a terminal outcome is recorded and the repository is not wedged</span>
+        <span class="spec-time">8m8s</span>
+        <p class="spec-proves">SIGKILLing the prune mid-flight orphans restic&rsquo;s exclusive lock; the maintenance Job&rsquo;s pod-level retry absorbs the kill, a terminal outcome lands in <code>status.recentMaintenance</code> (so the cron baseline advances), and concurrent <code>--no-lock</code> reads never block.</p>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">Tampering is caught by check --read-data-subset and surfaced on the repository</span>
+        <span class="spec-time">3m0s</span>
+        <p class="spec-proves">Bytes flipped inside a pack object in S3 are found by the scheduled <code>check --read-data-subset</code> &mdash; silent bit-rot a structural check cannot see &mdash; and surfaced as <code>lastCheckResult: Failed</code> plus the <code>RepositoryCheckFailed</code> condition and alert metric.</p>
+      </li>
+    </ul>
+  </section>
+
+  <section class="group">
+    <div class="group-head"><h2>M4 · Crash-only teardown — the leak audit&rsquo;s gate</h2><span class="count">3 / 3</span></div>
+    <p class="group-note">The teardown that used to get exactly one chance now converges by re-entry, whatever instant the process dies. These three ran green in <b>every</b> sampled lane.</p>
+    <ul class="specs">
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">The operator SIGKILLed at the terminal transition still converges to zero residual snapshot objects</span>
+        <span class="spec-time">58.3s</span>
+        <p class="spec-proves">The new aimed spec: watch a child Backup at 200ms and grace-0 kill the operator the instant the terminal phase appears &mdash; inside the exact [status write &rarr; teardown] window the leak lived in. The fresh operator&rsquo;s re-entry sweep finishes the teardown, stamps <code>exposures-cleaned</code>, and the leak-check finds nothing.</p>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">Leak-check — a run leaves zero residual snapshot objects</span>
+        <span class="spec-time">5m22.9s</span>
+        <p class="spec-proves">After a full multi-namespace run: zero CrystalBackup-labelled VolumeSnapshots, zero attributable VolumeSnapshotContents (cluster-scoped included), zero temp clone PVCs &mdash; measured independently of the operator&rsquo;s own accounting, in all seven lanes.</p>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">The operator killed mid-run converges via Job re-adoption</span>
+        <span class="spec-time">5m30.6s</span>
+        <p class="spec-proves">The historical restart criterion: killed mid-run, the fresh operator re-adopts the in-flight mover Jobs (same UID &mdash; never duplicated), drives the run terminal, and the leak invariant still holds afterwards.</p>
+      </li>
+    </ul>
+  </section>
+
+  <section class="group">
+    <div class="group-head"><h2>Non-regression — platform &amp; M0&ndash;M3</h2><span class="count">40 / 40</span></div>
+    <p class="group-note">The rest of the full suite, green in the same run: platform 8/8 (storage, snapshots, Ceph health, S3), M0 3/3 (+1 conditional skip), M1 15/15 (engine, discovery, reliability), M2 5/5 (self-service restore), M3 11/11 (manifests &amp; cluster-scoped DR). Every previous milestone keeps its promise on the M4 codebase.</p>
+  </section>
+
+  <section class="caught">
+    <p class="eyebrow">What the campaign surfaced</p>
+    <h2 style="color:var(--ink); text-transform:none; font-family:var(--sans); font-size:19px; letter-spacing:-.01em; margin:8px 0 2px;">Four findings only repetition on real infrastructure could produce</h2>
+    <p class="context" style="margin-top:6px;">Running the same suite seven times on seven clusters is what turned three distinct one-in-N defects from anecdotes into fixes &mdash; each round of the campaign caught a different one, none of which a single green run would have shown.</p>
+
+    <div class="fixes">
+      <div class="fix">
+        <span class="tag">product</span>
+        <h3>The teardown leak itself</h3>
+        <p>One-shot teardown + a terminal short-circuit + a cluster-scoped Retain content no GC can reach = a permanent leak from a single ill-timed process death (or a status write that commits server-side while erroring client-side). Fixed by re-entry: sweep until nothing remains, then stamp; the orphan reaper now really does sweep VS/VSC as the slow backstop.</p>
+      </div>
+      <div class="fix">
+        <span class="tag">product</span>
+        <h3>&ldquo;Deletes issued&rdquo; is not &ldquo;nothing remains&rdquo;</h3>
+        <p>A validation lane caught the sweep stamping its marker while the external snapshot-controller was still draining a content (~10 minutes under load). The marker now requires a verified-empty read &mdash; and each re-verify pass actively accelerates the drain by reclaiming directly.</p>
+      </div>
+      <div class="fix">
+        <span class="tag">product</span>
+        <h3>Back-to-back maintenance ops raced a grave</h3>
+        <p>Op B, queued behind op A under the same deterministic Job name, could adopt A&rsquo;s foreground-deleting Job &mdash; which vanished mid-poll (a spurious <code>Failed</code> record) or could even hand B a success it never earned. A terminating grave is now waited out; only a live leftover is adopted.</p>
+      </div>
+      <div class="fix test">
+        <span class="tag">test harness · ops</span>
+        <h3>The harness had to earn seven clean measurements</h3>
+        <p>Ginkgo enforces its own suite timeout (a lane announcing 120m was silently cut at Ginkgo&rsquo;s 1h default &mdash; a truncated run reports specs failed that were merely cut off); transient Ceph <code>HEALTH_WARN</code>s on ephemeral VMs get a bounded window to clear; a residual measurement that cannot read the cluster records <code>?</code>, never <code>0</code>; and a Hetzner-side volume lock taught the fanout to sidestep poisoned lane names.</p>
+      </div>
+    </div>
+  </section>
+
+  <p class="foot">
+    <b>Full-suite gate —</b> this run exercises all 46 criteria (platform, M0&ndash;M3 non-regression, and the M4 label) with no filter; the one skipped line is conditional, not a failure. M4 also passed <code>make e2e</code> on kind (29/29 &mdash; including the consistency-hook policies and the pre/post crash case, which need a kubelet) plus the full unit + envtest suite and the custom linter. Consistency hooks (R16) are kind-validated because the crucible&rsquo;s seeded workloads are storage-focused; their exec path, freeze-window bounds and unconditional unfreeze are covered there. · Report generated from <code>test/crucible/artifacts/lanes/m1/crucible-report.md</code> (campaign lane 7 of 7, release image).
+  </p>
+
+</div>
+</body>
+</html>

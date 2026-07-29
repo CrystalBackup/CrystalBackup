@@ -69,7 +69,7 @@ const milestones = [
   ['M3', 'Manifests & cluster-scoped DR', 'done', `${base}/reports/crucible-m3.html`],
   ['0.3.1', 'Hardening — operator throughput audit & fixes', 'patch', [['Audit report', `${base}/reports/audit-m3.1.html`]]],
   ['0.3.2', 'Hardening — restore safety (Recreate data loss, finalizer leak)', 'patch', [['Report', `${base}/reports/audit-m3.2.html`]]],
-  ['M4', 'Consistency hooks, verification & maintenance', 'done'],
+  ['M4', 'Consistency hooks, verification & maintenance', 'done', `${base}/reports/crucible-m4.html`],
   ['M5', 'Namespace plane, external sync & right-to-erasure', 'here', `${base}/reports/crucible-m5.html`],
   ['M6', 'Observability hardening & production beta', ''],
   ['M7', 'CLI & browse UI', ''],
@@ -124,7 +124,7 @@ const description =
       <section class="hero">
         <div class="hero-copy">
           <span class="pill">
-            <span class="dot"></span> Building M4 · M3 shipped (v0.3.0)
+            <span class="dot"></span> Building M5 · M4 shipped (v0.4.0)
           </span>
           <h1>
             Every namespace gets <span class="grad">its own backups.</span>
@@ -219,6 +219,8 @@ const description =
               <span class="sep"></span>
               <span class="chip">ClusterBackup</span>
               <span class="sep"></span>
+              <span class="chip">N × Backup<small>per namespace</small></span>
+              <span class="sep"></span>
               <span class="chip accent">mover Job<small>crystal-backup-system</small></span>
               <span class="sep"></span>
               <span class="chip repo">Shared DR repo<small>server-side <code>namespace=</code> filter</small></span>
@@ -242,8 +244,10 @@ const description =
         <p class="flow-note">
           A snapshot taken in a tenant namespace is mounted <strong>centrally</strong> — the
           cluster-scoped <code>VolumeSnapshotContent</code> is re-bound into the operator namespace,
-          so tenant data is never exposed to a neighbour. Every repository is standard restic; a
-          second location can be kept in sync, re-encrypted to its <strong>own</strong> key.
+          so tenant data is never exposed to a neighbour. The fan-out covers namespaced data only:
+          resources that live outside any namespace — CRDs, ClusterRoles, PersistentVolumes — are
+          captured by the cluster run itself, into the same repository. Every repository is standard
+          restic; a second location can be kept in sync, re-encrypted to its <strong>own</strong> key.
         </p>
       </section>
 
@@ -300,10 +304,11 @@ const description =
         <p class="eyebrow">Roadmap</p>
         <h2>Releasable, core-first, in the open</h2>
         <p class="section-lead">
-          Each milestone ships something usable. <strong>M0 through M3 have shipped</strong> — CRDs,
-          CI, the core engine, cluster disaster recovery, self-service &amp; admin restore and
-          manifest &amp; cluster-scoped DR are live (v0.3.0); we’re now building
-          <strong>M4 — Consistency hooks, verification &amp; maintenance</strong>.
+          Each milestone ships something usable. <strong>M0 through M4 have shipped</strong> — CRDs,
+          CI, the core engine, cluster disaster recovery, self-service &amp; admin restore,
+          manifest &amp; cluster-scoped DR, consistency hooks and repository maintenance are live
+          (v0.4.0); we’re now building
+          <strong>M5 — Namespace plane, external sync &amp; right-to-erasure</strong>.
         </p>
         <ol class="timeline">
           {
@@ -346,7 +351,7 @@ const description =
           <aside class="note">
             <h3>You’re early — and that’s the point</h3>
             <p>
-              M0 through M3 have shipped (v0.3.0) — real, tested code — but it’s still early: most
+              M0 through M4 have shipped (v0.4.0) — real, tested code — but it’s still early: most
               milestones are ahead and it isn’t production-ready yet, so try it in a sandbox, keep
               your existing backups, and use it at your own risk. It’s
               provided <strong>as-is under Apache-2.0</strong>, without warranty. If the direction
