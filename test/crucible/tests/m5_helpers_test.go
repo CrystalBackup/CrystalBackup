@@ -247,7 +247,18 @@ func m5RunManifestBackup(name, locationName string, namespaces ...string) *cbv1.
 		},
 	}
 	Expect(k8s.Create(ctx, cb)).To(Succeed(), "create ClusterBackup %s", name)
-	DeferCleanup(func() { _ = k8s.Delete(ctx, cb) })
+	DeferCleanup(func() {
+		// The child Backups are deleted EXPLICITLY, not left to a cascade: a fan-out child is not
+		// garbage-collected with its parent, so deleting only the ClusterBackup leaves one Backup
+		// per matched namespace behind. They accumulate in the SEEDED namespaces across runs on a
+		// reused cluster, where the M1 non-regression spec asserts that `kubectl get backups` lists
+		// exactly the restorable set — so this container's litter would fail somebody else's spec,
+		// which is the worst way for a leak to be discovered.
+		for _, ns := range namespaces {
+			_ = k8s.Delete(ctx, &cbv1.Backup{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns}})
+		}
+		_ = k8s.Delete(ctx, cb)
+	})
 
 	run := m1WaitClusterBackupTerminal(name, 15*time.Minute)
 	Expect(run.Status.Phase).To(Equal("Completed"),
