@@ -80,9 +80,10 @@ crucible always deploys by digest:
 
 ```sh
 REG=ghcr.io/crystalbackup
-OPERATOR_DIGEST="$(docker buildx imagetools inspect "$REG/operator:dev" --format '{{.Manifest.Digest}}')"
-# If that prints EMPTY (some buildx variants, or a multi-arch index), fall back to:
-#   docker buildx imagetools inspect "$REG/operator:dev" | awk '/^Digest:/{print $2}'
+OPERATOR_DIGEST="$(docker buildx imagetools inspect "$REG/operator:dev" | awk '/^Digest:/{print $2; exit}')"
+# Parse the PLAIN output. `--format '{{.Manifest.Digest}}'` is not honoured by every buildx
+# version — some print the whole inspect, which is NON-EMPTY and so slips past an "is it set?"
+# check. The first Digest line is the multi-arch INDEX's; the per-arch children follow it.
 # Never deploy `head image-refs.txt` — it can be a per-arch child digest → ImagePullBackOff / stale code.
 ```
 
@@ -178,8 +179,11 @@ milestone's report(s) under `website/public/reports/`, and a roadmap row in
   `GOTOOLCHAIN=local PATH="$(dirname $(mise which go)):$PATH" ./bin/controller-gen …`.
   Don't hand-run `object` gen without a copyright year — it writes a "Copyright ."
   header into `zz_generated.deepcopy.go`.
-- **Image digest**: prefer `imagetools inspect --format '{{.Manifest.Digest}}'`;
-  if empty, `| awk '/^Digest:/{print $2}'`. Never `head image-refs.txt`.
+- **Image digest**: `imagetools inspect …:dev | awk '/^Digest:/{print $2; exit}'` — the FIRST
+  Digest line is the multi-arch index's. Not `--format '{{.Manifest.Digest}}'` (ignored by some
+  buildx versions, which then print the entire inspect — non-empty, so it passes a naive check),
+  and never `head image-refs.txt` (a per-arch child). The release workflow signed an amd64 child
+  for four releases on exactly that mistake.
 - **kind e2e CI flake**: `kubectl` hangs → `panic: test timed out after 10m0s`.
   A kind API-server hiccup, not a regression — verify, then `gh run rerun <id>
   --failed`.

@@ -57,7 +57,8 @@ pulls it), and deployed **by digest**. Full recipe — with the macOS/arm64 gotc
 restic-from-source mover build you should **build once and reuse**) — is in
 `build/README.md` at the repo root. In short: rebuild → `apko publish …:dev` →
 resolve the digest (`docker buildx imagetools inspect …:dev --format
-'{{.Manifest.Digest}}'`) → `OPERATOR_IMAGE_DIGEST=… MOVER_IMAGE_DIGEST=…
+… | awk '/^Digest:/{print $2; exit}'`, NOT the `--format` template, which some buildx
+versions ignore) → `OPERATOR_IMAGE_DIGEST=… MOVER_IMAGE_DIGEST=…
 SYNC_IMAGE_DIGEST=… test/crucible/deploy/deploy.sh` (or `helm upgrade
 --reuse-values --set image.digest=…` for an operator-only change) → `mise run
 test m1`.

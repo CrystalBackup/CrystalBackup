@@ -102,9 +102,12 @@ apko publish build/apko/operator.yaml "$REG/operator:dev" \
   -r ./packages -k "$PWD/melange.rsa.pub" \
   --sbom-path ./sbom --image-refs image-refs.txt
 
-# 5. resolve the digest to DEPLOY — the manifest the :dev tag points to.
+# 5. resolve the digest to DEPLOY — the INDEX the :dev tag points to.
 #    Use imagetools, NOT `head image-refs.txt` (which can be a per-arch child digest).
-OPERATOR_DIGEST="$(docker buildx imagetools inspect "$REG/operator:dev" --format '{{.Manifest.Digest}}')"
+#    Parse the PLAIN output: `--format '{{.Manifest.Digest}}'` is not honoured by every buildx
+#    version — some print the whole inspect instead, which is non-empty and therefore slips past
+#    a "did I get something?" check. The first Digest line is the index's.
+OPERATOR_DIGEST="$(docker buildx imagetools inspect "$REG/operator:dev" | awk '/^Digest:/{print $2; exit}')"
 echo "operator@$OPERATOR_DIGEST"
 ```
 
@@ -136,7 +139,7 @@ apko publish build/apko/mover.yaml "$REG/mover:dev" \
   -r ./packages -k "$PWD/melange.rsa.pub" \
   --sbom-path ./sbom --image-refs image-refs.txt
 
-MOVER_DIGEST="$(docker buildx imagetools inspect "$REG/mover:dev" --format '{{.Manifest.Digest}}')"
+MOVER_DIGEST="$(docker buildx imagetools inspect "$REG/mover:dev" | awk '/^Digest:/{print $2; exit}')"
 echo "mover@$MOVER_DIGEST"
 ```
 
@@ -162,7 +165,7 @@ apko publish build/apko/sync.yaml "$REG/sync:dev" \
   -r ./packages -k "$PWD/melange.rsa.pub" \
   --sbom-path ./sbom --image-refs image-refs.txt
 
-SYNC_DIGEST="$(docker buildx imagetools inspect "$REG/sync:dev" --format '{{.Manifest.Digest}}')"
+SYNC_DIGEST="$(docker buildx imagetools inspect "$REG/sync:dev" | awk '/^Digest:/{print $2; exit}')"
 echo "sync@$SYNC_DIGEST"
 ```
 
@@ -203,7 +206,7 @@ mise run test            # in test/crucible/  (e.g. `mise run test m1`)
 | `melange … unable to populate workspace: open build/melange/test-dirfs-0: no such file` | melange's multi-arch test-workspace race. **Build one arch at a time** (`--arch x86_64` only, as above). CI hit this with combined `--arch x86_64,aarch64` and fixes it with a per-arch loop. |
 | `go: downloading go1.26.5` / toolchain version mismatch | a stray older `/usr/local/go`. Use `GOTOOLCHAIN=local mise exec -- go …` and keep the mise go first on `PATH`. |
 | `apko lock` can't resolve `restic=0.19.1-r0` | the restic apk isn't in `./packages` (or is a different version). Re-run the restic melange build (mover step 2); the apko pin in `build/apko/mover.yaml` must equal `restic.yaml`'s `version`-r`epoch`. |
-| mover Jobs `ImagePullBackOff`, or the operator runs old code | you deployed `head image-refs.txt` instead of the tag's manifest digest. Always deploy `docker buildx imagetools inspect …:dev --format '{{.Manifest.Digest}}'`. |
+| mover Jobs `ImagePullBackOff`, or the operator runs old code | you deployed `head image-refs.txt` instead of the tag's INDEX digest. Always resolve it with `docker buildx imagetools inspect …:dev \| awk '/^Digest:/{print $2; exit}'` — and not the `--format '{{.Manifest.Digest}}'` template, which some buildx versions ignore, printing the entire inspect instead. The release workflow signed an amd64 child manifest for four releases because of exactly this. |
 | `denied` on `apko publish` | `docker login ghcr.io` with a `write:packages` token (packages are public to pull, but pushing needs auth). |
 | stale `./packages` after a version bump | `rm -rf ./packages apko.lock.json` and rebuild; melange appends to the local apk index, so a leftover old version can shadow the new one. |
 

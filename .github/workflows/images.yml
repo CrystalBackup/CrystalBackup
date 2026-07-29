@@ -607,10 +607,27 @@ jobs:
       - name: Resolve the published image index digests
         run: |
           set -euo pipefail
-          op="$(docker buildx imagetools inspect "${REGISTRY}/${IMAGE_NAMESPACE}/operator:${VERSION}" --format '{{.Manifest.Digest}}')"
-          mv="$(docker buildx imagetools inspect "${REGISTRY}/${IMAGE_NAMESPACE}/mover:${VERSION}" --format '{{.Manifest.Digest}}')"
-          sy="$(docker buildx imagetools inspect "${REGISTRY}/${IMAGE_NAMESPACE}/sync:${VERSION}" --format '{{.Manifest.Digest}}')"
-          [ -n "$op" ] && [ -n "$mv" ] && [ -n "$sy" ] || { echo "could not resolve operator/mover/sync digests for ${VERSION}" >&2; exit 1; }
+          # Same robust resolution as the signing job, and for the same reason: the
+          # `--format '{{.Manifest.Digest}}'` template is not honoured by every buildx version —
+          # some print the whole inspect, which is NON-EMPTY and would sail straight past a
+          # `[ -n "$op" ]` check, pinning the chart to a blob of text. The plain output's FIRST
+          # Digest line is the index's; a non-index media type is refused outright, because a
+          # chart pinned to a per-arch child would deploy an amd64-only image onto arm64 nodes.
+          resolve_index() {
+            local ref="$1" inspect digest media
+            inspect="$(docker buildx imagetools inspect "$ref")"
+            digest="$(printf '%s\n' "$inspect" | awk '/^Digest:/{print $2; exit}')"
+            media="$(printf '%s\n' "$inspect" | awk '/^MediaType:/{print $2; exit}')"
+            case "$digest" in sha256:*) ;; *) echo "::error title=Digest resolution::${ref} gave '${digest}'" >&2; return 1 ;; esac
+            case "$media" in
+              application/vnd.oci.image.index.v1+json|application/vnd.docker.distribution.manifest.list.v2+json) ;;
+              *) echo "::error title=Not an index::${ref} is ${media}, not a multi-arch index" >&2; return 1 ;;
+            esac
+            printf '%s' "$digest"
+          }
+          op="$(resolve_index "${REGISTRY}/${IMAGE_NAMESPACE}/operator:${VERSION}")"
+          mv="$(resolve_index "${REGISTRY}/${IMAGE_NAMESPACE}/mover:${VERSION}")"
+          sy="$(resolve_index "${REGISTRY}/${IMAGE_NAMESPACE}/sync:${VERSION}")"
           echo "OPERATOR_DIGEST=${op}" >> "$GITHUB_ENV"
           echo "MOVER_DIGEST=${mv}" >> "$GITHUB_ENV"
           echo "SYNC_DIGEST=${sy}" >> "$GITHUB_ENV"
