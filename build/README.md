@@ -18,7 +18,7 @@ Three images:
 |-------|---------------|-------|
 | **operator** (`build/{melange,apko}/operator.yaml`) | the `manager` binary (`./cmd`) | — |
 | **mover** (`build/{melange,apko}/mover.yaml`) | the `crystal-mover` binary (`./cmd/crystal-mover`) | **also needs `restic` built from source** (`build/melange/restic.yaml`), which apko pins as `restic=0.19.1-r0` |
-| **sync** (`build/{melange,apko}/sync.yaml`) | the **same** `crystal-mover` binary | the same pinned `restic`, **plus `rclone`** (a Wolfi apk, no melange build) |
+| **sync** (`build/{melange,apko}/sync.yaml`) | the **same** `crystal-mover` binary | the same pinned `restic`, **plus `rclone`** built from source too (`build/melange/rclone.yaml`), which apko pins as `rclone=1.74.4-r2` |
 
 > **The mover and sync are the slow ones** (they compile restic from source under emulation). They
 > change rarely — the operator computes the restic arguments, the mover just runs `restic`. **Build
@@ -144,10 +144,17 @@ echo "mover@$MOVER_DIGEST"
 
 Steps 1–3 of the mover build produce everything this one needs — the same `crystal-mover` binary and
 the same restic apk — so if you have just built the mover, **skip straight to the lock+publish
-below**. rclone needs no melange build: it is a Wolfi apk, pinned in `build/apko/sync.yaml`.
+below**, after the rclone step. rclone IS a melange build here — Wolfi's package carried
+advisories with no published fix, so the recipe tracks the newest upstream release and overrides
+what upstream has not fixed yet ([adr/0013](../spec/adr/0013-external-backup-sync.md)).
 
 ```bash
-# Steps 1–3 are the mover's, unchanged. Then:
+# Steps 1–3 are the mover's, unchanged. Then build rclone from source — same shape as restic, and
+# for the same reason: we ship this binary, so we pin and patch its source (adr/0013).
+melange build build/melange/rclone.yaml \
+  --arch x86_64 --runner docker \
+  --signing-key melange.rsa --out-dir ./packages
+
 apko lock build/apko/sync.yaml \
   --arch x86_64 -r ./packages -k "$PWD/melange.rsa.pub" --output apko.lock.json
 apko publish build/apko/sync.yaml "$REG/sync:dev" \

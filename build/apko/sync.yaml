@@ -26,7 +26,7 @@ contents:
     - ca-certificates-bundle   # TLS to S3 / object storage
     - tzdata                   # IANA zones (consistent time handling)
     - restic=0.19.1-r0         # pinned engine from build/melange/restic.yaml (local apk); exact pin selects our build
-    - rclone                   # the backend that lets ONE restic process reach TWO differently-credentialed repos
+    - rclone=1.74.4-r2         # pinned backend from build/melange/rclone.yaml (local apk); exact pin selects OUR build, not Wolfi's
     - crystal-backup-sync      # local apk (build/melange/sync.yaml); CI stages it into ./packages
 
 # No `accounts` block: the image default user is root (uid 0), as in the mover image. The sync

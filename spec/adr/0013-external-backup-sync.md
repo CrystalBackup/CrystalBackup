@@ -161,6 +161,45 @@ and rejected *for now*, not forever:
 
 Revisit if the wait ever blocks a release; the ordering above is the arbitration to apply.
 
+### The wait did block the release (2026-07-29) — resolution, and one thing it taught
+
+Wolfi still offered nothing past `1.74.3-r0` on either architecture when M5 was otherwise ready:
+code validated, 14/14 on the crucible's `m5` label, 32/32 on the kind e2e. So the arbitration above
+was applied as written — **build rclone from source**, the option it ranked first. VEX stayed
+rejected for the reason already recorded: suppressing a finding *because a gate is red* is the
+wrong reason to reverse the no-suppression decision.
+
+**What the attempt taught, and what the arbitration had not anticipated: building from source does
+not, by itself, clear the gate.** trivy matches Wolfi advisories against the apk's NAME and
+VERSION, not against the module graph actually linked into the binary. The first build — rclone
+`1.74.3` with `x/image` overridden to 0.43.0, genuinely clean bytes — was flagged by the very
+advisory it had fixed, because it still called itself `rclone-1.74.3-r0` and the advisory names
+`1.74.3-r5` as the fix. Verified by building exactly that and scanning it.
+
+That leaves the version string as part of the security claim, which has a right answer and a wrong
+one. The wrong one is picking a number that silences the scanner. The right one is making the
+number true:
+
+- **Track the newest upstream release, not the one Wolfi packages.** rclone `1.74.4` pins
+  `x/image v0.43.0` itself, so both TIFF advisories are cleared **upstream** rather than by our
+  patch — the outcome to prefer whenever it is available.
+- **Override only what upstream has not fixed.** 1.74.4 still pins `x/text v0.38.0`, reachable for
+  CVE-2026-56852; Wolfi names `1.74.4-r2` as the release carrying that fix, and so does ours.
+- **The epoch asserts that equivalence.** `-r2` is a claim that this build carries the r2 fix, and
+  the pipeline establishes it. If the override were ever dropped, the epoch would become exactly
+  the suppression this ADR refused — so the two move together, and the recipe says so in place.
+
+One consequence propagates: `build/vex/generate-vex.sh` excluded rclone on the grounds that it came
+from Wolfi as a maintained apk with its own CVE feed. That premise is now false, so rclone gets the
+same govulncheck analysis as restic, against the same overridden source. Nobody upstream tracks the
+binary we ship; if we do not analyse it, no one does.
+
+Result: the sync image scans **0 HIGH / 0 CRITICAL**. The cost the amendment accepted — rclone's
+surface must be kept current at restic's cadence — is now paid in the same currency as restic's: a
+version, a checksum and an override in one recipe, bumped deliberately and in lockstep with
+`build/apko/sync.yaml`. When Wolfi ships a clean rclone, this recipe can be dropped and the apko
+pin pointed back at the distro package — a deliberate, tested change, not a silent one.
+
 ### What did not change
 
 The snapshot-level, re-encrypting model, the two CRDs, `Mirror`/`AppendOnly`, tag selectivity, and
