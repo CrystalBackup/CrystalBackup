@@ -77,12 +77,14 @@ jobs:
             apko: build/apko/operator.yaml
             melange: build/melange/operator.yaml
             with_restic: "false"
+            with_rclone: "false"
           - component: mover
             binary: crystal-mover
             source: ./cmd/crystal-mover
             apko: build/apko/mover.yaml
             melange: build/melange/mover.yaml
             with_restic: "true"
+            with_rclone: "false"
           # Same binary as the mover, a different apko assembly: sync additionally carries
           # rclone, which is what lets one restic process open a source and a destination that
           # authenticate with different credentials (adr/0013 amendment). It is a separate image
@@ -93,6 +95,7 @@ jobs:
             apko: build/apko/sync.yaml
             melange: build/melange/sync.yaml
             with_restic: "true"
+            with_rclone: "true"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
@@ -147,6 +150,23 @@ jobs:
           melange keygen
           for a in x86_64 aarch64; do
             melange build build/melange/restic.yaml \
+              --arch "$a" --runner docker \
+              --signing-key melange.rsa --out-dir ./packages
+          done
+
+      - name: melange — build pinned rclone apk from source (sync only)
+        if: steps.gate.outputs.proceed == 'true' && matrix.with_rclone == 'true'
+        run: |
+          set -euo pipefail
+          # Only the sync image carries rclone, and it is built here rather than installed from
+          # Wolfi because Wolfi's package carried advisories with no published fix (adr/0013).
+          # apko pins the exact `rclone=<version>-r<epoch>` from build/melange/rclone.yaml, so
+          # WITHOUT this step `apko lock build/apko/sync.yaml` fails with
+          # `nothing provides "rclone=..."` — the local apk is the only thing that satisfies it.
+          # Per-arch for the same workspace-race reason as restic above.
+          [ -f melange.rsa ] || melange keygen
+          for a in x86_64 aarch64; do
+            melange build build/melange/rclone.yaml \
               --arch "$a" --runner docker \
               --signing-key melange.rsa --out-dir ./packages
           done
@@ -230,12 +250,14 @@ jobs:
             apko: build/apko/operator.yaml
             melange: build/melange/operator.yaml
             with_restic: "false"
+            with_rclone: "false"
           - component: mover
             binary: crystal-mover
             source: ./cmd/crystal-mover
             apko: build/apko/mover.yaml
             melange: build/melange/mover.yaml
             with_restic: "true"
+            with_rclone: "false"
           # Same binary as the mover, a different apko assembly: sync additionally carries
           # rclone, which is what lets one restic process open a source and a destination that
           # authenticate with different credentials (adr/0013 amendment). It is a separate image
@@ -246,6 +268,7 @@ jobs:
             apko: build/apko/sync.yaml
             melange: build/melange/sync.yaml
             with_restic: "true"
+            with_rclone: "true"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
@@ -330,6 +353,23 @@ jobs:
           melange keygen
           for a in x86_64 aarch64; do
             melange build build/melange/restic.yaml \
+              --arch "$a" --runner docker \
+              --signing-key melange.rsa --out-dir ./packages
+          done
+
+      - name: melange — build pinned rclone apk from source (sync only)
+        if: steps.gate.outputs.proceed == 'true' && matrix.with_rclone == 'true'
+        run: |
+          set -euo pipefail
+          # Only the sync image carries rclone, and it is built here rather than installed from
+          # Wolfi because Wolfi's package carried advisories with no published fix (adr/0013).
+          # apko pins the exact `rclone=<version>-r<epoch>` from build/melange/rclone.yaml, so
+          # WITHOUT this step `apko lock build/apko/sync.yaml` fails with
+          # `nothing provides "rclone=..."` — the local apk is the only thing that satisfies it.
+          # Per-arch for the same workspace-race reason as restic above.
+          [ -f melange.rsa ] || melange keygen
+          for a in x86_64 aarch64; do
+            melange build build/melange/rclone.yaml \
               --arch "$a" --runner docker \
               --signing-key melange.rsa --out-dir ./packages
           done
