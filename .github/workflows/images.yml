@@ -439,9 +439,40 @@ jobs:
             --arch x86_64,aarch64 --lockfile apko.lock.json \
             -r ./packages -k "${PWD}/melange.rsa.pub" \
             --sbom-path ./sbom --image-refs image-refs.txt
-          REF="$(head -n1 image-refs.txt)"
           NAME="${REGISTRY}/${IMAGE_NAMESPACE}/${{ matrix.component }}"
-          DIGEST="${REF##*@}"        # sha256:... of the multi-arch index
+          # Resolve the INDEX digest from the registry, not from image-refs.txt.
+          #
+          # `head -n1 image-refs.txt` returns whichever ref apko wrote first, which for a
+          # multi-arch publish is a PER-ARCH CHILD manifest — the exact trap build/README.md's
+          # troubleshooting table warns humans about ("Never deploy `head image-refs.txt`").
+          # The comment here used to assert it was the index; it was not, and every release since
+          # signing was introduced therefore signed the amd64 child while the tag consumers pull
+          # resolved to an unsigned index. `cosign verify <image>:<version>` failed for everyone.
+          #
+          # The tag was just pushed by apko above and points at the index by construction, so
+          # asking the registry what it resolves to is both correct and the thing a consumer's
+          # own `cosign verify` will do.
+          # docker buildx is preinstalled on the runner and already authenticated to GHCR by the
+          # login step above, so this needs no new pinned action.
+          #
+          # The PLAIN output is parsed rather than `--format '{{.Manifest.Digest}}'`: that template
+          # is not honoured by every buildx version (some print the whole inspect instead, which
+          # would sail past a naive check and hand cosign a garbage ref). build/README.md records
+          # the same variability. In the plain output the FIRST Digest/MediaType pair is the index's;
+          # the per-arch children follow underneath.
+          INSPECT="$(docker buildx imagetools inspect "${NAME}:${VERSION}")"
+          DIGEST="$(printf '%s\n' "$INSPECT" | awk '/^Digest:/{print $2; exit}')"
+          MEDIA="$(printf '%s\n' "$INSPECT" | awk '/^MediaType:/{print $2; exit}')"
+          case "$DIGEST" in
+            sha256:*) ;;
+            *) echo "::error title=Digest resolution::expected a sha256 digest, got '${DIGEST}'" >&2; exit 1 ;;
+          esac
+          # Belt and braces: the signed subject MUST be an index, never a child manifest. A
+          # regression here is silent — signing succeeds, verification fails months later.
+          case "$MEDIA" in
+            application/vnd.oci.image.index.v1+json|application/vnd.docker.distribution.manifest.list.v2+json) ;;
+            *) echo "::error title=Not an index::${NAME}@${DIGEST} is ${MEDIA}, not a multi-arch index" >&2; exit 1 ;;
+          esac
           echo "IMAGE_NAME=${NAME}" >> "$GITHUB_ENV"
           echo "IMAGE_DIGEST=${DIGEST}" >> "$GITHUB_ENV"
           echo "IMAGE_REF=${NAME}@${DIGEST}" >> "$GITHUB_ENV"
