@@ -20,7 +20,6 @@ package crucible
 
 import (
 	"fmt"
-	"os"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -103,14 +102,20 @@ var _ = Describe("Milestone M0 — CRDs and chart on a real cluster", Label("m0"
 		}
 	})
 
-	It("runs the operator (once a released image exists)", func() {
+	// This spec was gated behind CRUCIBLE_EXPECT_OPERATOR_READY from M0, when GHCR held no
+	// operator image and "is it Available" was a question with no honest answer. The gate
+	// outlived its reason by twelve releases: it compares against "true", the one place that
+	// documented it (scripts/run-tests.sh) proposed "=1", and so every published crucible
+	// report — M1 through the M4 seven-lane fanout — carries this spec SKIPPED, under a message
+	// that still says "pre-v0.0.1".
+	//
+	// A skip reads as a pass in every summary anyone actually looks at. The gate is gone rather
+	// than re-defaulted: an escape hatch nobody takes is not flexibility, it is a permanent skip
+	// with extra steps. If the operator does not come up, that is the single most important
+	// thing a real-infrastructure run can tell us, and it should be impossible to silence.
+	It("runs the operator", func() {
 		var deploy appsv1.Deployment
 		Expect(k8s.Get(ctx, client.ObjectKey{Namespace: operatorNS, Name: "crystal-backup"}, &deploy)).To(Succeed())
-
-		if os.Getenv("CRUCIBLE_EXPECT_OPERATOR_READY") != "true" {
-			Skip("no released operator image yet (pre-v0.0.1) — " +
-				"set CRUCIBLE_EXPECT_OPERATOR_READY=true once GHCR has one")
-		}
 
 		Eventually(func(g Gomega) {
 			var d appsv1.Deployment

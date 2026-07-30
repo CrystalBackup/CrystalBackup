@@ -8,7 +8,6 @@
 #
 # Env toggles:
 #   CRUCIBLE_VERBOSE=1               stream full Ginkgo output (debugging)
-#   CRUCIBLE_EXPECT_OPERATOR_READY=1 require the operator Deployment to be Available
 #   CRUCIBLE_TIMEOUT=3h              whole-suite go-test budget (default 90m)
 #
 # Exits non-zero when any spec fails (so automation and the skill can detect it).

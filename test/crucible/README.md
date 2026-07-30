@@ -95,16 +95,27 @@ labels**:
 | ------- | ------------------------------------------------------------------------------ |
 | `infra` | nodes/roles, 4 storage classes, snapshot classes, Ceph `HEALTH_OK`, PVC provisioning + CSI snapshot smoke on ceph-block & longhorn, local-path (no snapshots), S3 bucket reachability |
 | `m0`    | 12 CRDs `Established`, chart artifacts (namespace/PSA, deployment, RBAC, SA), live create→get→delete round-trip of every kind |
+| `m1`    | the cluster-DR cascade `ClusterBackupSchedule → ClusterBackup → Backup → mover Jobs` over the seeded namespaces, discovery from the repository, shared-repository lifecycle, retention, same-named PVCs across namespaces not colliding, convergence with no orphaned snapshots, and an **off-cluster restore** driven by upstream `restic` alone |
+| `m2`    | self-service `Restore` (modes × selection × mediation), operator-mediated `ClusterRestore` reconstituting a deleted namespace, admission policies; every restored volume byte-compared against `MANIFEST.sha256` |
+| `m3`    | manifest backup/restore round-trip, the sanitization engine and mode-aware apply, cluster-scoped capture with opt-in + selective restore, DR bootstrap into a fresh namespace |
+| `m4`    | repository maintenance and verification — prune vs. a live backup, a prune killed mid-flight, a silently corrupted pack caught by `restic check`, and crash-only teardown via terminal re-entry |
+| `m5`    | the namespace plane, external sync (deployment + queue behaviour), and the right to erasure |
 
-Each milestone adds a `tests/m<N>_test.go` with its own label — e.g. M1 will
-assert the cascade `ClusterBackupSchedule → ClusterBackup → Backup → mover
-Jobs` against the seeded namespaces, restore fidelity against the recorded
-`MANIFEST.sha256` checksums, and so on. Enrich, never rewrite: old labels stay
-green forever (non-regression).
+Each milestone adds a `tests/m<N>_*_test.go` carrying its own label. Enrich,
+never rewrite: old labels stay green forever (non-regression), which is why
+`mise run test` with no argument is the real gate and a single label is only a
+debugging shortcut.
 
-> The `m0` operator-readiness spec self-skips until a released image exists on
-> GHCR (the chart pins by digest; M0 predates the first release). Set
-> `CRUCIBLE_EXPECT_OPERATOR_READY=true` once `v0.0.x` is published.
+> **The `m0` operator-readiness check runs unconditionally** (since M6). It used to
+> self-skip unless `CRUCIBLE_EXPECT_OPERATOR_READY` was set to exactly `true` — a
+> guard from the days before any image existed on GHCR. Releases have existed since
+> `v0.1.0`, but nothing ever set it: the only place that documented the variable
+> proposed `=1`, which the comparison rejects. So "is the operator `Available`"
+> was skipped in **every published run**, M1 through the M4 seven-lane fanout,
+> behind a message that still said "pre-v0.0.1" — and a skip reads as a pass in
+> every summary anyone actually looks at. The variable is gone; if the operator
+> does not come up, the run now fails, which is the single most useful thing a
+> real-infrastructure run can tell you.
 
 ## The seed matrix (tenant namespaces)
 
@@ -117,8 +128,8 @@ green forever (non-regression).
 | `c-edge`   | longhorn PVC with **exotic data** (hardlinks, symlinks incl. broken, sparse, unicode, xattrs, odd perms) + a **scaled-to-zero** Deployment with a detached PVC |
 | `c-empty`  | policy objects only (quota/limits/RBAC), no workload                                          |
 
-Every data volume carries a `MANIFEST.sha256` written at seed time — future
-restore tests verify integrity against it, byte for byte.
+Every data volume carries a `MANIFEST.sha256` written at seed time — the `m1`
+and `m2` restore specs verify integrity against it, byte for byte.
 
 ## Version pins
 
