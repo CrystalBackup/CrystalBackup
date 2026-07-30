@@ -26,7 +26,7 @@ backed up to it, including ones whose owners have moved on and whose `Backup` ob
 long ago. The objects in your cluster are not the inventory — the repository is:
 
 ```bash
-kubectl get backuprepository <name> -o jsonpath='{.status.snapshotCount}{"\n"}{.status.sizeBytes}{"\n"}'
+kubectl get backuprepository <name> -o jsonpath='{.status.snapshotCount}{"\n"}{.status.approximateSizeBytes}{"\n"}'
 ```
 
 `status.snapshotCount` is what discovery last saw. If it is stale or empty, run a listing before
@@ -58,12 +58,28 @@ of millions of objects is neither.
 
 ### 1.1 Stop everything that writes to it
 
+**Cluster plane.** Pause the schedules pointing at this location:
+
 ```bash
-# Cluster plane: pause the schedules pointing at this location.
 kubectl patch clusterbackupschedule <name> --type=merge -p '{"spec":{"paused":true}}'
-# Namespace plane: same, per namespace.
-kubectl patch backupschedule <name> -n <ns> --type=merge -p '{"spec":{"paused":true}}'
 ```
+
+**Namespace plane.** There is **no `spec.paused` on `BackupSchedule`** — only the cluster-plane types
+carry one (`ClusterBackupSchedule`, `ClusterBackupExternalSync`). Repoint the tenant's schedule at
+another `BackupLocation`, or delete it:
+
+```bash
+kubectl patch backupschedule <name> -n <ns> --type=merge \
+  -p '{"spec":{"locationRef":{"name":"<another-location>"}}}'
+# or, if the namespace is being retired along with the repository:
+kubectl delete backupschedule <name> -n <ns>
+```
+
+Leaving it alone does not endanger the decommission: once [§1.2](#12-delete-the-location) removes the
+`BackupLocation`, every run it stamps fails `LocationNotFound` before it ever opens the repository,
+so nothing writes. It is noise rather than risk — the schedule keeps firing on its cron and each
+failing run counts against your backup alerting. Settle it here instead of explaining the pages
+afterwards.
 
 Then wait for in-flight movers to drain — a mover that starts before you destroy the key and
 finishes after will report a failure that looks like a storage fault:
@@ -89,7 +105,9 @@ kubectl delete backuplocation <name> -n <ns>
 Before the key goes, write down what it protected. Afterwards nothing can reconstruct it:
 
 - location name, bucket, prefix, cluster ID;
-- `status.snapshotCount` and `status.sizeBytes` at decommission time;
+- `status.snapshotCount` and `status.approximateSizeBytes` at decommission time — the size is the
+  post-dedup physical footprint under the prefix, and it is *approximate* by name; record it as
+  what it is rather than as an exact byte count;
 - the date, and who authorised it.
 
 This is the only artefact that will exist. Treat it as the compliance record it is.
@@ -172,7 +190,7 @@ metadata:
 spec:
   s3: { endpoint: "https://s3.example.com", bucket: "backups-rekeyed", prefix: "dr" }
   encryption:
-    clusterKEKSecretRef: { name: crystal-cluster-kek }
+    clusterKEKSecretRef: { name: cluster-kek }
 ```
 
 > **If the new repository will ALSO receive native backups**, initialize it with the source's
@@ -212,8 +230,14 @@ Check the new repository on its own terms, and restore something real from it:
 
 ```bash
 # structural integrity, under the NEW key
-kubectl get backuprepository dr-primary-rekeyed -o jsonpath='{.status.lastCheckSucceeded}{"\n"}'
+kubectl get backuprepository dr-primary-rekeyed \
+  -o jsonpath='{.status.lastCheckResult}{" at "}{.status.lastCheckTime}{"\n"}'
 ```
+
+The green light is `Passed` **and** a `lastCheckTime` after the sync completed. Both halves matter:
+`lastCheckResult` is refreshed on failure as well as success, so `Passed` on its own can be a stale
+verdict from before the copy existed — and an empty pair means the new repository has never been
+checked at all, which is not the same as healthy.
 
 Then run an actual `Restore` against the new location. A rekey verified only by counters is a rekey
 verified only by the thing that would also be wrong if the copy were broken.
