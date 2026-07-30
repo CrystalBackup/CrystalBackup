@@ -165,7 +165,7 @@ var _ = Describe("M5 — external sync (restic copy, re-encrypted to the destina
 		}
 
 		BeforeAll(func() {
-			m1SkipIfNoS3()
+			m1RequireS3()
 			m1EnsurePlatformSecrets()
 
 			clusterID = m5ClusterIDFor("sync")

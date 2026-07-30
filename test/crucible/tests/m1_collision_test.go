@@ -69,7 +69,7 @@ var _ = Describe("M1 — same-named PVCs across namespaces do not collide (0.2.1
 	collisionNamespaces := []string{"c-collide-a", "c-collide-b"}
 
 	BeforeAll(func() {
-		m1SkipIfNoS3()
+		m1RequireS3()
 
 		By("Given an initialized ClusterBackupLocation \"dr\" for the shared repository")
 		m1EnsurePlatformSecrets()

@@ -33,10 +33,13 @@ export CRUCIBLE_REPORT_PATH="${_artifacts}/crucible-report.md"
 rm -f "${CRUCIBLE_REPORT_PATH}"
 
 # Whole-suite wall-clock budget. 60m was overrun by the M3 full-suite run (go test panicked
-# mid-flight, losing the report), so the default is 90m — the suite's own Eventually deadlines,
-# not this, are what should fail a spec. Override for a long debugging run:
+# mid-flight, losing the report), so it became 90m; M6's restore-fidelity gate then added the
+# heaviest lane in the suite — it backs up and restores ~600 MiB of real data (plus 2.5 GiB of
+# sparse apparent size) on Ceph RBD and hashes it twice — so the default is now 120m. The suite's
+# own Eventually deadlines, not this, are what should fail a spec; this only exists so a slow run
+# is not TRUNCATED, which is worse than no run. Override for a long debugging run:
 #   CRUCIBLE_TIMEOUT=3h mise run test
-CRUCIBLE_TIMEOUT="${CRUCIBLE_TIMEOUT:-90m}"
+CRUCIBLE_TIMEOUT="${CRUCIBLE_TIMEOUT:-120m}"
 
 # BOTH timeouts, and the Ginkgo one is the load-bearing fix: Ginkgo enforces its OWN suite
 # timeout (default 1h) independently of `go test -timeout`. Passing only the go-test budget let a

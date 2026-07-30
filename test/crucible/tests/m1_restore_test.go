@@ -62,7 +62,7 @@ var _ = Describe("M1 — off-cluster restore with upstream restic", Label("m1"),
 	const restoreRunName = "crucible-restore"
 
 	BeforeAll(func() {
-		m1SkipIfNoS3()
+		m1RequireS3()
 
 		By("Given an initialized ClusterBackupLocation \"dr\" for the shared repository")
 		m1EnsurePlatformSecrets()

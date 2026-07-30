@@ -53,7 +53,7 @@ var _ = Describe("M1 — shared cluster-DR repository lifecycle", Label("m1"), O
 	const secondName = "dr2"
 
 	BeforeAll(func() {
-		m1SkipIfNoS3()
+		m1RequireS3()
 		m1EnsurePlatformSecrets()
 
 		// A ClusterBackupLocation is cluster-scoped and survives a namespace wipe, so a
@@ -88,7 +88,7 @@ var _ = Describe("M1 — shared cluster-DR repository lifecycle", Label("m1"), O
 	It("A ClusterBackupLocation provisions one initialized shared repository", func() {
 		By("Given an S3 bucket reachable at the crucible's S3 endpoint")
 		By(`And a platform KEK (an age X25519 identity) stored as a Secret in "crystal-backup-system"`)
-		// Both Background givens are established by BeforeAll (m1SkipIfNoS3 +
+		// Both Background givens are established by BeforeAll (m1RequireS3 +
 		// m1EnsurePlatformSecrets); the KEK identity is now in m1KEKIdentity.
 
 		By(`When I create a ClusterBackupLocation "dr" for the bucket with clusterID "crucible"`)

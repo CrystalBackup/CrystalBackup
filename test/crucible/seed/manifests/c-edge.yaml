@@ -60,7 +60,14 @@ spec:
             - -ec
             - |
               if [ -f /data/MANIFEST.sha256 ]; then echo "already seeded"; exit 0; fi
-              apk add --no-cache attr >/dev/null 2>&1 || echo "WARN: no attr package (xattrs skipped)"
+              # No `|| echo WARN` anywhere in this script, deliberately. This corpus exists so the
+              # m1/m2 restore assertions have something hard to restore; a seed that degrades
+              # quietly makes every one of those assertions vacuous while they keep reporting
+              # green. The xattr step used to swallow both a failed `apk add` and a failed
+              # `setfattr`, so the whole fixture could arrive with no xattrs at all and nothing
+              # downstream would notice. Under `-e`, a broken seed now fails the init container and
+              # the pod never becomes Ready — loud, at the only moment anyone can still act on it.
+              apk add --no-cache attr >/dev/null 2>&1
               mkdir -p /data/exotic
 
               # regular content
@@ -85,11 +92,12 @@ spec:
               mkdir -p /data/exotic/setgid-dir
               chmod 2755 /data/exotic/setgid-dir
 
-              # xattrs (best effort)
-              if command -v setfattr >/dev/null 2>&1; then
-                setfattr -n user.crystalbackup -v "must-survive-restore" /data/exotic/plain.txt \
-                  || echo "WARN: xattr not supported by this filesystem"
-              fi
+              # xattrs — required, not best effort. R10 promises the mover stores them
+              # unconditionally and passes no filter on restore; if this filesystem cannot set one,
+              # the promise is untestable here and that is worth failing over.
+              setfattr -n user.crystalbackup -v "must-survive-restore" /data/exotic/plain.txt
+              getfattr -n user.crystalbackup --only-values /data/exotic/plain.txt \
+                | grep -qx "must-survive-restore"
 
               cd /data
               find . -type f ! -name MANIFEST.sha256 -exec sha256sum {} + > /tmp/manifest

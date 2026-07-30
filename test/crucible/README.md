@@ -100,11 +100,44 @@ labels**:
 | `m3`    | manifest backup/restore round-trip, the sanitization engine and mode-aware apply, cluster-scoped capture with opt-in + selective restore, DR bootstrap into a fresh namespace |
 | `m4`    | repository maintenance and verification — prune vs. a live backup, a prune killed mid-flight, a silently corrupted pack caught by `restic check`, and crash-only teardown via terminal re-entry |
 | `m5`    | the namespace plane, external sync (deployment + queue behaviour), and the right to erasure |
+| `m6`    | the **restore-fidelity gate** — a corpus engineered to be hard to restore faithfully, backed up from a Rook-Ceph RBD volume and restored into a *fresh* one, then compared per file by manifest: content digests (with 16 MiB-window digests naming a corrupted byte range), modes and setuid/setgid/sticky, numeric ownership, xattrs, POSIX ACLs incl. a directory's default ACL, sparseness, symlinks, hard links, nanosecond mtimes, FIFOs, hostile file names, deep trees |
 
 Each milestone adds a `tests/m<N>_*_test.go` carrying its own label. Enrich,
 never rewrite: old labels stay green forever (non-regression), which is why
 `mise run test` with no argument is the real gate and a single label is only a
 debugging shortcut.
+
+### The restore-fidelity gate (`m6`)
+
+`m6` is the beta bar for `0.6`, and it is written to a stricter rule than the rest
+of the suite: **it cannot self-disable**. No enable flag, no conditional `Skip()`,
+no tunable tolerance. Missing S3 credentials, a missing `getfattr`, a container log
+that came back truncated — each of those *fails* the run rather than quietly
+measuring less. A backup tool that has not proven its restores is worth nothing,
+and a gate that skips itself reads as a pass in every summary a human looks at.
+
+Two consequences worth knowing before reading a red `m6` line:
+
+- **It restores into a volume that did not exist.** The scenario drives a
+  `ClusterRestore` into a namespace created on the spot, so the PVC comes from the
+  snapshot's own `pvcsize`/`pvcclass` tags and the filesystem is fresh. Restoring
+  in place over the source would make the whole comparison dishonest: a mode, an
+  xattr or an ACL the restore failed to re-apply would still be sitting on the
+  pre-existing file, and the diff would come back green.
+- **A broken facet stays in the corpus.** Each property (content, permissions,
+  xattrs, ACLs, timestamps, symlinks, hard links, sparseness, presence) is asserted
+  by its own spec, so one regression is one red line next to the facets that still
+  hold. In particular the content facet is aimed squarely at
+  [restic#5543](https://github.com/restic/restic/issues/5543) — deterministic
+  corruption at an offset inside a file when restoring large data sets to
+  Rook-Ceph, open upstream — and the failure message names the differing 16 MiB
+  window. If it fires, the fix is upstream, not a smaller corpus.
+
+Deliberately *not* measured, so that nobody re-discovers it as a gap: `atime`
+(reading the corpus to measure it destroys it), `ctime` (no interface sets it),
+`trusted.*` xattrs (documented as not restored — they need `CAP_SYS_ADMIN`), and
+device nodes (whether one can exist in a tenant PVC depends on the kubelet's mount
+options, not on the backup).
 
 > **The `m0` operator-readiness check runs unconditionally** (since M6). It used to
 > self-skip unless `CRUCIBLE_EXPECT_OPERATOR_READY` was set to exactly `true` — a

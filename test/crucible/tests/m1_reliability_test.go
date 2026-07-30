@@ -134,7 +134,7 @@ var _ = Describe("M1 — convergence and no orphans", Label("m1"), Ordered, func
 	}
 
 	BeforeAll(func() {
-		m1SkipIfNoS3()
+		m1RequireS3()
 		m1EnsurePlatformSecrets()
 
 		// Ensure the one shared cluster-DR location exists and its repository is initialized.

@@ -58,7 +58,7 @@ var _ = Describe("M1 — discovery projects restorable backups", Label("m1"), Or
 	)
 
 	BeforeAll(func() {
-		m1SkipIfNoS3()
+		m1RequireS3()
 		m1EnsurePlatformSecrets()
 
 		// An initialized ClusterBackupLocation "dr" for the shared repository —

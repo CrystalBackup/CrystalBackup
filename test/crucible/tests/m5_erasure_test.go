@@ -95,7 +95,7 @@ var _ = Describe("M5 — right to erasure (forget + prune, verified by re-scanni
 		}
 
 		BeforeAll(func() {
-			m1SkipIfNoS3()
+			m1RequireS3()
 			m1EnsurePlatformSecrets()
 
 			clusterID = m5ClusterIDFor("erase")

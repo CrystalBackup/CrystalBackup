@@ -337,6 +337,11 @@ crucible lanes, all with zero residual snapshot objects
       S3 RGW tuning (`s3.connections`, wave test vs `rgw_max_concurrent_requests`) — delta 13.
 - [ ] **Restore-fidelity gate** (the beta bar for `0.6`, not a 1.0/GA claim): e2e restore +
       checksum comparison to a Rook-Ceph PVC while restic#5543 stays open (delta 14).
+      **Executable as the `m6` crucible label** (`mise run test m6`) — the exit criterion is a
+      command, not a paragraph. It restores into a namespace that does not exist yet, so a mode,
+      an xattr or an ACL the restore fails to re-apply cannot be masked by what was already on
+      the target; and it carries no enable flag and no conditional skip, because a gate that can
+      disable itself reads as a pass.
 - [ ] NetworkPolicies, PodSecurity review, resource limits/requests; docs (user guide, ops
       guide, DR runbooks); deploy alongside Velero on a staging cluster, soak 2+ weeks.
 

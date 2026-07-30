@@ -72,7 +72,7 @@ var m1CascadeSeedNamespaces = []string{"c-db", "c-media", "c-edge", "c-legacy", 
 var _ = Describe("M1 — cluster-DR backup cascade", Label("m1"), Ordered, func() {
 
 	BeforeAll(func() {
-		m1SkipIfNoS3()
+		m1RequireS3()
 
 		By("Given an initialized ClusterBackupLocation \"dr\" for the shared repository")
 		m1EnsurePlatformSecrets()

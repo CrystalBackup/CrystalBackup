@@ -61,7 +61,7 @@ var _ = Describe("M4 — crash-only teardown (terminal re-entry sweep)", Ordered
 	)
 
 	BeforeAll(func() {
-		m1SkipIfNoS3()
+		m1RequireS3()
 		m1EnsurePlatformSecrets()
 
 		// Reuse the shared cluster-DR location a sibling feature already created; otherwise

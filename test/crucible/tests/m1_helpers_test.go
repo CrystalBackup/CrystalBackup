@@ -77,14 +77,22 @@ const (
 // straddle several helper calls.
 var m1KEKIdentity string
 
-// m1SkipIfNoS3 Skip()s the current spec unless every S3 coordinate the M1 data path needs is
-// present in the environment (exported by test/crucible/scripts/load-env.sh).
-func m1SkipIfNoS3() {
+// m1RequireS3 FAILS the current spec unless every S3 coordinate the M1 data path needs is present
+// in the environment (exported by test/crucible/scripts/load-env.sh).
+//
+// It used to Skip(), and that was the wrong verb. Every spec from m1 to m5 that touches data goes
+// through here, so one unset variable turned the entire data path — the reason this suite exists —
+// into a block of skips, and a skip reads as a pass in every summary a human actually looks at.
+// The suite already lost the m0 operator-readiness check that way for twelve releases.
+//
+// There is no legitimate run without S3: `mise run up` provisions the bucket and
+// `mise run test` exports its coordinates. An empty variable here means the harness is broken,
+// which is a failure, not a reason to measure less.
+func m1RequireS3() {
 	GinkgoHelper()
 	for _, key := range []string{"S3_ENDPOINT", "S3_BUCKET", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"} {
-		if os.Getenv(key) == "" {
-			Skip("S3 not configured: $" + key + " is empty — run via `mise run test` so terraform facts + secrets are loaded")
-		}
+		Expect(os.Getenv(key)).NotTo(BeEmpty(),
+			"S3 not configured: $%s is empty — run via `mise run test` so terraform facts + secrets are loaded", key)
 	}
 }
 

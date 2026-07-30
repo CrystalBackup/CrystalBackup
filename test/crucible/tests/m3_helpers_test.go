@@ -64,7 +64,7 @@ var m3RunID = strconv.FormatInt(time.Now().Unix(), 36)
 // specs call it in their BeforeAll and share the one repository.
 func m3EnsureDRLocation() {
 	GinkgoHelper()
-	m1SkipIfNoS3()
+	m1RequireS3()
 	m1EnsurePlatformSecrets()
 	var loc cbv1.ClusterBackupLocation
 	if apierrors.IsNotFound(k8s.Get(ctx, client.ObjectKey{Name: m1LocationName}, &loc)) {

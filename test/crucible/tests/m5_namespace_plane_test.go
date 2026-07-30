@@ -81,7 +81,7 @@ var _ = Describe("M5 — namespace plane (the user's own repository, under the u
 		)
 
 		BeforeAll(func() {
-			m1SkipIfNoS3()
+			m1RequireS3()
 
 			clusterID = m5ClusterIDFor("nsplane")
 			repoURL = m5RepoURL(m5TenantPrefix, clusterID)

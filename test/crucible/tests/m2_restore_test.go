@@ -52,7 +52,7 @@ var _ = Describe("M2 — self-service restore (modes × selection × mediation)"
 	)
 
 	BeforeAll(func() {
-		m1SkipIfNoS3()
+		m1RequireS3()
 		m1EnsurePlatformSecrets()
 		var loc cbv1.ClusterBackupLocation
 		if apierrors.IsNotFound(k8s.Get(ctx, client.ObjectKey{Name: m1LocationName}, &loc)) {

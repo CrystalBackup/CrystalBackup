@@ -152,6 +152,28 @@ matches every PVC, so put the specific items first. Anything excluded when the m
   `restoredBytes` / `restoredResources` counters, per-volume detail in Events and per-resource
   detail in `status.resources`.
 
+### What file metadata survives a restore
+
+Restored, and asserted by the `m6` restore-fidelity gate on a real Rook-Ceph volume: file
+contents, mode bits **including setuid/setgid/sticky**, numeric uid/gid, `user.*` and
+`security.*` extended attributes, POSIX ACLs **including a directory's default ACL**,
+modification times at nanosecond precision, symlinks (stored as links, never resolved), hard
+links (shared inodes stay shared), sparseness, FIFOs, empty directories, and names containing
+non-ASCII characters, spaces or shell metacharacters.
+
+**Not restored**, by design rather than oversight:
+
+| | why |
+|---|---|
+| `trusted.*` xattrs | writing them requires `CAP_SYS_ADMIN`, which the mover deliberately does not hold |
+| `atime` | not preserved by restic, and unmeasurable anyway — reading a file to verify it destroys it |
+| `ctime` | no interface exists to set it; it records when the inode was last changed, so a restore legitimately updates it |
+| device nodes | whether one can even be created depends on the target volume's mount options, which is a property of your cluster, not of the backup |
+
+If your workload depends on any of these, it depends on something no backup of a POSIX
+filesystem can return to you, and that is worth knowing before an incident rather than during
+one.
+
 ## Disaster recovery: `ClusterRestore` (admins)
 
 A `ClusterRestore` addresses a **repository coordinate** — location + origin namespace +
