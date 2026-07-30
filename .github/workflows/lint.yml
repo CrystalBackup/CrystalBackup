@@ -74,6 +74,46 @@ jobs:
       - name: Verify the chart's alert rules are regenerated
         run: make alert-rules-verify
 
+      # The site's Metrics and Alerts reference pages are generated from the same two sources:
+      # the prometheus.Desc values internal/metrics registers, and the rule table in
+      # internal/alerts. Fifty-three series and eleven rules maintained by hand drift within one
+      # release, and a metrics reference that disagrees with a scrape is worse than none — it
+      # sends a reader to write an alert on a label nothing emits, which is valid PromQL that
+      # matches nothing, forever, in silence. Exactly the defect this milestone removed from the
+      # rules; a stale page would put it back one step further from the code.
+      - name: Verify the Metrics and Alerts reference pages are regenerated
+        run: make observability-docs-verify
+
+  alert-rules:
+    name: Alert rules parse and fire
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      # No Go toolchain and no Helm: `make promtool` fetches the pinned Prometheus release archive
+      # and verifies it against a SHA-256 committed in the Makefile, and everything below runs off
+      # the generated YAML in the checkout. Until M6 this check existed as `check-alert-rules` and
+      # skipped itself whenever promtool was absent from PATH — which, on every CI runner ever used
+      # by this project, was always.
+      - name: Syntax-check the PromQL and the annotation templates
+        run: make check-alert-rules
+
+      # The one that matters. `promtool check rules` proves the expressions PARSE; five of the nine
+      # rules that shipped before M6 parsed perfectly and could never fire, because they read series
+      # the operator does not emit. These unit tests feed each rule synthetic series and assert both
+      # directions — it fires when it should, and it stays quiet when it should not, including the
+      # absence cases where silence is the specified behaviour.
+      #
+      # The target also fails when a rule has no test at all: an untested rule passes a rule-test
+      # run by not being mentioned in it, which is the same silence in a new costume.
+      - name: Evaluate every rule against synthetic series
+        run: make test-alert-rules
+
   helm-lint:
     name: helm lint
     runs-on: ubuntu-latest

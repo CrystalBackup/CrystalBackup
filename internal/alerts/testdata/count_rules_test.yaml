@@ -1,0 +1,266 @@
+# promtool unit tests — the four rules whose bound is a number: StaleLocks, ErasureBlocked,
+# PVCSnapshotPileup and BackupFailed.
+#
+# Each gets three shapes: one that fires, one sitting exactly ON the threshold that must not (every
+# one of these is a strict `>`, and off-by-one on a `>` is a rule that pages a bucket early or a day
+# late), and one that crosses the threshold but recovers inside the `for:` hold.
+#
+# BackupFailed is the odd one out and gets the most attention: it is a counter read through
+# increase(), which is a different failure mode from every other rule here. It has no `for:`,
+# because the 1h range IS the hold; and it has to survive the operator restart that resets the
+# counter to zero, which is the entire reason spec §1 made it a counter instead of the gauge
+# sibling that was there before.
+rule_files:
+  - ../../../charts/crystal-backup/rules/crystalbackup.rules.yaml
+
+evaluation_interval: 1m
+
+tests:
+  # ── CrystalbackupStaleLocks ───────────────────────────────────────────────
+  - interval: 1m
+    name: stale locks persisting past the reaper's budget
+    input_series:
+      - series: 'crystalbackup_repository_stale_locks{location="dr",scope="cluster",namespace="",cluster="prod"}'
+        values: "2x60"
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: CrystalbackupStaleLocks
+        exp_alerts: []
+      - eval_time: 35m
+        alertname: CrystalbackupStaleLocks
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              location: dr
+              scope: cluster
+              cluster: prod
+            exp_annotations:
+              summary: "Stale restic locks persist on dr (reaper not clearing)"
+              description: "Stale locks block backups and maintenance on this repository. The orphan reaper normally clears them within minutes; 30 minutes of persistence means it is not running or cannot reach the backend."
+
+  # Zero locks is the ordinary state of every repository in the fleet. `> 0` on a gauge that is
+  # present and zero must be as silent as a gauge that is absent.
+  - interval: 1m
+    name: no stale locks — silent
+    input_series:
+      - series: 'crystalbackup_repository_stale_locks{location="dr",scope="cluster",namespace="",cluster="prod"}'
+        values: "0x60"
+    alert_rule_test:
+      - eval_time: 45m
+        alertname: CrystalbackupStaleLocks
+        exp_alerts: []
+
+  # The reaper doing its job: a lock appears, and is gone well inside the 30m hold. This is what
+  # the hold is FOR — a backup that takes twenty minutes holds a lock for twenty minutes.
+  - interval: 1m
+    name: a lock the reaper clears inside the hold — never pages
+    input_series:
+      - series: 'crystalbackup_repository_stale_locks{location="dr",scope="cluster",namespace="",cluster="prod"}'
+        values: "0x5 1x20 0x40"
+    alert_rule_test:
+      - eval_time: 26m
+        alertname: CrystalbackupStaleLocks
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: CrystalbackupStaleLocks
+        exp_alerts: []
+
+  # ── CrystalbackupErasureBlocked ───────────────────────────────────────────
+  # The erasure family carries only (location, cluster) — no namespace, no scope. An alert that
+  # arrived with a namespace label here would mean the collector changed shape underneath the rule.
+  - interval: 1m
+    name: an erasure parked behind an object-lock window
+    input_series:
+      - series: 'crystalbackup_erasure_blocked{location="immutable-eu",cluster="prod"}'
+        values: "1x120"
+    alert_rule_test:
+      - eval_time: 50m
+        alertname: CrystalbackupErasureBlocked
+        exp_alerts: []
+      - eval_time: 70m
+        alertname: CrystalbackupErasureBlocked
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              location: immutable-eu
+              cluster: prod
+            exp_annotations:
+              summary: "Right-to-erasure blocked on immutable-eu (Immutable object-lock not yet expired, R21/ADR 0005)"
+              description: "A ClusterErasure cannot complete until the object-lock window expires. This is expected on Immutable locations, but it is a GDPR clock running: someone has to know."
+
+  - interval: 1m
+    name: nothing blocked — silent
+    input_series:
+      - series: 'crystalbackup_erasure_blocked{location="immutable-eu",cluster="prod"}'
+        values: "0x120"
+    alert_rule_test:
+      - eval_time: 90m
+        alertname: CrystalbackupErasureBlocked
+        exp_alerts: []
+
+  # ── CrystalbackupPVCSnapshotPileup ────────────────────────────────────────
+  # 20 exactly. The ceph-csi flatten threshold this rule exists for is a hard number, and `> 20`
+  # rather than `>= 20` is a deliberate one-snapshot margin. A test that only ever used 25 would
+  # never notice the comparison being loosened.
+  - interval: 1m
+    name: exactly 20 snapshots — on the threshold, not over it
+    input_series:
+      - series: 'crystalbackup_pvc_volumesnapshot_count{namespace="team-a",pvc="data-0",cluster="prod"}'
+        values: "20x60"
+    alert_rule_test:
+      - eval_time: 45m
+        alertname: CrystalbackupPVCSnapshotPileup
+        exp_alerts: []
+
+  - interval: 1m
+    name: 21 snapshots — one over, pages after the hold
+    input_series:
+      - series: 'crystalbackup_pvc_volumesnapshot_count{namespace="team-a",pvc="data-0",cluster="prod"}'
+        values: "21x60"
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: CrystalbackupPVCSnapshotPileup
+        exp_alerts: []
+      - eval_time: 35m
+        alertname: CrystalbackupPVCSnapshotPileup
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              namespace: team-a
+              pvc: data-0
+              cluster: prod
+            exp_annotations:
+              # $value is in the summary, so this also pins that the operator is shown the count
+              # and not a bare "a PVC has too many snapshots".
+              summary: "21 VolumeSnapshots piling up on PVC team-a/data-0 (ceph-csi flatten risk, ADR 0006)"
+              description: "Snapshots are accumulating faster than they are released — usually a coexisting backup tool, or our own temp snapshots not being cleaned up. On ceph-csi this crosses the flatten threshold and stalls the volume."
+
+  # Per-PVC cardinality is the documented exception in spec §2.9, and the reason it is worth paying
+  # is that the alert names the ONE claim to go and look at. Two PVCs over the line must produce two
+  # alerts, not one aggregate that says "somewhere in team-a".
+  - interval: 1m
+    name: two PVCs piling up — two separately addressable alerts
+    input_series:
+      - series: 'crystalbackup_pvc_volumesnapshot_count{namespace="team-a",pvc="data-0",cluster="prod"}'
+        values: "30x60"
+      - series: 'crystalbackup_pvc_volumesnapshot_count{namespace="team-b",pvc="data-1",cluster="prod"}'
+        values: "40x60"
+      - series: 'crystalbackup_pvc_volumesnapshot_count{namespace="team-b",pvc="data-2",cluster="prod"}'
+        values: "3x60"
+    alert_rule_test:
+      - eval_time: 35m
+        alertname: CrystalbackupPVCSnapshotPileup
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              namespace: team-a
+              pvc: data-0
+              cluster: prod
+            exp_annotations:
+              summary: "30 VolumeSnapshots piling up on PVC team-a/data-0 (ceph-csi flatten risk, ADR 0006)"
+              description: "Snapshots are accumulating faster than they are released — usually a coexisting backup tool, or our own temp snapshots not being cleaned up. On ceph-csi this crosses the flatten threshold and stalls the volume."
+          - exp_labels:
+              severity: warning
+              namespace: team-b
+              pvc: data-1
+              cluster: prod
+            exp_annotations:
+              summary: "40 VolumeSnapshots piling up on PVC team-b/data-1 (ceph-csi flatten risk, ADR 0006)"
+              description: "Snapshots are accumulating faster than they are released — usually a coexisting backup tool, or our own temp snapshots not being cleaned up. On ceph-csi this crosses the flatten threshold and stalls the volume."
+
+  # ── CrystalbackupBackupFailed ─────────────────────────────────────────────
+  - interval: 1m
+    name: a backup failure inside the last hour
+    input_series:
+      - series: 'crystalbackup_backup_failures_total{namespace="team-a",tenant="acme",schedule="nightly",origin="namespace",location="dr",cluster="prod"}'
+        values: "0x20 1x60"
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: CrystalbackupBackupFailed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              namespace: team-a
+              tenant: acme
+              schedule: nightly
+              origin: namespace
+              location: dr
+              cluster: prod
+            exp_annotations:
+              summary: "Backup failed for team-a/nightly"
+              description: "At least one Backup reached Failed or PartiallyFailed in the last hour. kubectl get backups -n team-a shows which."
+
+  # The counter never moves. This is the fleet's normal state and the case a `> 0` on a raw counter
+  # (rather than on increase()) would get catastrophically wrong: a namespace that failed once, ever,
+  # would page for the lifetime of the process.
+  - interval: 1m
+    name: a failure older than the window — silent
+    input_series:
+      - series: 'crystalbackup_backup_failures_total{namespace="team-a",tenant="acme",schedule="nightly",origin="namespace",location="dr",cluster="prod"}'
+        values: "3x200"
+    alert_rule_test:
+      - eval_time: 180m
+        alertname: CrystalbackupBackupFailed
+        exp_alerts: []
+
+  # The reason this is a counter and not the gauge. The operator restarts, the counter goes back to
+  # zero, and increase() must still account for the failures that happened before the restart
+  # rather than reading the drop as "nothing happened". A `crystalbackup_backup_failures` gauge —
+  # which also exists, and counts wreckage that still EXISTS — cannot answer this question at all.
+  - interval: 1m
+    name: a failure that straddles an operator restart still counts
+    input_series:
+      - series: 'crystalbackup_backup_failures_total{namespace="team-a",tenant="acme",schedule="nightly",origin="namespace",location="dr",cluster="prod"}'
+        values: "0x10 1x10 0x40"
+    alert_rule_test:
+      - eval_time: 55m
+        alertname: CrystalbackupBackupFailed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              namespace: team-a
+              tenant: acme
+              schedule: nightly
+              origin: namespace
+              location: dr
+              cluster: prod
+            exp_annotations:
+              summary: "Backup failed for team-a/nightly"
+              description: "At least one Backup reached Failed or PartiallyFailed in the last hour. kubectl get backups -n team-a shows which."
+
+  # A cluster-plane schedule reaches the same namespace with origin=cluster. Both planes have to
+  # page, and they have to be distinguishable — the operator's first question on a missed backup is
+  # "which schedule", and origin is half of that answer.
+  - interval: 1m
+    name: both planes page separately for the same namespace
+    input_series:
+      - series: 'crystalbackup_backup_failures_total{namespace="team-a",tenant="acme",schedule="nightly",origin="namespace",location="dr",cluster="prod"}'
+        values: "0x20 1x60"
+      - series: 'crystalbackup_backup_failures_total{namespace="team-a",tenant="acme",schedule="fleet-wide",origin="cluster",location="dr",cluster="prod"}'
+        values: "0x20 1x60"
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: CrystalbackupBackupFailed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              namespace: team-a
+              tenant: acme
+              schedule: fleet-wide
+              origin: cluster
+              location: dr
+              cluster: prod
+            exp_annotations:
+              summary: "Backup failed for team-a/fleet-wide"
+              description: "At least one Backup reached Failed or PartiallyFailed in the last hour. kubectl get backups -n team-a shows which."
+          - exp_labels:
+              severity: warning
+              namespace: team-a
+              tenant: acme
+              schedule: nightly
+              origin: namespace
+              location: dr
+              cluster: prod
+            exp_annotations:
+              summary: "Backup failed for team-a/nightly"
+              description: "At least one Backup reached Failed or PartiallyFailed in the last hour. kubectl get backups -n team-a shows which."

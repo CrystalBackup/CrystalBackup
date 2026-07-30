@@ -1,0 +1,307 @@
+# promtool unit tests — the two fixed-26h staleness rules: MaintenanceStalled and
+# ExternalSyncStale.
+#
+# Reading the timeline: promtool's synthetic clock starts at the Unix epoch, so `time()` at
+# eval_time T is exactly T seconds. A series whose VALUE is 0 therefore means "this last happened at
+# t=0", and its age at eval_time T is T. That is what makes a 26h threshold testable at all without
+# a real clock — and it is also why these tests evaluate on a 10-minute grid: a 1-minute grid over a
+# 27-hour horizon is sixteen hundred evaluations of every rule in the file for no extra coverage.
+#
+# Both rules hold for 1h, so each one gets three points: below the threshold, past the threshold but
+# inside the hold, and past both. ExternalSyncStale additionally carries a pause guard on
+# crystalbackup_externalsync_active and a never-completed fallback onto
+# crystalbackup_externalsync_created_timestamp_seconds, so every sync in this file publishes all
+# three series — a test that omitted one would be asserting against a rule term that can never
+# match, and the collector emits them together for exactly that reason.
+rule_files:
+  - ../../../charts/crystal-backup/rules/crystalbackup.rules.yaml
+
+evaluation_interval: 10m
+
+tests:
+  # ── CrystalbackupMaintenanceStalled ───────────────────────────────────────
+  # The repository was pruned at t=0 and never again. 26h + the 1h hold means the page lands at 27h.
+  - interval: 10m
+    name: no successful prune for 26h
+    input_series:
+      - series: 'crystalbackup_repository_last_maintenance_timestamp_seconds{location="dr",scope="cluster",namespace="",cluster="prod"}'
+        values: "0x170"
+    alert_rule_test:
+      # 25h — a daily pruneSchedule that missed exactly one window. Explicitly not a page: that
+      # tolerance is the whole reason the bound is 26h and not 24h.
+      - eval_time: 25h
+        alertname: CrystalbackupMaintenanceStalled
+        exp_alerts: []
+      # 26h30m — over the bound, inside the 1h hold.
+      - eval_time: 26h30m
+        alertname: CrystalbackupMaintenanceStalled
+        exp_alerts: []
+      - eval_time: 27h10m
+        alertname: CrystalbackupMaintenanceStalled
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              location: dr
+              scope: cluster
+              cluster: prod
+            exp_annotations:
+              summary: "No successful prune on dr for over 26h — the repository is growing unreclaimed"
+              description: "Forgotten snapshots are not being reclaimed, so the repository grows and the bill with it. Check the maintenance Job history in BackupRepository status.recentMaintenance."
+
+  # A repository pruning on schedule: the timestamp advances with the clock, so its age stays near
+  # zero forever. If the rule's arithmetic were inverted or the threshold sign wrong, THIS is the
+  # test that goes red rather than the firing one.
+  - interval: 10m
+    name: a repository pruning on schedule never pages
+    input_series:
+      - series: 'crystalbackup_repository_last_maintenance_timestamp_seconds{location="dr",scope="cluster",namespace="",cluster="prod"}'
+        values: "0+600x170"
+    alert_rule_test:
+      - eval_time: 27h10m
+        alertname: CrystalbackupMaintenanceStalled
+        exp_alerts: []
+
+  # An Immutable location never prunes BY DESIGN and emits no timestamp at all (spec §2.4,
+  # adr/0005). The rule stays silent through absence rather than through a label exclusion nobody
+  # would remember to maintain — so the location is present here in every other respect, and this
+  # test fails the day the collector starts emitting a zero for it.
+  - interval: 10m
+    name: an Immutable location emits no prune timestamp and never pages
+    input_series:
+      - series: 'crystalbackup_repository_size_bytes{location="immutable-eu",scope="cluster",namespace="",cluster="prod"}'
+        values: "1000x170"
+      - series: 'crystalbackup_repository_last_check_timestamp_seconds{location="immutable-eu",scope="cluster",namespace="",cluster="prod"}'
+        values: "0+600x170"
+    alert_rule_test:
+      - eval_time: 27h10m
+        alertname: CrystalbackupMaintenanceStalled
+        exp_alerts: []
+
+  # ── CrystalbackupExternalSyncStale ────────────────────────────────────────
+  # A sync that has NEVER completed publishes last_success = 0, deliberately unlike the repository
+  # family's absence (spec §2.12) — so a secondary broken from day one is not the single case the
+  # rule cannot see. That 0 is a SENTINEL, not a timestamp, and the rule measures this sync's age
+  # from its CREATION instead. Created at t=0 here, so the age reaches 26h at 26h and the page lands
+  # at 27h once the hold clears.
+  - interval: 10m
+    name: a sync that has never completed pages a day after it was created
+    input_series:
+      - series: 'crystalbackup_externalsync_last_success_timestamp_seconds{sync="offsite",source="dr",destination="cold",scope="cluster",namespace="",cluster="prod"}'
+        values: "0x170"
+      - series: 'crystalbackup_externalsync_created_timestamp_seconds{sync="offsite",source="dr",destination="cold",scope="cluster",namespace="",cluster="prod"}'
+        values: "0x170"
+      - series: 'crystalbackup_externalsync_active{sync="offsite",source="dr",destination="cold",scope="cluster",namespace="",cluster="prod"}'
+        values: "1x170"
+    alert_rule_test:
+      - eval_time: 25h
+        alertname: CrystalbackupExternalSyncStale
+        exp_alerts: []
+      - eval_time: 27h10m
+        alertname: CrystalbackupExternalSyncStale
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              sync: offsite
+              source: dr
+              destination: cold
+              scope: cluster
+              cluster: prod
+            exp_annotations:
+              summary: "External sync offsite (dr→cold) has not completed in 26h"
+              description: "The secondary copy is falling behind. Check the sync CR's phase and the queue: a secondary nobody has verified is not a secondary."
+
+  # ── the never-completed sentinel, on a REAL clock ─────────────────────────
+  # The test above is honest about the rule but flattering about the clock: promtool starts at the
+  # epoch, so the 0 sentinel and "created just now" coincide, and an age measured from either one
+  # grows at the same rate. A real cluster's `time()` is around 1.77e9, so `time() - 0` is fifty-four
+  # YEARS on the very first scrape. Under a pure staleness test the 26h bound was therefore crossed
+  # instantly by every sync that had ever been created, and the only thing standing between
+  # `kubectl apply` and a page reading "has not completed in 26h" was the 1h `for:`.
+  #
+  # -1.77e9 is that arithmetic moved into promtool's frame: a sentinel whose distance from `time()`
+  # is already past 26h at t=0. It stays at that value here ON PURPOSE, rather than being softened
+  # to a plain 0, because it proves the fix does not depend on the sentinel being exactly zero — the
+  # rule discards it via `> 0` and measures from creation, so ANY not-yet-succeeded marker works.
+  #
+  # The expectation is now silence for the first day and a page after it, which is the same
+  # behaviour as the never-completed test above. That is the point: those two cases describe the
+  # same situation, and before the creation fallback they disagreed by twenty-five hours purely
+  # because of where the clock happened to start.
+  - interval: 10m
+    name: a sync created minutes ago has never completed — and stays silent until it is a day old
+    input_series:
+      - series: 'crystalbackup_externalsync_last_success_timestamp_seconds{sync="brand-new",source="dr",destination="cold",scope="cluster",namespace="",cluster="prod"}'
+        values: "-1.77e9x170"
+      # Created at t=0, i.e. minutes before the first evaluation below.
+      - series: 'crystalbackup_externalsync_created_timestamp_seconds{sync="brand-new",source="dr",destination="cold",scope="cluster",namespace="",cluster="prod"}'
+        values: "0x170"
+      - series: 'crystalbackup_externalsync_active{sync="brand-new",source="dr",destination="cold",scope="cluster",namespace="",cluster="prod"}'
+        values: "1x170"
+    alert_rule_test:
+      # Fifty minutes old. Under the old expression this was already past 26h of "staleness" and was
+      # only held back by the `for:`; now the age is fifty minutes, which is what it actually is.
+      - eval_time: 50m
+        alertname: CrystalbackupExternalSyncStale
+        exp_alerts: []
+      # Ninety minutes old — past the 1h hold, and the exact instant the bug used to page.
+      - eval_time: 1h30m
+        alertname: CrystalbackupExternalSyncStale
+        exp_alerts: []
+      # 25h: still inside the bound.
+      - eval_time: 25h
+        alertname: CrystalbackupExternalSyncStale
+        exp_alerts: []
+      # A full day and a bit later it is genuinely a secondary that has never worked, and it pages.
+      - eval_time: 27h10m
+        alertname: CrystalbackupExternalSyncStale
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              sync: brand-new
+              source: dr
+              destination: cold
+              scope: cluster
+              cluster: prod
+            exp_annotations:
+              summary: "External sync brand-new (dr→cold) has not completed in 26h"
+              description: "The secondary copy is falling behind. Check the sync CR's phase and the queue: a secondary nobody has verified is not a secondary."
+
+  # A sync created and paused straight away must be silent on BOTH counts: the creation fallback
+  # would otherwise start its clock, and the pause guard is what stops it. The coordination between
+  # the two is the thing being pinned — each was added for its own reason, and neither was written
+  # with the other in mind.
+  - interval: 10m
+    name: a sync created and immediately paused pages for neither reason
+    input_series:
+      - series: 'crystalbackup_externalsync_last_success_timestamp_seconds{sync="stillborn",source="dr",destination="cold",scope="cluster",namespace="",cluster="prod"}'
+        values: "0x170"
+      - series: 'crystalbackup_externalsync_created_timestamp_seconds{sync="stillborn",source="dr",destination="cold",scope="cluster",namespace="",cluster="prod"}'
+        values: "0x170"
+      - series: 'crystalbackup_externalsync_active{sync="stillborn",source="dr",destination="cold",scope="cluster",namespace="",cluster="prod"}'
+        values: "0x170"
+    alert_rule_test:
+      - eval_time: 1h30m
+        alertname: CrystalbackupExternalSyncStale
+        exp_alerts: []
+      - eval_time: 27h10m
+        alertname: CrystalbackupExternalSyncStale
+        exp_alerts: []
+
+  # A sync that ran fine for a day and then stopped. The timestamp freezes at 10h and the age
+  # crosses 26h at 36h — a case the "never completed" test above cannot distinguish, because there
+  # the freeze point and the epoch coincide.
+  - interval: 10m
+    name: a sync that worked and then stopped pages 26h after its last success
+    input_series:
+      - series: 'crystalbackup_externalsync_last_success_timestamp_seconds{sync="offsite",source="dr",destination="cold",scope="cluster",namespace="",cluster="prod"}'
+        values: "0+600x60 36000x180"
+      - series: 'crystalbackup_externalsync_created_timestamp_seconds{sync="offsite",source="dr",destination="cold",scope="cluster",namespace="",cluster="prod"}'
+        values: "0x241"
+      - series: 'crystalbackup_externalsync_active{sync="offsite",source="dr",destination="cold",scope="cluster",namespace="",cluster="prod"}'
+        values: "1x241"
+    alert_rule_test:
+      # 30h wall-clock, 20h since the last success. Not yet.
+      - eval_time: 30h
+        alertname: CrystalbackupExternalSyncStale
+        exp_alerts: []
+      # 37h10m wall-clock, 27h10m since the last success: past the bound and past the hold.
+      - eval_time: 37h10m
+        alertname: CrystalbackupExternalSyncStale
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              sync: offsite
+              source: dr
+              destination: cold
+              scope: cluster
+              cluster: prod
+            exp_annotations:
+              summary: "External sync offsite (dr→cold) has not completed in 26h"
+              description: "The secondary copy is falling behind. Check the sync CR's phase and the queue: a secondary nobody has verified is not a secondary."
+
+  # ── the pause guard ───────────────────────────────────────────────────────
+  # spec.paused has existed on ClusterBackupExternalSync since M5, and it is the documented way to
+  # stop writes before decommissioning a location. Without this guard the rule would page, 26 hours
+  # later, to report that the thing the operator deliberately stopped had indeed stopped. Every
+  # sibling series is still present — pausing does not make the sync half-disappear — so the
+  # silence has to come from the guard and not from an absence.
+  - interval: 10m
+    name: a paused sync — stale by every measure, and silent
+    input_series:
+      - series: 'crystalbackup_externalsync_last_success_timestamp_seconds{sync="offsite",source="dr",destination="cold",scope="cluster",namespace="",cluster="prod"}'
+        values: "0x170"
+      - series: 'crystalbackup_externalsync_created_timestamp_seconds{sync="offsite",source="dr",destination="cold",scope="cluster",namespace="",cluster="prod"}'
+        values: "0x170"
+      - series: 'crystalbackup_externalsync_lag_snapshots{sync="offsite",source="dr",destination="cold",scope="cluster",namespace="",cluster="prod"}'
+        values: "40x170"
+      - series: 'crystalbackup_externalsync_active{sync="offsite",source="dr",destination="cold",scope="cluster",namespace="",cluster="prod"}'
+        values: "0x170"
+    alert_rule_test:
+      - eval_time: 27h10m
+        alertname: CrystalbackupExternalSyncStale
+        exp_alerts: []
+
+  # A DELETED sync drops every series, including active — unlike a paused one, which keeps them all
+  # at 0. Both must be silent, and they get there by different routes: the guard for the pause, the
+  # empty vector for the deletion. Testing only one of the two leaves the other free to regress.
+  - interval: 10m
+    name: a deleted sync leaves no series and nothing pages
+    input_series:
+      - series: 'crystalbackup_repository_size_bytes{location="cold",scope="cluster",namespace="",cluster="prod"}'
+        values: "1000x170"
+    alert_rule_test:
+      - eval_time: 27h10m
+        alertname: CrystalbackupExternalSyncStale
+        exp_alerts: []
+
+  # A namespaced sync carries scope=namespace and its namespace, so the alert routes to the tenant.
+  # Two syncs between the same pair of locations in different namespaces must page separately —
+  # source and destination alone do not identify a sync, which is why `sync` is a label.
+  - interval: 10m
+    name: two namespaced syncs page as two distinct alerts
+    input_series:
+      - series: 'crystalbackup_externalsync_last_success_timestamp_seconds{sync="a-offsite",source="team-a-vault",destination="cold",scope="namespace",namespace="team-a",cluster="prod"}'
+        values: "0x170"
+      - series: 'crystalbackup_externalsync_created_timestamp_seconds{sync="a-offsite",source="team-a-vault",destination="cold",scope="namespace",namespace="team-a",cluster="prod"}'
+        values: "0x170"
+      - series: 'crystalbackup_externalsync_active{sync="a-offsite",source="team-a-vault",destination="cold",scope="namespace",namespace="team-a",cluster="prod"}'
+        values: "1x170"
+      - series: 'crystalbackup_externalsync_last_success_timestamp_seconds{sync="b-offsite",source="team-b-vault",destination="cold",scope="namespace",namespace="team-b",cluster="prod"}'
+        values: "0x170"
+      - series: 'crystalbackup_externalsync_created_timestamp_seconds{sync="b-offsite",source="team-b-vault",destination="cold",scope="namespace",namespace="team-b",cluster="prod"}'
+        values: "0x170"
+      - series: 'crystalbackup_externalsync_active{sync="b-offsite",source="team-b-vault",destination="cold",scope="namespace",namespace="team-b",cluster="prod"}'
+        values: "1x170"
+      # Healthy: keeps up with the clock, must not appear.
+      - series: 'crystalbackup_externalsync_last_success_timestamp_seconds{sync="c-offsite",source="team-c-vault",destination="cold",scope="namespace",namespace="team-c",cluster="prod"}'
+        values: "0+600x170"
+      - series: 'crystalbackup_externalsync_created_timestamp_seconds{sync="c-offsite",source="team-c-vault",destination="cold",scope="namespace",namespace="team-c",cluster="prod"}'
+        values: "0x170"
+      - series: 'crystalbackup_externalsync_active{sync="c-offsite",source="team-c-vault",destination="cold",scope="namespace",namespace="team-c",cluster="prod"}'
+        values: "1x170"
+    alert_rule_test:
+      - eval_time: 27h10m
+        alertname: CrystalbackupExternalSyncStale
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              sync: a-offsite
+              source: team-a-vault
+              destination: cold
+              scope: namespace
+              namespace: team-a
+              cluster: prod
+            exp_annotations:
+              summary: "External sync a-offsite (team-a-vault→cold) has not completed in 26h"
+              description: "The secondary copy is falling behind. Check the sync CR's phase and the queue: a secondary nobody has verified is not a secondary."
+          - exp_labels:
+              severity: warning
+              sync: b-offsite
+              source: team-b-vault
+              destination: cold
+              scope: namespace
+              namespace: team-b
+              cluster: prod
+            exp_annotations:
+              summary: "External sync b-offsite (team-b-vault→cold) has not completed in 26h"
+              description: "The secondary copy is falling behind. Check the sync CR's phase and the queue: a secondary nobody has verified is not a secondary."

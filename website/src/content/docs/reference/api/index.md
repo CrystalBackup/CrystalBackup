@@ -91,6 +91,7 @@ _Appears in:_
 | `destinationLocationRef` _[LocalObjectReference](#localobjectreference)_ | destinationLocationRef is another BackupLocation in this namespace with its own key<br />(must differ from source — admission rule 9; never a ClusterBackupLocation — rule 2). |  |  |
 | `schedule` _string_ | schedule is a cron expression; empty ⇒ on-demand only. |  |  |
 | `timezone` _string_ | timezone for the cron expression (IANA name). |  |  |
+| `paused` _boolean_ | paused suspends new syncs. |  |  |
 | `mode` _[ExternalSyncMode](#externalsyncmode)_ | mode tracks the source (Mirror) or only adds (AppendOnly, forced on Immutable destinations). | Mirror | Enum: [Mirror AppendOnly] <br /> |
 
 
@@ -326,6 +327,7 @@ _Appears in:_
 | `locationRef` _[LocalObjectReference](#localobjectreference)_ | locationRef is a BackupLocation in this namespace (required; never a ClusterBackupLocation). |  |  |
 | `schedule` _string_ | schedule is a cron expression. |  | MinLength: 1 <br /> |
 | `timezone` _string_ | timezone for the cron expression (IANA name). |  |  |
+| `paused` _boolean_ | paused suspends new runs. |  |  |
 | `jitter` _boolean_ | jitter spreads execution deterministically. |  |  |
 | `concurrencyPolicy` _[ConcurrencyPolicy](#concurrencypolicy)_ | concurrencyPolicy governs overlapping runs. | Forbid | Enum: [Forbid Skip] <br /> |
 | `startingDeadlineSeconds` _integer_ | startingDeadlineSeconds bounds catch-up after downtime. |  |  |

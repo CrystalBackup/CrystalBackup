@@ -1,0 +1,220 @@
+# promtool unit tests — CrystalbackupExternalSyncPausedTooLong.
+#
+# Its own file, alongside schedule_paused_test.yaml and for the same reason: a seven-day horizon on
+# a 10-minute grid would be a thousand evaluations of every rule in the table to learn nothing. The
+# grid is hourly, so the `for: 1h` is exactly one step — what this rule needs resolution on is the
+# 7d `max_over_time` window, not the hold.
+#
+# The rule is SchedulePausedTooLong's twin, built from the same pausedTooLongExpr, so the cases below
+# are deliberately its mirror image. If one file grows a case the other lacks, the two rules have
+# started to diverge and somebody should know why.
+#
+#   * max_over_time(externalsync_active[7d]) == 0 — the pair had no unpaused sync at ANY point in the
+#     window. History rather than a 7d `for:`, so an operator restart does not reset the clock;
+#   * time() - externalsync_created > 7d — excludes a sync YOUNGER than the window, which would
+#     otherwise fire merely because a 168h lookback is longer than its whole life;
+#   * and, because externalsync_created is an instant vector, that same term requires the sync to
+#     still EXIST — a deleted sync's samples linger in the lookback for a week.
+#
+# Note that these fixtures deliberately omit last_success, so CrystalbackupExternalSyncStale may or
+# may not also be firing on them. That is irrelevant here and invisible to promtool: every case below
+# filters on `alertname`, and the staleness rule has its own file.
+rule_files:
+  - ../../../charts/crystal-backup/rules/crystalbackup.rules.yaml
+
+evaluation_interval: 1h
+
+tests:
+  # Paused since the day it was applied — the shape of "we set up the secondary, paused it during the
+  # migration, and never came back". The 7d window is the binding term only after the age term is
+  # satisfied at t=168h; the hold lands the page at 170h.
+  - interval: 1h
+    name: paused since creation — pages once it is more than 7 days old
+    input_series:
+      - series: 'crystalbackup_externalsync_active{sync="offsite",source="dr",destination="cold",scope="cluster",namespace="",cluster="prod"}'
+        values: "0x180"
+      - series: 'crystalbackup_externalsync_created_timestamp_seconds{sync="offsite",source="dr",destination="cold",scope="cluster",namespace="",cluster="prod"}'
+        values: "0x180"
+    alert_rule_test:
+      - eval_time: 168h
+        alertname: CrystalbackupExternalSyncPausedTooLong
+        exp_alerts: []
+      - eval_time: 170h
+        alertname: CrystalbackupExternalSyncPausedTooLong
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              sync: offsite
+              source: dr
+              destination: cold
+              scope: cluster
+              cluster: prod
+            exp_annotations:
+              summary: "External sync offsite (dr→cold) has been paused for over 7 days — the secondary is no longer being fed"
+              description: "The destination has stopped receiving copies and ExternalSyncStale is guarded on the same pause, so nothing else will say so. Resume it (spec.paused=false), or delete the sync if this secondary is genuinely being retired."
+
+  # The case this rule was actually written for: replication that WORKED, was paused "while we
+  # migrate the bucket", and was never resumed. It copied for its first ten hours, so the clock
+  # starts at the pause and not at creation — at 100h the pair has been unfed for ninety hours, which
+  # is a migration, not a forgotten intent, and the 1 at t=10h is still inside the lookback.
+  - interval: 1h
+    name: paused mid-life — the clock starts at the pause, not at creation
+    input_series:
+      - series: 'crystalbackup_externalsync_active{sync="offsite",source="dr",destination="cold",scope="cluster",namespace="",cluster="prod"}'
+        values: "1x10 0x180"
+      - series: 'crystalbackup_externalsync_created_timestamp_seconds{sync="offsite",source="dr",destination="cold",scope="cluster",namespace="",cluster="prod"}'
+        values: "0x190"
+    alert_rule_test:
+      - eval_time: 100h
+        alertname: CrystalbackupExternalSyncPausedTooLong
+        exp_alerts: []
+      - eval_time: 177h
+        alertname: CrystalbackupExternalSyncPausedTooLong
+        exp_alerts: []
+      - eval_time: 180h
+        alertname: CrystalbackupExternalSyncPausedTooLong
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              sync: offsite
+              source: dr
+              destination: cold
+              scope: cluster
+              cluster: prod
+            exp_annotations:
+              summary: "External sync offsite (dr→cold) has been paused for over 7 days — the secondary is no longer being fed"
+              description: "The destination has stopped receiving copies and ExternalSyncStale is guarded on the same pause, so nothing else will say so. Resume it (spec.paused=false), or delete the sync if this secondary is genuinely being retired."
+
+  # A sync created at t=100h and paused from the start. max_over_time over the window sees only zeros
+  # — there is no `1` in the last seven days because the object did not exist for most of them — and
+  # without the age term this brand-new pause would page immediately.
+  - interval: 1h
+    name: a young sync paused from birth does not page on a lookback longer than its life
+    input_series:
+      - series: 'crystalbackup_externalsync_active{sync="fresh",source="dr",destination="cold",scope="cluster",namespace="",cluster="prod"}'
+        values: "_x99 0x200"
+      - series: 'crystalbackup_externalsync_created_timestamp_seconds{sync="fresh",source="dr",destination="cold",scope="cluster",namespace="",cluster="prod"}'
+        values: "_x99 360000x200"
+    alert_rule_test:
+      - eval_time: 170h
+        alertname: CrystalbackupExternalSyncPausedTooLong
+        exp_alerts: []
+      # 100h + 7d + the hold. Now it genuinely has been paused for a week.
+      - eval_time: 270h
+        alertname: CrystalbackupExternalSyncPausedTooLong
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              sync: fresh
+              source: dr
+              destination: cold
+              scope: cluster
+              cluster: prod
+            exp_annotations:
+              summary: "External sync fresh (dr→cold) has been paused for over 7 days — the secondary is no longer being fed"
+              description: "The destination has stopped receiving copies and ExternalSyncStale is guarded on the same pause, so nothing else will say so. Resume it (spec.paused=false), or delete the sync if this secondary is genuinely being retired."
+
+  # DELETED, not paused — the end of a decommission, where the secondary was retired on purpose.
+  # max_over_time still finds the old zeros inside the 168h window, so the first term matches; the
+  # whole weight of not alerting about an object nobody can act on rests on externalsync_created
+  # being an instant vector that is now empty.
+  - interval: 1h
+    name: a deleted sync leaves samples in the window and still does not page
+    input_series:
+      - series: 'crystalbackup_externalsync_active{sync="retired",source="dr",destination="cold",scope="cluster",namespace="",cluster="prod"}'
+        values: "0x50"
+      - series: 'crystalbackup_externalsync_created_timestamp_seconds{sync="retired",source="dr",destination="cold",scope="cluster",namespace="",cluster="prod"}'
+        values: "0x50"
+    alert_rule_test:
+      - eval_time: 170h
+        alertname: CrystalbackupExternalSyncPausedTooLong
+        exp_alerts: []
+
+  # The fleet's normal state. A sync that has been replicating for a month must never appear here,
+  # and this is the test that goes red if the `== 0` is ever loosened.
+  - interval: 1h
+    name: an unpaused sync never pages
+    input_series:
+      - series: 'crystalbackup_externalsync_active{sync="offsite",source="dr",destination="cold",scope="cluster",namespace="",cluster="prod"}'
+        values: "1x180"
+      - series: 'crystalbackup_externalsync_created_timestamp_seconds{sync="offsite",source="dr",destination="cold",scope="cluster",namespace="",cluster="prod"}'
+        values: "0x180"
+    alert_rule_test:
+      - eval_time: 170h
+        alertname: CrystalbackupExternalSyncPausedTooLong
+        exp_alerts: []
+
+  # Resuming has to CLEAR the alert, not just stop it from starting. Paused from birth, pages at
+  # 170h as in the first test, resumed at 175h — from which point the `1` sits in the lookback window
+  # and the rule must go quiet on the very next evaluation.
+  - interval: 1h
+    name: resuming clears the alert
+    input_series:
+      - series: 'crystalbackup_externalsync_active{sync="offsite",source="dr",destination="cold",scope="cluster",namespace="",cluster="prod"}'
+        values: "0x174 1x20"
+      - series: 'crystalbackup_externalsync_created_timestamp_seconds{sync="offsite",source="dr",destination="cold",scope="cluster",namespace="",cluster="prod"}'
+        values: "0x194"
+    alert_rule_test:
+      - eval_time: 172h
+        alertname: CrystalbackupExternalSyncPausedTooLong
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              sync: offsite
+              source: dr
+              destination: cold
+              scope: cluster
+              cluster: prod
+            exp_annotations:
+              summary: "External sync offsite (dr→cold) has been paused for over 7 days — the secondary is no longer being fed"
+              description: "The destination has stopped receiving copies and ExternalSyncStale is guarded on the same pause, so nothing else will say so. Resume it (spec.paused=false), or delete the sync if this secondary is genuinely being retired."
+      - eval_time: 177h
+        alertname: CrystalbackupExternalSyncPausedTooLong
+        exp_alerts: []
+
+  # A namespaced sync carries scope=namespace and its own namespace, so the alert routes to the
+  # tenant whose secondary stopped being fed rather than to the platform team. Two paused syncs
+  # between the same pair of locations in different namespaces must page separately — source and
+  # destination alone do not identify a sync, which is why `sync` is a label.
+  - interval: 1h
+    name: paused namespaced syncs page separately and route to their own tenants
+    input_series:
+      - series: 'crystalbackup_externalsync_active{sync="a-offsite",source="team-a-vault",destination="cold",scope="namespace",namespace="team-a",cluster="prod"}'
+        values: "0x180"
+      - series: 'crystalbackup_externalsync_created_timestamp_seconds{sync="a-offsite",source="team-a-vault",destination="cold",scope="namespace",namespace="team-a",cluster="prod"}'
+        values: "0x180"
+      - series: 'crystalbackup_externalsync_active{sync="b-offsite",source="team-b-vault",destination="cold",scope="namespace",namespace="team-b",cluster="prod"}'
+        values: "0x180"
+      - series: 'crystalbackup_externalsync_created_timestamp_seconds{sync="b-offsite",source="team-b-vault",destination="cold",scope="namespace",namespace="team-b",cluster="prod"}'
+        values: "0x180"
+      # Running normally, must not appear.
+      - series: 'crystalbackup_externalsync_active{sync="c-offsite",source="team-c-vault",destination="cold",scope="namespace",namespace="team-c",cluster="prod"}'
+        values: "1x180"
+      - series: 'crystalbackup_externalsync_created_timestamp_seconds{sync="c-offsite",source="team-c-vault",destination="cold",scope="namespace",namespace="team-c",cluster="prod"}'
+        values: "0x180"
+    alert_rule_test:
+      - eval_time: 170h
+        alertname: CrystalbackupExternalSyncPausedTooLong
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              sync: a-offsite
+              source: team-a-vault
+              destination: cold
+              scope: namespace
+              namespace: team-a
+              cluster: prod
+            exp_annotations:
+              summary: "External sync a-offsite (team-a-vault→cold) has been paused for over 7 days — the secondary is no longer being fed"
+              description: "The destination has stopped receiving copies and ExternalSyncStale is guarded on the same pause, so nothing else will say so. Resume it (spec.paused=false), or delete the sync if this secondary is genuinely being retired."
+          - exp_labels:
+              severity: warning
+              sync: b-offsite
+              source: team-b-vault
+              destination: cold
+              scope: namespace
+              namespace: team-b
+              cluster: prod
+            exp_annotations:
+              summary: "External sync b-offsite (team-b-vault→cold) has been paused for over 7 days — the secondary is no longer being fed"
+              description: "The destination has stopped receiving copies and ExternalSyncStale is guarded on the same pause, so nothing else will say so. Resume it (spec.paused=false), or delete the sync if this secondary is genuinely being retired."

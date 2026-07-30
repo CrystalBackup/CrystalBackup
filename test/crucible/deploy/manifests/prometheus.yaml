@@ -1,0 +1,150 @@
+# Crucible — the Prometheus that actually EVALUATES the shipped alert rules.
+#
+# promtool unit tests (internal/alerts/testdata, `make test-alert-rules`) prove the expressions are
+# right. They cannot prove the chain: that the operator exposes the series, that a scrape gets past
+# the metrics endpoint's authn/authz and the chart's NetworkPolicy, and that the PrometheusRule the
+# chart ships is one a real Prometheus loads and runs. That is what this file is for, and it is why
+# a spec that cannot reach Prometheus FAILS rather than skipping.
+#
+# Deliberately not kube-prometheus-stack: no Alertmanager, no Grafana, no node-exporter, no
+# kube-state-metrics, no default rules. Nothing here is about Kubernetes' own health — the only
+# target that matters is crystal-backup's, and every component not installed is a component that
+# cannot make a crucible run flaky for reasons unrelated to backups.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: monitoring
+  labels:
+    # The chart's operator NetworkPolicy admits the metrics port `from` a namespaceSelector on
+    # kubernetes.io/metadata.name (see networkPolicy.monitoringNamespace). The API server sets that
+    # label itself on every namespace; it is named here so the coupling is visible from this file.
+    kubernetes.io/metadata.name: monitoring
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: crucible-prometheus
+  namespace: monitoring
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: crucible-prometheus
+rules:
+  - apiGroups: [""]
+    resources: [nodes, nodes/metrics, services, endpoints, pods]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [get]
+  - apiGroups: [discovery.k8s.io]
+    resources: [endpointslices]
+    verbs: [get, list, watch]
+  - apiGroups: [networking.k8s.io]
+    resources: [ingresses]
+    verbs: [get, list, watch]
+# NOTE the omission: `nonResourceURLs: ["/metrics"]` is NOT granted here. It comes from the chart's
+# own crystal-backup-metrics-reader ClusterRole, bound below. The chart creates that role and
+# deliberately does not bind it ("Scrapers bind this to read /metrics"), so a crucible that granted
+# itself the permission directly would install the chart and never find out whether the role it
+# ships is the right one. If it is wrong, the target goes down and the alert specs fail — which is
+# the correct outcome.
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: crucible-prometheus
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: crucible-prometheus
+subjects:
+  - kind: ServiceAccount
+    name: crucible-prometheus
+    namespace: monitoring
+---
+# The chart's role. Applied BEFORE the chart exists, which RBAC allows: a roleRef to a missing
+# ClusterRole is a binding that grants nothing until the role appears, not an error. Ordering the
+# other way would mean re-running deploy.sh to pick it up.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: crucible-prometheus-crystal-backup-metrics
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: crystal-backup-metrics-reader
+subjects:
+  - kind: ServiceAccount
+    name: crucible-prometheus
+    namespace: monitoring
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Prometheus
+metadata:
+  name: crucible
+  namespace: monitoring
+spec:
+  # Pinned to the same version promtool is pinned to in the repo Makefile. The two layers of lot I
+  # then agree on what PromQL means: an expression that behaves one way in CI and another on the
+  # cluster would make both results worthless.
+  version: 3.13.1
+  replicas: 1
+  serviceAccountName: crucible-prometheus
+  # Pinned rather than left to the default, because the Service below addresses the port BY NAME
+  # through the API-server proxy and a renamed default would break the suite's only way in.
+  portName: web
+  # A label of our own on the pod. The operator stamps its own set (app.kubernetes.io/name,
+  # /instance, /managed-by, plus `prometheus`), and selecting on those would couple the crucible's
+  # Service to prometheus-operator's internal labelling conventions across upgrades. This one
+  # cannot drift: it is declared here and matched below.
+  podMetadata:
+    labels:
+      crucible.crystalbackup.io/component: prometheus
+  # 15s rather than the 30s default, on both. The rules' own `for:` durations (5m up to 7d) are what
+  # the specs wait on; there is no reason to add half a minute of scrape latency to each of them.
+  scrapeInterval: 15s
+  evaluationInterval: 15s
+  # No PVC: emptyDir. A crucible cluster is destroyed at the end of the run, and a Prometheus that
+  # needed storage to come up would put Ceph in the path of the alerting tests.
+  retention: 6h
+  # Empty selectors mean "everything", including across namespaces. Nil would mean "nothing", which
+  # is the classic way to install a PrometheusRule that is valid, present and completely ignored.
+  serviceMonitorSelector: {}
+  serviceMonitorNamespaceSelector: {}
+  podMonitorSelector: {}
+  podMonitorNamespaceSelector: {}
+  probeSelector: {}
+  probeNamespaceSelector: {}
+  scrapeConfigSelector: {}
+  scrapeConfigNamespaceSelector: {}
+  ruleSelector: {}
+  ruleNamespaceSelector: {}
+  resources:
+    requests:
+      cpu: 100m
+      memory: 400Mi
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65534
+    fsGroup: 65534
+    seccompProfile:
+      type: RuntimeDefault
+---
+# A normal ClusterIP Service, not the operator's headless `prometheus-operated`. The suite reaches
+# the HTTP API through the API server's service proxy (no port-forward, no NodePort, nothing to
+# leave running), and a service proxy wants a service with a port name to address.
+apiVersion: v1
+kind: Service
+metadata:
+  name: crucible-prometheus
+  namespace: monitoring
+spec:
+  type: ClusterIP
+  ports:
+    - name: web
+      port: 9090
+      targetPort: web
+      protocol: TCP
+  selector:
+    crucible.crystalbackup.io/component: prometheus

@@ -117,7 +117,9 @@ fi
 echo "==> running the suite in ${N} lanes, SEQUENTIALLY (see the comment: concurrent suites truncate)"
 for lane in "${lanes[@]}"; do
   echo "--> lane ${lane}"
-  CRUCIBLE_LANE="${lane}" CRUCIBLE_TIMEOUT="${CRUCIBLE_TIMEOUT:-150m}" \
+  # 30m of headroom over run-tests.sh's own default, kept as that default moved from 120m to 180m
+  # when M6's alert lane added an hour of unavoidable waiting on the rules' `for:` holds.
+  CRUCIBLE_LANE="${lane}" CRUCIBLE_TIMEOUT="${CRUCIBLE_TIMEOUT:-210m}" \
     mise run test ${LABELS:+"${LABELS}"} > "${log_dir}/${lane}-test.log" 2>&1 || true
 
   # Residual exposure objects, read BEFORE teardown. This is the one measurement that depends on

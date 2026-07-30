@@ -214,19 +214,57 @@ alert-rules-verify: ## Fail if the committed alert rules are stale (CI guard).
 	fi; \
 	echo "$(ALERT_RULES_OUT) is up to date."
 
-## promtool is the only thing that actually PARSES the PromQL and the annotation templates. It is
-## not vendored (prometheus/prometheus cannot be `go install`ed, and pulling it in as a library
-## would drag its whole dependency tree through this project's vulnerability surface for a syntax
-## check), so this target uses one if the machine has it and says so plainly when it does not.
-## The series/label correctness that MATTERS is checked in Go, in internal/alerts/rules_test.go.
+## promtool is the only thing that actually PARSES the PromQL and the annotation templates, and —
+## through `promtool test rules` — the only thing that EVALUATES them. Everything else in this
+## build reads the rules; promtool runs them.
+##
+## It used to be "used if the machine happens to have one", which made the PromQL check the fourth
+## self-disabling guard in this project: green on every machine that lacked the binary, including
+## CI. It is now downloaded, pinned by version AND by SHA-256, into $(LOCALBIN) like every other
+## tool here. It is fetched from the official release archive rather than `go install`ed because
+## prometheus/prometheus cannot be `go install`ed at all (v3 module path plus `replace`
+## directives), and vendoring it as a library would drag its whole dependency tree through this
+## project's vulnerability surface for a syntax check.
 .PHONY: check-alert-rules
-check-alert-rules: ## Syntax-check the generated alert rules with promtool, when one is available.
-	@command -v promtool >/dev/null 2>&1 || { \
-		echo "promtool not on PATH — skipping the PromQL syntax check."; \
-		echo "  (internal/alerts/rules_test.go still checks every series and label against the catalogue.)"; \
-		exit 0; \
-	}; \
-	promtool check rules "$(ALERT_RULES_OUT)"
+check-alert-rules: promtool ## Syntax-check the generated alert rules with promtool.
+	"$(PROMTOOL)" check rules "$(ALERT_RULES_OUT)"
+
+## The unit tests. `promtool check rules` proves the PromQL PARSES; only this proves it can fire.
+## Five of the nine rules shipped reading series nobody emitted — valid PromQL, evaluated without
+## error, unable to match anything, ever. That class of defect is invisible to a syntax check by
+## construction: the files below feed each rule synthetic series and assert both that it fires when
+## it should and that it stays silent when it should not, including the absence cases (spec §2.4:
+## a repository that has never been checked emits nothing and must NOT page).
+ALERT_RULE_TESTS ?= $(wildcard internal/alerts/testdata/*.yaml)
+
+.PHONY: test-alert-rules
+test-alert-rules: promtool ## Run the promtool unit tests for the alert rules.
+	@test -n "$(ALERT_RULE_TESTS)" || { \
+		echo "ERROR: no rule-test files found under internal/alerts/testdata/."; \
+		echo "       The alert rules would then be 'tested' by running nothing at all."; \
+		exit 1; \
+	}
+	"$(PROMTOOL)" test rules $(ALERT_RULE_TESTS)
+	@$(MAKE) --no-print-directory alert-rules-covered
+
+## A rule with no test passes `promtool test rules` by not being mentioned, which is the same shape
+## of silence this whole milestone exists to remove. Adding a rule to internal/alerts/rules.go must
+## therefore fail the build until somebody has watched it fire. Two rules appeared in this table
+## while lot I was being written; without this they would have shipped untested and nothing would
+## have said so.
+.PHONY: alert-rules-covered
+alert-rules-covered: ## Fail if any shipped alert rule has no promtool test case.
+	@missing=""; \
+	for name in $$(sed -n 's/^ *- alert: //p' "$(ALERT_RULES_OUT)"); do \
+		grep -qE "^ *alertname: $${name}\b" $(ALERT_RULE_TESTS) || missing="$$missing $$name"; \
+	done; \
+	if [ -n "$$missing" ]; then \
+		echo "ERROR: alert rules with no promtool test case:$$missing"; \
+		echo "       Add cases under internal/alerts/testdata/ — at minimum one that fires and one"; \
+		echo "       just under the threshold that does not."; \
+		exit 1; \
+	fi; \
+	echo "every alert rule in $(ALERT_RULES_OUT) has at least one promtool test case."
 
 ##@ Build
 
@@ -320,6 +358,7 @@ CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen
 ENVTEST ?= $(LOCALBIN)/setup-envtest
 GOLANGCI_LINT = $(LOCALBIN)/golangci-lint
 CRD_REF_DOCS ?= $(LOCALBIN)/crd-ref-docs
+PROMTOOL ?= $(LOCALBIN)/promtool
 
 ## Tool Versions
 KUSTOMIZE_VERSION ?= v5.8.1
@@ -376,6 +415,61 @@ $(GOLANGCI_LINT): $(LOCALBIN)
 		$(GOLANGCI_LINT) custom --destination $(LOCALBIN) --name golangci-lint-custom && \
 		mv -f $(LOCALBIN)/golangci-lint-custom $(GOLANGCI_LINT); \
 	} || true
+
+# promtool ships inside the Prometheus release archive and is the ONE tool here that cannot come
+# through go-install-tool: `go install github.com/prometheus/prometheus/cmd/promtool@vX` fails on
+# the v3 module path plus the `replace` directives in that repo's go.mod. So it is fetched from the
+# official release tarball and verified against a checksum committed HERE — a downloaded binary
+# that is only as trustworthy as whatever GitHub served today has no business gating a build.
+#
+# Bumping PROMETHEUS_VERSION means replacing the four lines below with that release's own
+# sha256sums.txt entries. That is deliberate friction: a version bump that left stale digests
+# behind would fail loudly on the next fetch instead of silently accepting a different binary.
+PROMETHEUS_VERSION ?= 3.13.1
+
+# From https://github.com/prometheus/prometheus/releases/download/v$(PROMETHEUS_VERSION)/sha256sums.txt
+define prometheus_sha256sums
+bc6cef4bdbeb3d0974ac161684dd2a0c4d4e341a13a4a634917b1c09d0f33fc5  prometheus-$(PROMETHEUS_VERSION).darwin-amd64.tar.gz
+28d1f1224b2a22f84c801487fad4b3bd58f94a8cb58cf9340557e787030c9703  prometheus-$(PROMETHEUS_VERSION).darwin-arm64.tar.gz
+962b812371aff838d152b6ff2d56fdb7a6396f5542f48ebf73421b9721f0d103  prometheus-$(PROMETHEUS_VERSION).linux-amd64.tar.gz
+fbd8e5e0f6ad2e7d053e717739186caee4fd0cab2cf9335bfc86c292fe2a2bfe  prometheus-$(PROMETHEUS_VERSION).linux-arm64.tar.gz
+endef
+export prometheus_sha256sums
+
+.PHONY: promtool
+promtool: $(PROMTOOL) ## Download promtool (from the pinned Prometheus release) if necessary.
+$(PROMTOOL): $(LOCALBIN)
+	@set -eu; \
+	versioned="$(PROMTOOL)-$(PROMETHEUS_VERSION)"; \
+	if [ -x "$$versioned" ]; then ln -sf "$$versioned" "$(PROMTOOL)"; exit 0; fi; \
+	os="$$(uname -s | tr '[:upper:]' '[:lower:]')"; \
+	case "$$(uname -m)" in \
+		x86_64|amd64) arch=amd64 ;; \
+		arm64|aarch64) arch=arm64 ;; \
+		*) echo "promtool: no Prometheus release archive for $$(uname -m)" >&2; exit 1 ;; \
+	esac; \
+	archive="prometheus-$(PROMETHEUS_VERSION).$${os}-$${arch}.tar.gz"; \
+	want="$$(printf '%s\n' "$$prometheus_sha256sums" | awk -v a="$$archive" '$$2 == a { print $$1 }')"; \
+	[ -n "$$want" ] || { \
+		echo "promtool: no pinned checksum for $$archive — add it from that release's sha256sums.txt" >&2; \
+		exit 1; \
+	}; \
+	tmp="$$(mktemp -d)"; trap 'rm -rf "$$tmp"' EXIT; \
+	url="https://github.com/prometheus/prometheus/releases/download/v$(PROMETHEUS_VERSION)/$$archive"; \
+	echo "Downloading $$url"; \
+	curl -fsSL --retry 3 -o "$$tmp/$$archive" "$$url"; \
+	if command -v sha256sum >/dev/null 2>&1; then got="$$(sha256sum "$$tmp/$$archive" | awk '{print $$1}')"; \
+	else got="$$(shasum -a 256 "$$tmp/$$archive" | awk '{print $$1}')"; fi; \
+	[ "$$got" = "$$want" ] || { \
+		echo "promtool: checksum mismatch for $$archive" >&2; \
+		echo "  expected $$want" >&2; \
+		echo "  got      $$got" >&2; \
+		exit 1; \
+	}; \
+	tar -xzf "$$tmp/$$archive" -C "$$tmp"; \
+	install -m 0755 "$$tmp/prometheus-$(PROMETHEUS_VERSION).$${os}-$${arch}/promtool" "$$versioned"; \
+	ln -sf "$$versioned" "$(PROMTOOL)"; \
+	"$(PROMTOOL)" --version | head -1
 
 # go-install-tool will 'go install' any package with custom target and name of binary, if it doesn't exist
 # $1 - target path with name of binary
@@ -478,3 +572,37 @@ api-docs-verify: api-docs ## Fail if the committed API reference is stale (CI gu
 		exit 1; \
 	fi
 	@echo "$(API_DOCS_OUT) is up to date."
+
+## The Metrics and Alerts reference pages are GENERATED, for the same reason the API reference is
+## and at a larger scale of damage. Fifty-three series and eleven rules maintained by hand disagree
+## with the operator within one release, and a metrics reference that disagrees with a scrape is
+## worse than none: it sends someone to write an alert on a label that does not exist, which is
+## valid PromQL that matches nothing, forever, in silence. That is the defect M6 spent itself
+## removing from the rules themselves — documenting it back in would be the same bug, one step
+## further from the code.
+##
+## Nothing in the generator restates a name, a label, a help string, a bucket boundary, a threshold
+## or an expression: the metric facts are read back out of the prometheus.Desc values the collectors
+## register (and out of a real Gather, for the histogram buckets), and the rules out of
+## alerts.Rules(), Rationale included.
+OBS_DOCS_OUT ?= website/src/content/docs/reference/metrics.md website/src/content/docs/reference/alerts.md
+
+.PHONY: observability-docs
+observability-docs: ## Generate the website's Metrics and Alerts reference from internal/metrics and internal/alerts.
+	go run ./internal/refdocs/cmd/gendocs --root .
+
+## Regenerates into a scratch directory and diffs, rather than regenerating in place and asking
+## git — the same choice alert-rules-verify makes, for the same reason: a page that has never been
+## committed is invisible to `git diff`, and this guard has to work on the change that ADDS one.
+.PHONY: observability-docs-verify
+observability-docs-verify: ## Fail if the committed Metrics/Alerts reference pages are stale (CI guard).
+	@tmp="$$(mktemp -d)"; trap 'rm -rf "$$tmp"' EXIT; \
+	go run ./internal/refdocs/cmd/gendocs --root "$$tmp" >/dev/null; \
+	for page in $(OBS_DOCS_OUT); do \
+		if ! diff -u "$$page" "$$tmp/$$page"; then \
+			echo "ERROR: $$page is out of date with internal/metrics and internal/alerts."; \
+			echo "       Run 'make observability-docs' and commit the result."; \
+			exit 1; \
+		fi; \
+	done; \
+	echo "the Metrics and Alerts reference pages are up to date."

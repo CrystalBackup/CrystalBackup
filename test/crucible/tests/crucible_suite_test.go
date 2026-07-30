@@ -36,6 +36,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/kubernetes"
 	clientscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -55,7 +56,11 @@ var (
 	// VAPs (which exempt that identity), letting a spec reach a controller/storage backstop
 	// that the admission layer would otherwise stop at creation.
 	k8sAsOperator client.Client
-	ctx           = context.Background()
+	// k8sTyped is the typed clientset. controller-runtime's client speaks only to the object
+	// API, and the M6 alert specs need the SUBRESOURCE proxy — reaching Prometheus's HTTP API
+	// through the API server instead of a port-forward or a NodePort left open on a public IP.
+	k8sTyped *kubernetes.Clientset
+	ctx      = context.Background()
 )
 
 func TestCrucible(t *testing.T) {
@@ -77,6 +82,9 @@ var _ = BeforeSuite(func() {
 	Expect(cbv1.AddToScheme(sc)).To(Succeed())
 
 	k8s, err = client.New(cfg, client.Options{Scheme: sc})
+	Expect(err).NotTo(HaveOccurred())
+
+	k8sTyped, err = kubernetes.NewForConfig(cfg)
 	Expect(err).NotTo(HaveOccurred())
 
 	opCfg := rest.CopyConfig(cfg)

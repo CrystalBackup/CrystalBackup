@@ -1,0 +1,128 @@
+# promtool unit tests — the two state-gauge rules, and the absence that must stay silent.
+#
+# Run with `make test-alert-rules`. The rule file is the GENERATED chart artifact, not a copy: a
+# test that restated the expression here would pass forever against its own transcription.
+#
+# CrystalbackupRepositoryCheckFailed is the only critical rule in the table, and the one whose
+# ABSENCE semantics carry meaning. spec/05-observability.md §2.4 says a repository that has never
+# been checked emits no `last_check_success` series at all, precisely so a freshly created location
+# does not page the moment it exists. That is a property of the collector AND of the rule together,
+# and nothing but an evaluation can hold them to it — `== 0` against a missing series is a silence
+# that looks identical to a healthy repository until you make the distinction explicit.
+rule_files:
+  - ../../../charts/crystal-backup/rules/crystalbackup.rules.yaml
+
+evaluation_interval: 1m
+
+tests:
+  # ── CrystalbackupRepositoryCheckFailed ────────────────────────────────────
+  - interval: 1m
+    name: repository check failed — a damaged repository pages after the 5m hold
+    input_series:
+      - series: 'crystalbackup_repository_last_check_success{location="dr",scope="cluster",namespace="",cluster="prod"}'
+        values: "0x30"
+    alert_rule_test:
+      # Inside the hold. A `for: 5m` that fired instantly would page on the single failed check
+      # that the next reconcile clears.
+      - eval_time: 4m
+        alertname: CrystalbackupRepositoryCheckFailed
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: CrystalbackupRepositoryCheckFailed
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              location: dr
+              scope: cluster
+              cluster: prod
+            exp_annotations:
+              summary: "restic check failed on repository dr (cluster)"
+              description: "restic found repository damage (R17). Restores from this repository may not work. Do not prune it until the check passes: inspect BackupRepository status.recentMaintenance."
+
+  - interval: 1m
+    name: repository check passing — silent
+    input_series:
+      - series: 'crystalbackup_repository_last_check_success{location="dr",scope="cluster",namespace="",cluster="prod"}'
+        values: "1x30"
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CrystalbackupRepositoryCheckFailed
+        exp_alerts: []
+
+  # THE absence case. The location exists — it publishes size and snapshot counts — but has never
+  # been checked, so last_check_success is absent rather than 0. If the collector ever "helpfully"
+  # initialised it to 0, this test goes red, which is the whole point: every fresh location in
+  # every cluster would otherwise page critical on creation.
+  - interval: 1m
+    name: repository never checked — no series, no page
+    input_series:
+      - series: 'crystalbackup_repository_size_bytes{location="fresh",scope="cluster",namespace="",cluster="prod"}'
+        values: "0x30"
+      - series: 'crystalbackup_repository_snapshot_count{location="fresh",scope="cluster",namespace="",cluster="prod"}'
+        values: "0x30"
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: CrystalbackupRepositoryCheckFailed
+        exp_alerts: []
+
+  # A tenant repository carries scope=namespace and a non-empty namespace, and the alert has to
+  # carry them through so Alertmanager can route it to the tenant rather than the platform.
+  - interval: 1m
+    name: repository check failed on a namespaced repository routes with its namespace
+    input_series:
+      - series: 'crystalbackup_repository_last_check_success{location="team-a-vault",scope="namespace",namespace="team-a",cluster="prod"}'
+        values: "0x30"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: CrystalbackupRepositoryCheckFailed
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              location: team-a-vault
+              scope: namespace
+              namespace: team-a
+              cluster: prod
+            exp_annotations:
+              summary: "restic check failed on repository team-a-vault (namespace)"
+              description: "restic found repository damage (R17). Restores from this repository may not work. Do not prune it until the check passes: inspect BackupRepository status.recentMaintenance."
+
+  # ── CrystalbackupDiscoveryFailed ──────────────────────────────────────────
+  - interval: 1m
+    name: discovery failing — pages after the 30m hold
+    input_series:
+      - series: 'crystalbackup_discovery_last_success{location="dr",scope="namespace",namespace="team-a",cluster="prod"}'
+        values: "0x60"
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: CrystalbackupDiscoveryFailed
+        exp_alerts: []
+      - eval_time: 35m
+        alertname: CrystalbackupDiscoveryFailed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              location: dr
+              scope: namespace
+              namespace: team-a
+              cluster: prod
+            exp_annotations:
+              summary: "Discovery failing on dr — Backup projections may be stale vs the repository"
+              description: "The repository is the source of truth (adr/0009). While discovery fails, `kubectl get backups` no longer reflects what is actually restorable."
+
+  # A discovery pass that fails and recovers inside the hold is the normal shape of a transient S3
+  # 503. The 30m `for:` exists to absorb exactly that, so it must not page at ANY point.
+  - interval: 1m
+    name: discovery fails for 20m then recovers — never pages
+    input_series:
+      - series: 'crystalbackup_discovery_last_success{location="dr",scope="cluster",namespace="",cluster="prod"}'
+        values: "1x5 0x20 1x40"
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CrystalbackupDiscoveryFailed
+        exp_alerts: []
+      - eval_time: 40m
+        alertname: CrystalbackupDiscoveryFailed
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: CrystalbackupDiscoveryFailed
+        exp_alerts: []

@@ -1,0 +1,302 @@
+# promtool unit tests — CrystalbackupBackupMissed, on its own, because it is the only rule in the
+# table that does vector-to-vector matching and the only one with more than one way to be wrong.
+#
+# Four terms, and every one of them is here because it closes a hole the previous shape had:
+#
+#   1. the age is `time() - last_success`, falling back through `or on(...)` to
+#      `time() - schedule_created` when NOTHING has ever succeeded;
+#   2. the deadline is the schedule's own period (1.1x + 1h), joined per-series;
+#   3. a second branch keeps the flat 26h for a schedule whose cron cannot be parsed and therefore
+#      publishes no period at all — `unless on(...) period` is what stops that branch from
+#      double-firing on schedules that DO have one;
+#   4. `and on(...) schedule_active == 1` is what keeps a paused or deleted schedule from paging
+#      forever on a last_success that will never advance again.
+#
+# Each of the four gets its own test, in both directions. As in staleness_rules_test.yaml, the
+# synthetic clock starts at the epoch, so a series whose value is 0 last happened at t=0 and its age
+# at eval_time T is T.
+rule_files:
+  - ../../../charts/crystal-backup/rules/crystalbackup.rules.yaml
+
+evaluation_interval: 10m
+
+tests:
+  # ── term 2: the deadline is the schedule's OWN period ─────────────────────
+  # Hourly cron: period 3600, so the deadline is 3600*1.1 + 3600 = 7560s = 2h06m. Under the old flat
+  # 26h this schedule could be a full day dead in silence.
+  - interval: 10m
+    name: hourly schedule — silent under its own deadline, pages over it
+    input_series:
+      - series: 'crystalbackup_backup_last_success_timestamp_seconds{namespace="team-a",tenant="acme",schedule="hourly",origin="namespace",location="dr",cluster="prod"}'
+        values: "0x30"
+      - series: 'crystalbackup_schedule_period_seconds{namespace="team-a",tenant="acme",schedule="hourly",origin="namespace",location="dr",cluster="prod"}'
+        values: "3600x30"
+      - series: 'crystalbackup_schedule_created_timestamp_seconds{namespace="team-a",tenant="acme",schedule="hourly",origin="namespace",location="dr",cluster="prod"}'
+        values: "0x30"
+      - series: 'crystalbackup_schedule_active{namespace="team-a",tenant="acme",schedule="hourly",origin="namespace",location="dr",cluster="prod"}'
+        values: "1x30"
+    alert_rule_test:
+      # 2h00m: age 7200 < 7560. One skipped run on an hourly schedule is not an incident.
+      - eval_time: 2h
+        alertname: CrystalbackupBackupMissed
+        exp_alerts: []
+      # 2h20m: over the deadline (crossed at 2h10m) but inside the 15m hold.
+      - eval_time: 2h20m
+        alertname: CrystalbackupBackupMissed
+        exp_alerts: []
+      # 2h40m: past both. `tenant` is in the expected labels on purpose — the join is
+      # `on (namespace, schedule, origin, location, cluster)`, which does NOT include tenant, and
+      # `group_left()` is what carries it through from the left-hand side. Lose that and every
+      # alert arrives without the label Alertmanager routes tenants by.
+      - eval_time: 2h40m
+        alertname: CrystalbackupBackupMissed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              namespace: team-a
+              tenant: acme
+              schedule: hourly
+              origin: namespace
+              location: dr
+              cluster: prod
+            exp_annotations:
+              summary: "No successful backup for team-a/hourly (namespace) within its schedule's deadline"
+              description: "The schedule is active and its deadline has passed with no successful Backup. Check the namespace's Backup objects for a failed or stuck run, and the mover Jobs in the operator namespace."
+
+  # The other half of the same correction, and the one a flat threshold gets catastrophically wrong
+  # in the noisy direction: a WEEKLY schedule whose deadline is 604800*1.1 + 3600 ≈ 7d17h. At 27h it
+  # is well past the old fixed 26h and completely healthy. If `unless on(...) schedule_period` ever
+  # stopped excluding it, this schedule would page every single Tuesday.
+  - interval: 10m
+    name: weekly schedule at 27h — past the old flat 26h, nowhere near its own deadline
+    input_series:
+      - series: 'crystalbackup_backup_last_success_timestamp_seconds{namespace="team-a",tenant="acme",schedule="weekly",origin="namespace",location="dr",cluster="prod"}'
+        values: "0x170"
+      - series: 'crystalbackup_schedule_period_seconds{namespace="team-a",tenant="acme",schedule="weekly",origin="namespace",location="dr",cluster="prod"}'
+        values: "604800x170"
+      - series: 'crystalbackup_schedule_created_timestamp_seconds{namespace="team-a",tenant="acme",schedule="weekly",origin="namespace",location="dr",cluster="prod"}'
+        values: "0x170"
+      - series: 'crystalbackup_schedule_active{namespace="team-a",tenant="acme",schedule="weekly",origin="namespace",location="dr",cluster="prod"}'
+        values: "1x170"
+    alert_rule_test:
+      - eval_time: 27h10m
+        alertname: CrystalbackupBackupMissed
+        exp_alerts: []
+
+  # ── term 3: no period series ⇒ the flat 26h fallback ──────────────────────
+  # A cron the operator cannot parse publishes no period (spec §2.1 — deliberately, rather than
+  # inventing one). That schedule will NEVER run, so it is precisely the one that must still page,
+  # and the only deadline available is the fixed 26h.
+  - interval: 10m
+    name: unparseable cron — no period series, flat 26h fallback fires
+    input_series:
+      - series: 'crystalbackup_backup_last_success_timestamp_seconds{namespace="team-a",tenant="acme",schedule="broken-cron",origin="namespace",location="dr",cluster="prod"}'
+        values: "0x180"
+      - series: 'crystalbackup_schedule_created_timestamp_seconds{namespace="team-a",tenant="acme",schedule="broken-cron",origin="namespace",location="dr",cluster="prod"}'
+        values: "0x180"
+      - series: 'crystalbackup_schedule_active{namespace="team-a",tenant="acme",schedule="broken-cron",origin="namespace",location="dr",cluster="prod"}'
+        values: "1x180"
+    alert_rule_test:
+      - eval_time: 25h
+        alertname: CrystalbackupBackupMissed
+        exp_alerts: []
+      # 26h + the 15m hold, rounded up to the 10m evaluation grid (crossed at 26h10m, fires 26h30m).
+      - eval_time: 26h40m
+        alertname: CrystalbackupBackupMissed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              namespace: team-a
+              tenant: acme
+              schedule: broken-cron
+              origin: namespace
+              location: dr
+              cluster: prod
+            exp_annotations:
+              summary: "No successful backup for team-a/broken-cron (namespace) within its schedule's deadline"
+              description: "The schedule is active and its deadline has passed with no successful Backup. Check the namespace's Backup objects for a failed or stuck run, and the mover Jobs in the operator namespace."
+
+  # ── term 1: the schedule_created fallback ─────────────────────────────────
+  # THE case that motivated the whole correction, and the one no amount of PromQL could reach before
+  # the collector published schedule_created. A schedule that has never produced a successful Backup
+  # emits NO last_success series at all — `time() - <nothing>` is nothing, so the rule was silent for
+  # exactly the installation that was never protected in the first place.
+  - interval: 10m
+    name: never succeeded — only schedule_created exists, and it still pages
+    input_series:
+      - series: 'crystalbackup_schedule_created_timestamp_seconds{namespace="team-a",tenant="acme",schedule="hourly",origin="namespace",location="dr",cluster="prod"}'
+        values: "0x30"
+      - series: 'crystalbackup_schedule_period_seconds{namespace="team-a",tenant="acme",schedule="hourly",origin="namespace",location="dr",cluster="prod"}'
+        values: "3600x30"
+      - series: 'crystalbackup_schedule_active{namespace="team-a",tenant="acme",schedule="hourly",origin="namespace",location="dr",cluster="prod"}'
+        values: "1x30"
+    alert_rule_test:
+      # Still inside the deadline: a schedule applied two hours ago has not missed anything yet.
+      - eval_time: 2h
+        alertname: CrystalbackupBackupMissed
+        exp_alerts: []
+      - eval_time: 2h40m
+        alertname: CrystalbackupBackupMissed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              namespace: team-a
+              tenant: acme
+              schedule: hourly
+              origin: namespace
+              location: dr
+              cluster: prod
+            exp_annotations:
+              summary: "No successful backup for team-a/hourly (namespace) within its schedule's deadline"
+              description: "The schedule is active and its deadline has passed with no successful Backup. Check the namespace's Backup objects for a failed or stuck run, and the mover Jobs in the operator namespace."
+
+  # Both halves of the disaster at once: a schedule applied with a cron nobody can parse, which has
+  # therefore never run and never will. No period, no last_success, only schedule_created — the
+  # fallback and the fallback's fallback, together.
+  - interval: 10m
+    name: applied with a broken cron and never ran — created + no period still pages
+    input_series:
+      - series: 'crystalbackup_schedule_created_timestamp_seconds{namespace="team-a",tenant="acme",schedule="stillborn",origin="namespace",location="dr",cluster="prod"}'
+        values: "0x180"
+      - series: 'crystalbackup_schedule_active{namespace="team-a",tenant="acme",schedule="stillborn",origin="namespace",location="dr",cluster="prod"}'
+        values: "1x180"
+    alert_rule_test:
+      - eval_time: 25h
+        alertname: CrystalbackupBackupMissed
+        exp_alerts: []
+      - eval_time: 26h40m
+        alertname: CrystalbackupBackupMissed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              namespace: team-a
+              tenant: acme
+              schedule: stillborn
+              origin: namespace
+              location: dr
+              cluster: prod
+            exp_annotations:
+              summary: "No successful backup for team-a/stillborn (namespace) within its schedule's deadline"
+              description: "The schedule is active and its deadline has passed with no successful Backup. Check the namespace's Backup objects for a failed or stuck run, and the mover Jobs in the operator namespace."
+
+  # The fallback must be a FALLBACK, not a second opinion. This schedule was created at the epoch and
+  # backs up every ten minutes; its created-age passes every threshold in the table within a day. If
+  # the `or` ever matched the wrong way round — or lost its `on (...)` and started unioning both
+  # series — a perfectly healthy hourly schedule would page one day after it was applied and never
+  # stop.
+  - interval: 10m
+    name: a healthy schedule's ancient creation time is not an age
+    input_series:
+      - series: 'crystalbackup_backup_last_success_timestamp_seconds{namespace="team-a",tenant="acme",schedule="hourly",origin="namespace",location="dr",cluster="prod"}'
+        values: "0+600x180"
+      - series: 'crystalbackup_schedule_created_timestamp_seconds{namespace="team-a",tenant="acme",schedule="hourly",origin="namespace",location="dr",cluster="prod"}'
+        values: "0x180"
+      - series: 'crystalbackup_schedule_period_seconds{namespace="team-a",tenant="acme",schedule="hourly",origin="namespace",location="dr",cluster="prod"}'
+        values: "3600x180"
+      - series: 'crystalbackup_schedule_active{namespace="team-a",tenant="acme",schedule="hourly",origin="namespace",location="dr",cluster="prod"}'
+        values: "1x180"
+    alert_rule_test:
+      - eval_time: 27h10m
+        alertname: CrystalbackupBackupMissed
+        exp_alerts: []
+
+  # ── term 4: the schedule_active guard ─────────────────────────────────────
+  # Paused is 0, not absent (spec §2.1). The schedule is hopelessly stale and must stay silent —
+  # somebody suspended it on purpose. Note that all three sibling series are still present: pausing
+  # does not make the schedule half-disappear, which is exactly what makes this a guard the rule has
+  # to apply rather than an absence it gets for free.
+  - interval: 10m
+    name: paused schedule — stale in every other respect, and silent
+    input_series:
+      - series: 'crystalbackup_backup_last_success_timestamp_seconds{namespace="team-a",tenant="acme",schedule="hourly",origin="namespace",location="dr",cluster="prod"}'
+        values: "0x180"
+      - series: 'crystalbackup_schedule_created_timestamp_seconds{namespace="team-a",tenant="acme",schedule="hourly",origin="namespace",location="dr",cluster="prod"}'
+        values: "0x180"
+      - series: 'crystalbackup_schedule_period_seconds{namespace="team-a",tenant="acme",schedule="hourly",origin="namespace",location="dr",cluster="prod"}'
+        values: "3600x180"
+      - series: 'crystalbackup_schedule_active{namespace="team-a",tenant="acme",schedule="hourly",origin="namespace",location="dr",cluster="prod"}'
+        values: "0x180"
+    alert_rule_test:
+      - eval_time: 2h40m
+        alertname: CrystalbackupBackupMissed
+        exp_alerts: []
+      - eval_time: 27h10m
+        alertname: CrystalbackupBackupMissed
+        exp_alerts: []
+
+  # The schedule was DELETED. Its three schedule_* series vanish with the object, but
+  # backup_last_success survives — it is derived from Backup objects, which outlive the schedule that
+  # made them. Without the `and` guard, every deleted schedule in the cluster's history would page a
+  # day later and never stop, and the alert would name an object that no longer exists.
+  - interval: 10m
+    name: deleted schedule — its Backups remain, and nothing pages
+    input_series:
+      - series: 'crystalbackup_backup_last_success_timestamp_seconds{namespace="team-a",tenant="acme",schedule="retired",origin="namespace",location="dr",cluster="prod"}'
+        values: "0x180"
+    alert_rule_test:
+      - eval_time: 27h10m
+        alertname: CrystalbackupBackupMissed
+        exp_alerts: []
+
+  # ── the whole rule, on a fleet ────────────────────────────────────────────
+  # Four schedules over the same namespace and repository: one late namespaced, one late
+  # cluster-plane, one paused, one healthy. Only the first two may appear, and they must be
+  # separately addressable — `origin` is half the answer to "which schedule", and a rule that
+  # collapsed the two planes would tell an operator a namespace is late without saying whose job it
+  # was to back it up.
+  - interval: 10m
+    name: a fleet — only the late and active schedules page, one alert each
+    input_series:
+      - series: 'crystalbackup_backup_last_success_timestamp_seconds{namespace="team-a",tenant="acme",schedule="hourly",origin="namespace",location="dr",cluster="prod"}'
+        values: "0x30"
+      - series: 'crystalbackup_schedule_period_seconds{namespace="team-a",tenant="acme",schedule="hourly",origin="namespace",location="dr",cluster="prod"}'
+        values: "3600x30"
+      - series: 'crystalbackup_schedule_active{namespace="team-a",tenant="acme",schedule="hourly",origin="namespace",location="dr",cluster="prod"}'
+        values: "1x30"
+
+      - series: 'crystalbackup_backup_last_success_timestamp_seconds{namespace="team-a",tenant="acme",schedule="fleet-wide",origin="cluster",location="dr",cluster="prod"}'
+        values: "0x30"
+      - series: 'crystalbackup_schedule_period_seconds{namespace="team-a",tenant="acme",schedule="fleet-wide",origin="cluster",location="dr",cluster="prod"}'
+        values: "3600x30"
+      - series: 'crystalbackup_schedule_active{namespace="team-a",tenant="acme",schedule="fleet-wide",origin="cluster",location="dr",cluster="prod"}'
+        values: "1x30"
+
+      - series: 'crystalbackup_backup_last_success_timestamp_seconds{namespace="team-b",tenant="globex",schedule="hourly",origin="namespace",location="dr",cluster="prod"}'
+        values: "0x30"
+      - series: 'crystalbackup_schedule_period_seconds{namespace="team-b",tenant="globex",schedule="hourly",origin="namespace",location="dr",cluster="prod"}'
+        values: "3600x30"
+      - series: 'crystalbackup_schedule_active{namespace="team-b",tenant="globex",schedule="hourly",origin="namespace",location="dr",cluster="prod"}'
+        values: "0x30"
+
+      - series: 'crystalbackup_backup_last_success_timestamp_seconds{namespace="team-c",tenant="initech",schedule="hourly",origin="namespace",location="dr",cluster="prod"}'
+        values: "0+600x30"
+      - series: 'crystalbackup_schedule_period_seconds{namespace="team-c",tenant="initech",schedule="hourly",origin="namespace",location="dr",cluster="prod"}'
+        values: "3600x30"
+      - series: 'crystalbackup_schedule_active{namespace="team-c",tenant="initech",schedule="hourly",origin="namespace",location="dr",cluster="prod"}'
+        values: "1x30"
+    alert_rule_test:
+      - eval_time: 2h40m
+        alertname: CrystalbackupBackupMissed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              namespace: team-a
+              tenant: acme
+              schedule: fleet-wide
+              origin: cluster
+              location: dr
+              cluster: prod
+            exp_annotations:
+              summary: "No successful backup for team-a/fleet-wide (cluster) within its schedule's deadline"
+              description: "The schedule is active and its deadline has passed with no successful Backup. Check the namespace's Backup objects for a failed or stuck run, and the mover Jobs in the operator namespace."
+          - exp_labels:
+              severity: warning
+              namespace: team-a
+              tenant: acme
+              schedule: hourly
+              origin: namespace
+              location: dr
+              cluster: prod
+            exp_annotations:
+              summary: "No successful backup for team-a/hourly (namespace) within its schedule's deadline"
+              description: "The schedule is active and its deadline has passed with no successful Backup. Check the namespace's Backup objects for a failed or stuck run, and the mover Jobs in the operator namespace."

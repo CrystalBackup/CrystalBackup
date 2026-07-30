@@ -1,0 +1,201 @@
+# promtool unit tests — CrystalbackupSchedulePausedTooLong.
+#
+# Its own file, because it is the only rule with a seven-day horizon and evaluating a 10-minute grid
+# over 170 hours would be a thousand evaluations of every rule in the table to learn nothing. Here
+# the grid is hourly; the `for: 1h` is then exactly one step, which is fine — what this rule needs
+# resolution on is the 7d `max_over_time` window, not the hold.
+#
+# The expression is two terms, and the second is claimed to do three separate jobs:
+#
+#   * max_over_time(schedule_active[7d]) == 0 — the schedule was not active at ANY point in the
+#     window. History rather than a 7d `for:`, so an operator restart does not reset the clock;
+#   * time() - schedule_created > 7d — excludes a schedule YOUNGER than the window, which would
+#     otherwise fire merely because a 168h lookback is longer than its whole life;
+#   * and, because schedule_created is an instant vector, that same term requires the schedule to
+#     still EXIST — a deleted schedule's samples linger in the lookback window for a week.
+#
+# There is one test per job, plus the firing case and the healthy case. Three claims stated in a
+# comment is three claims nobody has checked.
+rule_files:
+  - ../../../charts/crystal-backup/rules/crystalbackup.rules.yaml
+
+evaluation_interval: 1h
+
+tests:
+  # Paused since the day it was applied. The 7d window is (t-168h, t], so the age term is the
+  # binding one: it crosses at t=168h and the hold lands the page at 170h.
+  - interval: 1h
+    name: paused since creation — pages once it is more than 7 days old
+    input_series:
+      - series: 'crystalbackup_schedule_active{namespace="team-a",tenant="acme",schedule="nightly",origin="namespace",location="dr",cluster="prod"}'
+        values: "0x180"
+      - series: 'crystalbackup_schedule_created_timestamp_seconds{namespace="team-a",tenant="acme",schedule="nightly",origin="namespace",location="dr",cluster="prod"}'
+        values: "0x180"
+      - series: 'crystalbackup_schedule_period_seconds{namespace="team-a",tenant="acme",schedule="nightly",origin="namespace",location="dr",cluster="prod"}'
+        values: "86400x180"
+    alert_rule_test:
+      - eval_time: 168h
+        alertname: CrystalbackupSchedulePausedTooLong
+        exp_alerts: []
+      - eval_time: 170h
+        alertname: CrystalbackupSchedulePausedTooLong
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              namespace: team-a
+              tenant: acme
+              schedule: nightly
+              origin: namespace
+              location: dr
+              cluster: prod
+            exp_annotations:
+              summary: "Schedule team-a/nightly (namespace) has been paused for over 7 days — nothing is backing this namespace up"
+              description: "A paused schedule protects nothing, and no other alert can say so: BackupMissed is guarded on the same pause. Unpause it (spec.paused=false), or delete it if the namespace is genuinely no longer being protected — an intent nobody has to re-check in a month."
+
+  # Job 1, both directions. The schedule ran for its first ten hours and was then paused. At 100h it
+  # has been paused for 90 hours — a long weekend plus a migration, not a forgotten intent — and the
+  # 1 at t=10h is still inside the 168h lookback, so max_over_time is 1 and the rule is silent. At
+  # 179h the last 1 has finally aged out of the window, which is exactly seven days after the pause.
+  - interval: 1h
+    name: paused mid-life — the clock starts at the pause, not at creation
+    input_series:
+      - series: 'crystalbackup_schedule_active{namespace="team-a",tenant="acme",schedule="nightly",origin="namespace",location="dr",cluster="prod"}'
+        values: "1x10 0x180"
+      - series: 'crystalbackup_schedule_created_timestamp_seconds{namespace="team-a",tenant="acme",schedule="nightly",origin="namespace",location="dr",cluster="prod"}'
+        values: "0x190"
+    alert_rule_test:
+      - eval_time: 100h
+        alertname: CrystalbackupSchedulePausedTooLong
+        exp_alerts: []
+      - eval_time: 177h
+        alertname: CrystalbackupSchedulePausedTooLong
+        exp_alerts: []
+      - eval_time: 180h
+        alertname: CrystalbackupSchedulePausedTooLong
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              namespace: team-a
+              tenant: acme
+              schedule: nightly
+              origin: namespace
+              location: dr
+              cluster: prod
+            exp_annotations:
+              summary: "Schedule team-a/nightly (namespace) has been paused for over 7 days — nothing is backing this namespace up"
+              description: "A paused schedule protects nothing, and no other alert can say so: BackupMissed is guarded on the same pause. Unpause it (spec.paused=false), or delete it if the namespace is genuinely no longer being protected — an intent nobody has to re-check in a month."
+
+  # Job 2: a schedule created at t=100h and paused from the start. max_over_time over the window
+  # sees only zeros — there is no `1` in the last seven days because the object did not exist for
+  # most of them — and without the age term this brand-new pause would page immediately.
+  - interval: 1h
+    name: a young schedule paused from birth does not page on a lookback longer than its life
+    input_series:
+      - series: 'crystalbackup_schedule_active{namespace="team-a",tenant="acme",schedule="fresh",origin="namespace",location="dr",cluster="prod"}'
+        values: "_x99 0x200"
+      - series: 'crystalbackup_schedule_created_timestamp_seconds{namespace="team-a",tenant="acme",schedule="fresh",origin="namespace",location="dr",cluster="prod"}'
+        values: "_x99 360000x200"
+    alert_rule_test:
+      - eval_time: 170h
+        alertname: CrystalbackupSchedulePausedTooLong
+        exp_alerts: []
+      # 100h + 7d + the hold. Now it genuinely has been paused for a week.
+      - eval_time: 270h
+        alertname: CrystalbackupSchedulePausedTooLong
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              namespace: team-a
+              tenant: acme
+              schedule: fresh
+              origin: namespace
+              location: dr
+              cluster: prod
+            exp_annotations:
+              summary: "Schedule team-a/fresh (namespace) has been paused for over 7 days — nothing is backing this namespace up"
+              description: "A paused schedule protects nothing, and no other alert can say so: BackupMissed is guarded on the same pause. Unpause it (spec.paused=false), or delete it if the namespace is genuinely no longer being protected — an intent nobody has to re-check in a month."
+
+  # Job 3: DELETED, not paused. Both series stop at t=50h. max_over_time still finds the old zeros
+  # inside the 168h window, so the first term matches — the whole weight of not alerting about an
+  # object nobody can act on rests on schedule_created being an instant vector that is now empty.
+  # Deleting a schedule is a decision someone finished making; this rule is about the other kind.
+  - interval: 1h
+    name: a deleted schedule leaves samples in the window and still does not page
+    input_series:
+      - series: 'crystalbackup_schedule_active{namespace="team-a",tenant="acme",schedule="retired",origin="namespace",location="dr",cluster="prod"}'
+        values: "0x50"
+      - series: 'crystalbackup_schedule_created_timestamp_seconds{namespace="team-a",tenant="acme",schedule="retired",origin="namespace",location="dr",cluster="prod"}'
+        values: "0x50"
+    alert_rule_test:
+      - eval_time: 170h
+        alertname: CrystalbackupSchedulePausedTooLong
+        exp_alerts: []
+
+  # The fleet's normal state. A schedule that has been running for a month must never appear here,
+  # and this is the test that goes red if the `== 0` is ever loosened.
+  - interval: 1h
+    name: an active schedule never pages
+    input_series:
+      - series: 'crystalbackup_schedule_active{namespace="team-a",tenant="acme",schedule="nightly",origin="namespace",location="dr",cluster="prod"}'
+        values: "1x180"
+      - series: 'crystalbackup_schedule_created_timestamp_seconds{namespace="team-a",tenant="acme",schedule="nightly",origin="namespace",location="dr",cluster="prod"}'
+        values: "0x180"
+    alert_rule_test:
+      - eval_time: 170h
+        alertname: CrystalbackupSchedulePausedTooLong
+        exp_alerts: []
+
+  # Unpausing has to CLEAR the alert, not just stop it from starting. The schedule is paused from
+  # birth, pages at 170h as in the first test, and is unpaused at 175h — from which point the `1`
+  # sits in the lookback window and the rule must go quiet on the very next evaluation.
+  - interval: 1h
+    name: unpausing clears the alert
+    input_series:
+      - series: 'crystalbackup_schedule_active{namespace="team-a",tenant="acme",schedule="nightly",origin="namespace",location="dr",cluster="prod"}'
+        values: "0x174 1x20"
+      - series: 'crystalbackup_schedule_created_timestamp_seconds{namespace="team-a",tenant="acme",schedule="nightly",origin="namespace",location="dr",cluster="prod"}'
+        values: "0x194"
+    alert_rule_test:
+      - eval_time: 172h
+        alertname: CrystalbackupSchedulePausedTooLong
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              namespace: team-a
+              tenant: acme
+              schedule: nightly
+              origin: namespace
+              location: dr
+              cluster: prod
+            exp_annotations:
+              summary: "Schedule team-a/nightly (namespace) has been paused for over 7 days — nothing is backing this namespace up"
+              description: "A paused schedule protects nothing, and no other alert can say so: BackupMissed is guarded on the same pause. Unpause it (spec.paused=false), or delete it if the namespace is genuinely no longer being protected — an intent nobody has to re-check in a month."
+      - eval_time: 177h
+        alertname: CrystalbackupSchedulePausedTooLong
+        exp_alerts: []
+
+  # The cluster plane pauses too, and its alert has to name the ClusterBackupSchedule rather than
+  # leave a tenant hunting for a BackupSchedule that was never in their namespace. `origin` is the
+  # label that says which, and it is in the summary for that reason.
+  - interval: 1h
+    name: a paused cluster-plane schedule names its own plane
+    input_series:
+      - series: 'crystalbackup_schedule_active{namespace="team-a",tenant="acme",schedule="fleet-wide",origin="cluster",location="dr",cluster="prod"}'
+        values: "0x180"
+      - series: 'crystalbackup_schedule_created_timestamp_seconds{namespace="team-a",tenant="acme",schedule="fleet-wide",origin="cluster",location="dr",cluster="prod"}'
+        values: "0x180"
+    alert_rule_test:
+      - eval_time: 170h
+        alertname: CrystalbackupSchedulePausedTooLong
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              namespace: team-a
+              tenant: acme
+              schedule: fleet-wide
+              origin: cluster
+              location: dr
+              cluster: prod
+            exp_annotations:
+              summary: "Schedule team-a/fleet-wide (cluster) has been paused for over 7 days — nothing is backing this namespace up"
+              description: "A paused schedule protects nothing, and no other alert can say so: BackupMissed is guarded on the same pause. Unpause it (spec.paused=false), or delete it if the namespace is genuinely no longer being protected — an intent nobody has to re-check in a month."

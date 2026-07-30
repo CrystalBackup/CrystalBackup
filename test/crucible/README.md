@@ -101,11 +101,61 @@ labels**:
 | `m4`    | repository maintenance and verification — prune vs. a live backup, a prune killed mid-flight, a silently corrupted pack caught by `restic check`, and crash-only teardown via terminal re-entry |
 | `m5`    | the namespace plane, external sync (deployment + queue behaviour), and the right to erasure |
 | `m6`    | the **restore-fidelity gate** — a corpus engineered to be hard to restore faithfully, backed up from a Rook-Ceph RBD volume and restored into a *fresh* one, then compared per file by manifest: content digests (with 16 MiB-window digests naming a corrupted byte range), modes and setuid/setgid/sticky, numeric ownership, xattrs, POSIX ACLs incl. a directory's default ACL, sparseness, symlinks, hard links, nanosecond mtimes, FIFOs, hostile file names, deep trees |
+| `alerts` | the **alert-rule chain**, end to end: a Prometheus on the cluster scrapes the operator through the chart's own ServiceMonitor and loads the chart's own PrometheusRule, then three conditions are provoked for real (a failed backup, a corrupted pack, a VolumeSnapshot pile-up) and the alert is waited for in `firing` state. Also carries `m6` |
 
 Each milestone adds a `tests/m<N>_*_test.go` carrying its own label. Enrich,
 never rewrite: old labels stay green forever (non-regression), which is why
 `mise run test` with no argument is the real gate and a single label is only a
 debugging shortcut.
+
+### The alert lane (`alerts`, also `m6`)
+
+The ten shipped alert rules are generated from `internal/alerts/rules.go` and
+tested on two levels, because one level cannot see what the other checks.
+
+`make test-alert-rules` runs [promtool unit
+tests](../../internal/alerts/testdata/) over the same YAML the chart ships: every
+rule, both directions, with a case just under each threshold and a case for every
+absence the spec makes meaningful. It needs no cluster and takes about three
+seconds, so it runs in CI on every push, and `make alert-rules-covered` fails the
+build when a rule has no test at all.
+
+What that cannot prove is the chain. Between a correct expression and a page sit a
+collector that has to emit the series, a ServiceMonitor the Prometheus Operator has
+to select, a scrape that has to get past the metrics endpoint's authn/authz and the
+chart's own NetworkPolicy, and a PrometheusRule a real Prometheus has to load. Each
+of those fails silently. So `deploy/deploy.sh` installs prometheus-operator and one
+`Prometheus` (no Alertmanager, no Grafana, no node-exporter — nothing whose health
+could make this lane flaky for reasons unrelated to backups), turns on
+`metrics.serviceMonitor.enabled` and `metrics.rules.enabled`, and closes the
+operator NetworkPolicy down to the `monitoring` namespace so the scrape is tested
+in the configuration an operator following the chart's advice will run.
+
+The lane then provokes three conditions and waits for the page:
+
+| rule | how it is provoked | hold |
+| ---- | ------------------ | ---- |
+| `CrystalbackupBackupFailed` | an isolated location's S3 credentials are replaced with garbage after one successful backup, then a second run | none |
+| `CrystalbackupRepositoryCheckFailed` | bytes rewritten inside one pack object, name and length intact (the `m4` provocation) | 5m |
+| `CrystalbackupPVCSnapshotPileup` | 21 VolumeSnapshots on one tenant PVC — one past the threshold, not a comfortable forty | 30m |
+
+The pile-up's clock is started first and runs underneath the repository work, so the
+whole lane is under an hour rather than the sum of its holds.
+
+The other rules are **not** provoked here, and are not faked either: their holds put
+them out of reach (`MaintenanceStalled` 26h, `SchedulePausedTooLong` 7 days,
+`BackupMissed` at least 76 minutes since its deadline floor is period x 1.1 + 1h,
+`ExternalSyncStale` and `ErasureBlocked` an hour each). Shortening a threshold for
+the test would mean shipping one rule and testing another. They are covered
+exhaustively in the promtool layer, where time is free.
+
+Two things this lane asserts for free, without provoking anything: that Prometheus
+has **loaded every rule the chart ships** with `health: ok` and no evaluation error
+— a PrometheusRule nobody selects is valid, installed and completely inert — and
+that the healthy shared `dr` repository is *not* paging while the corrupted one is.
+
+Like the fidelity gate, it cannot self-disable. If Prometheus is unreachable, if the
+ServiceMonitor was not selected, if the scrape is denied — the spec fails.
 
 ### The restore-fidelity gate (`m6`)
 

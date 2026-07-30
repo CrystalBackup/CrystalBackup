@@ -5,12 +5,12 @@ sidebar:
   order: 9
 ---
 
-:::note[Being reworked]
-The metrics catalogue and the alert rules are being finalised in M6, which is in progress
-and has not been released. This page covers
-how to *get* the signals; the exhaustive list of series lives on
+:::note
+This page covers how to *get* the signals. The exhaustive list lives on
 [Metrics](/CrystalBackup/docs/reference/metrics/) and
-[Alerts](/CrystalBackup/docs/reference/alerts/), both of which are still being filled in.
+[Alerts](/CrystalBackup/docs/reference/alerts/) — both generated from the operator's own
+registry and rule table, so they describe what this build publishes rather than what was
+planned for it.
 :::
 
 ## The metrics endpoint
@@ -111,7 +111,10 @@ a workload that has started rewriting its whole dataset nightly.
 kubectl get backuprepository <name> -o jsonpath='{.status.lastCheckTime}{"\t"}{.status.lastCheckResult}{"\t"}{.status.staleLocks}{"\t"}{.status.lastMaintenanceTime}{"\n"}'
 ```
 
-Three things to alert on manually until the shipped rules land:
+The three signals to read here, each covered by a shipped rule if you enable the bundle —
+`CrystalbackupRepositoryCheckFailed`, `CrystalbackupMaintenanceStalled` and
+`CrystalbackupStaleLocks`. Without Prometheus, `crystal-backup selfcheck` evaluates the same
+three from the same state:
 
 - `lastCheckResult: Failed` — restic found repository damage. An incident.
 - `lastCheckTime` far in the past — nothing has been verified in a long time. A different
