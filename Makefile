@@ -182,8 +182,17 @@ cleanup-test-e2e: ## Tear down the Kind cluster used for e2e tests
 	@$(KIND) delete cluster --name $(KIND_CLUSTER)
 
 .PHONY: lint
-lint: golangci-lint ## Run golangci-lint linter
+lint: golangci-lint ## Run golangci-lint over the whole tree, INCLUDING the build-tagged crucible suite.
 	"$(GOLANGCI_LINT)" run
+	# The crucible suite is behind `//go:build crucible`, so the run above cannot see it: an
+	# entire test package went unlinted until M6, and a dead variable silently made the report's
+	# section order depend on Go map iteration. Hence a second, scoped pass.
+	#
+	# Scoped, and not `--build-tags crucible` on the whole tree, deliberately: the tag is a
+	# two-way switch. test/crucible/tests/runname_hermeticity_test.go is `//go:build !crucible`
+	# precisely so it runs in the ORDINARY suite while inspecting the tagged one — enabling the
+	# tag globally would hide the very guard that keeps the tagged suite honest.
+	"$(GOLANGCI_LINT)" run --build-tags crucible ./test/crucible/tests/...
 
 .PHONY: lint-fix
 lint-fix: golangci-lint ## Run golangci-lint linter and perform fixes

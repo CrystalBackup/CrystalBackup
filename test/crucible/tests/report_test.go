@@ -282,7 +282,6 @@ func renderCrucibleReport(report types.Report) string {
 	var passed, failed, skippedFor, deselected, pending int
 	var setupFailed bool
 	byArea := map[string][]checkLine{}
-	areaOrder := []string{}
 	failures := []checkLine{}
 
 	for _, sr := range report.SpecReports {
@@ -334,9 +333,6 @@ func renderCrucibleReport(report types.Report) string {
 		}
 
 		area := areaOf(sr.Labels())
-		if _, seen := byArea[area]; !seen {
-			areaOrder = append(areaOrder, area)
-		}
 		byArea[area] = append(byArea[area], line)
 	}
 
@@ -428,7 +424,17 @@ func renderCrucibleReport(report types.Report) string {
 	for a := range byArea {
 		areas = append(areas, a)
 	}
-	slices.SortFunc(areas, func(a, b string) int { return cmp.Compare(areaRank(a), areaRank(b)) })
+	// Rank first, then NAME — the tiebreak is what makes the order total. areaRank returns the
+	// same 1<<20 for every area that is neither infra nor m<N>, so on rank alone any two such
+	// areas compare equal and slices.SortFunc leaves them in the order the map handed them over,
+	// which Go deliberately randomises. Two runs of the same suite then emit their sections in a
+	// different order and cannot be diffed by eye — which is most of what a saved report is for.
+	slices.SortFunc(areas, func(a, b string) int {
+		if c := cmp.Compare(areaRank(a), areaRank(b)); c != 0 {
+			return c
+		}
+		return cmp.Compare(a, b)
+	})
 
 	stats := map[string]areaStats{}
 	for _, area := range areas {
