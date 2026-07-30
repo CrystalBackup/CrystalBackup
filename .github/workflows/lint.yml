@@ -84,3 +84,29 @@ jobs:
 
       - name: Lint chart
         run: helm lint charts/crystal-backup
+
+  dashboards:
+    name: Grafana dashboards match the metric catalogue
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      # The checker is stdlib-only (no pip install), but pin the interpreter rather than
+      # inherit whatever the runner image happens to ship.
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.x"
+
+      # The dashboards are JSON, so no Go build can notice a panel querying a series the
+      # operator never emits: it renders "No data", which on a backup dashboard is
+      # indistinguishable from "nothing to report". This job makes internal/metrics/names.go
+      # the authority for the series names, the label sets AND the enum label values used in
+      # every dashboard query. It needs no Go toolchain and no Helm — just the checkout.
+      - name: Verify dashboard series, labels and label values
+        run: make check-dashboards

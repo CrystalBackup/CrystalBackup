@@ -1,0 +1,41 @@
+{{- if .Values.metrics.dashboards.enabled }}
+{{- /*
+One ConfigMap per dashboard, each carrying the sidecar's discovery label. The Grafana
+sidecar watches for that label and drops the JSON into Grafana's provisioning directory —
+no Grafana API call, no credentials, no ordering constraint with the Grafana install.
+
+Split rather than one ConfigMap with two keys: a ConfigMap is capped at ~1 MiB and the two
+dashboards together are a meaningful fraction of it. Splitting also lets the sidecar reload
+one dashboard without touching the other.
+
+`Files.Get` is deliberate, not `tpl`: the JSON is full of Grafana legend formats like
+{{`{{namespace}}`}}, and running it through the template engine would either error or
+silently blank them.
+*/ -}}
+{{- range $path, $_ := .Files.Glob "dashboards/*.json" }}
+{{- $name := base $path | trimSuffix ".json" }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "crystal-backup.fullname" $ }}-dashboard-{{ $name }}
+  namespace: {{ default (include "crystal-backup.namespace" $) $.Values.metrics.dashboards.namespace }}
+  labels:
+    {{- include "crystal-backup.labels" $ | nindent 4 }}
+    {{ $.Values.metrics.dashboards.label }}: {{ $.Values.metrics.dashboards.labelValue | quote }}
+    {{- with $.Values.metrics.dashboards.extraLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- $annotations := deepCopy (default dict $.Values.metrics.dashboards.annotations) }}
+  {{- with $.Values.metrics.dashboards.folder }}
+  {{- $_ := set $annotations $.Values.metrics.dashboards.folderAnnotation . }}
+  {{- end }}
+  {{- with $annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+data:
+  {{ $name }}.json: |-
+    {{- $.Files.Get $path | nindent 4 }}
+{{- end }}
+{{- end }}

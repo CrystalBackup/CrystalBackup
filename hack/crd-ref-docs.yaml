@@ -1,0 +1,20 @@
+# Configuration for crd-ref-docs (`make api-docs`), which renders the user-facing
+# API reference at website/src/content/docs/reference/api/ from the Go types in
+# api/v1alpha1/.
+#
+# The reference is GENERATED, never hand-written: twelve CRDs' worth of fields
+# drift within one release if a human has to mirror them, and a reference that
+# disagrees with the CRD is worse than no reference at all.
+
+processor:
+  # The *List wrappers are Kubernetes machinery, not something anyone writes.
+  ignoreTypes:
+    - "List$"
+  # metadata is standard ObjectMeta on every kind; status stays IN, because
+  # `status.phase` and the conditions are what an operator actually reads.
+  ignoreFields:
+    - "TypeMeta$"
+
+render:
+  # Link bare Kubernetes types to the upstream reference instead of inlining them.
+  kubernetesVersion: "1.30"

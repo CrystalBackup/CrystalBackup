@@ -171,6 +171,31 @@ metrics:
     scrapeTimeout: 10s
     # -- Extra labels for the ServiceMonitor (e.g. to match a Prometheus selector).
     labels: {}
+  dashboards:
+    # -- Ship the two Grafana dashboards (`crystalbackup-tenant`, `crystalbackup-platform`)
+    # as ConfigMaps for the Grafana sidecar to provision. Off by default, like
+    # `serviceMonitor.enabled`: it requires a Grafana with the dashboard sidecar running,
+    # and a ConfigMap the sidecar never reads is dead weight in every namespace listing.
+    # Panel contents: spec/05-observability.md §7.
+    enabled: false
+    # -- Label the Grafana dashboard sidecar watches for. The upstream Grafana chart's
+    # default is `grafana_dashboard`; override if `sidecar.dashboards.label` differs.
+    label: grafana_dashboard
+    # -- Value that label must carry (`sidecar.dashboards.labelValue`).
+    labelValue: "1"
+    # -- Grafana folder to file both dashboards under. Empty leaves them in the sidecar's
+    # default folder.
+    folder: ""
+    # -- Annotation carrying the folder name. `grafana_folder` is the sidecar's default;
+    # some distributions use `k8s-sidecar-target-directory`.
+    folderAnnotation: grafana_folder
+    # -- Namespace for the dashboard ConfigMaps. Empty means the operator namespace. Set it
+    # when the sidecar only watches its own namespace (`sidecar.dashboards.searchNamespace`).
+    namespace: ""
+    # -- Extra labels on the dashboard ConfigMaps.
+    extraLabels: {}
+    # -- Extra annotations on the dashboard ConfigMaps.
+    annotations: {}
 
 livenessProbe:
   initialDelaySeconds: 15

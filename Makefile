@@ -181,6 +181,14 @@ lint-fix: golangci-lint ## Run golangci-lint linter and perform fixes
 lint-config: golangci-lint ## Verify golangci-lint linter configuration
 	"$(GOLANGCI_LINT)" config verify
 
+# The Grafana dashboards are JSON, so nothing in the Go build can notice that a panel queries
+# a series the operator does not emit — it just renders "No data", which on a backup dashboard
+# is indistinguishable from "all clear". This target makes internal/metrics/names.go the
+# authority for both the series names and the label sets used in every dashboard query.
+.PHONY: check-dashboards
+check-dashboards: ## Verify the Grafana dashboards only use series/labels declared in internal/metrics.
+	python3 hack/check-dashboard-metrics.py
+
 ##@ Build
 
 .PHONY: build
@@ -272,10 +280,14 @@ KUSTOMIZE ?= $(LOCALBIN)/kustomize
 CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen
 ENVTEST ?= $(LOCALBIN)/setup-envtest
 GOLANGCI_LINT = $(LOCALBIN)/golangci-lint
+CRD_REF_DOCS ?= $(LOCALBIN)/crd-ref-docs
 
 ## Tool Versions
 KUSTOMIZE_VERSION ?= v5.8.1
 CONTROLLER_TOOLS_VERSION ?= v0.21.0
+# v0.2.0 is the floor that still builds on a current Go toolchain: v0.1.0 pins
+# golang.org/x/tools v0.19.0, whose tokeninternal package no longer compiles.
+CRD_REF_DOCS_VERSION ?= v0.2.0
 
 #ENVTEST_VERSION is the controller-runtime version to use for setup-envtest, derived from go.mod
 ENVTEST_VERSION ?= $(shell v='$(call gomodver,sigs.k8s.io/controller-runtime)'; \
@@ -310,6 +322,11 @@ setup-envtest: envtest ## Download the binaries required for ENVTEST in the loca
 envtest: $(ENVTEST) ## Download setup-envtest locally if necessary.
 $(ENVTEST): $(LOCALBIN)
 	$(call go-install-tool,$(ENVTEST),sigs.k8s.io/controller-runtime/tools/setup-envtest,$(ENVTEST_VERSION))
+
+.PHONY: crd-ref-docs
+crd-ref-docs: $(CRD_REF_DOCS) ## Download crd-ref-docs locally if necessary.
+$(CRD_REF_DOCS): $(LOCALBIN)
+	$(call go-install-tool,$(CRD_REF_DOCS),github.com/elastic/crd-ref-docs,$(CRD_REF_DOCS_VERSION))
 
 .PHONY: golangci-lint
 golangci-lint: $(GOLANGCI_LINT) ## Download golangci-lint locally if necessary.
@@ -363,3 +380,62 @@ chart-lint: chart-crds ## Lint the Helm chart (helm lint), CRDs included.
 chart-package: chart-crds ## Package the Helm chart (CRDs included) into dist/.
 	@mkdir -p dist
 	$(HELM) package "$(CHART_DIR)" --destination dist
+
+##@ Docs
+
+## The user-facing API reference is GENERATED from api/v1alpha1/ into the Starlight
+## docs site. Twelve hand-maintained CRD tables drift apart from the Go types within
+## one release, and a reference that disagrees with the CRD is worse than none — so
+## this is the only source, and it is regenerated, never edited in place.
+API_DOCS_SRC ?= api/v1alpha1
+API_DOCS_DIR ?= website/src/content/docs/reference/api
+API_DOCS_OUT ?= $(API_DOCS_DIR)/index.md
+API_DOCS_CONFIG ?= hack/crd-ref-docs.yaml
+
+.PHONY: api-docs
+api-docs: crd-ref-docs ## Generate the website's API reference from api/v1alpha1/ (website/src/content/docs/reference/api/).
+	@mkdir -p "$(API_DOCS_DIR)"
+	@tmp="$$(mktemp -d)"; trap 'rm -rf "$$tmp"' EXIT; \
+	"$(CRD_REF_DOCS)" \
+		--config "$(API_DOCS_CONFIG)" \
+		--source-path "$(API_DOCS_SRC)" \
+		--renderer markdown \
+		--output-mode single \
+		--output-path "$$tmp/api.md" \
+		--max-depth 12 \
+		--log-level ERROR; \
+	{ \
+		printf '%s\n' '---'; \
+		printf '%s\n' 'title: API reference'; \
+		printf '%s\n' 'description: Every field of every CrystalBackup custom resource, generated from the Go types in api/v1alpha1.'; \
+		printf '%s\n' 'tableOfContents:'; \
+		printf '%s\n' '  minHeadingLevel: 2'; \
+		printf '%s\n' '  maxHeadingLevel: 2'; \
+		printf '%s\n' '---'; \
+		printf '\n'; \
+		printf '%s\n' '<!-- GENERATED FILE — do not edit. Run `make api-docs` after changing api/v1alpha1/. -->'; \
+		printf '\n'; \
+		printf '%s\n' 'This page is generated from the Go types in `api/v1alpha1/`, so it is exactly what'; \
+		printf '%s\n' 'the CRDs installed in your cluster accept. `kubectl explain` on a live cluster is the'; \
+		printf '%s\n' 'same information from the same source.'; \
+		printf '\n'; \
+		sed \
+			-e '/^# API Reference$$/d' \
+			-e '/^## Packages$$/d' \
+			-e '/^- \[crystalbackup\.io\/v1alpha1\](#crystalbackupiov1alpha1)$$/d' \
+			-e '/^## crystalbackup\.io\/v1alpha1$$/d' \
+			-e '/^Package v1alpha1 contains API Schema definitions/d' \
+			-e 's/^### Resource Types$$/## Resource types/' \
+			-e 's/^#### /## /' \
+			"$$tmp/api.md"; \
+	} > "$(API_DOCS_OUT)"
+	@echo "Wrote $(API_DOCS_OUT)"
+
+.PHONY: api-docs-verify
+api-docs-verify: api-docs ## Fail if the committed API reference is stale (CI guard).
+	@if ! git diff --quiet -- "$(API_DOCS_OUT)"; then \
+		echo "ERROR: $(API_DOCS_OUT) is out of date. Run 'make api-docs' and commit the result."; \
+		git --no-pager diff -- "$(API_DOCS_OUT)"; \
+		exit 1; \
+	fi
+	@echo "$(API_DOCS_OUT) is up to date."
