@@ -34,7 +34,22 @@ fi
 _artifacts="${CRUCIBLE_ARTIFACTS:-${CRUCIBLE_DIR}/artifacts}"
 mkdir -p "${_artifacts}"
 export CRUCIBLE_REPORT_PATH="${_artifacts}/crucible-report.md"
-rm -f "${CRUCIBLE_REPORT_PATH}"
+CRUCIBLE_PREV_REPORT="${_artifacts}/crucible-report.prev.md"
+
+# The report path must be EMPTY when the suite starts — that is how the tail of this script knows
+# whether this run wrote one, and it is what stops a crashed run from leaving the previous run's
+# document looking like this one's. But it used to be emptied with `rm -f`, which destroys a
+# report before its replacement exists: two successive sessions on the SAME lane (the per-lane
+# split above only isolates DIFFERENT lanes) and the first one's report is gone the instant the
+# second one starts — including when the second dies in BeforeSuite and writes nothing at all.
+#
+# So: move, never delete. One generation is kept, under a fixed name that is overwritten each
+# run. One slot rather than timestamped copies on purpose — the case worth covering is "I
+# re-ran before reading the last report", which one generation covers, whereas timestamped
+# copies would pile up unread in a directory that already holds fanout rounds nobody prunes.
+if [[ -f "${CRUCIBLE_REPORT_PATH}" ]]; then
+  mv -f "${CRUCIBLE_REPORT_PATH}" "${CRUCIBLE_PREV_REPORT}"
+fi
 
 # Whole-suite wall-clock budget. 60m was overrun by the M3 full-suite run (go test panicked
 # mid-flight, losing the report), so it became 90m; M6's restore-fidelity gate then added the
@@ -95,8 +110,14 @@ if [[ -f "${CRUCIBLE_REPORT_PATH}" ]]; then
   cat "${CRUCIBLE_REPORT_PATH}"
   echo "────────────────────────────────────────────────────────────────────────"
   echo "(report saved to ${CRUCIBLE_REPORT_PATH})"
+  [[ -f "${CRUCIBLE_PREV_REPORT}" ]] && echo "(the previous run's report is kept at ${CRUCIBLE_PREV_REPORT})"
 else
   echo "WARNING: no report produced — the suite likely failed to start (see output above)." >&2
+  # Say where the last good one is, so nobody concludes it was lost along with this run.
+  if [[ -f "${CRUCIBLE_PREV_REPORT}" ]]; then
+    echo "         the PREVIOUS run's report was preserved at ${CRUCIBLE_PREV_REPORT}" >&2
+    echo "         (it describes an earlier run — do not read it as this one's result)." >&2
+  fi
 fi
 
 exit "${rc}"

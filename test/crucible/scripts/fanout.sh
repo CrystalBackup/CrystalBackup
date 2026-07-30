@@ -174,8 +174,55 @@ for lane in "${lanes[@]}"; do
   if [[ ! -s "${tmp}/${lane}" ]]; then
     echo "  ${lane}: report exists but NO spec lines parsed — the report format changed" >&2
   fi
-  printf '  %-6s %s passed, %s failed\n' "${lane}" \
-    "$(grep -c '^✅' "${tmp}/${lane}" || true)" "$(grep -c '^❌' "${tmp}/${lane}" || true)"
+
+  # ── Coverage, not just colour ───────────────────────────────────────────────
+  # Counting ✅ and ❌ answers "did anything fail in this lane". It does NOT answer "did this lane
+  # run the suite" — and seven lanes each passing the two specs a label selected would have come
+  # out of the block below as "CLEAN — every lane green". Same mistake the per-run report used to
+  # make, one level up, in the tool we reach for precisely when we no longer know what to believe.
+  #
+  # The report states both facts in machine-readable form; this reads them rather than re-deriving
+  # them. The contract with test/crucible/tests/report_test.go is these two lines:
+  #   **Coverage: <ran> of <total> checks ran (<pct>% of the suite)**
+  #   **Result: <p> passed · <f> failed · [<n> skipped with a stated reason] ·
+  #             [<n> never selected | <n> never reached]**
+  # "never selected" = a filter left them out; "never reached" = the run was cut short. Different
+  # events with different verdicts, so they are counted apart. A report whose Coverage line cannot
+  # be read yields "? ?" and is treated as unreadable — never as full coverage.
+  awk '
+    /^\*\*Coverage: / {
+      if (match($0, /Coverage: [0-9]+ of [0-9]+/)) {
+        split(substr($0, RSTART, RLENGTH), a, " "); ran = a[2]; total = a[4]
+      }
+    }
+    /^\*\*Result: / {
+      if (match($0, /[0-9]+ never selected/)) { split(substr($0, RSTART, RLENGTH), b, " "); nsel = b[1] }
+      if (match($0, /[0-9]+ never reached/))  { split(substr($0, RSTART, RLENGTH), c, " "); nrch = c[1] }
+      if (match($0, /[0-9]+ skipped with a stated reason/)) {
+        split(substr($0, RSTART, RLENGTH), d, " "); nskp = d[1]
+      }
+    }
+    END {
+      if (total == "") { print "? ? 0 0 0" } else { printf "%s %s %d %d %d\n", ran, total, nsel, nrch, nskp }
+    }' "${report}" > "${tmp}/${lane}.cov"
+
+  # `|| true`: read returns 1 at EOF, and under `set -e` that is an abort, not a value.
+  c_ran='?' c_total='?' c_nsel=0 c_nrch=0 c_nskp=0
+  read -r c_ran c_total c_nsel c_nrch c_nskp < "${tmp}/${lane}.cov" || true
+  if [[ "${c_total}" == "?" ]]; then
+    cov_note="coverage UNREADABLE — the report format changed"
+  elif (( c_nrch > 0 )); then
+    cov_note="${c_ran}/${c_total} checks — TRUNCATED, ${c_nrch} never reached"
+  elif (( c_nsel > 0 )); then
+    cov_note="${c_ran}/${c_total} checks — FILTERED, ${c_nsel} never selected"
+  elif (( c_nskp > 0 )); then
+    cov_note="${c_ran}/${c_total} checks — whole suite (${c_nskp} skipped with a reason)"
+  else
+    cov_note="${c_ran}/${c_total} checks — whole suite"
+  fi
+  printf '  %-6s %s passed, %s failed  ·  %s\n' "${lane}" \
+    "$(grep -c '^✅' "${tmp}/${lane}" || true)" "$(grep -c '^❌' "${tmp}/${lane}" || true)" \
+    "${cov_note}"
 done
 
 echo
@@ -204,8 +251,52 @@ fi
 
 echo
 echo "Specs that failed in EVERY lane (these are your bugs):"
-for lane in "${lanes[@]}"; do [[ -f "${tmp}/${lane}" ]] && grep '^❌' "${tmp}/${lane}" | cut -f2-; done \
-  | sort | uniq -c | awk -v n="${N}" '$1 == n { $1=""; print "  " substr($0,2) }'
+# `|| true` on the grep, and an `if` rather than `[[ … ]] &&`, because BOTH return 1 in the good
+# case — no lane has a ❌ — and `set -euo pipefail` at the top of this file turned that into an
+# abort. The effect was the exact inversion of what this script promises: a campaign where every
+# lane was GREEN died right here, printed neither the residual measurement nor the verdict, and
+# exited 1; a campaign WITH failures ran to the end and reported properly. The one outcome the
+# tool exists to certify was the one it could not report. Anything below this line is unreachable
+# on a green run until this stays fixed — including the coverage verdict.
+common_failures="$(
+  for lane in "${lanes[@]}"; do
+    if [[ -f "${tmp}/${lane}" ]]; then grep '^❌' "${tmp}/${lane}" | cut -f2- || true; fi
+  done | sort | uniq -c | awk -v n="${N}" '$1 == n { $1=""; print "  " substr($0,2) }'
+)"
+if [[ -n "${common_failures}" ]]; then
+  printf '%s\n' "${common_failures}"
+else
+  # Said out loud, like the flake block above it. A bare heading with nothing under it is
+  # ambiguous in exactly the wrong direction: no common failures, or a parser that broke?
+  echo "  (none — no spec failed in all ${N} lanes)"
+fi
+
+echo
+echo "Coverage per lane (the whole suite everywhere is what makes this a release gate):"
+# Printed as its own measurement, next to the residuals, because it is one: "every lane agreed"
+# is a claim about the specs that RAN, and it is worth exactly as much as the number of specs
+# that ran. Lanes disagreeing on the TOTAL is worse still — it means they did not execute the
+# same suite, which invalidates the comparison this whole tool exists to make.
+cov_totals=""
+for lane in "${lanes[@]}"; do
+  if [[ -f "${tmp}/${lane}.cov" ]]; then
+    c_ran='?' c_total='?'
+    read -r c_ran c_total _ _ _ < "${tmp}/${lane}.cov" || true
+    printf '  %-6s %s of %s checks ran\n' "${lane}" "${c_ran}" "${c_total}"
+    # Only READABLE totals feed the drift check. A lane with no report is already reported as
+    # such below; letting its "?" also trip "lanes disagree on the suite size" would explain one
+    # problem twice and send the reader looking for a second one that does not exist.
+    [[ "${c_total}" != "?" ]] && cov_totals="${cov_totals}${c_total}"$'\n'
+  else
+    printf '  %-6s ? (no report)\n' "${lane}"
+  fi
+done
+cov_drift=0
+if [[ "$(printf '%s' "${cov_totals}" | sort -u | grep -c . || true)" -gt 1 ]]; then
+  cov_drift=1
+  echo "  ⚠  lanes disagree on the suite SIZE — they did not run the same code, so the" >&2
+  echo "     agreement analysis above is meaningless until that is explained." >&2
+fi
 
 echo
 echo "Residual exposure objects per lane (0 everywhere is the release gate):"
@@ -219,11 +310,34 @@ echo "Lanes are destroyed as each suite finishes. Verify nothing lingers:"
 for i in $(seq 1 "${N}"); do echo "  CRUCIBLE_LANE=${LANE_PREFIX}${i} mise run status"; done
 
 # ─── Machine-readable verdict ─────────────────────────────────────────────────
-# Exit 0 ONLY when every lane produced a parsed report with zero ❌ AND measured zero residuals.
-# Anything else — a missing report, an unparsed one, a failed spec, a residual, an unreadable
-# residual ('?') — exits 1, so an automation chaining rounds stops on the first dirty one
-# instead of spending the next round's money on a gate that is already red.
+# Exit 0 ONLY when every lane produced a parsed report with zero ❌ AND measured zero residuals
+# AND actually ran what it was asked to run. Anything else — a missing report, an unparsed one, a
+# failed spec, a residual, an unreadable residual ('?'), an unreadable or truncated coverage —
+# exits 1, so an automation chaining rounds stops on the first dirty one instead of spending the
+# next round's money on a gate that is already red.
+#
+# Coverage splits the outcome three ways rather than two, and the middle one is new:
+#
+#   TRUNCATED  a lane reports checks "never reached" — the suite was cut off. Hard NOT clean,
+#              whatever the labels were: this file's own header says a truncated run is worse
+#              than no run, because it reports specs as failed when they were merely cut off.
+#   FILTERED   a lane reports checks "never selected". Deliberate when `scripts/fanout.sh N m4`
+#              asked for a label — that is the documented flake hunt, and failing it would break
+#              the loop the tool exists for. So it still exits 0, but the word CLEAN is withheld
+#              and the verdict says in full what it settles and what it does not. A filter with
+#              NO label passed is nobody's intent, so that one is hard NOT clean.
+#   FULL       every check selected. The only shape entitled to "CLEAN".
+#
+# The exit code answers "did something go wrong"; the WORDS answer "can I ship this". Conflating
+# the two is how "every lane green" came to be printed over two specs out of eighty-three.
 verdict=0
+partial=0
+cov_summary=""
+cov_skipped=0
+if (( cov_drift != 0 )); then
+  echo "verdict: lanes disagree on the suite size — they did not run the same suite — NOT clean" >&2
+  verdict=1
+fi
 for lane in "${lanes[@]}"; do
   if [[ ! -s "${tmp}/${lane}" ]]; then
     echo "verdict: ${lane} has no parsed specs — NOT clean" >&2; verdict=1; continue
@@ -235,6 +349,56 @@ for lane in "${lanes[@]}"; do
   if [[ "${res}" != "0" ]]; then
     echo "verdict: ${lane} residual='${res}' — NOT clean" >&2; verdict=1
   fi
+
+  if [[ ! -f "${tmp}/${lane}.cov" ]]; then
+    echo "verdict: ${lane} has no coverage line — NOT clean" >&2; verdict=1; continue
+  fi
+  c_ran='?' c_total='?' c_nsel=0 c_nrch=0 c_nskp=0
+  read -r c_ran c_total c_nsel c_nrch c_nskp < "${tmp}/${lane}.cov" || true
+  cov_summary="${c_ran} of ${c_total}"
+  (( c_nskp > cov_skipped )) && cov_skipped="${c_nskp}"
+  if [[ "${c_total}" == "?" ]]; then
+    echo "verdict: ${lane} coverage unreadable — NOT clean (an unparsed report is not consensus)" >&2
+    verdict=1
+  elif (( c_nrch > 0 )); then
+    echo "verdict: ${lane} ran only ${c_ran} of ${c_total} checks, ${c_nrch} never reached (truncated) — NOT clean" >&2
+    verdict=1
+  elif (( c_nsel > 0 )); then
+    if [[ -z "${LABELS}" ]]; then
+      echo "verdict: ${lane} left ${c_nsel} of ${c_total} checks unselected with no label requested — NOT clean" >&2
+      verdict=1
+    else
+      partial=1
+    fi
+  elif (( 10 * c_nskp > c_total )); then
+    # The same 10% tolerance the per-run report applies (fullRunSkipTolerance in
+    # tests/report_test.go). One rule, stated once, enforced in both places: a suite that
+    # abstains on more than a tenth of itself is green for what it covered, not for the suite.
+    echo "verdict: ${lane} selected the whole suite but ${c_nskp} of ${c_total} checks skipped themselves" >&2
+    partial=1
+  fi
 done
-if (( verdict == 0 )); then echo "verdict: CLEAN — every lane green, zero residuals everywhere"; fi
+
+if (( verdict != 0 )); then
+  :
+elif (( partial != 0 )); then
+  if [[ -n "${LABELS}" ]]; then
+    echo "verdict: PARTIAL — every lane green and residual-free, but each ran only ${cov_summary} checks (label '${LABELS}')."
+    echo "verdict: that settles the specs it ran across ${N} independent lanes; it is NOT a release gate."
+    echo "verdict: re-run without a label — 'scripts/fanout.sh ${N}' — before shipping on this evidence."
+  else
+    echo "verdict: PARTIAL — every lane green and residual-free, but too much of the suite skipped itself"
+    echo "verdict: (${cov_summary} checks ran). Green for what it covered, not for the suite; resolve what"
+    echo "verdict: those checks are waiting on before shipping on this evidence."
+  fi
+else
+  # "the whole suite" means every check was SELECTED. Say the skips out loud rather than let
+  # "ran the whole suite (78 of 81 checks)" contradict itself in its own sentence.
+  if (( cov_skipped > 0 )); then
+    echo "verdict: CLEAN — every lane selected the whole suite, all green, zero residuals everywhere"
+    echo "verdict: (${cov_summary} checks ran; ${cov_skipped} skipped with a stated reason — see the per-lane reports)"
+  else
+    echo "verdict: CLEAN — every lane ran the whole suite (${cov_summary} checks), all green, zero residuals everywhere"
+  fi
+fi
 exit "${verdict}"
