@@ -72,7 +72,7 @@ on — a discovery projection, an earlier run of the same name, and the namespac
 neither administrator did anything unusual to get there.
 
 The coordinate is therefore never read as proof of ownership. Every `Backup` created by a run or a
-schedule carries **`crystalbackup.io/parent-uid`**: the `metadata.uid` of the `ClusterBackup` run,
+schedule carries the **annotation** `crystalbackup.io/parent-uid`: the `metadata.uid` of the `ClusterBackup` run,
 or of the `BackupSchedule`, that created it. A UID is never reused, and a crash-restarted run keeps
 its CR and hence its UID, so the test is exact rather than heuristic:
 

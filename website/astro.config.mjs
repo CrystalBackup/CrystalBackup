@@ -59,6 +59,8 @@ export default defineConfig({
           items: [
             { label: 'Requirements', slug: 'docs/start/requirements' },
             { label: 'Install with Helm', slug: 'docs/start/install' },
+            { label: 'Install with Argo CD', slug: 'docs/start/install-argocd' },
+            { label: 'Install with Flux', slug: 'docs/start/install-flux' },
             { label: 'Quickstart', slug: 'docs/start/quickstart' },
           ],
         },

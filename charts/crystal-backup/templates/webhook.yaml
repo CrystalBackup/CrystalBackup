@@ -9,6 +9,18 @@ Serving certs are CHART-GENERATED (genCA/genSignedCert) and pinned for the relea
 lookup-less regeneration on upgrade: a helm upgrade re-issues the pair and rolls the
 Deployment (the Secret is mounted), which is acceptable for a non-safety, fail-open
 webhook and keeps the chart free of a cert-manager dependency.
+
+That reasoning holds for `helm upgrade`, which renders ONCE per upgrade. It does not hold
+under continuous rendering. Argo CD re-renders on every refresh — three minutes by default
+— so with self-heal on, the Secret and the caBundle differ every cycle and the Deployment
+rolls with them: an operator restarting every three minutes, which is a fault, not a cost.
+Flux is inert here unless driftDetection.mode is enabled.
+
+`lookup` would not fix it: Argo CD renders with `helm template`, which has no cluster to
+look anything up in. The GitOps pages under website/…/start/ therefore ship the exact
+ignoreDifferences / driftDetection.ignore blocks, and name `admission.webhook.enabled:
+false` as the honest alternative — the webhook covers ONE cross-object rule, fails open,
+and the controller's MultipleDefaults condition already backstops it.
 */ -}}
 {{- if .Values.admission.webhook.enabled }}
 {{- $serviceName := printf "%s-webhook" (include "crystal-backup.fullname" .) }}

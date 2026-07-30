@@ -24,6 +24,17 @@ helm install crystal-backup \
 The chart creates the namespace itself by default (`namespace.create: true`), so
 `--create-namespace` is belt and braces.
 
+:::caution[Installing from Git instead?]
+Do not translate the command above into an `Application` or a `HelmRelease` unaided. A GitOps
+controller prunes, recreates and uninstalls on its own, and all three are hazardous here: a
+prune can delete the namespace holding your cluster KEK, a recreated `ClusterBackup` collides
+with the run it is named after, and an unordered uninstall strands namespaces in `Terminating`
+permanently. The procedures handle each of those explicitly:
+
+- [Install with Argo CD](/CrystalBackup/docs/start/install-argocd/)
+- [Install with Flux](/CrystalBackup/docs/start/install-flux/)
+:::
+
 Check it came up:
 
 ```bash
