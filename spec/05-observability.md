@@ -58,11 +58,20 @@ discovery) use `scope` (`cluster|namespace`, from `BackupRepository.status.scope
 of `origin`, and carry `namespace` **only for namespaced user repos** (empty for the shared
 cluster repo). `ClusterRestore` operations are recorded under the **origin** namespace.
 
+**`scope` is `cluster|namespace`, NOT the API's enum spelling.** The collector MAPS
+`BackupRepository.status.scope` (`Cluster`/`Namespaced`, a kubebuilder enum) onto these values; it
+does not publish it verbatim. Corrected in M6, where publishing it raw had made `scope` mean two
+different things depending on family — repository and discovery emitted `Cluster|Namespaced` while
+external sync emitted `cluster|namespace`, deriving from the same constants as `origin`. One alert
+expression written across both families would silently match nothing on one of them. One
+vocabulary, lowercase, matching `origin` (the dimension `scope` replaces on these families) and
+matching the Prometheus convention for enumerated label values.
+
 ### 2.1 Backup (per namespace — from `Backup` objects)
 
 | Metric | Type | Labels | Description |
 |---|---|---|---|
-| `crystalbackup_backup_last_success_timestamp_seconds` | gauge | namespace, tenant, schedule, origin, location, cluster | Unix time of the last `Completed` `Backup`. Initialized to the schedule's creation time on first reconcile, so `BackupMissed` fires even if no backup ever succeeded. Rebuilt on restart from `Backup`/schedule status. |
+| `crystalbackup_backup_last_success_timestamp_seconds` | gauge | namespace, tenant, schedule, origin, location, cluster | Unix time of the last `Completed` or `PartiallyCompleted` `Backup`. Derived from the `Backup` objects at scrape time, so it is **absent** until one has succeeded. |
 | `crystalbackup_backup_duration_seconds` | histogram | namespace, tenant, schedule, origin, location, cluster | End-to-end `Backup` duration (Pending→Completed). Buckets: 60, 300, 900, 1800, 3600, 7200, 14400, 28800. |
 | `crystalbackup_backup_last_duration_seconds` | gauge | namespace, tenant, schedule, origin, location, cluster | Duration of the LAST successful `Backup`, the same quantity the histogram above observes. Shipped since M1 and omitted from this table until M6 — recorded here because the omission is exactly the drift `names.go` now prevents. The gauge answers "how long did last night take" without a quantile; the histogram answers "how long does this usually take". |
 | `crystalbackup_backup_last_size_bytes` | gauge | namespace, tenant, schedule, origin, location, cluster | Logical size of the last backup (Σ `status.volumes[].sizeBytes`) — per-namespace even in the shared repo (unaffected by cross-namespace dedup). |
@@ -70,6 +79,24 @@ cluster repo). `ClusterRestore` operations are recorded under the **origin** nam
 | `crystalbackup_backup_added_bytes_total` | counter | namespace, tenant, schedule, origin, location, cluster | Cumulative bytes uploaded to the repository (S3 egress estimation). |
 | `crystalbackup_backup_failures_total` | counter | namespace, tenant, schedule, origin, location, cluster | `Backup`s ending `Failed` or `PartiallyFailed`. |
 | `crystalbackup_schedule_active` | gauge | namespace, tenant, schedule, origin, location, cluster | 1 when an unpaused schedule is expected to back up this `(namespace, schedule)`: a namespaced `BackupSchedule` (`origin=namespace`), **or** a `ClusterBackupSchedule` whose namespace selection matches this namespace (`origin=cluster` — the operator resolves the selection and emits one series per matched namespace). Drives per-namespace `BackupMissed` across the cluster-plane fan-out. |
+| `crystalbackup_schedule_period_seconds` | gauge | namespace, tenant, schedule, origin, location, cluster | Longest gap between two consecutive activations of the schedule's cron expression. **Absent** when the expression cannot be parsed. Added in M6; it is what lets `BackupMissed` carry a per-schedule deadline instead of a flat 26 h (§8 q3). |
+| `crystalbackup_schedule_created_timestamp_seconds` | gauge | namespace, tenant, schedule, origin, location, cluster | Unix time the schedule object was created — the instant from which backups started being expected. Added in M6; see the note below. |
+
+**The never-succeeded hole, and why there are two extra series rather than one.** Until M6 this
+table claimed `last_success` was "initialized to the schedule's creation time on first reconcile,
+so `BackupMissed` fires even if no backup ever succeeded". The collector has never done that and
+cannot honestly: `last_success` is derived from `Backup` objects at scrape time, and a schedule
+that has never produced a successful one emits no series at all. `time() - <nothing>` is nothing —
+so a schedule that was broken from the day it was applied, which is the single most likely way for
+a NEW installation to be silently unprotected, was the one case the rule could never see. Seeding
+`last_success` with a fake success timestamp would have closed it while lying to every dashboard
+panel that reads "last backup". `schedule_created_timestamp_seconds` says the true thing instead,
+and `BackupMissed` falls back to it when there is no success to measure from.
+
+**Both are emitted from the same site as `schedule_active`**, with the same label set and the same
+absence semantics, because `BackupMissed` joins all three in one expression: a schedule that is
+paused, deleted or has an unselectable selector drops all of them at once and the rule goes quiet
+together rather than half-quiet.
 
 ### 2.2 ClusterBackup runs (run-level — from `ClusterBackup`)
 
@@ -137,10 +164,17 @@ Per `BackupRepository`; derived from `restic snapshots` grouped by `(namespace, 
 
 | Metric | Type | Labels | Description |
 |---|---|---|---|
-| `crystalbackup_discovery_last_timestamp_seconds` | gauge | location, scope, cluster | Last discovery scan completion (`status.lastDiscoveryTime`). |
-| `crystalbackup_discovery_last_success` | gauge | location, scope, cluster | 1 if the last discovery scan succeeded, else 0. Restart-safe; drives `DiscoveryFailed`. |
-| `crystalbackup_discovery_projected_backups` | gauge | location, scope, cluster | `Backup` projections currently materialized from this repo into **existing** namespaces — i.e. exactly what `kubectl get backups` lists for it (CR lifetime = data lifetime). |
-| `crystalbackup_discovery_orphan_snapshots` | gauge | location, scope, cluster | Snapshot `(namespace, run)` groups whose namespace does **not** exist (not projected; restorable only via `ClusterRestore`). A non-zero value is DR data for gone namespaces, not an error. |
+| `crystalbackup_discovery_last_timestamp_seconds` | gauge | location, scope, namespace, cluster | Last discovery scan completion (`status.lastDiscoveryTime`). |
+| `crystalbackup_discovery_last_success` | gauge | location, scope, namespace, cluster | 1 if the last discovery scan succeeded, else 0. Restart-safe; drives `DiscoveryFailed`. |
+| `crystalbackup_discovery_projected_backups` | gauge | location, scope, namespace, cluster | `Backup` projections currently materialized from this repo into **existing** namespaces — i.e. exactly what `kubectl get backups` lists for it (CR lifetime = data lifetime). |
+| `crystalbackup_discovery_orphan_snapshots` | gauge | location, scope, namespace, cluster | Snapshot `(namespace, run)` groups whose namespace does **not** exist (not projected; restorable only via `ClusterRestore`). A non-zero value is DR data for gone namespaces, not an error. |
+
+`namespace` carries the repository's **owner** — empty for the shared cluster repo, the tenant's
+namespace for a `scope=namespace` one — exactly as §2.4 uses it. It does not split a scan: a scan
+covers every namespace in its repository at once. Added in M6, because without it a tenant could
+see whether their repository was INTACT (check, prune, locks) but never whether the list
+`kubectl get backups` gives them still matches what is in it. A failing discovery means precisely
+that their restore points are silently stale — and it was visible only to the platform.
 
 ### 2.6 Right-to-erasure (`ClusterErasure`, R21)
 
@@ -289,90 +323,75 @@ silently missed.
 
 ## 3. Alert rules
 
-> **NOT YET SHIPPED — as of 0.5.0 this whole section is a specification, not a description.**
-> The chart has no `PrometheusRule` template and no `metrics.rules.enabled` value; none of the
-> rules below exist in any released artifact, `CrystalbackupExternalSyncStale` included. The
-> METRICS they alert on do ship (§2), so an operator can paste these expressions into their own
-> rule file today — which is the honest reading of the gap, and also why closing it is a
-> self-contained piece of work rather than a blocker for any of the features here.
->
-> Tracked for M6 (observability hardening), where it belongs: shipping nine alert rules means
-> owning their thresholds against real fleet behaviour, and every one of them was written before
-> there was a fleet to check them against.
+**Shipped in M6, and no longer written here.** The nine rules live in a Go table,
+`internal/alerts/rules.go`, from which the chart's `PrometheusRule` body is GENERATED into
+`charts/crystal-backup/rules/crystalbackup.rules.yaml` (`make alert-rules`). Enable it with
+`metrics.rules.enabled=true`; `metrics.rules.labels` sets whatever the Prometheus Operator's
+`ruleSelector` matches on, without which the rules install, validate and are completely ignored.
 
-Intended shape: a `PrometheusRule` in the Helm chart (optional, `metrics.rules.enabled`).
+**Why the expressions are not reproduced in this section.** They were, from M1 to 0.5.1, and
+**five of the nine referenced series the operator never emitted** — `crystalbackup_backup_failures_total`
+against a shipped `crystalbackup_backup_failures`, plus four families that did not exist at all.
+Every one was valid PromQL. Every one evaluated without error. None could ever fire, and nothing in
+the build could notice, because the rule text and the metric definitions never met. Restating them
+here would be re-opening that gap on the first rename. Each expression is now CONCATENATED from the
+constants in `internal/metrics/names.go`, so a renamed series is a compile failure;
+`internal/alerts/rules_test.go` additionally checks every label, every join key and every
+`{{ $labels.x }}` against the label sets the collectors actually register, and proves it can by
+failing on seven injected faults.
+
+Read the generated file for the current expressions and thresholds — it carries the reasoning for
+each rule as a comment, which is what an operator deciding whether to silence one at 03:00 actually
+needs.
+
+| Alert | Severity | For | Fires when |
+|---|---|---|---|
+| `CrystalbackupBackupMissed` | warning | 15m | An active schedule has gone past **its own** deadline (1.1 × the cron period + 1 h) with no successful `Backup`. Falls back to the schedule's creation time when nothing has ever succeeded, and to a fixed 26 h when the cron expression cannot be parsed. |
+| `CrystalbackupBackupFailed` | warning | — | A `Backup` reached `Failed` or `PartiallyFailed` in the last hour. |
+| `CrystalbackupRepositoryCheckFailed` | **critical** | 5m | `restic check` found repository damage. The only critical rule: it is the only one that says the RESTORE PATH is compromised rather than that a backup is late. |
+| `CrystalbackupStaleLocks` | warning | 30m | Stale restic locks persist past the reaper's own cycle. |
+| `CrystalbackupMaintenanceStalled` | warning | 1h | No successful prune for 26 h. Cannot fire on an `Immutable` location, which emits no series (§2.4). |
+| `CrystalbackupDiscoveryFailed` | warning | 30m | Discovery is failing, so `kubectl get backups` no longer matches the repository. |
+| `CrystalbackupErasureBlocked` | warning | 1h | A `ClusterErasure` is parked on an object-lock window. Not an error; a GDPR clock. |
+| `CrystalbackupPVCSnapshotPileup` | warning | 30m | More than 20 VolumeSnapshots on one PVC (ceph-csi flatten risk, ADR 0006). |
+| `CrystalbackupExternalSyncStale` | warning | 1h | No completed external sync in 26 h. |
+
 Tenant-facing alerts carry the `namespace` label for per-tenant routing; repository-level
 alerts route to admins for the shared cluster repo (`scope=cluster`) and to the tenant for
 a user repo (`scope=namespace`, non-empty `namespace`).
 
-```yaml
-groups:
-  - name: crystalbackup
-    rules:
-      - alert: CrystalbackupBackupMissed
-        expr: |
-          (time() - crystalbackup_backup_last_success_timestamp_seconds > 26 * 3600)
-          and on (namespace, schedule, cluster) crystalbackup_schedule_active == 1
-        for: 15m
-        labels: { severity: warning }
-        annotations:
-          summary: "No successful backup for {{ $labels.namespace }}/{{ $labels.schedule }} ({{ $labels.origin }}) in 26h"
-      - alert: CrystalbackupBackupFailed
-        expr: increase(crystalbackup_backup_failures_total[1h]) > 0
-        labels: { severity: warning }
-        annotations:
-          summary: "Backup failed for {{ $labels.namespace }}/{{ $labels.schedule }}"
-      - alert: CrystalbackupRepositoryCheckFailed
-        expr: crystalbackup_repository_last_check_success == 0
-        for: 5m
-        labels: { severity: critical }
-        annotations:
-          summary: "restic check failed on repository {{ $labels.location }} ({{ $labels.scope }})"
-      - alert: CrystalbackupStaleLocks
-        expr: crystalbackup_repository_stale_locks > 0
-        for: 30m
-        labels: { severity: warning }
-        annotations:
-          summary: "Stale restic locks persist on {{ $labels.location }} (reaper not clearing)"
-      - alert: CrystalbackupMaintenanceStalled
-        # A prune that keeps FAILING never advances lastMaintenanceTime, so staleness is the
-        # signal — one rule covers "never ran", "erroring every night" and "controller wedged".
-        # 26h ⇒ a daily pruneSchedule may miss one window without paging.
-        expr: time() - crystalbackup_repository_last_maintenance_timestamp_seconds > 26 * 3600
-        for: 1h
-        labels: { severity: warning }
-        annotations:
-          summary: "No successful prune on {{ $labels.location }} for over 26h — the repository is growing unreclaimed"
-      - alert: CrystalbackupDiscoveryFailed
-        expr: crystalbackup_discovery_last_success == 0
-        for: 30m
-        labels: { severity: warning }
-        annotations:
-          summary: "Discovery failing on {{ $labels.location }} — Backup projections may be stale vs the repository"
-      - alert: CrystalbackupErasureBlocked
-        expr: crystalbackup_erasure_blocked > 0
-        for: 1h
-        labels: { severity: warning }
-        annotations:
-          summary: "Right-to-erasure blocked on {{ $labels.location }} (Immutable object-lock not yet expired, R21/ADR 0005)"
-      - alert: CrystalbackupPVCSnapshotPileup
-        expr: crystalbackup_pvc_volumesnapshot_count > 20
-        for: 30m
-        labels: { severity: warning }
-        annotations:
-          summary: "{{ $value }} VolumeSnapshots piling up on PVC {{ $labels.namespace }}/{{ $labels.pvc }} (ceph-csi flatten risk, ADR 0006)"
-      - alert: CrystalbackupExternalSyncStale
-        expr: |
-          time() - crystalbackup_externalsync_last_success_timestamp_seconds > 26 * 3600
-        for: 1h
-        labels: { severity: warning }
-        annotations:
-          summary: "External sync {{ $labels.sync }} ({{ $labels.source }}→{{ $labels.destination }}) has not completed in 26h"
-```
+**`BackupMissed` joins on `(namespace, schedule, origin, location, cluster)` — every term, and not
+the `(namespace, schedule, cluster)` this section specified until M6.** `schedule` is a CR name, and
+a `BackupSchedule` and a `ClusterBackupSchedule` may both be called `daily`; on the narrow key an
+unrelated namesake on the other plane answers the "is this schedule still active" guard, so a
+paused cluster schedule's breach is retained by the namespace schedule next to it — or silenced by
+it. That collision is invisible today only because the namespace plane emits `cluster=""` and the
+cluster plane `cluster=<clusterID>`, which is the very gap §1 says is being closed in 0.6: filling
+the label in would have activated the bug, silently. The narrow key also fails **now** on a
+schedule whose `locationRef` is edited, where the series left behind by the old location keeps a
+guard partner it should have lost and pages forever. `tenant` stays out of the join because
+`last_success` resolves it from the `Backup`'s label and `schedule_active` from the namespace's —
+two sources, and a join on the full set would break precisely while someone is changing one.
 
-The 26 h `BackupMissed` deadline assumes the platform default of daily schedules (24 h +
-2 h grace for jitter and long uploads). Non-daily schedules need a per-schedule threshold
-(see Open questions).
+**`BackupMissed`'s deadline is derived, the rest are fixed.** A flat 26 h is only ever right for a
+daily schedule: an hourly one could be twenty-five hours dead in silence, and a weekly one paged
+every Tuesday until somebody silenced it permanently, which is the worst thing that can happen to
+an alert. `crystalbackup_schedule_period_seconds` (§2.1) is what makes the deadline follow the cron
+expression, so changing a schedule moves its alert with no rule edit. `ExternalSyncStale` keeps its
+fixed 26 h because a sync's schedule is optional — a manual sync has no period to derive from
+(§8 q3 remains open for that one).
+
+**Two rules are deliberately NOT here yet**, and both for the same reason the five broken ones
+were: they depend on series nothing emits. A pause guard on `ExternalSyncStale` needs
+`crystalbackup_externalsync_active`, and a `SchedulePausedTooLong` needs `schedule_active` to emit
+`0` for a paused schedule rather than nothing. Shipping either now would mean shipping a rule that
+cannot fire, which is the exact defect M6 exists to end.
+
+**Each rule also declares a `Threshold`, and a slot for a Go state predicate** that answers the
+same question by reading object state instead of Prometheus — the half the exportable self-check
+consumes, so an operator with no monitoring stack still gets a verdict. Two of the nine are
+implemented as the worked shape. The threshold is declared ONCE and read by both: two
+implementations of one bound diverge, and it is only a question of which release.
 
 ## 4. Logging
 
@@ -500,7 +519,11 @@ Two dashboards ship in the Helm chart as ConfigMaps labeled `grafana_dashboard: 
 2. **`cluster` label ownership**: the operator stamps `cluster=<clusterID>`; the platform
    Prometheus also sets external labels at federation. Confirm they agree (same value) to
    avoid duplicate series across the platform monitoring stack.
-3. **Per-schedule `BackupMissed` deadline**: derive the threshold from the cron interval
-   (e.g. 1.1 × period) instead of the fixed 26 h — candidate refinement for M6. The same
-   per-schedule treatment applies to `ExternalSyncStale` (§2.12), whose sync schedules may be
-   weekly/monthly — its fixed 26 h threshold must become per-schedule too.
+3. **Per-schedule `BackupMissed` deadline** — **DONE in M6 for `BackupMissed`**, still open for
+   `ExternalSyncStale`. The threshold is 1.1 × the schedule's own cron period + 1 h, read from
+   `crystalbackup_schedule_period_seconds` (§2.1) rather than hardcoded, so it follows a change to
+   the cron expression with no rule edit. The proportional factor absorbs jitter and an overrunning
+   run; the flat hour keeps a five-minute schedule from getting a five-and-a-half-minute deadline.
+   `ExternalSyncStale` keeps the fixed 26 h, and the reason is not laziness: a sync's `schedule` is
+   **optional** (a manual sync has no period at all), so the same treatment needs a decision about
+   what a manual sync's deadline even means before it needs a series.

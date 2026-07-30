@@ -161,3 +161,39 @@ func TestJitterOffset(t *testing.T) {
 		t.Fatalf("JitterOffset with zero window = %v, want 0", got)
 	}
 }
+
+// TestPeriodTakesTheLongestGap covers the case a naive "time to the next activation" gets wrong.
+// An expression like `0 2,3 * * *` alternates a one-hour gap and a twenty-three-hour one; a
+// deadline derived from whichever came next would page every night at 03:05 for a schedule that is
+// working perfectly.
+func TestPeriodTakesTheLongestGap(t *testing.T) {
+	for _, tc := range []struct {
+		expr string
+		want time.Duration
+	}{
+		{"0 2 * * *", 24 * time.Hour},
+		{"@daily", 24 * time.Hour},
+		{"0 * * * *", time.Hour},
+		{"*/15 * * * *", 15 * time.Minute},
+		{"0 2 * * 0", 7 * 24 * time.Hour},   // weekly — the shape a fixed 26h deadline pages on
+		{"0 2,3 * * *", 23 * time.Hour},     // irregular: the LONG gap, not the next one
+		{"0 2 * * 1-5", 3 * 24 * time.Hour}, // weekdays: Friday → Monday
+	} {
+		if got := mustParse(t, tc.expr, "").Period(at(0, 0, 0)); got != tc.want {
+			t.Errorf("Period(%q) = %s, want %s", tc.expr, got, tc.want)
+		}
+	}
+}
+
+// TestPeriodIsStableAcrossTheStartingInstant: the value feeds a Prometheus gauge read at scrape
+// time, so a period that moved with the clock would make a schedule's alert deadline breathe.
+func TestPeriodIsStableAcrossTheStartingInstant(t *testing.T) {
+	s := mustParse(t, "0 2,3 * * *", "")
+	want := s.Period(at(0, 0, 0))
+	for h := range 24 {
+		if got := s.Period(at(h, 30, 0)); got != want {
+			t.Fatalf("Period from %02d:30 = %s, from 00:00 = %s — the deadline would move "+
+				"through the day", h, got, want)
+		}
+	}
+}

@@ -171,6 +171,23 @@ metrics:
     scrapeTimeout: 10s
     # -- Extra labels for the ServiceMonitor (e.g. to match a Prometheus selector).
     labels: {}
+  rules:
+    # -- Create a Prometheus Operator PrometheusRule with the nine Crystal Backup alert rules
+    # (spec/05-observability.md §3). Off by default, like `serviceMonitor.enabled`: it requires
+    # the monitoring.coreos.com CRDs, and the thresholds are platform policy — an operator should
+    # turn these on deliberately, having read them. The rule bodies are generated from
+    # `internal/alerts/rules.go` into `rules/crystalbackup.rules.yaml`; `helm show` them, or read
+    # that file, before enabling.
+    enabled: false
+    # -- Extra labels on the PrometheusRule. This is the one you usually need: a Prometheus
+    # Operator only picks up rules matching its `ruleSelector`, so an unlabelled PrometheusRule is
+    # installed, valid and completely ignored.
+    labels: {}
+    # -- Extra annotations on the PrometheusRule.
+    annotations: {}
+    # -- Namespace for the PrometheusRule. Empty means the operator namespace. Set it when the
+    # Prometheus Operator's `ruleNamespaceSelector` only covers the monitoring namespace.
+    namespace: ""
   dashboards:
     # -- Ship the two Grafana dashboards (`crystalbackup-tenant`, `crystalbackup-platform`)
     # as ConfigMaps for the Grafana sidecar to provision. Off by default, like

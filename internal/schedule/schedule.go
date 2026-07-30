@@ -99,6 +99,39 @@ func (s *Schedule) DueTick(after, now time.Time, deadline *time.Duration) (time.
 	return last, true
 }
 
+// periodSamples bounds the forward scan Period walks. Eight activations covers a
+// full cycle of every irregular expression anyone writes in practice (twice a day,
+// weekdays-only, every six hours) without turning a scrape into a computation: a
+// monthly cron walks eight months, which is enough to see the longest gap of the
+// year.
+const periodSamples = 8
+
+// Period returns the LONGEST gap between two consecutive activations over the next
+// few activations after t — the interval a caller must wait before concluding that
+// a schedule has missed a run.
+//
+// The longest gap, not the next one, and that is the whole point. A `0 2,3 * * *`
+// expression alternates one-hour and twenty-three-hour gaps: a deadline derived from
+// whichever gap happens to come next would page every night at 03:05 for a schedule
+// that is working perfectly. The longest gap is the only bound that is never wrong in
+// the direction that pages someone.
+//
+// It is evaluated against t rather than cached because a cron's period is not a
+// constant: DST makes a daily schedule 23 or 25 hours twice a year, and taking the
+// maximum absorbs that instead of alerting through it.
+func (s *Schedule) Period(t time.Time) time.Duration {
+	var longest time.Duration
+	prev := s.Next(t)
+	for range periodSamples {
+		next := s.Next(prev)
+		if gap := next.Sub(prev); gap > longest {
+			longest = gap
+		}
+		prev = next
+	}
+	return longest
+}
+
 // JitterOffset derives a deterministic offset in [0, window) from seed (the
 // schedule's stable identity — its UID or name), so many schedules sharing a cron
 // expression fire at spread-out instants instead of stampeding the same tick,

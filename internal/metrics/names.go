@@ -46,6 +46,8 @@ const (
 	NameBackupAddedTotal     = "crystalbackup_backup_added_bytes_total"
 	NameBackupFailuresTotal  = "crystalbackup_backup_failures_total"
 	NameScheduleActive       = "crystalbackup_schedule_active"
+	NameSchedulePeriod       = "crystalbackup_schedule_period_seconds"
+	NameScheduleCreated      = "crystalbackup_schedule_created_timestamp_seconds"
 	NameBackupTotal          = "crystalbackup_backup_total"
 	NameBackupProtectedBytes = "crystalbackup_backup_protected_bytes"
 

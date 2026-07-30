@@ -189,6 +189,45 @@ lint-config: golangci-lint ## Verify golangci-lint linter configuration
 check-dashboards: ## Verify the Grafana dashboards only use series/labels declared in internal/metrics.
 	python3 hack/check-dashboard-metrics.py
 
+## The chart's alert rules are GENERATED from the table in internal/alerts/rules.go, where every
+## expression is concatenated from the constants in internal/metrics/names.go. That is the whole
+## point: renaming a series becomes a compile error instead of an alert that quietly stops firing,
+## which is the state five of these nine rules shipped in until M6. The YAML is an artifact —
+## regenerated, never edited.
+ALERT_RULES_OUT ?= $(CHART_DIR)/rules/crystalbackup.rules.yaml
+
+.PHONY: alert-rules
+alert-rules: ## Generate the chart's PrometheusRule body from internal/alerts/rules.go.
+	go run ./internal/alerts/cmd/genrules --chart-dir "$(CHART_DIR)"
+
+## Regenerates into a scratch directory and diffs, rather than regenerating in place and asking
+## git: a file that has never been committed is invisible to `git diff`, and this guard has to
+## work on the change that ADDS a rule as well as on the one that edits it.
+.PHONY: alert-rules-verify
+alert-rules-verify: ## Fail if the committed alert rules are stale (CI guard).
+	@tmp="$$(mktemp -d)"; trap 'rm -rf "$$tmp"' EXIT; \
+	go run ./internal/alerts/cmd/genrules --chart-dir "$$tmp" >/dev/null; \
+	if ! diff -u "$(ALERT_RULES_OUT)" "$$tmp/rules/crystalbackup.rules.yaml"; then \
+		echo "ERROR: $(ALERT_RULES_OUT) is out of date with internal/alerts/rules.go."; \
+		echo "       Run 'make alert-rules' and commit the result."; \
+		exit 1; \
+	fi; \
+	echo "$(ALERT_RULES_OUT) is up to date."
+
+## promtool is the only thing that actually PARSES the PromQL and the annotation templates. It is
+## not vendored (prometheus/prometheus cannot be `go install`ed, and pulling it in as a library
+## would drag its whole dependency tree through this project's vulnerability surface for a syntax
+## check), so this target uses one if the machine has it and says so plainly when it does not.
+## The series/label correctness that MATTERS is checked in Go, in internal/alerts/rules_test.go.
+.PHONY: check-alert-rules
+check-alert-rules: ## Syntax-check the generated alert rules with promtool, when one is available.
+	@command -v promtool >/dev/null 2>&1 || { \
+		echo "promtool not on PATH — skipping the PromQL syntax check."; \
+		echo "  (internal/alerts/rules_test.go still checks every series and label against the catalogue.)"; \
+		exit 0; \
+	}; \
+	promtool check rules "$(ALERT_RULES_OUT)"
+
 ##@ Build
 
 .PHONY: build

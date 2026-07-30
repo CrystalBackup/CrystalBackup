@@ -1,0 +1,156 @@
+# GENERATED FILE — do not edit.
+#
+# Source of truth: internal/alerts/rules.go. Regenerate with `make alert-rules`.
+#
+# These rules are generated rather than written because five of the nine shipped as prose in
+# spec/05-observability.md §3 read series the operator has never emitted: valid PromQL, evaluated
+# without error, unable to fire, and invisible to every check in the build. Every expression below
+# is assembled from the constants in internal/metrics/names.go, so a renamed series is now a
+# compile error instead of an alert that quietly stops firing.
+#
+# Editing this file by hand puts that guarantee back where it was.
+groups:
+  - name: crystalbackup
+    rules:
+      # The deadline is the schedule's OWN period (1.1x + 1h), not a fixed 26h: a flat
+      # threshold is silent for a day on an hourly schedule and pages every week on a weekly one.
+      # Three parts, and each closes a hole the previous shape had:
+      #   * the age term falls back to crystalbackup_schedule_created_timestamp_seconds when nothing has
+      #     ever succeeded — a schedule that was broken from the day it was applied emits no
+      #     last_success series at all, and `time() - <nothing>` is nothing;
+      #   * the second branch keeps the old fixed deadline for a schedule whose cron cannot be
+      #     parsed (no period series), because that schedule will never run and must still page;
+      #   * the `and` guard on crystalbackup_schedule_active is what stops a deleted or
+      #     paused schedule from paging forever on a last_success that will never advance again.
+      - alert: CrystalbackupBackupMissed
+        expr: |
+          (
+            (
+              (
+                (time() - crystalbackup_backup_last_success_timestamp_seconds)
+                or on (namespace, schedule, origin, location, cluster)
+                (time() - crystalbackup_schedule_created_timestamp_seconds)
+              )
+              > on (namespace, schedule, origin, location, cluster) group_left()
+                (crystalbackup_schedule_period_seconds * 1.1 + 3600)
+            )
+            or
+            (
+              ((
+                (time() - crystalbackup_backup_last_success_timestamp_seconds)
+                or on (namespace, schedule, origin, location, cluster)
+                (time() - crystalbackup_schedule_created_timestamp_seconds)
+              ) > 93600)
+              unless on (namespace, schedule, origin, location, cluster)
+                crystalbackup_schedule_period_seconds
+            )
+          )
+          and on (namespace, schedule, origin, location, cluster)
+            (crystalbackup_schedule_active == 1)
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "No successful backup for {{ $labels.namespace }}/{{ $labels.schedule }} ({{ $labels.origin }}) within its schedule's deadline"
+          description: "The schedule is active and its deadline has passed with no successful Backup. Check the namespace's Backup objects for a failed or stuck run, and the mover Jobs in the operator namespace."
+      # Counter, so increase(): it survives the operator restart that resets it to zero (spec §1).
+      # The gauge sibling crystalbackup_backup_failures counts wreckage that still EXISTS — a
+      # different and also useful question, but not one increase() can ask.
+      - alert: CrystalbackupBackupFailed
+        expr: |
+          increase(crystalbackup_backup_failures_total[1h]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Backup failed for {{ $labels.namespace }}/{{ $labels.schedule }}"
+          description: "At least one Backup reached Failed or PartiallyFailed in the last hour. kubectl get backups -n {{ $labels.namespace }} shows which."
+      # The only critical rule here, because it is the only one that says the RESTORE PATH is
+      # compromised rather than that a backup is late.
+      # A repository that has never been checked emits no series at all (spec §2.4), so this stays
+      # silent on a fresh location instead of paging the moment one is created.
+      - alert: CrystalbackupRepositoryCheckFailed
+        expr: |
+          crystalbackup_repository_last_check_success == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "restic check failed on repository {{ $labels.location }} ({{ $labels.scope }})"
+          description: "restic found repository damage (R17). Restores from this repository may not work. Do not prune it until the check passes: inspect BackupRepository status.recentMaintenance."
+      # The 30m hold is the reaper's own budget: a lock is only stale after 30 minutes by restic's
+      # definition, and the reaper gets a full cycle to clear it before this says anything.
+      - alert: CrystalbackupStaleLocks
+        expr: |
+          crystalbackup_repository_stale_locks > 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Stale restic locks persist on {{ $labels.location }} (reaper not clearing)"
+          description: "Stale locks block backups and maintenance on this repository. The orphan reaper normally clears them within minutes; 30 minutes of persistence means it is not running or cannot reach the backend."
+      # A prune that keeps FAILING never advances lastMaintenanceTime, so staleness covers 'never
+      # ran', 'erroring every night' and 'controller wedged' in a single rule. 26h lets a daily
+      # pruneSchedule miss one window without paging.
+      # An Immutable location never prunes by design and emits no series at all (spec §2.4,
+      # adr/0005), so it cannot fire here — the absence is what makes that work, not a label
+      # exclusion this rule would have to remember to keep.
+      - alert: CrystalbackupMaintenanceStalled
+        expr: |
+          time() - crystalbackup_repository_last_maintenance_timestamp_seconds > 93600
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "No successful prune on {{ $labels.location }} for over 26h — the repository is growing unreclaimed"
+          description: "Forgotten snapshots are not being reclaimed, so the repository grows and the bill with it. Check the maintenance Job history in BackupRepository status.recentMaintenance."
+      # Tenant-visible: at scope=namespace with a non-empty namespace this routes to the tenant,
+      # who is the one whose list of restore points has silently gone stale (spec §2.5).
+      - alert: CrystalbackupDiscoveryFailed
+        expr: |
+          crystalbackup_discovery_last_success == 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Discovery failing on {{ $labels.location }} — Backup projections may be stale vs the repository"
+          description: "The repository is the source of truth (adr/0009). While discovery fails, `kubectl get backups` no longer reflects what is actually restorable."
+      # Not an error: the erasure is waiting, correctly, on a lock that exists to make deletion
+      # impossible. It is an alert because a right-to-erasure request quietly parked for weeks is
+      # a compliance problem regardless of whose fault it is.
+      - alert: CrystalbackupErasureBlocked
+        expr: |
+          crystalbackup_erasure_blocked > 0
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Right-to-erasure blocked on {{ $labels.location }} (Immutable object-lock not yet expired, R21/ADR 0005)"
+          description: "A ClusterErasure cannot complete until the object-lock window expires. This is expected on Immutable locations, but it is a GDPR clock running: someone has to know."
+      # The one family carrying a per-PVC label, and the documented exception to the
+      # no-per-PVC-label rule (spec §2.9): cardinality is bounded by the live PVC count, and this
+      # alert is the reason that cost is worth paying.
+      - alert: CrystalbackupPVCSnapshotPileup
+        expr: |
+          crystalbackup_pvc_volumesnapshot_count > 20
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} VolumeSnapshots piling up on PVC {{ $labels.namespace }}/{{ $labels.pvc }} (ceph-csi flatten risk, ADR 0006)"
+          description: "Snapshots are accumulating faster than they are released — usually a coexisting backup tool, or our own temp snapshots not being cleaned up. On ceph-csi this crosses the flatten threshold and stalls the volume."
+      # A never-completed sync emits last_success as 0, NOT absent (spec §2.12, deliberately unlike
+      # the repository family), so a secondary that never worked from day one fires here instead of
+      # being the one case the rule misses.
+      # The 26h stays fixed, unlike BackupMissed's: a sync's schedule is optional, so a manual sync
+      # has no period to derive a deadline from. The pause guard this rule also wants waits on
+      # crystalbackup_externalsync_active, which does not exist yet — and a rule referencing a series
+      # nobody emits is the exact defect this table was built to make impossible.
+      - alert: CrystalbackupExternalSyncStale
+        expr: |
+          time() - crystalbackup_externalsync_last_success_timestamp_seconds > 93600
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "External sync {{ $labels.sync }} ({{ $labels.source }}→{{ $labels.destination }}) has not completed in 26h"
+          description: "The secondary copy is falling behind. Check the sync CR's phase and the queue: a secondary nobody has verified is not a secondary."

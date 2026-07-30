@@ -67,12 +67,15 @@ var Version = "dev"
 var buildInfoDesc = prometheus.NewDesc(
 	NameBuildInfo,
 	"A constant 1, labelled with the operator build version; always present.",
-	[]string{"version"}, nil)
+	[]string{versionLabel}, nil)
 
 // Prometheus label names shared by the two metric families' label sets below (extracted so the
 // repeated names are defined once): the originating schedule, the location, and the cluster
 // identity (resolved from a location's clusterID).
 const (
+	// versionLabel is build_info's only label: the operator version, so a dashboard can join a
+	// series against the build that produced it.
+	versionLabel   = "version"
 	namespaceLabel = "namespace"
 	tenantLabel    = "tenant"
 	originLabel    = "origin"
@@ -157,6 +160,8 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- backupFailuresDesc
 	ch <- backupProtectedBytesDesc
 	ch <- scheduleActiveDesc
+	ch <- schedulePeriodDesc
+	ch <- scheduleCreatedDesc
 	ch <- clusterBackupLastSuccessDesc
 	ch <- clusterBackupNamespacesMatchedDesc
 	ch <- clusterBackupNamespacesFailedDesc

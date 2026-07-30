@@ -1,0 +1,29 @@
+{{- if .Values.metrics.rules.enabled }}
+{{- /*
+The nine alert rules of spec/05-observability.md §3, as a Prometheus Operator PrometheusRule.
+
+The body is `.Files.Get`, not a template, for two reasons that are really one. The annotations are
+full of Prometheus's OWN Go templates ({{`{{ $labels.namespace }}`}}), which Helm's engine would
+either error on or silently blank — the same reason templates/dashboards.yaml reads the dashboard
+JSON as a file. And the file is GENERATED from internal/alerts/rules.go (`make alert-rules`), where
+every expression is built from the constants in internal/metrics/names.go: transcribing the rules
+into a template here would put back exactly the drift that let five of these nine rules ship
+reading series the operator never emitted.
+*/ -}}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "crystal-backup.fullname" . }}
+  namespace: {{ default (include "crystal-backup.namespace" .) .Values.metrics.rules.namespace }}
+  labels:
+    {{- include "crystal-backup.labels" . | nindent 4 }}
+    {{- with .Values.metrics.rules.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with .Values.metrics.rules.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- $.Files.Get "rules/crystalbackup.rules.yaml" | nindent 2 }}
+{{- end }}

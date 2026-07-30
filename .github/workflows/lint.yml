@@ -66,6 +66,14 @@ jobs:
             exit 1
           fi
 
+      # The chart's alert rules are generated from internal/alerts/rules.go, where every
+      # expression is built from the internal/metrics/names.go constants. A stale committed
+      # file would mean the chart ships the previous release's rules while the Go source
+      # says otherwise — the same divergence between rule text and metric definitions that
+      # let five of the nine rules ship unable to fire, moved one step downstream.
+      - name: Verify the chart's alert rules are regenerated
+        run: make alert-rules-verify
+
   helm-lint:
     name: helm lint
     runs-on: ubuntu-latest
