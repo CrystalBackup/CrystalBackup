@@ -49,7 +49,7 @@ Architecture Decision Records live in [adr/](adr/). Key ones:
 - [0009 — Shared cluster repository, tag tenancy, cascade & repository-as-source-of-truth](adr/0009-shared-cluster-repo-tag-tenancy.md)
 - [0010 — Admission: ValidatingAdmissionPolicy first, webhook only for dynamic checks](adr/0010-admission-vap-first.md)
 - [0011 — Cluster-scoped disaster recovery: capture & selective restore](adr/0011-cluster-scoped-dr.md)
-- [0012 — Container images: apko + Wolfi base, SLSA L3+ provenance](adr/0012-container-images-apko-wolfi-slsa.md)
+- [0012 — Container images: apko + Wolfi base, SLSA Build Level 3 provenance](adr/0012-container-images-apko-wolfi-slsa.md)
 - [0013 — External backup synchronization to a secondary location](adr/0013-external-backup-sync.md)
 - [0014 — Versioning & release scheme (SemVer; milestone → minor on major 0)](adr/0014-versioning-and-release.md)
 - [0015 — Per-repository exclusive-queue serialization (movers are readers, maintenance ops are writers)](adr/0015-per-repository-exclusive-queue-serialization.md)

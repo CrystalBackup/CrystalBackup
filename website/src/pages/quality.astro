@@ -11,6 +11,7 @@ const links = {
   how: `${base}/#how`,
   compare: `${base}/#compare`,
   roadmap: `${base}/#roadmap`,
+  docs: `${base}/docs/`,
   testing: `${gh}/blob/main/spec/08-testing-and-dod.md`,
   security: `${gh}/blob/main/spec/03-security-and-tenancy.md`,
   adr: `${gh}/tree/main/spec/adr`,
@@ -24,6 +25,44 @@ const layers = [
   { layer: 'e2e core', harness: 'kind + csi-driver-hostpath + SeaweedFS', runs: 'every PR', gate: 'merge' },
   { layer: 'e2e full + fidelity', harness: 'same, extended matrix + metadata corpus', runs: 'nightly + release tags', gate: 'release' },
   { layer: 'Crucible', harness: 'disposable real platform — Ceph, Longhorn, Object Storage', runs: 'on demand', gate: 'milestone acceptance' },
+];
+
+// Every crucible acceptance run is published in full — passes, skips and the defects each
+// round found. Files live in website/public/reports/, so they are served from `${base}/reports/`.
+const reports = [
+  {
+    milestone: 'M1',
+    covered: 'Core engine and cluster DR — the schedule → backup → per-namespace fan-out cascade, CSI snapshot exposers, discovery from the repository, retention',
+    links: [['Crucible M1', 'crucible-m1.html']],
+  },
+  {
+    milestone: 'M2',
+    covered: 'Restore — self-service in a namespace, operator-mediated cluster-DR restore, <code>ClusterRestore</code>, admission policies. Every restored volume byte-compared against the seed manifest',
+    links: [
+      ['Crucible M2', 'crucible-m2.html'],
+      ['0.2.1 re-run', 'crucible-m2.1.html'],
+      ['Audit 2.1', 'audit-m2.1.html'],
+    ],
+  },
+  {
+    milestone: 'M3',
+    covered: 'Manifests and cluster-scoped DR — the sanitization engine, mode-aware apply, cluster-resource capture with opt-in and selective restore',
+    links: [
+      ['Crucible M3', 'crucible-m3.html'],
+      ['Audit 3.1', 'audit-m3.1.html'],
+      ['Audit 3.2', 'audit-m3.2.html'],
+    ],
+  },
+  {
+    milestone: 'M4',
+    covered: 'Consistency hooks, repository verification (<code>restic&nbsp;check</code>) and scheduled maintenance. Run <strong>seven independent times</strong> — the milestone’s hardest bug was a snapshot leak reproducing about one run in three',
+    links: [['Crucible M4', 'crucible-m4.html']],
+  },
+  {
+    milestone: 'M5',
+    covered: 'Namespace plane, external sync, right to erasure — plus a full-suite non-regression pass on the build that shipped',
+    links: [['Crucible M5', 'crucible-m5.html']],
+  },
 ];
 
 const gates = [
@@ -42,7 +81,7 @@ const gates = [
 const guards = [
   ['Coverage gates', 'At least 80% on the controllers and 100% on the sanitization rules — an unreached rule fails CI, so no rule can rot untested.'],
   ['No flaky retries', 'No automatic retries — they hide the very races we cannot afford. Tests must pass under <code>-count=2</code>; two flakes within 7 days quarantines a test with a tracked fix SLA.'],
-  ['Hardened supply chain', 'Images built with <strong>apko</strong> on <strong>Wolfi</strong> for a near-zero CVE surface, a 0-known-CVE scan gate, cosign signatures, an SBOM, and verified <strong>SLSA&nbsp;L3+</strong> provenance — re-attested on a scheduled rebuild.'],
+  ['Hardened supply chain', 'Images built with <strong>apko</strong> on <strong>Wolfi</strong> for a near-zero CVE surface, a 0-known-CVE scan gate, cosign signatures, an SBOM, and verified <strong>SLSA&nbsp;Build&nbsp;Level&nbsp;3</strong> provenance — plus an <strong>OpenVEX</strong> document re-generated and re-attested daily for the three most recent releases.'],
   ['Two-person review', 'CODEOWNERS forces two approvals on anything that touches encryption keys, the server-side tenancy derivation, or admission.'],
 ];
 
@@ -80,6 +119,7 @@ const description =
         <a href={links.how}>How it works</a>
         <a href={links.compare}>Compare</a>
         <a href={links.roadmap}>Roadmap</a>
+        <a href={links.docs}>Docs</a>
         <a class="current" href="#top" aria-current="page">Quality</a>
         <a class="btn btn-ghost btn-sm" href={links.gh} target="_blank" rel="noopener">
           <span class="star">★</span> Star on GitHub
@@ -183,6 +223,47 @@ const description =
         </p>
       </section>
 
+      <!-- ─────────────────── the published reports ────────────── -->
+      <section class="section">
+        <p class="eyebrow">The evidence</p>
+        <h2>Every acceptance run, published in full</h2>
+        <p class="section-lead">
+          No milestone shipped without passing its crucible run on real infrastructure. The
+          reports below are the raw output of those runs — check by check, including the
+          <strong>skips</strong> and the <strong>defects each round found</strong>. Writing the M5
+          suite alone surfaced three advertised features that were completely inert on real
+          storage. That is the argument for reading them rather than a summary.
+        </p>
+        <div class="table-wrap">
+          <table class="layers reports">
+            <thead>
+              <tr><th>Milestone</th><th>What the run covered</th><th>Report</th></tr>
+            </thead>
+            <tbody>
+              {
+                reports.map((r) => (
+                  <tr>
+                    <td class="lname">{r.milestone}</td>
+                    <td set:html={r.covered} />
+                    <td class="rlinks">
+                      {r.links.map(([label, file]) => (
+                        <a href={`${base}/reports/${file}`}>{label}</a>
+                      ))}
+                    </td>
+                  </tr>
+                ))
+              }
+            </tbody>
+          </table>
+        </div>
+        <p class="section-foot">
+          The oracle in those runs is <strong>independent</strong>: every claim about a repository
+          is re-checked by a throwaway Job running the plain upstream <code>restic</code> CLI
+          against the same repository, credentials and key the operator used. A controller that
+          both writes and reports the same wrong thing cannot make a check pass.
+        </p>
+      </section>
+
       <!-- ───────────────────── the guardrails ────────────────── -->
       <section class="section">
         <p class="eyebrow">The guardrails</p>
@@ -222,6 +303,7 @@ const description =
       </div>
       <nav class="foot-links">
         <a href={links.home}>Home</a>
+        <a href={links.docs}>Documentation</a>
         <a href={links.testing} target="_blank" rel="noopener">Testing &amp; DoD</a>
         <a href={links.security} target="_blank" rel="noopener">Security &amp; tenancy</a>
         <a href={links.crucible} target="_blank" rel="noopener">Crucible</a>
@@ -265,6 +347,19 @@ const description =
         border-radius: 999px;
         white-space: nowrap;
       }
+
+      /* The reports table reuses .layers; only the link cell needs its own rules. */
+      .reports tbody tr:last-child { background: none; }
+      .reports td.rlinks { white-space: nowrap; }
+      .reports td.rlinks a {
+        display: block;
+        color: var(--cyan);
+        font-weight: 650;
+        font-size: 0.92rem;
+        text-decoration: none;
+      }
+      .reports td.rlinks a + a { margin-top: 6px; }
+      .reports td.rlinks a:hover { text-decoration: underline; }
 
       .gate-card { display: flex; flex-direction: column; }
       .cards { grid-template-columns: repeat(2, 1fr); }

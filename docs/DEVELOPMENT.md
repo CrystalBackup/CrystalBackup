@@ -199,7 +199,7 @@ Both the operator and the `crystal-mover` images are:
 - **multi-arch** — `linux/amd64` + `linux/arm64`, assembled as one image index (no QEMU); the
   **index digest** is what gets signed/attested;
 - gated at **0-known-CVE** (trivy), **cosign-signed keyless**, shipped with an **SPDX SBOM**,
-  an **OpenVEX** document and **SLSA L3+ provenance**;
+  an **OpenVEX** document and **SLSA Build Level 3 provenance**;
 - published to **GHCR** `ghcr.io/crystalbackup/*` and pinned by digest.
 
 The build/sign/scan/publish pipeline lives in the release workflow
@@ -274,14 +274,24 @@ SemVer with milestone→minor mapping on major `0`
 freeze) is a deliberate post-M9 decision. The operator image, mover image, chart `appVersion`, and
 `crystalctl` (from M7) share one version per release; releases are git tags `vX.Y.Z`.
 
-## 10. Known gaps at M0
+## 10. Known gaps in the toolchain
 
-M0 is scaffolding — the operator has no reconcile logic yet ([../spec/90-roadmap.md](../spec/90-roadmap.md)).
-A few CI/toolchain items intentionally trail the spec until the code they guard exists:
+M0 through M5 have shipped ([../spec/90-roadmap.md](../spec/90-roadmap.md)); this section is no
+longer about missing code, but about **CI/toolchain items that still trail the spec**. Each one
+below was re-checked against the current tree — do the same before adding or removing an entry.
 
-- **Coverage gates** (§4) are not yet enforced in CI (no `internal/controller` / sanitization
-  packages yet); the artifact is published for inspection.
-- The spec calls for `go test -race`; enabling `-race` in the Makefile `test` target is a follow-up
-  for the Makefile owner.
-- `charts/crystal-backup` is landed by the chart track; until it exists the `helm lint` job will
-  report the chart as missing.
+- **Coverage gates** (§4) are still **not enforced** in CI. `make test` writes `cover.out` and
+  `.github/workflows/test.yml` uploads it as an artifact for inspection, but nothing compares it
+  against the spec's thresholds (≥ 80 % on `internal/controller/...`, 100 % on the sanitization
+  rules). The packages the gate was waiting on exist now, so the only thing missing is the check
+  itself.
+- **`-race` is still not on.** The spec calls for `go test -race`; the Makefile `test` target runs
+  `go test … -coverprofile cover.out` with no `-race`. `make test-e2e` does not enable it either.
+- **No scheduled image rebuild.** [adr/0012](../spec/adr/0012-container-images-apko-wolfi-slsa.md)
+  and [08-testing-and-dod.md](../spec/08-testing-and-dod.md) describe a scheduled rebuild against
+  the rolling Wolfi apk set; the only scheduled supply-chain workflow that exists is
+  `.github/workflows/vex-refresh.yml`, which re-attests VEX **without rebuilding**. That closes
+  the information gap, not the remediation one.
+
+Resolved since M0, kept here only so nobody re-adds them: `charts/crystal-backup` exists and
+`helm lint` runs against it in `.github/workflows/lint.yml`.

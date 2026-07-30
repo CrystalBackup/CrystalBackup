@@ -37,7 +37,7 @@ within a milestone are **patch** releases.**
 - **Tags, registry & provenance.** Releases are git tags `vX.Y.Z`; images publish **by digest**
   to **GHCR** (`ghcr.io/crystalbackup/*`) with the release version as an added tag, as a
   **multi-arch index** (`linux/amd64` + `linux/arm64`) carrying cosign signature + SBOM + SLSA
-  L3+ provenance ([adr/0012](0012-container-images-apko-wolfi-slsa.md)). CLI/UI binaries are
+  Build Level 3 provenance ([adr/0012](0012-container-images-apko-wolfi-slsa.md)). CLI/UI binaries are
   cross-platform (linux/windows/darwin × amd64/arm64, [06-cli.md §7](../06-cli.md)).
   Pre-releases use SemVer pre-release suffixes (`0.1.0-rc.1`).
 

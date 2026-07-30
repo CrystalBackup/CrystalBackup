@@ -1,0 +1,195 @@
+/*
+ * Starlight, wearing the landing page's clothes.
+ *
+ * The palette, the type scale and the surface treatment are lifted from
+ * src/styles/site.css so that /docs and / read as one product. Everything here is
+ * a remap of Starlight's own custom properties — no structural overrides — so a
+ * Starlight upgrade changes layout, never colour.
+ *
+ * Dark only, on purpose: see src/components/docs/ThemeSelect.astro.
+ */
+
+:root,
+:root[data-theme='dark'],
+:root[data-theme='light'] {
+  color-scheme: dark;
+
+  /* ── the site palette (kept in sync with src/styles/site.css) ── */
+  --cb-bg: #060912;
+  --cb-bg-2: #0a1020;
+  --cb-panel: rgba(255, 255, 255, 0.035);
+  --cb-panel-2: rgba(255, 255, 255, 0.055);
+  --cb-brd: rgba(255, 255, 255, 0.09);
+  --cb-brd-2: rgba(255, 255, 255, 0.16);
+  --cb-cyan: #3fc8f5;
+  --cb-blue: #2b63f0;
+  --cb-text: #e9f0ff;
+  --cb-muted: #9aabce;
+  --cb-muted-2: #6f7fa6;
+  --cb-grad: linear-gradient(135deg, #3fc8f5, #2b63f0);
+
+  /* ── Starlight accent scale ── */
+  --sl-color-accent-low: #10233f;
+  --sl-color-accent: #2b63f0;
+  --sl-color-accent-high: #9ddcf7;
+
+  /* ── Starlight greyscale, mapped onto the site's ink ── */
+  --sl-color-white: #ffffff;
+  --sl-color-gray-1: var(--cb-text);
+  --sl-color-gray-2: #c7d6f5;
+  --sl-color-gray-3: var(--cb-muted);
+  --sl-color-gray-4: var(--cb-muted-2);
+  --sl-color-gray-5: #2a3452;
+  --sl-color-gray-6: #161d31;
+  --sl-color-gray-7: #0e1526;
+  --sl-color-black: var(--cb-bg);
+
+  --sl-color-bg: var(--cb-bg);
+  --sl-color-bg-nav: rgba(6, 9, 18, 0.72);
+  --sl-color-bg-sidebar: transparent;
+  --sl-color-bg-inline-code: rgba(63, 200, 245, 0.1);
+  --sl-color-hairline: var(--cb-brd);
+  --sl-color-hairline-light: var(--cb-brd);
+  --sl-color-hairline-shade: var(--cb-brd);
+  --sl-color-text: var(--cb-text);
+  --sl-color-text-accent: var(--cb-cyan);
+  --sl-color-text-invert: #041027;
+
+  /* ── semantic asides ── */
+  --sl-color-green: #57d6a8;
+  --sl-color-green-low: #0d2b21;
+  --sl-color-green-high: #a8ecd3;
+  --sl-color-orange: #f2c14e;
+  --sl-color-orange-low: #2e2410;
+  --sl-color-orange-high: #f8dd9c;
+  --sl-color-red: #ff7a8a;
+  --sl-color-red-low: #35131a;
+  --sl-color-red-high: #ffc0c8;
+  --sl-color-blue: var(--cb-cyan);
+  --sl-color-blue-low: #0c2536;
+  --sl-color-blue-high: #b9e8fb;
+  --sl-color-purple: #b39dff;
+  --sl-color-purple-low: #1d1836;
+  --sl-color-purple-high: #d9cfff;
+
+  --sl-font: 'Inter', system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  --sl-font-mono: ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, Consolas, monospace;
+
+  --sl-content-width: 50rem;
+  --sl-nav-height: 3.75rem;
+}
+
+/* The landing page's ambient glow, so scrolling from / into /docs feels continuous. */
+body {
+  background:
+    radial-gradient(900px 600px at 78% -8%, rgba(43, 99, 240, 0.16), transparent 60%),
+    radial-gradient(700px 520px at 8% 4%, rgba(63, 200, 245, 0.1), transparent 58%),
+    linear-gradient(180deg, var(--cb-bg), var(--cb-bg-2));
+  background-attachment: fixed;
+  -webkit-font-smoothing: antialiased;
+}
+
+header.header {
+  background: var(--sl-color-bg-nav);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  border-bottom: 1px solid var(--cb-brd);
+}
+
+.site-title {
+  font-weight: 800;
+  letter-spacing: -0.01em;
+}
+.site-title img {
+  filter: drop-shadow(0 3px 10px rgba(43, 99, 240, 0.5));
+}
+
+/* ── headings: the landing page's tight, negative-tracked scale ── */
+.sl-markdown-content h1,
+.sl-markdown-content h2,
+.sl-markdown-content h3,
+.sl-markdown-content h4,
+.content-panel h1 {
+  letter-spacing: -0.02em;
+  font-weight: 750;
+}
+.sl-markdown-content h2 {
+  padding-top: 0.4em;
+  border-top: 1px solid var(--cb-brd);
+}
+.sl-markdown-content h2:first-of-type {
+  border-top: 0;
+  padding-top: 0;
+}
+
+/* ── inline code: same cyan chip as the landing page ── */
+.sl-markdown-content
+  :not(a, strong, em, del, span, input, code, pre)
+  > code:not(:where(.not-content *)) {
+  border: 1px solid rgba(63, 200, 245, 0.16);
+  border-radius: 6px;
+  color: #b9e8fb;
+  font-size: 0.86em;
+  padding: 0.08em 0.4em;
+}
+
+/* ── surfaces: the panel treatment used by every card on / ── */
+.sl-markdown-content .expressive-code .frame pre,
+.sl-markdown-content pre:not(:where(.not-content *)) {
+  border: 1px solid var(--cb-brd);
+  border-radius: 12px;
+}
+
+.sl-markdown-content table:not(:where(.not-content *)) {
+  border: 1px solid var(--cb-brd);
+  border-radius: var(--cb-radius, 12px);
+  border-collapse: collapse;
+  overflow: hidden;
+}
+.sl-markdown-content :is(th, td):not(:where(.not-content *)) {
+  border-bottom: 1px solid var(--cb-brd);
+  padding: 0.6rem 0.8rem;
+}
+.sl-markdown-content th:not(:where(.not-content *)) {
+  background: rgba(255, 255, 255, 0.02);
+  color: var(--cb-muted);
+  font-weight: 700;
+}
+
+.sl-markdown-content .starlight-aside {
+  border-radius: 12px;
+  border-inline-start-width: 3px;
+}
+
+/* ── sidebar ── */
+.sidebar-content .large {
+  color: var(--cb-cyan);
+  font-size: 0.74rem;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+.sidebar-content a[aria-current='page'] {
+  background: linear-gradient(135deg, rgba(63, 200, 245, 0.12), rgba(43, 99, 240, 0.1));
+  border-radius: 8px;
+  color: var(--cb-text);
+}
+
+/* ── links ── */
+.sl-markdown-content a:not(:where(.not-content *)) {
+  color: var(--cb-cyan);
+  text-underline-offset: 0.2em;
+}
+
+/* The site title is the way back to the landing page (Starlight points it at the
+   site root, which is `/CrystalBackup/`), so give it a visible hover state — /docs
+   is not the site root and that link is the only route home. */
+.site-title:hover {
+  color: var(--cb-cyan);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation: none !important;
+  }
+}

@@ -6,6 +6,7 @@ const base = import.meta.env.BASE_URL.replace(/\/$/, '');
 const gh = 'https://github.com/CrystalBackup/CrystalBackup';
 const links = {
   gh,
+  docs: `${base}/docs/`,
   quality: `${base}/quality/`,
   specs: `${gh}/tree/main/spec`,
   requirements: `${gh}/blob/main/spec/00-requirements.md`,
@@ -71,7 +72,7 @@ const milestones = [
   ['0.3.2', 'Hardening — restore safety (Recreate data loss, finalizer leak)', 'patch', [['Report', `${base}/reports/audit-m3.2.html`]]],
   ['M4', 'Consistency hooks, verification & maintenance', 'done', `${base}/reports/crucible-m4.html`],
   ['M5', 'Namespace plane, external sync & right-to-erasure', 'done', `${base}/reports/crucible-m5.html`],
-  ['M6', 'Observability hardening & production beta', 'here'],
+  ['M6', 'Observability hardening & production readiness', 'here'],
   ['M7', 'CLI & browse UI', ''],
   ['M8', 'Immutable locations', ''],
   ['M9', 'Coexistence hardening & DR drills', ''],
@@ -112,6 +113,7 @@ const description =
         <a href="#how">How it works</a>
         <a href="#compare">Compare</a>
         <a href="#roadmap">Roadmap</a>
+        <a href={links.docs}>Docs</a>
         <a href={links.quality}>Quality</a>
         <a class="btn btn-ghost btn-sm" href={links.gh} target="_blank" rel="noopener">
           <span class="star">★</span> Star on GitHub
@@ -136,8 +138,11 @@ const description =
             repositories. Real tenant isolation. No lock-in.
           </p>
           <div class="hero-cta">
-            <a class="btn btn-primary" href={links.specs} target="_blank" rel="noopener">
-              Read the design →
+            <a class="btn btn-primary" href={links.docs}>
+              Read the docs →
+            </a>
+            <a class="btn btn-ghost" href={links.specs} target="_blank" rel="noopener">
+              Read the design
             </a>
             <a class="btn btn-ghost" href={links.gh} target="_blank" rel="noopener">
               <span class="star">★</span> Watch the repo
@@ -148,6 +153,13 @@ const description =
             <li>restic-compatible</li>
             <li>0-CVE images (apko/Wolfi)</li>
             <li>Built in the open, with AI</li>
+            <li>
+              <a
+                href={links.quality}
+                style="color: var(--cyan); text-decoration: underline; text-underline-offset: 3px;"
+                >Real-cluster test reports, published</a
+              >
+            </li>
           </ul>
         </div>
         <div class="hero-art" aria-hidden="true">
@@ -254,10 +266,12 @@ const description =
       <!-- ─────────────────────── compare ─────────────────────── -->
       <section id="compare" class="section">
         <p class="eyebrow">How it compares</p>
-        <h2>Where Crystal Backup aims</h2>
+        <h2>Where Crystal Backup stands</h2>
         <p class="section-lead">
-          Early-stage <strong>targets</strong> vs the <strong>current</strong> capabilities of
-          established tools, to our knowledge — different projects, different goals, not a benchmark.
+          Our column is <strong>v0.5.1 as shipped</strong> — every “yes” below is code you can
+          install today, exercised by the <a href={links.quality}>published acceptance reports</a>.
+          The other columns are those tools’ <strong>current</strong> capabilities, to our
+          knowledge — different projects, different goals, not a benchmark.
         </p>
 
         <div class="table-wrap">
@@ -267,7 +281,7 @@ const description =
                 <th class="cap">Capability</th>
                 {
                   compareCols.map((c, i) => (
-                    <th class={i === 0 ? 'ours' : ''}>{c}{i === 0 && <small>target</small>}</th>
+                    <th class={i === 0 ? 'ours' : ''}>{c}{i === 0 && <small>shipped</small>}</th>
                   ))
                 }
               </tr>
@@ -297,6 +311,14 @@ const description =
           <span class="mark partial"></span> Partial / conditional
           <span class="mark no"></span> No
         </p>
+        <p class="section-foot">
+          Deliberately absent from that table, because they are <strong>not shipped</strong>:
+          immutable locations with S3 Object Lock (<strong>M8</strong> — the field is accepted,
+          Object Lock is not implemented, so it does not give you WORM), and the
+          <code>crystalctl</code> CLI with its browse UI (<strong>M7</strong> — there is no
+          user-facing command-line tool yet). The full list, with the costs you accept, is on
+          <a href={`${base}/docs/discover/when-not-to-use/`}>when not to choose it</a>.
+        </p>
       </section>
 
       <!-- ─────────────────────── roadmap ─────────────────────── -->
@@ -308,7 +330,9 @@ const description =
           CI, the core engine, cluster disaster recovery, self-service &amp; admin restore,
           manifest &amp; cluster-scoped DR, consistency hooks, repository maintenance, the
           namespace plane, external sync and the right to erasure are live (v0.5.1); we’re now
-          building <strong>M6 — Observability hardening &amp; production beta</strong>.
+          building <strong>M6 — Observability hardening &amp; production readiness</strong>. Each
+          shipped milestone links its acceptance report below — the checks it had to pass on a
+          real cluster, in full.
         </p>
         <ol class="timeline">
           {
@@ -331,7 +355,9 @@ const description =
           }
         </ol>
         <p class="section-foot">
-          Full breakdown in <a href={links.roadmap} target="_blank" rel="noopener">the roadmap</a>.
+          Full breakdown in <a href={links.roadmap} target="_blank" rel="noopener">the roadmap</a>,
+          or <a href={`${base}/docs/discover/status/`}>project status</a> for what each milestone
+          delivered and how it was verified.
         </p>
       </section>
 
@@ -351,9 +377,11 @@ const description =
           <aside class="note">
             <h3>You’re early — and that’s the point</h3>
             <p>
-              M0 through M5 have shipped (v0.5.1) — real, tested code — but it’s still early: most
-              milestones are ahead and it isn’t production-ready yet, so try it in a sandbox, keep
-              your existing backups, and use it at your own risk. It’s
+              M0 through M5 have shipped (v0.5.1) — real, tested code, accepted on a real
+              RKE2/Ceph cluster with <a href={links.quality}>the reports published</a>. It is
+              still early: four milestones are ahead, the CRD API is <code>v1alpha1</code> and
+              will still move, and the production-hardening pass is M6. So try it in a sandbox,
+              keep your existing backups, test your restores, and use it at your own risk. It’s
               provided <strong>as-is under Apache-2.0</strong>, without warranty. If the direction
               speaks to you, <a href={links.gh} target="_blank" rel="noopener">star or watch the
               repo</a> and follow along.
@@ -364,14 +392,21 @@ const description =
 
       <!-- ───────────────────────── cta ───────────────────────── -->
       <section class="cta">
-        <h2>Follow the build</h2>
-        <p>The specifications, 16 decision records and manifest &amp; cluster-scoped DR (v0.3.0) are public. Consistency hooks, verification &amp; maintenance are next.</p>
+        <h2>Try it, or read every decision</h2>
+        <p>
+          M0–M5 are installable today (v0.5.1); the specifications, the 18 decision records and
+          every acceptance report are public. Observability hardening &amp; production readiness
+          (M6) are next.
+        </p>
         <div class="hero-cta">
-          <a class="btn btn-primary" href={links.gh} target="_blank" rel="noopener">
+          <a class="btn btn-primary" href={`${base}/docs/start/install/`}>
+            Install it →
+          </a>
+          <a class="btn btn-ghost" href={links.gh} target="_blank" rel="noopener">
             <span class="star">★</span> Star / watch on GitHub
           </a>
           <a class="btn btn-ghost" href={links.requirements} target="_blank" rel="noopener">
-            Read the requirements →
+            Read the requirements
           </a>
         </div>
       </section>
@@ -384,6 +419,7 @@ const description =
         <span class="brand-name">Crystal<span>Backup</span></span>
       </div>
       <nav class="foot-links">
+        <a href={links.docs}>Documentation</a>
         <a href={links.requirements} target="_blank" rel="noopener">Requirements</a>
         <a href={links.architecture} target="_blank" rel="noopener">Architecture</a>
         <a href={links.security} target="_blank" rel="noopener">Security &amp; tenancy</a>

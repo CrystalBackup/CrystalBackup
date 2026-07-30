@@ -1,9 +1,16 @@
-# ADR 0012 — Container images: apko + Wolfi base, SLSA L3+ provenance
+# ADR 0012 — Container images: apko + Wolfi base, SLSA Build Level 3 provenance
 
 Status: **Accepted** (2026-07-15, product owner + tech lead)
 · **Amended 2026-07-20**: VEX (OpenVEX) generation, attestation, support window, and the
 fix-first position of the release gate — see the *VEX for the day-N question* and *Support
 window* bullets in the Decision.
+· **Amended 2026-07-30**: this ADR — and the documents that quoted it — described the target
+as "SLSA L3+". **There is no such level.** The SLSA v1.0 Build Track defines Build L1, L2 and
+L3; "L3+" was a rhetorical flourish that read as a claim above the top of the track. The level
+the pipeline actually reaches is **Build Level 3**, via `actions/attest-build-provenance` on
+GitHub-hosted runners — which is what `.github/workflows/images.yml` has always said. Only the
+wording changed; no decision, target or control was revised. The file name is kept so existing
+links resolve.
 
 ## Context
 
@@ -14,7 +21,7 @@ posture is therefore a **product** property, not a build detail:
 - a **0-known-CVE** baseline is required ([00-requirements.md §5](../00-requirements.md)): a
   backup tool that ships CVEs undermines the trust it exists to provide;
 - the build must produce **verifiable provenance** (who/what/how built this exact digest),
-  targeting **SLSA Build L3+**;
+  targeting **SLSA Build Level 3**;
 - images must stay **minimal** (no shell, no package manager at runtime) to shrink attack
   surface, and be **reproducible** so rebuilding a tag yields the same content.
 
@@ -25,7 +32,7 @@ Debian-cadence. Three base strategies were compared: Debian-based **distroless**
 ## Decision
 
 **Build every image (operator, mover) declaratively with `apko` on a Wolfi (glibc) base,
-package anything compiled from source with `melange`, and emit SLSA L3+ provenance from GitHub
+package anything compiled from source with `melange`, and emit SLSA Build Level 3 provenance from GitHub
 Actions.**
 
 - **Wolfi, glibc — not Alpine/musl.** restic + our shim are data-critical; musl's DNS/NSS and
@@ -51,11 +58,13 @@ Actions.**
   architecture. Images publish to **GHCR** (`ghcr.io/crystalbackup/*`) and are pinned by index
   digest; arm64 lets the operator run on Graviton/Ampere and Arm edge clusters. Adding an arch
   later is a config line, not a build-system change.
-- **SLSA L3+ in GitHub Actions.** Build on GitHub-hosted runners with an **isolated builder** and
-  **non-falsifiable provenance** — the attestation is generated with the SLSA GitHub generator /
-  `cosign attest` using the workflow's ephemeral OIDC identity (Fulcio/Rekor) → **Build L3** (L3
-  requires builder isolation + unforgeable provenance, **not** full hermeticity). `slsa-verifier`
-  / `cosign verify-attestation` gate the release.
+- **SLSA Build Level 3 in GitHub Actions.** Build on GitHub-hosted runners with an **isolated
+  builder** and **non-falsifiable provenance** — the attestation is generated with the SLSA
+  GitHub generator / `cosign attest` using the workflow's ephemeral OIDC identity
+  (Fulcio/Rekor) → **Build Level 3**, which requires builder isolation + unforgeable provenance,
+  **not** full hermeticity. Build L3 is the **top** of the SLSA v1.0 Build Track: there is
+  nothing above it to claim, and the earlier "L3+" wording implied otherwise.
+  `slsa-verifier` / `cosign verify-attestation` gate the release.
 - **CI gate.** A container CVE scan (trivy) blocks release above a **0-known-CVE** threshold;
   signature + provenance verification run in the release job
   ([08-testing-and-dod.md §7](../08-testing-and-dod.md)). The gate is **fix-first**: a CVE found
@@ -162,5 +171,7 @@ Actions.**
 - Wolfi rolling churn becomes operationally heavy → pin to a Chainguard stable stream.
 - A surfaced need proves the operator can be pure-`scratch` static with no glibc/cert/tz
   dependency → reconsider a scratch operator image (the mover still needs the restic apk).
-- SLSA **L4** tooling matures on GitHub Actions → raise the provenance target.
+- **SLSA defines a Build Level above 3** and the tooling for it matures on GitHub Actions →
+  raise the provenance target. As of v1.0 the Build Track stops at L3, so there is no higher
+  target to aim at today.
 - restic ships an official, version-matched Wolfi apk → drop the melange recipe.

@@ -459,7 +459,7 @@ full namespace recovery (R15). Implications, stated plainly:
   a **0-known-CVE** posture (not Alpine/musl), **signed (cosign, keyless)**, carrying an SPDX
   **SBOM**, and referenced **by digest** in the Helm chart; no user-facing CR field selects
   images ([adr/0012](adr/0012-container-images-apko-wolfi-slsa.md)).
-- **SLSA L3+ build provenance** is generated in GitHub Actions (isolated builder + ephemeral OIDC
+- **SLSA Build Level 3 provenance** is generated in GitHub Actions (isolated builder + ephemeral OIDC
   identity → non-falsifiable provenance) and verified in the release job; a **CVE-scan gate**
   (0-known-CVE threshold) plus a **scheduled rebuild** against the rolling Wolfi apk set
   **minimize the known-CVE exposure window** between releases (base/OS CVEs are remediated by the

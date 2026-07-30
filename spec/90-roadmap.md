@@ -33,7 +33,7 @@ but stays `0.6.z`. Images publish to **GHCR** (`ghcr.io/crystalbackup`) as multi
       `make` targets ([02-api.md](02-api.md)).
 - [ ] CI (GitHub Actions): lint (golangci-lint), unit tests + coverage gate, **multi-arch
       (`linux/amd64` + `linux/arm64`) image build with apko on Wolfi (glibc, 0-known-CVE) +
-      melange-built restic + SBOM + cosign sign + SLSA L3+ provenance + container CVE-scan gate,
+      melange-built restic + SBOM + cosign sign + SLSA Build Level 3 provenance + container CVE-scan gate,
       published to GHCR** ([adr/0012](adr/0012-container-images-apko-wolfi-slsa.md)),
       chart packaging (`crystal-backup`), e2e stage skeleton.
 - [ ] Observability plumbing: zap JSON-lines on stdout, controller-runtime metrics endpoint
@@ -47,7 +47,7 @@ but stays `0.6.z`. Images publish to **GHCR** (`ghcr.io/crystalbackup`) as multi
 **Exit criteria**: `make test && make e2e` green in CI on an empty-logic operator; JSON logs
 and `/metrics` verified; every CRD installs and round-trips; **multi-arch images
 (`linux/amd64` + `linux/arm64`) build via apko (Wolfi), signed + SBOM + 0-known-CVE gate green +
-SLSA L3+ provenance attested, pushed to GHCR**.
+SLSA Build Level 3 provenance attested, pushed to GHCR**.
 
 ## M1 — Core engine & cluster DR (R1, R2 partial, R11, R12, R13, R20, R24 partial, R25, R26)
 
