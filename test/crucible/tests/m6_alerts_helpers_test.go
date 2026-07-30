@@ -233,6 +233,23 @@ type m6Sample struct {
 	Value  []any             `json:"value"`
 }
 
+// m6AllCrystalbackupSeries returns every crystalbackup_ series Prometheus holds AT THIS INSTANT,
+// with its full label set.
+//
+// An instant query, and NOT /api/v1/labels — which is the instrument the obvious version of this
+// check would reach for and which would be wrong. The labels endpoint answers "which label names
+// exist anywhere in this TSDB", block-granular: on the crucible it still listed
+// `exported_namespace` after the ServiceMonitor was fixed and the operator redeployed, because
+// series scraped before the fix were still inside the 6h retention window — and it kept listing it
+// when the query was narrowed to the last two minutes. A gate built on that endpoint goes red
+// forever the first time the bug occurs, including on the run that proves it fixed, which is the
+// most reliable way to get a gate deleted.
+//
+// The instant vector is the honest question: what is the CURRENT scrape putting in the database.
+func m6AllCrystalbackupSeries() ([]m6Sample, error) {
+	return m6Query(`{__name__=~"crystalbackup_.+"}`)
+}
+
 // m6Query runs an instant PromQL query and returns the vector result.
 func m6Query(expr string) ([]m6Sample, error) {
 	var data struct {
@@ -313,4 +330,5 @@ var m6ShippedAlertNames = []string{
 	"CrystalbackupPVCSnapshotPileup",
 	"CrystalbackupExternalSyncStale",
 	"CrystalbackupSchedulePausedTooLong",
+	"CrystalbackupExternalSyncPausedTooLong",
 }

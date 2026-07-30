@@ -110,7 +110,7 @@ debugging shortcut.
 
 ### The alert lane (`alerts`, also `m6`)
 
-The ten shipped alert rules are generated from `internal/alerts/rules.go` and
+The eleven shipped alert rules are generated from `internal/alerts/rules.go` and
 tested on two levels, because one level cannot see what the other checks.
 
 `make test-alert-rules` runs [promtool unit
@@ -153,6 +153,29 @@ Two things this lane asserts for free, without provoking anything: that Promethe
 has **loaded every rule the chart ships** with `health: ok` and no evaluation error
 — a PrometheusRule nobody selects is valid, installed and completely inert — and
 that the healthy shared `dr` repository is *not* paging while the corrupted one is.
+
+Before any of that, and before anything is provoked, the lane asserts a **label
+invariant**: no `crystalbackup_` series may carry an `exported_*` label, and no
+series from a family that declares its own `namespace` may report the operator's
+namespace. That check exists because the lane's first real run found the chart's
+ServiceMonitor was missing `honorLabels`, so the scrape target's `namespace`
+overwrote every tenant's and the real value survived only as `exported_namespace`.
+Nothing looked broken — the alert expressions still joined, because both sides of
+`on (namespace, …)` carried the same wrong value — so `BackupMissed` fired at the
+right moment and named the operator's namespace, routing every tenant's page to one
+place. It is asserted first because it invalidates every measurement downstream, and
+stated as `exported_*` rather than `exported_namespace` because the same collision
+is waiting for anything we ever add called `pod`, `service`, `container` or `job`.
+
+Two traps worth knowing if you touch that check. It uses an **instant query**, not
+`/api/v1/labels`: the labels endpoint reports any label name present anywhere in the
+TSDB blocks, so it still listed `exported_namespace` after the fix was deployed and
+verified — a gate built on it goes red forever the first time the bug occurs. And it
+only applies the namespace half to families that declare `namespace` in
+`metrics.Catalogue()`: a ServiceMonitor legitimately attaches the target's namespace
+to series that have none of their own, so `crystalbackup_build_info`,
+`crystalbackup_clusterbackup_*` and `crystalbackup_mover_*` carry
+`crystal-backup-system` on a perfectly healthy cluster.
 
 Like the fidelity gate, it cannot self-disable. If Prometheus is unreachable, if the
 ServiceMonitor was not selected, if the scrape is denied — the spec fails.

@@ -21,7 +21,9 @@ package crucible
 import (
 	"fmt"
 	"os"
+	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -35,6 +37,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	cbv1 "github.com/CrystalBackup/CrystalBackup/api/v1alpha1"
+	"github.com/CrystalBackup/CrystalBackup/internal/metrics"
 )
 
 // M6 lot I — the alert rules, watched firing.
@@ -82,6 +85,99 @@ var _ = Describe("Milestone M6 — alert rules fire on real conditions", Ordered
 		m6RequirePrometheus()
 	})
 
+	// ------------------------------------------------------------------
+	// FIRST, and before anything is provoked.
+	//
+	// This is here because of what the lane's own first real run found. The pile-up spec failed on
+	// "0 series", and the metric was being emitted and Prometheus did know it — but the query
+	// filtered on `namespace="m6-alerts-pileup"` and that label did not hold what everyone assumed.
+	//
+	// A ServiceMonitor attaches the TARGET's labels (namespace, pod, service, container, job), and
+	// with honorLabels false — the default, and what the chart shipped — the target wins every
+	// collision. Every crystalbackup_ series arrived carrying namespace="crystal-backup-system",
+	// for every tenant on the cluster; the real value survived only as `exported_namespace`, which
+	// nothing queries and nothing alerts on.
+	//
+	// Nothing looked broken, and that is the whole difficulty. The alert expressions still joined,
+	// because both sides of `on (namespace, …)` carried the same wrong value — so BackupMissed
+	// fired at the right moment and then named the operator's namespace, routing every tenant's
+	// page to one place. Every series this project emits is specified to be tenant-attributable
+	// (R19, spec/05-observability.md §1); at the scrape, none of them were.
+	//
+	// It runs before any provocation because it invalidates every measurement downstream: a lane
+	// that discovers this after twenty minutes of corrupting a repository has spent twenty minutes
+	// earning a confusing failure.
+	// ------------------------------------------------------------------
+	It("emits every series under the tenant's own labels, not the scraper's", func() {
+		By("Given the crystalbackup_ series Prometheus holds right now")
+		series, err := m6AllCrystalbackupSeries()
+		Expect(err).NotTo(HaveOccurred())
+		// Not a vacuous pass. Zero series would satisfy both assertions below while measuring
+		// nothing, which is the shape of guard this suite keeps deleting.
+		Expect(series).NotTo(BeEmpty(),
+			"Prometheus holds no crystalbackup_ series at all — the scrape is not landing, and "+
+				"every assertion in this lane would pass by having nothing to check")
+
+		By("Then not one of them carries an `exported_` label")
+		// The universal signature. `exported_<x>` is what Prometheus renames OUR label to when the
+		// target's own label of that name wins the collision, so its presence means a series is
+		// wearing the scraper's identity instead of its own. Stated generally rather than as
+		// `exported_namespace`: the same collision is waiting for anything we ever add called
+		// `pod`, `service`, `container` or `job`, and it would arrive exactly as silently.
+		var shadowed []string
+		for _, s := range series {
+			for label := range s.Metric {
+				if strings.HasPrefix(label, "exported_") {
+					shadowed = append(shadowed, fmt.Sprintf("%s has %s (its own %s was overwritten by the target's)",
+						s.Metric["__name__"], label, strings.TrimPrefix(label, "exported_")))
+				}
+			}
+		}
+		Expect(shadowed).To(BeEmpty(),
+			"a scrape label is masking one of ours — set honorLabels on the chart's ServiceMonitor.\n"+
+				"Every alert would still fire, still join, and still name the wrong object:\n  %s",
+			strings.Join(m6Unique(shadowed), "\n  "))
+
+		By("And no tenant-scoped series wears the operator's own namespace")
+		// The complement, and it is not redundant. The `exported_` invariant catches the collision
+		// being RESOLVED against us; it would not catch someone one day "fixing" it by relabelling
+		// our namespace out of the way instead of honouring it, which leaves no exported_ behind
+		// and the same wrong value sitting in `namespace`.
+		//
+		// TENANT-SCOPED, and the qualifier is load-bearing — the naive version of this check fails
+		// on a perfectly healthy cluster. A ServiceMonitor attaches the target's `namespace` to any
+		// series that does not already declare one, so crystalbackup_build_info,
+		// crystalbackup_clusterbackup_* and crystalbackup_mover_* legitimately carry
+		// "crystal-backup-system": they have no namespace dimension of their own and nothing was
+		// overwritten. (The cluster-scoped repository and discovery families are a third case again:
+		// they DO declare `namespace`, expose it empty, and Prometheus drops the empty label — so
+		// they end up with no namespace at all rather than the target's.)
+		//
+		// metrics.Catalogue() decides which is which, rather than a list maintained here. It is the
+		// same []string the collectors hand to prometheus.NewDesc and the same source the alert
+		// rules and the dashboard checker read, so a family that gains or loses its namespace label
+		// moves this assertion with it instead of drifting away from it.
+		tenantScoped := map[string]bool{}
+		for family, labels := range metrics.Catalogue() {
+			if slices.Contains(labels, "namespace") {
+				tenantScoped[family] = true
+			}
+		}
+		var stolen []string
+		for _, s := range series {
+			if s.Metric["namespace"] != operatorNS {
+				continue
+			}
+			if tenantScoped[m6FamilyOf(s.Metric["__name__"])] {
+				stolen = append(stolen, s.Metric["__name__"])
+			}
+		}
+		Expect(stolen).To(BeEmpty(),
+			"these families declare a `namespace` label of their own, so the only way they can report "+
+				"the scraper's namespace %q is by having had it overwritten: %v",
+			operatorNS, m6Unique(stolen))
+	})
+
 	It("loads every rule the chart ships, and evaluates all of them without error", func() {
 		By("Given the chart installed with metrics.rules.enabled")
 		loaded, err := m6LoadedRules()
@@ -123,11 +219,19 @@ var _ = Describe("Milestone M6 — alert rules fire on real conditions", Ordered
 	// The condition is set up here and asserted at the very end of the container, so the hold runs
 	// underneath the repository work instead of after it. That is the only reason this lane fits in
 	// under an hour.
+	//
+	// THE TEARDOWN IS AN AfterAll, AND IT HAS TO BE. A DeferCleanup registered inside this It runs
+	// when THIS It ends, not when the container does — so the namespace, the PVC and all 21
+	// VolumeSnapshots were being destroyed seconds after they were created, the gauge fell back
+	// through the threshold, and the alert at the bottom of this container could never fire. The
+	// first real run showed the series going 21 → 3 while the namespace drained. Anything whose
+	// condition has to survive into a later spec belongs in AfterAll.
 	// ------------------------------------------------------------------
+	AfterAll(func() { deleteNamespaceAndWaitGone(pileupNS, 15*time.Minute) })
+
 	It("counts another tool's VolumeSnapshots piling up on one PVC", func() {
 		By("Given a tenant PVC on the snapshot-capable class")
 		ensureNamespace(pileupNS)
-		DeferCleanup(func() { deleteNamespaceAndWaitGone(pileupNS, 15*time.Minute) })
 		m2SeedVolume(pileupNS, "m6-pileup-data", m4StorageClass, "1Gi")
 
 		By("When 21 VolumeSnapshots accumulate on it — one past the rule's threshold")
@@ -153,8 +257,16 @@ var _ = Describe("Milestone M6 — alert rules fire on real conditions", Ordered
 			samples, err := m6Query(fmt.Sprintf(
 				`crystalbackup_pvc_volumesnapshot_count{namespace=%q,pvc="m6-pileup-data"}`, pileupNS))
 			g.Expect(err).NotTo(HaveOccurred())
+			// This is the assertion that caught the honorLabels collision, and its message says so:
+			// "0 series" here does NOT mean the collector is silent. It meant the series existed
+			// under namespace="crystal-backup-system" with the real value hidden in
+			// exported_namespace. The invariant at the top of this container now fails first and
+			// says that directly — this line stays specific about the alternative so the next
+			// reader is not sent looking at the collector.
 			g.Expect(samples).To(HaveLen(1),
-				"exactly one series is expected for one PVC, got %d", len(samples))
+				"expected exactly one series for %s/m6-pileup-data, got %d. If this is 0, check the "+
+					"label VALUES before the collector: `{__name__=\"crystalbackup_pvc_volumesnapshot_count\"}` "+
+					"shows what namespace the series actually carries", pileupNS, len(samples))
 			g.Expect(samples[0].Value).To(HaveLen(2))
 			g.Expect(samples[0].Value[1]).To(Equal("21"),
 				"the collector counts %v VolumeSnapshots for %s/m6-pileup-data, 21 were created",
@@ -344,6 +456,31 @@ var _ = Describe("Milestone M6 — alert rules fire on real conditions", Ordered
 // ---------------------------------------------------------------------------
 // Fixtures used only by the alert lane.
 // ---------------------------------------------------------------------------
+
+// m6FamilyOf maps a scraped series name back to its catalogue family.
+//
+// Prometheus derives crystalbackup_backup_duration_seconds_{bucket,sum,count} from ONE histogram
+// family, and only the undecorated name is a key in metrics.Catalogue(). Stripping the suffix
+// blindly would be wrong in the other direction — crystalbackup_backup_failures_total and
+// crystalbackup_backup_added_bytes_total are counters whose full name IS the family — so the strip
+// only applies when what is left is a declared histogram.
+func m6FamilyOf(series string) string {
+	for _, suffix := range []string{"_bucket", "_sum", "_count"} {
+		base, found := strings.CutSuffix(series, suffix)
+		if found && slices.Contains(metrics.Histograms(), base) {
+			return base
+		}
+	}
+	return series
+}
+
+// m6Unique de-duplicates and sorts a list for a failure message. A collision affects every series
+// in a family at once, so the raw list is the same sentence repeated thirty times.
+func m6Unique(in []string) []string {
+	out := slices.Clone(in)
+	slices.Sort(out)
+	return slices.Compact(out)
+}
 
 // m6RuleNames lists the alert names Prometheus has loaded, for a failure message.
 func m6RuleNames(loaded map[string]m6Rule) []string {

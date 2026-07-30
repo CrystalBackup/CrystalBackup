@@ -346,7 +346,7 @@ func renderCrucibleReport(report types.Report) string {
 	selected := ran + skippedFor // checks this run was ASKED to exercise
 	incomplete := deselected > 0 // some checks never ran at all
 	narrowed := hasFilter(report.SuiteConfig)
-	filtered := incomplete && narrowed // ...and it was on purpose
+	filtered := incomplete && narrowed  // ...and it was on purpose
 	cutShort := incomplete && !narrowed // ...or the run was stopped before the end
 	nothingRan := ran == 0              // a filter that matched nothing must not read as PASS
 	skipHeavy := total > 0 &&           // most of the suite abstained on its own
