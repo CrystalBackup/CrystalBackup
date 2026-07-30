@@ -61,6 +61,37 @@ adopting a terminal execution `Backup` leaves whatever was materialized untouche
 [adr/0017](adr/0017-cascade-materialization-backup-carries-identity.md) for the decision and its
 accepted costs.
 
+### A run name is a coordinate, not an identity
+
+The child `Backup` of a run is named after the run, in every matched namespace, and the run name
+itself is deterministic: `<schedule>-<YYYYMMDD-HHMMSS>` in UTC, built by the **same** function on
+**both planes**. So `(namespace, name)` is a *coordinate* that several different producers can land
+on — a discovery projection, an earlier run of the same name, and the namespace plane's own stamped
+`Backup`. In particular, a `ClusterBackupSchedule` named `daily` covering a namespace and a
+`BackupSchedule` named `daily` inside it, on the same cron, produce a byte-identical name, and
+neither administrator did anything unusual to get there.
+
+The coordinate is therefore never read as proof of ownership. Every `Backup` created by a run or a
+schedule carries **`crystalbackup.io/parent-uid`**: the `metadata.uid` of the `ClusterBackup` run,
+or of the `BackupSchedule`, that created it. A UID is never reused, and a crash-restarted run keeps
+its CR and hence its UID, so the test is exact rather than heuristic:
+
+| At the coordinate | Verdict |
+|---|---|
+| same `parent-uid` | mine — the ordinary idempotent second pass |
+| different `parent-uid`, `crystalbackup.io/projected`, terminal, or already holding a snapshot ID / bytes / `backupTime` | **`RunNameCollision`** |
+| no `parent-uid`, non-terminal, and holding no result at all | adopted (upgrade path from a build predating the stamp) |
+
+A collision is always a **loud per-namespace failure** — a `FailureRecord` reading
+`RunNameCollision`, counted in `namespacesFailed`, taking the run to `Failed`/`PartiallyFailed`; on
+the namespace plane, the `BackupSchedule` goes to phase `RunNameCollision` with `Ready=False`. It is
+never a success: the name already designates data this run did not write, and nothing was backed up
+for that namespace. The remedy is a distinct run or schedule name.
+
+A projection is additionally barred from the aggregate roll-up outright, independently of the check
+above: its volumes are derived from the repository listing and read `Completed` by construction, so
+it must never be able to increment `pvcsSucceeded`.
+
 ## Repository is the source of truth
 
 `Backup` CRs are a **projection** of the restic repository, not the source of truth. The
@@ -705,6 +736,29 @@ The discovery controller (per `BackupRepository`, on location add and every
 
 This makes adding a `[Cluster]BackupLocation` sufficient to bootstrap DR: the operator
 inventories the repo and lists what is restorable, with no prior CRs.
+
+### The projection completes an execution report; it never replaces one
+
+A `Backup` is two things at once: a **catalogue of restore points** (R26 — it must survive the loss
+of the cluster, which is why discovery rebuilds it from the repository) and the **report of an
+execution**. Where the two disagree, the execution report wins. It is the more specific truth, and
+a reconstruction from `restic snapshots` knows, by construction, only what *succeeded*: a volume
+that was skipped or that failed has no snapshot to be listed.
+
+Concretely, when discovery projects over an object that already holds a recorded result — including
+a terminal execution `Backup` it is adopting:
+
+- `status.volumes` is **merged per PVC**, not replaced. A recorded entry wins over the derived one
+  (it carries `phase`, `reason`, `addedBytes`, `sizeBytes`, `node` that no snapshot listing holds);
+  only a missing `snapshotID` is filled in. A derived entry with no recorded counterpart is added —
+  that is what makes the catalogue survive cluster loss. A recorded entry with no surviving snapshot
+  is kept only when it carries something the repository cannot (`Skipped`, `Failed`, or a `reason`);
+  a recorded `Completed` volume whose snapshot has been forgotten is dropped, because advertising a
+  restore point that no longer exists would be worse.
+- `status.phase` is **never raised**. A recorded terminal phase is kept verbatim; only a coordinate
+  with no recorded terminal result takes the projection's `Completed`.
+
+
 
 ## Restore selection model
 

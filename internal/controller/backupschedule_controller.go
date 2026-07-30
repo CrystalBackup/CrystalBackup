@@ -79,7 +79,10 @@ func NewBackupScheduleReconciler(
 
 // +kubebuilder:rbac:groups=crystalbackup.io,resources=backupschedules,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=crystalbackup.io,resources=backupschedules/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=crystalbackup.io,resources=backups,verbs=get;list;watch;create
+// patch on backups is for ONE thing: stamping crystalbackup.io/parent-uid onto a Backup this
+// schedule fired before the stamp existed (the operator-upgrade adoption path in stampBackup). The
+// controller never otherwise mutates a Backup — it does not even own the ones it stamps.
+// +kubebuilder:rbac:groups=crystalbackup.io,resources=backups,verbs=get;list;watch;create;patch
 // +kubebuilder:rbac:groups=crystalbackup.io,resources=backuplocations,verbs=get;list;watch
 
 // Reconcile stamps the due Backup (if any) and refreshes the schedule's status.
@@ -139,6 +142,19 @@ func (r *BackupScheduleReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 				tick.UTC().Format(time.RFC3339), active.Name, backupConcurrencyPolicyOf(&sched))
 		} else {
 			name, err := r.stampBackup(ctx, &sched, tick)
+			if c := asRunNameCollision(err); c != nil {
+				// The tick's name is already taken by a Backup this schedule did not stamp — almost
+				// always the cluster plane's fan-out under an identically named ClusterBackupSchedule.
+				// This tick's backup DID NOT RUN, and saying so is the whole point: the old code
+				// returned the foreign name as if it had fired, so the tenant saw a lastRunName, a
+				// green schedule, and no backup. Surfaced as a spec-static fault (the name clash is
+				// not going to fix itself) rather than an error return, which would only hot-loop.
+				r.Recorder.Eventf(&sched, nil, corev1.EventTypeWarning, reasonRunNameCollision, "StampBackup",
+					"tick %s did NOT run: %s", tick.UTC().Format(time.RFC3339), c.Error())
+				return r.writeStatus(ctx, &sched, originalStatus, reasonRunNameCollision,
+					metav1.ConditionFalse, reasonRunNameCollision, clampMessage(c.Error()),
+					ctrl.Result{RequeueAfter: shortRequeueInterval})
+			}
 			if err != nil {
 				return ctrl.Result{}, err
 			}
@@ -166,7 +182,25 @@ func (r *BackupScheduleReconciler) listBackups(ctx context.Context, sched *cbv1.
 		client.MatchingLabels{apiconst.LabelSchedule: sched.Name}); err != nil {
 		return nil, err
 	}
-	return backups.Items, nil
+	// ...and to THIS PLANE. The schedule label is not plane-qualified, so a cluster-DR fan-out from
+	// a ClusterBackupSchedule of the SAME name stamps crystalbackup.io/schedule with that same
+	// value on its child in this very namespace — as does the discovery projection that later
+	// replaces it. Read as the tenant's own history, the other plane's objects poison everything
+	// derived from it: baselineTick advances to a tick this schedule never fired (so it SKIPS that
+	// tick, silently), activeBackup holds the Forbid gate shut behind someone else's in-flight run,
+	// and lastRunName ends up naming a Backup in a repository the tenant may not be able to read.
+	//
+	// The filter EXCLUDES what is provably the other plane's rather than including only what is
+	// provably this one's: an object with no origin label at all keeps its previous treatment,
+	// so nothing predating the label silently drops out of a schedule's history.
+	kept := backups.Items[:0]
+	for _, b := range backups.Items {
+		if b.Labels[apiconst.LabelOrigin] == apiconst.OriginCluster {
+			continue
+		}
+		kept = append(kept, b)
+	}
+	return kept, nil
 }
 
 // baselineTick is the last already-fired activation: the latest of the schedule's creation time,
@@ -193,7 +227,16 @@ func (r *BackupScheduleReconciler) baselineTick(sched *cbv1.BackupSchedule, back
 // stampBackup creates the Backup for tick, named deterministically so re-firing the same tick is
 // a harmless AlreadyExists no-op, and MATERIALIZES the schedule's run configuration into
 // spec.run (adr/0017 §5) — the only way a schedule-stamped Backup can carry its intent, since it
-// has no ClusterBackup parent to pull from.
+// has no ClusterBackup parent to pull from. The Backup is STAMPED with this schedule's UID
+// (apiconst.AnnotationParentUID), which is what makes "already fired this tick" answerable.
+//
+// AlreadyExists used to be read as "already fired this tick" outright. It is not: run names are
+// built by the SAME apiconst.RunName() on both planes, so a ClusterBackupSchedule named "daily"
+// covering this namespace stamps a child of exactly this name at exactly this tick. Whichever
+// plane got there first, the second silently did nothing — and on this side that meant the
+// tenant's backup NEVER RAN while the schedule reported a lastRunName pointing at the other
+// plane's object. A foreign occupant now returns a *runNameCollisionError, which the caller
+// surfaces on the schedule.
 //
 // No ownerReference: see the type doc. The Backup outlives the schedule because it is a restore
 // point, not a record of a run.
@@ -208,6 +251,7 @@ func (r *BackupScheduleReconciler) stampBackup(ctx context.Context, sched *cbv1.
 				apiconst.LabelOrigin:    apiconst.OriginNamespace,
 				apiconst.LabelNamespace: sched.Namespace,
 			},
+			Annotations: map[string]string{apiconst.AnnotationParentUID: string(sched.UID)},
 		},
 		Spec: cbv1.BackupSpec{
 			ScheduleRef: sched.Name,
@@ -222,10 +266,31 @@ func (r *BackupScheduleReconciler) stampBackup(ctx context.Context, sched *cbv1.
 		},
 	}
 	if err := r.Create(ctx, backup); err != nil {
-		if apierrors.IsAlreadyExists(err) {
-			return name, nil // already fired this tick.
+		if !apierrors.IsAlreadyExists(err) {
+			return "", fmt.Errorf("create Backup %s/%s: %w", sched.Namespace, name, err)
 		}
-		return "", fmt.Errorf("create Backup %s/%s: %w", sched.Namespace, name, err)
+		var existing cbv1.Backup
+		if gerr := r.Get(ctx, client.ObjectKey{Namespace: sched.Namespace, Name: name}, &existing); gerr != nil {
+			return "", fmt.Errorf("re-read Backup %s/%s after AlreadyExists: %w", sched.Namespace, name, gerr)
+		}
+		switch owner, detail := classifyCoordinate(&existing, sched.UID); owner {
+		case coordinateMine:
+			return name, nil // genuinely already fired this tick.
+		case coordinateAdoptable:
+			// A pre-stamp build fired this tick and the Backup has not produced anything yet:
+			// claim it rather than treat the upgrade as a collision (see coordinateAdoptable).
+			patch := client.MergeFrom(existing.DeepCopy())
+			if existing.Annotations == nil {
+				existing.Annotations = map[string]string{}
+			}
+			existing.Annotations[apiconst.AnnotationParentUID] = string(sched.UID)
+			if perr := r.Patch(ctx, &existing, patch); perr != nil {
+				return "", fmt.Errorf("stamp parent UID on Backup %s/%s: %w", sched.Namespace, name, perr)
+			}
+			return name, nil
+		default:
+			return "", &runNameCollisionError{Namespace: sched.Namespace, Name: name, Detail: detail}
+		}
 	}
 	r.Recorder.Eventf(sched, nil, corev1.EventTypeNormal, "BackupStamped", "StampBackup",
 		"created Backup %q for tick %s", name, tick.UTC().Format(time.RFC3339))

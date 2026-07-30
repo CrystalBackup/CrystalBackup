@@ -960,9 +960,12 @@ func (r *BackupReconciler) advanceVolume(ctx context.Context, backup *cbv1.Backu
 
 // advancePending resolves the exposer for the source PVC and starts the exposure. A storage
 // class with no CSI snapshot support (exposer.ErrUnsupported) makes the volume Skipped /
-// CSISnapshotUnsupported — a Skipped volume makes the Backup PartiallyCompleted, never Failed
-// (status.RollUpVolumePhases encodes this). SnapshottingHooks (M4) are skipped in M1: Pending
-// goes straight to Snapshotting.
+// CSISnapshotUnsupported — and a Skipped volume is NEUTRAL in the roll-up: it counts neither for
+// nor against the Backup's phase, so it never on its own makes the Backup PartiallyCompleted, and
+// certainly never Failed (status.RollUpVolumePhases is the authority, and says so at length: a
+// namespace holding one permanently unsnapshottable PVC must not alarm on every run, forever). The
+// skip stays visible per-volume, in status.volumes[].phase + reason. SnapshottingHooks (M4) are
+// skipped in M1: Pending goes straight to Snapshotting.
 func (r *BackupReconciler) advancePending(ctx context.Context, backup *cbv1.Backup, vol *cbv1.VolumeStatus) error {
 	var pvc corev1.PersistentVolumeClaim
 	if err := r.Get(ctx, client.ObjectKey{Namespace: backup.Namespace, Name: vol.Pvc}, &pvc); err != nil {

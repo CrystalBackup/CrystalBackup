@@ -310,6 +310,9 @@ func (r *DiscoveryReconciler) projectGroup(ctx context.Context, repo *cbv1.Backu
 		return groupProjected, nil
 	}
 
+	// recorded is the status an EXECUTION already wrote at this coordinate, if any. It is the input
+	// to the merge below: the projection COMPLETES an execution report, it never replaces one.
+	var recorded cbv1.BackupStatus
 	var existing cbv1.Backup
 	err := r.Get(ctx, client.ObjectKey{Namespace: key.Namespace, Name: key.Run}, &existing)
 	switch {
@@ -324,6 +327,7 @@ func (r *DiscoveryReconciler) projectGroup(ctx context.Context, repo *cbv1.Backu
 			// repository's data is visible through, so it counts as projected.
 			return groupProjected, nil
 		}
+		existing.Status.DeepCopyInto(&recorded)
 	}
 
 	proj := &cbv1.Backup{
@@ -361,14 +365,20 @@ func (r *DiscoveryReconciler) projectGroup(ctx context.Context, repo *cbv1.Backu
 		return groupProjected, fmt.Errorf("project Backup %s/%s: %w", key.Namespace, key.Run, err)
 	}
 
-	// Apply the derived status (one Completed volume per data snapshot) as a separate status-scoped
-	// apply targeting the same object.
+	// Apply the derived status as a separate status-scoped apply targeting the same object. This
+	// apply runs with ForceOwnership, so what it names it OWNS and overwrites — which is exactly how
+	// an adopted execution Backup used to lose its own report of itself: status.volumes has no
+	// listType marker, so the apply replaced the whole list, and a Skipped volume with its
+	// CSISnapshotUnsupported reason (a row `restic snapshots` cannot produce, because nothing was
+	// snapshotted) disappeared seconds after the run finished, along with the PartiallyCompleted
+	// phase that went with it. The value applied here is therefore the MERGE of what the repository
+	// shows with what the execution recorded, and the recorded phase is never raised to a better one.
 	statusObj := &cbv1.Backup{
 		TypeMeta:   metav1.TypeMeta{APIVersion: cbv1.SchemeGroupVersion.String(), Kind: "Backup"},
 		ObjectMeta: metav1.ObjectMeta{Namespace: key.Namespace, Name: key.Run},
 		Status: cbv1.BackupStatus{
-			Phase:   string(status.BackupPhaseCompleted),
-			Volumes: discovery.VolumesFromSnapshots(snaps),
+			Phase:   projectedPhase(recorded.Phase),
+			Volumes: discovery.MergeProjectedVolumes(recorded.Volumes, discovery.VolumesFromSnapshots(snaps)),
 		},
 	}
 	su, err := runtime.DefaultUnstructuredConverter.ToUnstructured(statusObj)
@@ -380,6 +390,23 @@ func (r *DiscoveryReconciler) projectGroup(ctx context.Context, repo *cbv1.Backu
 		return groupProjected, fmt.Errorf("project Backup status %s/%s: %w", key.Namespace, key.Run, err)
 	}
 	return groupProjected, nil
+}
+
+// projectedPhase is the phase a projection may write over an existing record. A recorded TERMINAL
+// phase is kept verbatim — never raised. A projection is rebuilt from `restic snapshots`, which by
+// construction lists only what succeeded: it cannot see the volume that was skipped or the manifest
+// dump that failed, so its opinion of the run is Completed no matter how the run actually ended.
+// Overwriting a recorded PartiallyCompleted/PartiallyFailed with that opinion made the failure
+// disappear from the cluster entirely within about thirty seconds of the run finishing.
+//
+// Only a coordinate with no recorded terminal result (a fresh projection, or a leftover in-flight
+// phase on an object discovery is allowed to touch) gets Completed: there, the repository IS the
+// only truth there is.
+func projectedPhase(recorded string) string {
+	if isTerminalBackupPhase(recorded) {
+		return recorded
+	}
+	return string(status.BackupPhaseCompleted)
 }
 
 // groupOutcome is what one snapshot (namespace, run) group resolved to. The two values ARE the

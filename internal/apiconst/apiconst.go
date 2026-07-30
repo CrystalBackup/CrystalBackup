@@ -184,6 +184,31 @@ const (
 	// operator's managed-by/reaper labels: a restored PVC is the USER'S object and must never
 	// be selectable by the reaper or the leak-check.
 	AnnotationRestoredFrom = Domain + "/restored-from"
+
+	// AnnotationParentUID pins, on a Backup, the metadata.uid of the object that OWNS its
+	// (namespace, name) COORDINATE: the ClusterBackup run for a cluster-DR fan-out child, the
+	// BackupSchedule for a namespace-plane stamped Backup. It is the only thing that tells
+	// "the child I created" apart from "some other object that happens to sit at this name".
+	//
+	// It exists because the name alone is NOT an identity. RunName() is deterministic and
+	// SHARED by both planes, so a ClusterBackupSchedule and a BackupSchedule both called
+	// "daily" on the same cron produce the SAME (namespace, name) — and a ClusterBackup
+	// recreated at a name a previous run already used lands on that run's Backups, or on the
+	// discovery PROJECTION that replaced them. Every one of those satisfies a bare Get. Before
+	// this stamp, the cluster fan-out read such a homonym as "my child already exists", skipped
+	// the namespace entirely, and then counted the homonym's status — snapshots written by
+	// somebody else, possibly weeks earlier — as this run's success. A UID cannot be reused: a
+	// crash-restarted run keeps its CR and therefore its UID, a recreated one gets a fresh one,
+	// so the test is exact rather than heuristic.
+	//
+	// A Backup carrying a DIFFERENT UID, or AnnotationProjected, or one carrying no UID but
+	// already holding a result, is a run-name COLLISION: the coordinate already designates data
+	// this run did not write. That is always a loud per-namespace failure, never a success. The
+	// one exception is an unstamped Backup that is still in flight and holds no result at all —
+	// a pre-stamp build's child caught by an operator upgrade — which is adopted rather than
+	// collided with. See internal/controller/runname.go for the classification.
+	AnnotationParentUID = Domain + "/parent-uid"
+
 	// AnnotationExposureNode is stamped on a pv-twin STAGING claim at creation with the node
 	// the target volume was singly attached on: the exposure's node pin must survive a
 	// controller restart without re-resolving live state (the original bound PV — the only

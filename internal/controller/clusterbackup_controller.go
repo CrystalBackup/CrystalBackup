@@ -157,14 +157,30 @@ func (r *ClusterBackupReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	// (3) Fan out: ensure one child Backup per matched namespace (idempotent, label-linked, no
 	// ownerRef). A per-namespace create failure is recorded and does not abort the other namespaces.
+	//
+	// A run-name COLLISION is separated out from ordinary create failures because it changes what
+	// the namespace's roll-up may say, not merely what the failure list contains: the coordinate is
+	// occupied by a Backup this run did not write, so that Backup's status — which the aggregate
+	// List will happily pick up, since a projection and a previous run's child both carry the
+	// cluster-backup label — must never be counted as this run's result.
 	var fanoutFailures []cbv1.FailureRecord
+	collided := make(map[string]string)
 	for _, ns := range matched {
-		if err := r.ensureChildBackup(ctx, &cb, ns); err != nil {
-			log.Error(err, "fan-out: ensure child Backup failed", "namespace", ns, "run", cb.Name)
-			fanoutFailures = append(fanoutFailures, cbv1.FailureRecord{
-				Namespace: ns, Backup: cb.Name, Message: clampMessage(err.Error()),
-			})
+		err := r.ensureChildBackup(ctx, &cb, ns)
+		if err == nil {
+			continue
 		}
+		if c := asRunNameCollision(err); c != nil {
+			log.Error(err, "fan-out: run-name collision; namespace NOT backed up", "namespace", ns, "run", cb.Name)
+			collided[ns] = clampMessage(c.Error())
+			r.Recorder.Eventf(&cb, nil, corev1.EventTypeWarning, reasonRunNameCollision, "FanOut",
+				"namespace %q was NOT backed up: %s", ns, c.Error())
+			continue
+		}
+		log.Error(err, "fan-out: ensure child Backup failed", "namespace", ns, "run", cb.Name)
+		fanoutFailures = append(fanoutFailures, cbv1.FailureRecord{
+			Namespace: ns, Backup: cb.Name, Message: clampMessage(err.Error()),
+		})
 	}
 
 	// (3.5) The run-level cluster-manifests capture (adr/0011 §1), driven INDEPENDENTLY of the
@@ -196,7 +212,7 @@ func (r *ClusterBackupReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// terminal phase: a run whose namespaces are all done but whose cluster capture is still
 	// running must NOT go terminal, or the already-terminal guard at the top of Reconcile would
 	// stop the pass that records the capture's snapshot.
-	res, err := r.aggregateAndWrite(ctx, &cb, &loc, matched, fanoutFailures, captureDone)
+	res, err := r.aggregateAndWrite(ctx, &cb, &loc, matched, fanoutFailures, collided, captureDone)
 	if err != nil {
 		return res, err
 	}
@@ -247,23 +263,30 @@ func (r *ClusterBackupReconciler) resolveClusterCaptureContext(
 // ensureChildBackup creates the run's child Backup in namespace ns if it does not already exist.
 // The child is named after the run (the name equals the run tag in every namespace; the namespace
 // disambiguates), linked to the run by the crystalbackup.io/cluster-backup label, marked
-// cluster-origin (read-only to users, per RBAC), and pointed at the run's ClusterBackupLocation.
-// It carries NO ownerReference to the ClusterBackup. An existing child is left untouched — it owns
-// its own lifecycle.
+// cluster-origin (read-only to users, per RBAC), pointed at the run's ClusterBackupLocation, and
+// STAMPED with this run's UID (apiconst.AnnotationParentUID). It carries NO ownerReference to the
+// ClusterBackup. A child that is genuinely this run's is left untouched — it owns its own lifecycle.
+//
+// The UID stamp is what makes "already exists" answerable. The bare Get this used to do tested
+// only the coordinate, and a discovery projection, a previous same-named run's terminal Backup, or
+// a namespace-plane schedule's Backup all satisfy it — after which the run skipped the namespace
+// and counted the stranger's Completed volumes as its own. Anything at the coordinate that is not
+// this run's is a *runNameCollisionError, which the caller records as a per-namespace FAILURE.
 func (r *ClusterBackupReconciler) ensureChildBackup(ctx context.Context, cb *cbv1.ClusterBackup, ns string) error {
 	key := client.ObjectKey{Namespace: ns, Name: cb.Name}
 	var existing cbv1.Backup
 	if err := r.Get(ctx, key, &existing); err == nil {
-		return nil // idempotent: never mutate an existing child here.
+		return r.resolveExistingChild(ctx, cb, &existing)
 	} else if !apierrors.IsNotFound(err) {
 		return fmt.Errorf("get child Backup %s/%s: %w", ns, cb.Name, err)
 	}
 
 	child := &cbv1.Backup{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      cb.Name,
-			Namespace: ns,
-			Labels:    childBackupLabels(cb, ns),
+			Name:        cb.Name,
+			Namespace:   ns,
+			Labels:      childBackupLabels(cb, ns),
+			Annotations: map[string]string{apiconst.AnnotationParentUID: string(cb.UID)},
 		},
 		Spec: cbv1.BackupSpec{
 			ScheduleRef: cb.Spec.ScheduleRef,
@@ -282,13 +305,50 @@ func (r *ClusterBackupReconciler) ensureChildBackup(ctx context.Context, cb *cbv
 	}
 	if err := r.Create(ctx, child); err != nil {
 		if apierrors.IsAlreadyExists(err) {
-			return nil // lost a create race with a prior reconcile of this same run; fine.
+			// The cached Get above missed it. That is USUALLY a lost race with a prior reconcile of
+			// this same run — but it is equally how a stale cache reports a coordinate somebody else
+			// already occupies, so re-read (the AlreadyExists proves the object is there now) and
+			// classify instead of assuming the create was ours.
+			var raced cbv1.Backup
+			if gerr := r.Get(ctx, key, &raced); gerr != nil {
+				return fmt.Errorf("re-read child Backup %s/%s after AlreadyExists: %w", ns, cb.Name, gerr)
+			}
+			return r.resolveExistingChild(ctx, cb, &raced)
 		}
 		return fmt.Errorf("create child Backup %s/%s: %w", ns, cb.Name, err)
 	}
 	r.Recorder.Eventf(cb, nil, corev1.EventTypeNormal, "FannedOut", "FanOut",
 		"created child Backup in namespace %q", ns)
 	return nil
+}
+
+// resolveExistingChild answers whether the Backup already sitting at this run's coordinate is the
+// run's own child. It returns nil for "mine" (the ordinary idempotent second pass), nil after
+// ADOPTING an unstamped in-flight child (the operator-upgrade path — see coordinateAdoptable), and
+// a *runNameCollisionError for anything else.
+func (r *ClusterBackupReconciler) resolveExistingChild(
+	ctx context.Context, cb *cbv1.ClusterBackup, existing *cbv1.Backup,
+) error {
+	switch owner, detail := classifyCoordinate(existing, cb.UID); owner {
+	case coordinateMine:
+		return nil // idempotent: never mutate an existing child here.
+	case coordinateAdoptable:
+		// A pre-stamp build fanned this child out and the run is still in flight. Claim it with
+		// the UID stamp so every later pass — and every later PROCESS — recognises it. This is the
+		// single exception to "never mutate an existing child": it touches one annotation, never
+		// spec or status, and only while the child holds no result of any kind.
+		patch := client.MergeFrom(existing.DeepCopy())
+		if existing.Annotations == nil {
+			existing.Annotations = map[string]string{}
+		}
+		existing.Annotations[apiconst.AnnotationParentUID] = string(cb.UID)
+		if err := r.Patch(ctx, existing, patch); err != nil {
+			return fmt.Errorf("stamp parent UID on child Backup %s/%s: %w", existing.Namespace, existing.Name, err)
+		}
+		return nil
+	default:
+		return &runNameCollisionError{Namespace: existing.Namespace, Name: existing.Name, Detail: detail}
+	}
 }
 
 // childBackupLabels are the labels every fanned-out child carries. crystalbackup.io/cluster-backup
@@ -314,7 +374,7 @@ func childBackupLabels(cb *cbv1.ClusterBackup, ns string) map[string]string {
 // Running until every matched namespace has a reporting child.
 func (r *ClusterBackupReconciler) aggregateAndWrite(
 	ctx context.Context, cb *cbv1.ClusterBackup, loc *cbv1.ClusterBackupLocation, matched []string,
-	fanoutFailures []cbv1.FailureRecord, captureDone bool,
+	fanoutFailures []cbv1.FailureRecord, collided map[string]string, captureDone bool,
 ) (ctrl.Result, error) {
 	var children cbv1.BackupList
 	if err := r.List(ctx, &children, client.MatchingLabels{apiconst.LabelClusterBackup: cb.Name}); err != nil {
@@ -350,9 +410,40 @@ func (r *ClusterBackupReconciler) aggregateAndWrite(
 
 	childPhases := make([]string, 0, len(matched))
 	for _, ns := range matched {
+		// A namespace whose coordinate is occupied by a Backup this run did not create is a hard
+		// per-namespace FAILURE, and its occupant's status is not this run's to read: the List above
+		// picks such an occupant up (a projection and a previous run's child both carry the
+		// cluster-backup label), so counting it would be exactly the false success this guard exists
+		// to stop. Recorded before the child lookup so no volume of it is ever tallied.
+		if msg, bad := collided[ns]; bad {
+			childPhases = append(childPhases, string(status.BackupPhaseFailed))
+			st.NamespacesFailed++
+			st.Failures = status.AppendCappedFailure(st.Failures, cbv1.FailureRecord{
+				Namespace: ns, Backup: cb.Name, Message: msg,
+			}, status.DefaultFailureCap)
+			continue
+		}
+
 		child := byNS[ns]
 		if child == nil {
 			childPhases = append(childPhases, "") // fanned out but not observed yet → in-flight.
+			continue
+		}
+		// Defence in depth, independent of the collision detection above: a discovery PROJECTION is
+		// a view of snapshots that already exist in the repository, derived by
+		// discovery.VolumesFromSnapshots — every one of its volumes reads Completed by construction,
+		// and none of them was written by this run. Even if the coordinate check upstream ever
+		// regressed, a projection must not be able to increment pvcsSucceeded.
+		if child.Annotations[apiconst.AnnotationProjected] == apiconst.AnnotationProjectedValue {
+			childPhases = append(childPhases, string(status.BackupPhaseFailed))
+			st.NamespacesFailed++
+			st.Failures = status.AppendCappedFailure(st.Failures, cbv1.FailureRecord{
+				Namespace: ns, Backup: child.Name,
+				Message: clampMessage((&runNameCollisionError{
+					Namespace: ns, Name: child.Name,
+					Detail: "it is a discovery projection of snapshots already in the repository",
+				}).Error()),
+			}, status.DefaultFailureCap)
 			continue
 		}
 		childPhases = append(childPhases, child.Status.Phase)
