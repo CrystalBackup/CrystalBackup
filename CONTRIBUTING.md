@@ -142,7 +142,7 @@ and each published image is:
 
 - **multi-arch** — `linux/amd64` + `linux/arm64` (one signed index digest covers both);
 - **0-known-CVE** — a grype/trivy scan gates release (documented, time-boxed exceptions only);
-- **cosign-signed (keyless)** with an **SPDX SBOM** and **SLSA L3+ provenance**;
+- **cosign-signed (keyless)** with an **SPDX SBOM** and **SLSA Build Level 3 provenance**;
 - published to **GHCR** (`ghcr.io/crystalbackup/*`) and referenced **by digest** in the chart —
   no floating tags, no user-facing image field.
 

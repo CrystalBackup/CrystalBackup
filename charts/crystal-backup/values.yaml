@@ -40,7 +40,7 @@ namespace:
 image:
   # -- Operator image repository on GHCR. Published multi-arch (linux/amd64 +
   # linux/arm64), built with apko on a Wolfi/glibc base, 0-known-CVE, cosign
-  # keyless-signed with an SBOM and SLSA L3+ provenance (adr/0012).
+  # keyless-signed with an SBOM and SLSA Build Level 3 provenance (adr/0012).
   repository: ghcr.io/crystalbackup/operator
   # -- Image digest — the immutable pin (production references images BY DIGEST,
   # never by floating tag). PLACEHOLDER for M0 scaffolding; the release pipeline
