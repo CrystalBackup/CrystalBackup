@@ -108,10 +108,19 @@ func TestScheduleActiveResolvesClusterSelection(t *testing.T) {
 	}
 }
 
-// TestScheduleActivePausedClusterScheduleIsAbsent pins the absence semantics: a paused schedule
-// emits no series at all rather than 0, so the BackupMissed join loses its partner and the rule
-// goes quiet — which is what pausing means.
-func TestScheduleActivePausedClusterScheduleIsAbsent(t *testing.T) {
+// TestScheduleActivePausedScheduleEmitsZero pins the semantics M6 changed, on BOTH planes.
+//
+// A paused schedule used to emit nothing at all. For BackupMissed the two readings are equivalent —
+// `== 1` drops a 0 exactly as it drops a missing series — so the rule goes quiet either way, which
+// is what pausing means. What absence additionally destroyed was the observation: a schedule
+// suspended "for the migration" and never resumed left no series anywhere saying so, and a
+// namespace with no protection looked exactly like a healthy one. A 0 is a schedule stating that it
+// exists and is protecting nothing, which is a thing CrystalbackupSchedulePausedTooLong can read.
+//
+// schedule_created must come with it: that rule needs to know how long the schedule has existed,
+// and it is also the term that makes a DELETED schedule (which really does emit nothing) stop
+// alerting instead of trailing for a week of lookback.
+func TestScheduleActivePausedScheduleEmitsZero(t *testing.T) {
 	sel := map[string]string{apiconst.LabelProtect: "true"}
 	cbs := &cbv1.ClusterBackupSchedule{
 		ObjectMeta: metav1.ObjectMeta{Name: "dr-daily"},
@@ -124,10 +133,39 @@ func TestScheduleActivePausedClusterScheduleIsAbsent(t *testing.T) {
 			}},
 		},
 	}
+	bs := &cbv1.BackupSchedule{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "team-a", Name: "nightly"},
+		Spec: cbv1.BackupScheduleSpec{
+			Schedule:    "0 3 * * *",
+			Paused:      true,
+			LocationRef: cbv1.LocalObjectReference{Name: "own"},
+		},
+	}
 	reg := prometheus.NewRegistry()
-	reg.MustRegister(NewCollector(newFakeClient(t, drLocation(), cbs, namespaceObj("team-a", sel)), testOperatorNamespace))
-	if n := countSamples(t, reg, NameScheduleActive); n != 0 {
-		t.Fatalf("schedule_active samples = %d, want 0 for a paused ClusterBackupSchedule", n)
+	reg.MustRegister(NewCollector(newFakeClient(t,
+		drLocation(), cbs, bs, namespaceObj("team-a", sel)), testOperatorNamespace))
+
+	for _, want := range []map[string]string{
+		{
+			"namespace": "team-a", "tenant": "team-a", "schedule": "dr-daily",
+			"origin": "cluster", "location": "dr", "cluster": "c1",
+		},
+		{
+			"namespace": "team-a", "tenant": "team-a", "schedule": "nightly",
+			"origin": "namespace", "location": "own", "cluster": "",
+		},
+	} {
+		if got, ok := gatherValue(t, reg, NameScheduleActive, want); !ok || got != 0 {
+			t.Errorf("schedule_active for %s = %v (found=%v), want 0 — a paused schedule must still "+
+				"say it exists, or nothing can ever alert on a pause nobody undid", want["schedule"], got, ok)
+		}
+		if _, ok := gatherValue(t, reg, NameScheduleCreated, want); !ok {
+			t.Errorf("schedule_created is absent for paused schedule %s; SchedulePausedTooLong joins "+
+				"on it to bound the schedule's age and to require that it still exists", want["schedule"])
+		}
+	}
+	if n := countSamples(t, reg, NameScheduleActive); n != 2 {
+		t.Errorf("schedule_active samples = %d, want exactly 2 (one per paused schedule)", n)
 	}
 }
 
@@ -152,11 +190,10 @@ func TestScheduleActiveInvalidSelectorEmitsNothing(t *testing.T) {
 	}
 }
 
-// TestScheduleActiveNamespacePlane: a BackupSchedule has no paused field, so its mere existence
-// is the signal. Its location is namespaced and carries no clusterID, so the cluster label is
-// empty — matching what the Backup gauges emit for the same series, which is what keeps the
-// BackupMissed join (on namespace, schedule, origin, location, cluster) intact on the namespace
-// plane.
+// TestScheduleActiveNamespacePlane: an unpaused BackupSchedule reports 1. Its location is
+// namespaced and carries no clusterID, so the cluster label is empty — matching what the Backup
+// gauges emit for the same series, which is what keeps the BackupMissed join (on namespace,
+// schedule, origin, location, cluster) intact on the namespace plane.
 func TestScheduleActiveNamespacePlane(t *testing.T) {
 	bs := &cbv1.BackupSchedule{
 		ObjectMeta: metav1.ObjectMeta{Namespace: "team-a", Name: "nightly"},
@@ -174,6 +211,156 @@ func TestScheduleActiveNamespacePlane(t *testing.T) {
 	}
 	if got, ok := gatherValue(t, reg, NameScheduleActive, want); !ok || got != 1 {
 		t.Fatalf("schedule_active = %v (found=%v), want 1 with an EMPTY cluster label", got, ok)
+	}
+}
+
+// TestExternalSyncActiveHonoursPauseOnBothPlanes covers the LATENT defect this lot found.
+//
+// ClusterBackupExternalSync.spec.paused has existed since M5 and NOTHING read it — not the metrics,
+// not the alert rules. ExternalSyncStale shipped as a pure staleness test, so pausing a sync (the
+// documented first step of decommissioning a location, docs/DECOMMISSION.md §1.1) would have paged
+// the operator 26 hours later about the thing they had just deliberately stopped. This series is
+// the join partner that guard needs, and it has to answer for the namespace plane too, which only
+// grew spec.paused in the same change.
+func TestExternalSyncActiveHonoursPauseOnBothPlanes(t *testing.T) {
+	running := &cbv1.ClusterBackupExternalSync{
+		ObjectMeta: metav1.ObjectMeta{Name: "dr-offsite"},
+		Spec: cbv1.ClusterBackupExternalSyncSpec{
+			SourceLocationRef:      cbv1.LocalObjectReference{Name: "dr"},
+			DestinationLocationRef: cbv1.LocalObjectReference{Name: "cold"},
+		},
+	}
+	pausedCluster := &cbv1.ClusterBackupExternalSync{
+		ObjectMeta: metav1.ObjectMeta{Name: "dr-retiring"},
+		Spec: cbv1.ClusterBackupExternalSyncSpec{
+			SourceLocationRef:      cbv1.LocalObjectReference{Name: "dr"},
+			DestinationLocationRef: cbv1.LocalObjectReference{Name: "old"},
+			Paused:                 true,
+		},
+	}
+	pausedNamespaced := &cbv1.BackupExternalSync{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "team-a", Name: "own-offsite"},
+		Spec: cbv1.BackupExternalSyncSpec{
+			SourceLocationRef:      cbv1.LocalObjectReference{Name: "own"},
+			DestinationLocationRef: cbv1.LocalObjectReference{Name: "own-cold"},
+			Paused:                 true,
+		},
+	}
+
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(NewCollector(newFakeClient(t,
+		drLocation(), running, pausedCluster, pausedNamespaced,
+		namespaceObj("team-a", nil)), testOperatorNamespace))
+
+	for _, tc := range []struct {
+		name string
+		want map[string]string
+		val  float64
+	}{
+		{"unpaused cluster sync", map[string]string{
+			"sync": "dr-offsite", "source": "dr", "destination": "cold",
+			"scope": "cluster", "namespace": "", "cluster": "c1",
+		}, 1},
+		{"paused cluster sync", map[string]string{
+			"sync": "dr-retiring", "source": "dr", "destination": "old",
+			"scope": "cluster", "namespace": "", "cluster": "c1",
+		}, 0},
+		{"paused namespaced sync", map[string]string{
+			"sync": "own-offsite", "source": "own", "destination": "own-cold",
+			"scope": "namespace", "namespace": "team-a", "cluster": "",
+		}, 0},
+	} {
+		got, ok := gatherValue(t, reg, NameExternalSyncActive, tc.want)
+		if !ok || got != tc.val {
+			t.Errorf("externalsync_active for the %s = %v (found=%v), want %v",
+				tc.name, got, ok, tc.val)
+		}
+	}
+
+	// The identity has to be the one ExternalSyncStale joins on, or the guard finds no partner and
+	// the rule goes permanently quiet — the same class of failure as naming a series nobody emits.
+	// The created series is in the same expression and travels with them for the same reason.
+	last := countSamples(t, reg, NameExternalSyncLastSuccess)
+	for _, name := range []string{NameExternalSyncActive, NameExternalSyncCreated} {
+		if n := countSamples(t, reg, name); n != last {
+			t.Errorf("%s has %d samples and last_success %d; ExternalSyncStale joins all three in "+
+				"one expression, so every series must carry all of them", name, n, last)
+		}
+	}
+}
+
+// TestExternalSyncCreatedIsTheNeverCompletedFallback covers a bug that promtool's clock hid.
+//
+// §2.12 has last_success emit 0 rather than nothing for a sync that has never completed, so that a
+// secondary broken from day one is not the one case ExternalSyncStale misses. That is right, and it
+// makes the 0 a SENTINEL rather than a timestamp: on a real clock `time() - 0` is about 1.77e9
+// seconds, so a pure staleness rule was past its 26h bound on the FIRST scrape after any sync was
+// created, with only the 1h hold between `kubectl apply` and a page. The unit tests did not show it
+// because promtool's clock starts at the epoch, where the sentinel and "created just now" coincide.
+//
+// The fix is this series, not a rewritten last_success: 0 means "never succeeded", which is the
+// true thing to show on a dashboard, and it is the RULE's job to know how to read it.
+func TestExternalSyncCreatedIsTheNeverCompletedFallback(t *testing.T) {
+	created := time.Date(2026, 7, 28, 9, 30, 0, 0, time.UTC)
+	sync := &cbv1.ClusterBackupExternalSync{
+		ObjectMeta: metav1.ObjectMeta{Name: "brand-new", CreationTimestamp: metav1.NewTime(created)},
+		Spec: cbv1.ClusterBackupExternalSyncSpec{
+			SourceLocationRef:      cbv1.LocalObjectReference{Name: "dr"},
+			DestinationLocationRef: cbv1.LocalObjectReference{Name: "cold"},
+		},
+		// No status at all: never ran, never completed.
+	}
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(NewCollector(newFakeClient(t, drLocation(), sync), testOperatorNamespace))
+
+	want := map[string]string{
+		"sync": "brand-new", "source": "dr", "destination": "cold",
+		"scope": "cluster", "namespace": "", "cluster": "c1",
+	}
+	if got, ok := gatherValue(t, reg, NameExternalSyncCreated, want); !ok || got != float64(created.Unix()) {
+		t.Errorf("externalsync_created = %v (found=%v), want %d", got, ok, created.Unix())
+	}
+	// And the premise the fallback exists for: last_success really is the 0 sentinel, not absent
+	// and not back-filled with the creation time. If this ever changes, the rule's `> 0` branch
+	// stops separating the two cases and must be revisited in the same change.
+	if got, ok := gatherValue(t, reg, NameExternalSyncLastSuccess, want); !ok || got != 0 {
+		t.Errorf("last_success = %v (found=%v), want the 0 sentinel — the alert rule's `> 0` branch "+
+			"is what tells 'never completed' from 'completed long ago', and it reads this value", got, ok)
+	}
+}
+
+// TestExternalSyncCreatedIsPerSyncNotPerPair: two syncs onto the SAME (source, destination) pair
+// are two series, because `sync` is the CR's own name and is part of the identity. Each therefore
+// carries its own creation time, and an old sync that has never worked keeps its own age rather
+// than borrowing the clock of a replacement created today.
+//
+// (Inside the collector the two would only be folded together if their whole key collided, which
+// two CRs cannot manage — the name is in the key. The earliest-wins fold is kept as the defensive
+// answer for a key that ever does collide; this test pins the behaviour operators actually see.)
+func TestExternalSyncCreatedIsPerSyncNotPerPair(t *testing.T) {
+	old := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+	recent := time.Date(2026, 7, 29, 0, 0, 0, 0, time.UTC)
+	onto := func(name string, at time.Time) *cbv1.ClusterBackupExternalSync {
+		return &cbv1.ClusterBackupExternalSync{
+			ObjectMeta: metav1.ObjectMeta{Name: name, CreationTimestamp: metav1.NewTime(at)},
+			Spec: cbv1.ClusterBackupExternalSyncSpec{
+				SourceLocationRef:      cbv1.LocalObjectReference{Name: "dr"},
+				DestinationLocationRef: cbv1.LocalObjectReference{Name: "cold"},
+			},
+		}
+	}
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(NewCollector(newFakeClient(t,
+		drLocation(), onto("veteran", old), onto("newcomer", recent)), testOperatorNamespace))
+
+	for name, at := range map[string]time.Time{"veteran": old, "newcomer": recent} {
+		want := map[string]string{
+			"sync": name, "source": "dr", "destination": "cold",
+			"scope": "cluster", "namespace": "", "cluster": "c1",
+		}
+		if got, ok := gatherValue(t, reg, NameExternalSyncCreated, want); !ok || got != float64(at.Unix()) {
+			t.Errorf("externalsync_created for %s = %v (found=%v), want %d", name, got, ok, at.Unix())
+		}
 	}
 }
 

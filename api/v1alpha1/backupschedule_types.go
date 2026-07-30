@@ -37,6 +37,10 @@ type BackupScheduleSpec struct {
 	// +optional
 	Timezone string `json:"timezone,omitempty"`
 
+	// paused suspends new runs.
+	// +optional
+	Paused bool `json:"paused,omitempty"`
+
 	// jitter spreads execution deterministically.
 	// +optional
 	Jitter bool `json:"jitter,omitempty"`
@@ -97,6 +101,7 @@ type BackupScheduleStatus struct {
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Namespaced,shortName=bs
 // +kubebuilder:printcolumn:name="Schedule",type=string,JSONPath=`.spec.schedule`
+// +kubebuilder:printcolumn:name="Paused",type=boolean,JSONPath=`.spec.paused`
 // +kubebuilder:printcolumn:name="Location",type=string,JSONPath=`.spec.locationRef.name`
 // +kubebuilder:printcolumn:name="Last-Success",type=date,JSONPath=`.status.lastSuccessTime`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`

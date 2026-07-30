@@ -78,7 +78,7 @@ matching the Prometheus convention for enumerated label values.
 | `crystalbackup_backup_last_added_bytes` | gauge | namespace, tenant, schedule, origin, location, cluster | Dedup delta of the last backup (Σ `status.volumes[].addedBytes`). |
 | `crystalbackup_backup_added_bytes_total` | counter | namespace, tenant, schedule, origin, location, cluster | Cumulative bytes uploaded to the repository (S3 egress estimation). |
 | `crystalbackup_backup_failures_total` | counter | namespace, tenant, schedule, origin, location, cluster | `Backup`s ending `Failed` or `PartiallyFailed`. |
-| `crystalbackup_schedule_active` | gauge | namespace, tenant, schedule, origin, location, cluster | 1 when an unpaused schedule is expected to back up this `(namespace, schedule)`: a namespaced `BackupSchedule` (`origin=namespace`), **or** a `ClusterBackupSchedule` whose namespace selection matches this namespace (`origin=cluster` — the operator resolves the selection and emits one series per matched namespace). Drives per-namespace `BackupMissed` across the cluster-plane fan-out. |
+| `crystalbackup_schedule_active` | gauge | namespace, tenant, schedule, origin, location, cluster | 1 when an unpaused schedule is expected to back up this `(namespace, schedule)`: a namespaced `BackupSchedule` (`origin=namespace`), **or** a `ClusterBackupSchedule` whose namespace selection matches this namespace (`origin=cluster` — the operator resolves the selection and emits one series per matched namespace). **0** when that schedule exists but is paused; **absent** when it does not exist. Drives per-namespace `BackupMissed` across the cluster-plane fan-out. |
 | `crystalbackup_schedule_period_seconds` | gauge | namespace, tenant, schedule, origin, location, cluster | Longest gap between two consecutive activations of the schedule's cron expression. **Absent** when the expression cannot be parsed. Added in M6; it is what lets `BackupMissed` carry a per-schedule deadline instead of a flat 26 h (§8 q3). |
 | `crystalbackup_schedule_created_timestamp_seconds` | gauge | namespace, tenant, schedule, origin, location, cluster | Unix time the schedule object was created — the instant from which backups started being expected. Added in M6; see the note below. |
 
@@ -95,8 +95,30 @@ and `BackupMissed` falls back to it when there is no success to measure from.
 
 **Both are emitted from the same site as `schedule_active`**, with the same label set and the same
 absence semantics, because `BackupMissed` joins all three in one expression: a schedule that is
-paused, deleted or has an unselectable selector drops all of them at once and the rule goes quiet
-together rather than half-quiet.
+deleted or has an unselectable selector drops all of them at once and the rule goes quiet together
+rather than half-quiet.
+
+**A paused schedule reports `0`, and until M6 it reported nothing at all.** For the `BackupMissed`
+join the two readings are equivalent — the guard is `== 1`, which drops a `0` exactly as it drops a
+missing series, so pausing still silences the rule, which is what pausing means. What absence
+additionally destroyed was the **observation**. Somebody suspends a schedule "for the migration",
+the migration ends, nobody resumes it, and there is no series anywhere that says so: the namespace
+is unprotected and every rule and every dashboard agrees that all is well, indefinitely. A backup
+tool cannot have a state in which silence and health are indistinguishable. `0` is a schedule
+stating that it exists and is protecting nothing, which is something an alert can read —
+`CrystalbackupSchedulePausedTooLong` (§3) is what reads it. **Deletion** remains the only thing that
+removes the series, and that asymmetry is the point: deleting a schedule is a decision somebody
+finished making, and leaving one paused usually is not.
+
+`schedule_period_seconds` and `schedule_created_timestamp_seconds` follow `schedule_active` into the
+paused state rather than dropping out with it. `SchedulePausedTooLong` needs `schedule_created` for
+two separate reasons — to know the schedule is old enough for a seven-day lookback to mean anything,
+and, because it is an instant vector, to require that the schedule still exists at evaluation time
+rather than merely leaving samples behind in the window.
+
+Both planes carry `spec.paused` since M6. Before it, a `BackupSchedule` had no way to suspend
+itself, so a tenant's only option was to **delete** the schedule — which took the status history and
+the baseline tick with it, and left a recreated schedule with no memory of when it last succeeded.
 
 ### 2.2 ClusterBackup runs (run-level — from `ClusterBackup`)
 
@@ -296,6 +318,8 @@ labels: `sync` (CR name), `source`/`destination` (location names), `scope` (`clu
 | `crystalbackup_externalsync_snapshots_copied` | gauge | sync, source, destination, scope, namespace, cluster | Snapshots present at the destination as copies of the source, as of the last completed sync (`status.snapshotsCopied`). | **shipped (M5)** |
 | `crystalbackup_externalsync_lag_snapshots` | gauge | sync, source, destination, scope, namespace, cluster | Source snapshots not yet present at the destination (`status.lagSnapshots`). | **shipped (M5)** |
 | `crystalbackup_externalsync_failures` | gauge | sync, source, destination, scope, namespace, cluster | External syncs currently in a failed terminal phase (`Failed` or `PartiallyFailed`). | **shipped (M5)** |
+| `crystalbackup_externalsync_active` | gauge | sync, source, destination, scope, namespace, cluster | 1 when a sync exists for this pair and is expected to copy, **0** when every sync on the pair is paused, absent when none exists. `schedule_active`'s counterpart, and the join partner `ExternalSyncStale` is guarded on. | **shipped (M6)** |
+| `crystalbackup_externalsync_created_timestamp_seconds` | gauge | sync, source, destination, scope, namespace, cluster | Unix time the sync object was created — the instant from which copies started being expected for this pair. The **earliest** creation when several syncs share a pair. `ExternalSyncStale` measures age from it when nothing has ever completed; see the note below. | **shipped (M6)** |
 | `crystalbackup_externalsync_duration_seconds` | histogram | sync, source, destination, scope, namespace, cluster | Sync run duration. Same buckets as §2.1. | M6 |
 | `crystalbackup_externalsync_bytes_copied_total` | counter | sync, source, destination, scope, namespace, cluster | Bytes streamed to the destination (blob-incremental; S3 egress estimation). | M6 |
 
@@ -321,9 +345,37 @@ repository family (§2.4), and deliberately: `time() - metric` over an absent se
 alert, so a secondary that never worked from day one would be the one case `ExternalSyncStale`
 silently missed.
 
+**That `0` is a sentinel, not a timestamp, and reading it as one was a real bug.** On a real
+cluster's clock `time()` is around 1.77 × 10⁹, so `time() - 0` is about fifty-four years. A pure
+staleness test therefore crossed a 26 h bound on the **first scrape after any sync was created**,
+and the only thing between `kubectl apply` and a page reading "has not completed in 26h" was the
+rule's 1 h hold — an alert about an object ninety minutes old whose first copy was not due until
+that night. The promtool unit tests were green throughout, because promtool's synthetic clock starts
+at the epoch: there the sentinel and "created just now" are the same instant, and the arithmetic
+that misbehaves on every real cluster cannot misbehave at all.
+
+The fix is `crystalbackup_externalsync_created_timestamp_seconds` and a rule that reads it, **not** a
+rewritten `last_success`. Back-filling the creation time into `last_success` would have closed the
+alert bug while lying to every dashboard panel that shows "last successful copy" for a sync that has
+copied nothing: `0` means *never*, which is the true and useful thing to display. So the metric goes
+on saying it, and `ExternalSyncStale` measures age from the last success when there was one and from
+the object's creation when there was not — the same fallback `BackupMissed` makes onto
+`schedule_created_timestamp_seconds` (§2.1), against the same class of hole.
+
+**`externalsync_active` closes a defect that was latent from M5 to M6, not a theoretical one.**
+`ClusterBackupExternalSync.spec.paused` shipped in M5 and **nothing read it** — not this family, not
+the alert rules. `ExternalSyncStale` was a pure staleness test, so the first operator to follow
+[docs/DECOMMISSION.md §1.1](../docs/DECOMMISSION.md) and pause a sync before retiring its location
+would have been paged 26 hours later, the rule correctly reporting that the thing they had
+deliberately stopped had indeed stopped. The value is `0` rather than absent for the same reason
+`schedule_active`'s is (§2.1): the guard is `== 1`, so both readings silence the alert, and only the
+`0` leaves something behind that says the secondary is deliberately not being maintained. Where
+several syncs address one `(source, destination)` pair the value is an **OR**, not a last-one-wins:
+if even one of them is still expected to copy, the relationship is still being maintained.
+
 ## 3. Alert rules
 
-**Shipped in M6, and no longer written here.** The nine rules live in a Go table,
+**Shipped in M6, and no longer written here.** The eleven rules live in a Go table,
 `internal/alerts/rules.go`, from which the chart's `PrometheusRule` body is GENERATED into
 `charts/crystal-backup/rules/crystalbackup.rules.yaml` (`make alert-rules`). Enable it with
 `metrics.rules.enabled=true`; `metrics.rules.labels` sets whatever the Prometheus Operator's
@@ -354,7 +406,9 @@ needs.
 | `CrystalbackupDiscoveryFailed` | warning | 30m | Discovery is failing, so `kubectl get backups` no longer matches the repository. |
 | `CrystalbackupErasureBlocked` | warning | 1h | A `ClusterErasure` is parked on an object-lock window. Not an error; a GDPR clock. |
 | `CrystalbackupPVCSnapshotPileup` | warning | 30m | More than 20 VolumeSnapshots on one PVC (ceph-csi flatten risk, ADR 0006). |
-| `CrystalbackupExternalSyncStale` | warning | 1h | No completed external sync in 26 h. |
+| `CrystalbackupExternalSyncStale` | warning | 1h | No completed external sync in 26 h — measured from the last success, or from the sync's **creation** when there has never been one — **and** the pair still has an unpaused sync (`externalsync_active == 1`, §2.12). |
+| `CrystalbackupSchedulePausedTooLong` | warning | 1h | A schedule has been paused for more than **7 days**, on either plane. Cannot fire on a schedule younger than the window, nor on a deleted one. |
+| `CrystalbackupExternalSyncPausedTooLong` | warning | 1h | An external sync has been paused for more than **7 days**, on either plane — the secondary has stopped being fed. Same shape and same exclusions as the rule above. |
 
 Tenant-facing alerts carry the `namespace` label for per-tenant routing; repository-level
 alerts route to admins for the shared cluster repo (`scope=cluster`) and to the tenant for
@@ -381,17 +435,63 @@ expression, so changing a schedule moves its alert with no rule edit. `ExternalS
 fixed 26 h because a sync's schedule is optional — a manual sync has no period to derive from
 (§8 q3 remains open for that one).
 
-**Two rules are deliberately NOT here yet**, and both for the same reason the five broken ones
-were: they depend on series nothing emits. A pause guard on `ExternalSyncStale` needs
-`crystalbackup_externalsync_active`, and a `SchedulePausedTooLong` needs `schedule_active` to emit
-`0` for a paused schedule rather than nothing. Shipping either now would mean shipping a rule that
-cannot fire, which is the exact defect M6 exists to end.
+**The two items this section previously listed as blocked are now shipped**, because the series they
+waited on now exist — and a third rule came with them, because guarding a rule on a pause is only
+half an answer. The count is **eleven**: nine, plus two new rules, with the pause guard modifying an
+existing one rather than adding to the total.
 
-**Each rule also declares a `Threshold`, and a slot for a Go state predicate** that answers the
-same question by reading object state instead of Prometheus — the half the exportable self-check
-consumes, so an operator with no monitoring stack still gets a verdict. Two of the nine are
-implemented as the worked shape. The threshold is declared ONCE and read by both: two
-implementations of one bound diverge, and it is only a question of which release.
+- The **pause guard on `ExternalSyncStale`** reads `crystalbackup_externalsync_active` (§2.12). This
+  was not a nicety — `ClusterBackupExternalSync.spec.paused` had existed since M5 with nothing
+  reading it, so the rule as shipped would have paged an operator 26 h after they paused a sync,
+  which is the documented first step of decommissioning a location. The same rule also gained a
+  **never-completed fallback** onto `crystalbackup_externalsync_created_timestamp_seconds`, because
+  reading the `last_success = 0` sentinel as a timestamp made every freshly created sync page one
+  hour after `kubectl apply` (§2.12). A sync created and immediately paused now fires for neither
+  reason, which is the case where the two corrections meet.
+- **`CrystalbackupSchedulePausedTooLong`** reads `schedule_active`'s new `0` (§2.1). Its expression
+  is two terms and the second one is load-bearing three times over: `max_over_time(...[7d]) == 0`
+  says the schedule was not active at any point in the window — read from history rather than
+  accumulated as a seven-day `for`, which Prometheus resets after an outage longer than its
+  restoration tolerance — while `time() - schedule_created > 7d` excludes a schedule too young to
+  have a `1` in a seven-day lookback *and*, being an instant vector, requires the schedule to still
+  exist, so a deleted one stops alerting immediately instead of trailing its samples for a week.
+
+**Every pause guard needs a paused-too-long companion, and that is a rule about rules.** Guarding an
+alert on a pause trades a false page for permanent silence — the right trade for the page and the
+wrong one for the operator, since the whole reason `schedule_active` and `externalsync_active` emit
+`0` rather than nothing is that a backup tool cannot have a state where silence and health are
+indistinguishable. So `CrystalbackupExternalSyncPausedTooLong` ships alongside the guard on
+`ExternalSyncStale`, exactly as `SchedulePausedTooLong` ships alongside the one on `BackupMissed`.
+
+The stakes are, if anything, higher on the sync side. A secondary is **insurance**: somebody pauses
+replication "while we migrate the bucket", leaves, and nothing anywhere reports that the safety copy
+stopped being fed. The silence is indistinguishable from a destination that is perfectly current,
+and the difference only becomes visible on the day the primary is gone — which is the worst possible
+moment to discover it. `internal/alerts/rules_test.go` enforces the pairing directly: an `_active`
+series that silences a rule must also feed one, so a third family growing a pause guard and no
+companion fails the build.
+
+**Each rule also declares a `Threshold` and a Go state predicate** that answers the same question by
+reading object state instead of Prometheus — the half the exportable self-check consumes, so an
+operator with no monitoring stack still gets a verdict. All eleven are implemented, and the
+threshold is declared ONCE and read by both: two implementations of one bound diverge, and it is
+only a question of which release.
+
+**The predicate hangs off `Rule.Predicate`, and that is the only place it is declared.** For part of
+M6 it was declared twice — in the field, and in a separate exported map that landed with the
+self-check while the rule table was owned by another change — with a test holding the two together.
+That test is the tell: a second declaration site for one thing needs a guard precisely because it
+will drift, which is the defect this entire section exists to have ended. There is one site now, and
+the self-check reads the field.
+
+Three predicates cannot reproduce their PromQL exactly, and each says so in `alerts.Fidelity()`,
+which travels with the verdict into the JSON and onto the rendered page. `BackupFailed` reads a
+counter the object graph no longer holds once a failed run is garbage-collected, so it *under*
+reports; the two paused-too-long rules ask about metric HISTORY, which object state does not hold at
+all, and substitute the `Ready` condition's transition into `reason=Paused` — a reading that can be
+older than the real pause, so they *over* report. Both directions are stated rather than smoothed
+over: a bare OK printed over a measurement with a blind spot is the one thing a self-check must
+never produce.
 
 ## 4. Logging
 

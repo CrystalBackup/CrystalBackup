@@ -172,7 +172,7 @@ metrics:
     # -- Extra labels for the ServiceMonitor (e.g. to match a Prometheus selector).
     labels: {}
   rules:
-    # -- Create a Prometheus Operator PrometheusRule with the nine Crystal Backup alert rules
+    # -- Create a Prometheus Operator PrometheusRule with the eleven Crystal Backup alert rules
     # (spec/05-observability.md §3). Off by default, like `serviceMonitor.enabled`: it requires
     # the monitoring.coreos.com CRDs, and the thresholds are platform policy — an operator should
     # turn these on deliberately, having read them. The rule bodies are generated from

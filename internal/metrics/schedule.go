@@ -53,9 +53,18 @@ import (
 // emitted once per schedule would join against nothing. The selection is therefore RESOLVED here,
 // against the live namespaces, exactly as the ClusterBackup controller resolves it at run time,
 // and one series is emitted per matched namespace.
+//
+// PAUSED IS 0, NOT ABSENT — the one semantic M6 changed here, and the reason is that a backup tool
+// cannot afford a state in which silence and health look identical. For the BackupMissed join the
+// two readings are equivalent: `== 1` drops a 0 exactly as it drops a missing series, so pausing
+// still silences the rule. What absence additionally destroyed was the OBSERVATION. Somebody
+// suspends a schedule "for the migration", the migration ends, nobody unpauses, and there is no
+// series anywhere that says so — the namespace is unprotected and every dashboard and every rule
+// agrees that all is well, forever. A 0 is a schedule saying "I exist and I am not protecting
+// anything", which is a thing an alert can read; CrystalbackupSchedulePausedTooLong reads it.
 var scheduleActiveDesc = prometheus.NewDesc(
 	NameScheduleActive,
-	"1 when an unpaused schedule is expected to back up this (namespace, schedule): a namespaced BackupSchedule, or a ClusterBackupSchedule whose namespace selection matches.",
+	"1 when an unpaused schedule is expected to back up this (namespace, schedule) — a namespaced BackupSchedule, or a ClusterBackupSchedule whose namespace selection matches — and 0 when that schedule exists but is paused.",
 	backupLabels, nil)
 
 // crystalbackup_schedule_period_seconds — the schedule's own cron period, and the reason
@@ -96,11 +105,15 @@ var scheduleCreatedDesc = prometheus.NewDesc(
 
 // collectSchedules emits crystalbackup_schedule_active from both planes.
 //
-// The value is always 1: this is a presence series, and a paused or deleted schedule is ABSENT
-// rather than 0. That is not a stylistic choice — `== 1` in the alert would also be satisfied by
-// nothing at all if the series went to 0, but the join would still MATCH, and a paused schedule
-// would keep the missed-backup rule alive on a namespace whose owner deliberately turned it off.
-// Absence removes the join partner, which is the semantics the rule was written against.
+// A schedule that EXISTS gets a series either way: 1 when it is expected to run, 0 when it is
+// paused. Deletion is what removes the series — and the distinction between "deleted" and "paused"
+// is the whole point, because the two are different operator intents and only one of them is
+// supposed to be permanent. See scheduleActiveDesc.
+//
+// schedule_period and schedule_created follow schedule_active into the paused state rather than
+// dropping out with it: SchedulePausedTooLong needs schedule_created to know how long the schedule
+// has existed at all, and a paused schedule whose three series disagreed on presence would be the
+// half-quiet state spec §2.1 says the shared emit() exists to prevent.
 func collectSchedules(ch chan<- prometheus.Metric,
 	schedules []cbv1.BackupSchedule, clusterSchedules []cbv1.ClusterBackupSchedule,
 	namespaces []corev1.Namespace, clusterByLocation map[string]string,
@@ -120,7 +133,7 @@ func collectSchedules(ch chan<- prometheus.Metric,
 		}
 		emitted[key] = struct{}{}
 		vals := key.values()
-		ch <- prometheus.MustNewConstMetric(scheduleActiveDesc, prometheus.GaugeValue, 1, vals...)
+		ch <- prometheus.MustNewConstMetric(scheduleActiveDesc, prometheus.GaugeValue, boolValue(!spec.paused), vals...)
 		ch <- prometheus.MustNewConstMetric(scheduleCreatedDesc, prometheus.GaugeValue,
 			float64(spec.created.Unix()), vals...)
 		if parsed, err := schedule.Parse(spec.cron, spec.timezone); err == nil {
@@ -131,12 +144,12 @@ func collectSchedules(ch chan<- prometheus.Metric,
 
 	tenants := tenantsByNamespace(namespaces)
 
-	// The namespace plane. BackupSchedule has NO paused field — the tenant-facing surface never
-	// grew one (spec/02-api.md) — so a BackupSchedule that exists is a BackupSchedule that is
-	// expected to run, and deleting it is how a user turns it off. Its location is a namespaced
-	// BackupLocation, which carries no clusterID, so `cluster` is empty here; the Backups it
-	// stamps out resolve their own cluster label from the same (absent) mapping, so the join in
-	// BackupMissed still lines up. An invented cluster ID would be the thing that broke it.
+	// The namespace plane. spec.paused reached BackupSchedule in M6; until then a tenant could only
+	// suspend its backups by DELETING the schedule, which took the history and the baseline tick
+	// with it. Its location is a namespaced BackupLocation, which carries no clusterID, so `cluster`
+	// is empty here; the Backups it stamps out resolve their own cluster label from the same
+	// (absent) mapping, so the join in BackupMissed still lines up. An invented cluster ID would be
+	// the thing that broke it.
 	for i := range schedules {
 		s := &schedules[i]
 		location := s.Spec.LocationRef.Name
@@ -147,15 +160,17 @@ func collectSchedules(ch chan<- prometheus.Metric,
 			Origin:    apiconst.OriginNamespace,
 			Location:  location,
 			Cluster:   clusterByLocation[location],
-		}, scheduleTiming{cron: s.Spec.Schedule, timezone: s.Spec.Timezone, created: s.CreationTimestamp.Time})
+		}, scheduleTiming{
+			cron: s.Spec.Schedule, timezone: s.Spec.Timezone,
+			created: s.CreationTimestamp.Time, paused: s.Spec.Paused,
+		})
 	}
 
-	// The cluster plane, resolved.
+	// The cluster plane, resolved. A paused cluster schedule still has its selection resolved and
+	// emits one 0 per matched namespace: those namespaces are precisely the ones that stopped being
+	// protected, and they are what SchedulePausedTooLong has to name.
 	for i := range clusterSchedules {
 		cs := &clusterSchedules[i]
-		if cs.Spec.Paused {
-			continue
-		}
 		matched, err := nsselector.Match(namespaces, cs.Spec.Template.Spec.Namespaces)
 		if err != nil {
 			// A selector this schedule's own controller will refuse to fan out on. Emitting
@@ -166,7 +181,8 @@ func collectSchedules(ch chan<- prometheus.Metric,
 		}
 		location := cs.Spec.Template.Spec.LocationRef.Name
 		timing := scheduleTiming{
-			cron: cs.Spec.Schedule, timezone: cs.Spec.Timezone, created: cs.CreationTimestamp.Time,
+			cron: cs.Spec.Schedule, timezone: cs.Spec.Timezone,
+			created: cs.CreationTimestamp.Time, paused: cs.Spec.Paused,
 		}
 		for _, ns := range matched {
 			emit(backupSeriesKey{
@@ -181,12 +197,22 @@ func collectSchedules(ch chan<- prometheus.Metric,
 	}
 }
 
-// scheduleTiming is the part of a schedule the period/creation series are derived from, carried
-// separately so the two planes reach the same emit() with one shape.
+// scheduleTiming is the part of a schedule the period/creation/active series are derived from,
+// carried separately so the two planes reach the same emit() with one shape.
 type scheduleTiming struct {
 	cron     string
 	timezone string
 	created  time.Time
+	paused   bool
+}
+
+// boolValue renders a Go bool as the 1/0 a Prometheus state gauge carries. Shared by the two
+// `_active` families so neither can accidentally invert it against the other.
+func boolValue(b bool) float64 {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 // namespaceTenants resolves a namespace to its tenant the same way the backup controllers do:

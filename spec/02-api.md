@@ -403,6 +403,9 @@ spec:
   locationRef: { name: my-offsite }  # a BackupLocation in this namespace (required)
   schedule: "0 1 * * *"
   timezone: Europe/Paris
+  paused: false                      # suspend without losing lastSuccessTime and the history
+                                     # (M6; deleting the schedule was the only way before, and it
+                                     # threw away the baseline every alert measures against)
   jitter: true
   concurrencyPolicy: Forbid
   startingDeadlineSeconds: 3600
@@ -587,6 +590,11 @@ spec:
   destinationLocationRef: { name: my-offsite-2 } # another BackupLocation in THIS namespace, its OWN key
   schedule: "0 4 * * *"
   timezone: Europe/Paris
+  paused: false                                   # M6, same as BackupSchedule. A paused sync stops
+                                                  # alerting as stale — and starts being watched by
+                                                  # ExternalSyncPausedTooLong instead, because a
+                                                  # forgotten pause on a secondary is discovered at
+                                                  # the worst possible moment.
   mode: Mirror                                    # Mirror | AppendOnly (forced on Immutable destination)
 status:
   phase: Completed

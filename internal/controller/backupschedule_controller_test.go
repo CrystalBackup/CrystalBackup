@@ -175,6 +175,65 @@ var _ = Describe("BackupScheduleReconciler", func() {
 		}, eventuallyTimeout, eventuallyPoll).Should(Succeed())
 	})
 
+	// The reason spec.paused exists on a tenant-facing type at all. Before it, the only way a
+	// namespace could suspend its own backups was `kubectl delete backupschedule`, which took the
+	// history AND the baseline tick with it — a recreated schedule restarts from its new
+	// creationTimestamp and has no memory of when it last succeeded. Pausing has to be the
+	// reversible operation deleting is not, and that is a claim about STATUS, not about stamping.
+	It("stamps nothing while paused, and preserves the status it had", func() {
+		const (
+			ns   = "bs-paused-ns"
+			name = "pausable"
+		)
+		createTenantNamespace(ns)
+		createTenantSchedule(newTenantSchedule(ns, name, "* * * * *", "bs-paused-loc"))
+		created := getTenantScheduleNow(ns, name)
+
+		By("firing once so there is a status worth preserving")
+		tick := created.CreationTimestamp.UTC().Truncate(time.Minute).Add(time.Minute)
+		scheduleClock.SetTime(tick.Add(30 * time.Second))
+		pokeTenantSchedule(ns, name)
+
+		firstRun := apiconst.RunName(name, tick)
+		Eventually(func(g Gomega) {
+			g.Expect(getTenantScheduleG(g, ns, name).Status.LastRunName).To(Equal(firstRun))
+		}, eventuallyTimeout, eventuallyPoll).Should(Succeed())
+
+		// lastSuccessTime is written here rather than driven through a real Backup because the
+		// property under test is that the pause branch does not TOUCH it. Its provenance is
+		// irrelevant; its survival is the whole point.
+		success := metav1.NewTime(tick.Add(time.Minute).UTC().Truncate(time.Second))
+		Eventually(func(g Gomega) {
+			s := getTenantScheduleG(g, ns, name)
+			s.Status.LastSuccessTime = &success
+			g.Expect(k8sClient.Status().Update(ctx, &s)).To(Succeed())
+		}, eventuallyTimeout, eventuallyPoll).Should(Succeed())
+
+		By("pausing it")
+		Eventually(func(g Gomega) {
+			s := getTenantScheduleG(g, ns, name)
+			s.Spec.Paused = true
+			g.Expect(k8sClient.Update(ctx, &s)).To(Succeed())
+		}, eventuallyTimeout, eventuallyPoll).Should(Succeed())
+
+		scheduleClock.SetTime(tick.Add(10 * time.Minute))
+		pokeTenantSchedule(ns, name)
+
+		By("the schedule reports Paused and keeps every status field it had")
+		Eventually(func(g Gomega) {
+			s := getTenantScheduleG(g, ns, name)
+			g.Expect(s.Status.Phase).To(Equal("Paused"))
+			g.Expect(s.Status.LastRunName).To(Equal(firstRun))
+			g.Expect(s.Status.LastSuccessTime).NotTo(BeNil())
+			g.Expect(s.Status.LastSuccessTime.Time.UTC()).To(Equal(success.Time.UTC()))
+		}, eventuallyTimeout, eventuallyPoll).Should(Succeed())
+
+		By("and no further tick is stamped, though ten of them have passed")
+		Consistently(func(g Gomega) {
+			g.Expect(listScheduleBackups(ns, name)).To(HaveLen(1))
+		}, 3*time.Second, 500*time.Millisecond).Should(Succeed())
+	})
+
 	It("leaves its Backups standing when the schedule itself is deleted", func() {
 		const (
 			ns   = "bs-delete-ns"

@@ -95,7 +95,7 @@ func TestRepositoryCheckFailedMirrorsAbsenceSemantics(t *testing.T) {
 // does not know that the bound is 26h, it asks the table. Move the number in one place and both
 // answers move.
 func TestMaintenanceStalledReadsTheRuleThreshold(t *testing.T) {
-	age := thresholdOf("CrystalbackupMaintenanceStalled").Age
+	age := mustThreshold(t, ruleMaintenanceStalled).Age
 	if age == 0 {
 		t.Fatal("CrystalbackupMaintenanceStalled declares no Age threshold")
 	}

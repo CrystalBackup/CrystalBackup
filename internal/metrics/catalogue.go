@@ -105,6 +105,8 @@ func Catalogue() map[string][]string {
 		NameExternalSyncLag:         externalSyncLabels,
 		NameExternalSyncFailures:    externalSyncLabels,
 		NameExternalSyncDuration:    externalSyncLabels,
+		NameExternalSyncActive:      externalSyncLabels,
+		NameExternalSyncCreated:     externalSyncLabels,
 	}
 	// Cloned on the way out: the values are the collectors' own label slices, and a caller that
 	// sorted or appended to one in place would reshape a live metric family.

@@ -142,15 +142,89 @@ groups:
       # the repository family), so a secondary that never worked from day one fires here instead of
       # being the one case the rule misses.
       # The 26h stays fixed, unlike BackupMissed's: a sync's schedule is optional, so a manual sync
-      # has no period to derive a deadline from. The pause guard this rule also wants waits on
-      # crystalbackup_externalsync_active, which does not exist yet — and a rule referencing a series
-      # nobody emits is the exact defect this table was built to make impossible.
+      # has no period to derive a deadline from.
+      # The `or` branch onto crystalbackup_externalsync_created_timestamp_seconds is not decoration. The 0 above
+      # is a SENTINEL, and on a real clock time()-0 is fifty-four years — so without this branch the
+      # rule was past its 26h bound on the first scrape after ANY sync was created, and only the 1h
+      # hold stood between `kubectl apply` and a page claiming a ninety-minute-old sync had not
+      # completed in 26h. Age is measured from the last success when there was one, and from the
+      # object's creation when there was not.
+      # The `and` guard on crystalbackup_externalsync_active closes a defect that was latent
+      # rather than theoretical: spec.paused has existed on ClusterBackupExternalSync since M5 and
+      # nothing read it, so pausing a sync — the documented first step of decommissioning a location
+      # (docs/DECOMMISSION.md §1.1) — would have paged 26h later, about the thing the operator had
+      # just deliberately stopped.
       - alert: CrystalbackupExternalSyncStale
         expr: |
-          time() - crystalbackup_externalsync_last_success_timestamp_seconds > 93600
+          (
+            (
+              (time() - (crystalbackup_externalsync_last_success_timestamp_seconds > 0))
+              or on (sync, source, destination, scope, namespace, cluster)
+              (time() - crystalbackup_externalsync_created_timestamp_seconds)
+            ) > 93600
+          )
+          and on (sync, source, destination, scope, namespace, cluster)
+            (crystalbackup_externalsync_active == 1)
         for: 1h
         labels:
           severity: warning
         annotations:
           summary: "External sync {{ $labels.sync }} ({{ $labels.source }}→{{ $labels.destination }}) has not completed in 26h"
           description: "The secondary copy is falling behind. Check the sync CR's phase and the queue: a secondary nobody has verified is not a secondary."
+      # This rule exists because of the blind spot the M6 semantics change opened up and then closed.
+      # A paused schedule used to emit NO crystalbackup_schedule_active series at all, which
+      # suppressed BackupMissed correctly and made the pause itself unobservable: someone suspends a
+      # schedule 'for the migration', the migration ends, nobody unpauses, and the namespace is
+      # unprotected while every rule and every dashboard reports perfect health. For a backup tool,
+      # silence that is indistinguishable from safety is the one failure mode that must not exist.
+      # Two terms, and the second is doing three jobs at once:
+      #   * max_over_time == 0 over the window means the schedule was not active at ANY point in it —
+      #     robust to an operator restart in a way a 7d `for` would not be, since it reads history
+      #     rather than accumulating pending state;
+      #   * the age term excludes a schedule younger than the window, which would otherwise fire
+      #     simply because there is no `1` in a lookback longer than its life;
+      #   * and because crystalbackup_schedule_created_timestamp_seconds is an instant vector, that same term
+      #     requires the schedule to still EXIST. A deleted schedule leaves samples in the lookback
+      #     window for a week; without this it would keep alerting about an object that is gone.
+      # Deleting a schedule is a decision someone made. Leaving one paused is usually a decision
+      # nobody finished making, and that is the difference this alert is about.
+      # CAVEAT: reading history means the lookback is only as long as your retention. Under 7d of
+      # retention max_over_time sees a shorter window than it asks for, and a schedule that was
+      # active six days ago can look like it never was. Raise retention or raise this threshold;
+      # do not silence the rule.
+      - alert: CrystalbackupSchedulePausedTooLong
+        expr: |
+          (
+            max_over_time(crystalbackup_schedule_active[604800s]) == 0
+          )
+          and on (namespace, schedule, origin, location, cluster)
+            (time() - crystalbackup_schedule_created_timestamp_seconds > 604800)
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Schedule {{ $labels.namespace }}/{{ $labels.schedule }} ({{ $labels.origin }}) has been paused for over 7 days — nothing is backing this namespace up"
+          description: "A paused schedule protects nothing, and no other alert can say so: BackupMissed is guarded on the same pause. Unpause it (spec.paused=false), or delete it if the namespace is genuinely no longer being protected — an intent nobody has to re-check in a month."
+      # SchedulePausedTooLong's twin, and it exists because the pause guard added to
+      # ExternalSyncStale in this same lot re-opened, for syncs, precisely the blind spot that
+      # rule closes for schedules: with the guard in place, pausing a sync is silent forever.
+      # The stakes are arguably higher here than on a schedule. A secondary is INSURANCE. Somebody
+      # pauses replication 'while we migrate the bucket', leaves, and nothing anywhere reports that
+      # the safety copy stopped being fed — the silence is indistinguishable from a destination
+      # that is perfectly up to date, and the difference only becomes visible on the day the
+      # primary is gone, which is the worst possible moment to find out.
+      # Same shape as its twin, same three jobs in the second term (see pausedTooLongExpr), and the
+      # same retention caveat: max_over_time cannot look further back than your Prometheus keeps.
+      - alert: CrystalbackupExternalSyncPausedTooLong
+        expr: |
+          (
+            max_over_time(crystalbackup_externalsync_active[604800s]) == 0
+          )
+          and on (sync, source, destination, scope, namespace, cluster)
+            (time() - crystalbackup_externalsync_created_timestamp_seconds > 604800)
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "External sync {{ $labels.sync }} ({{ $labels.source }}→{{ $labels.destination }}) has been paused for over 7 days — the secondary is no longer being fed"
+          description: "The destination has stopped receiving copies and ExternalSyncStale is guarded on the same pause, so nothing else will say so. Resume it (spec.paused=false), or delete the sync if this secondary is genuinely being retired."

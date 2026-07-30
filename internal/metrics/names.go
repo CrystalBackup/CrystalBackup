@@ -105,6 +105,8 @@ const (
 	NameExternalSyncLag         = "crystalbackup_externalsync_lag_snapshots"
 	NameExternalSyncFailures    = "crystalbackup_externalsync_failures"
 	NameExternalSyncDuration    = "crystalbackup_externalsync_duration_seconds"
+	NameExternalSyncActive      = "crystalbackup_externalsync_active"
+	NameExternalSyncCreated     = "crystalbackup_externalsync_created_timestamp_seconds"
 )
 
 // durationBuckets are the histogram buckets spec/05-observability.md §2.1 fixes for every

@@ -296,8 +296,8 @@ func TestTableIsWellFormed(t *testing.T) {
 			t.Errorf("%s: no threshold kind declared; lot J cannot evaluate it", r.Name)
 		}
 	}
-	if len(seen) != 9 {
-		t.Errorf("the table has %d rules; spec/05-observability.md §3 specifies 9. If a rule was "+
+	if len(seen) != 11 {
+		t.Errorf("the table has %d rules; spec/05-observability.md §3 specifies 11. If a rule was "+
 			"added or removed, update the spec in the same change.", len(seen))
 	}
 }
@@ -414,6 +414,124 @@ func TestBackupMissedReadsTheSchedulesOwnPeriod(t *testing.T) {
 	if missed.Threshold.Kind != ThresholdPeriod {
 		t.Errorf("BackupMissed threshold kind is %q, want %q — a fixed deadline is wrong for every "+
 			"schedule that is not daily (spec §8 q3)", missed.Threshold.Kind, ThresholdPeriod)
+	}
+}
+
+// TestExternalSyncStaleIsGuardedOnThePause pins the fix for a defect that was LATENT rather than
+// hypothetical, which is why it gets a test of its own rather than a line in the table check.
+//
+// ClusterBackupExternalSync.spec.paused shipped in M5 and NOTHING read it — not the collector, not
+// this table. ExternalSyncStale was pure staleness, so the first operator to follow
+// docs/DECOMMISSION.md §1.1 and pause a sync before retiring its location would have been paged 26
+// hours later, correctly reporting that the thing they deliberately stopped had stopped. The rule
+// even said so in its own Rationale, and waited for a series nobody emitted.
+func TestExternalSyncStaleIsGuardedOnThePause(t *testing.T) {
+	expr := ruleNamed(t, "CrystalbackupExternalSyncStale").Expr
+
+	guard := "and on (" + strings.Join(syncJoinKeys, ", ") + ")"
+	if !strings.Contains(expr, guard) {
+		t.Errorf("ExternalSyncStale does not join on the sync identity (%s):\n%s", guard, expr)
+	}
+	if !strings.Contains(expr, metrics.NameExternalSyncActive+" == 1") {
+		t.Errorf("ExternalSyncStale does not read %s; a paused sync will page 26h after somebody "+
+			"deliberately stops it:\n%s", metrics.NameExternalSyncActive, expr)
+	}
+}
+
+// TestExternalSyncStaleMeasuresFromCreationWhenNothingEverSucceeded pins the second defect in this
+// rule, which is subtler than the pause one and which promtool's clock actively hid.
+//
+// spec §2.12 has last_success emit 0, not absent, for a sync that has never completed — so that a
+// secondary broken from day one is not the single case the rule misses. Correct, and it makes 0 a
+// SENTINEL. On a real clock `time() - 0` is about 1.77e9 seconds, so the pure staleness form was
+// past its 26h bound on the first scrape after ANY sync was created, and the 1h hold was all that
+// separated `kubectl apply` from a page insisting a ninety-minute-old sync had not completed in
+// 26 hours. promtool starts at the epoch, where the sentinel and "created just now" are the same
+// instant, so the unit tests were green throughout.
+func TestExternalSyncStaleMeasuresFromCreationWhenNothingEverSucceeded(t *testing.T) {
+	expr := ruleNamed(t, "CrystalbackupExternalSyncStale").Expr
+
+	if !strings.Contains(expr, metrics.NameExternalSyncCreated) {
+		t.Errorf("ExternalSyncStale does not fall back to %s. With last_success emitting 0 as a "+
+			"sentinel, every freshly created sync is 1.77e9 seconds 'stale' on its first scrape:\n%s",
+			metrics.NameExternalSyncCreated, expr)
+	}
+	// The `> 0` is what separates "never completed" from "completed long ago". Without it the
+	// fallback branch never gets a chance to apply, because the sentinel is a perfectly good series.
+	if !strings.Contains(expr, metrics.NameExternalSyncLastSuccess+" > 0") {
+		t.Errorf("the fallback is not gated on the sentinel (%s > 0), so a sync that HAS copied "+
+			"could be measured from its creation instead of its last success:\n%s",
+			metrics.NameExternalSyncLastSuccess, expr)
+	}
+}
+
+// TestPausedTooLongRulesCannotFireOnAYoungOrDeletedObject pins the second term of two rules whose
+// first term reads perfectly well on its own — which is exactly the shape of mistake this package
+// exists to make impossible.
+//
+// `max_over_time(<active>[7d]) == 0` alone is wrong twice over, and both are silent: an object
+// created yesterday and paused since has no `1` anywhere in a seven-day lookback, so it fires six
+// days early; and a DELETED one leaves samples in that window for a week, so it keeps paging about
+// something nobody can unpause because it does not exist. The instant vector on the created series
+// fixes both, and the two durations must be the same one.
+//
+// Both rules are checked from one table because they are deliberately the same shape (they share
+// pausedTooLongExpr): a divergence between them is exactly what this would catch.
+func TestPausedTooLongRulesCannotFireOnAYoungOrDeletedObject(t *testing.T) {
+	for _, tc := range []struct{ rule, active, created string }{
+		{"CrystalbackupSchedulePausedTooLong", metrics.NameScheduleActive, metrics.NameScheduleCreated},
+		{"CrystalbackupExternalSyncPausedTooLong", metrics.NameExternalSyncActive, metrics.NameExternalSyncCreated},
+	} {
+		t.Run(tc.rule, func(t *testing.T) {
+			r := ruleNamed(t, tc.rule)
+			seconds := int64(r.Threshold.Age.Seconds())
+
+			if !strings.Contains(r.Expr, fmt.Sprintf("max_over_time(%s[%ds])", tc.active, seconds)) {
+				t.Errorf("the lookback window is not the declared threshold (%ds):\n%s", seconds, r.Expr)
+			}
+			if !strings.Contains(r.Expr, fmt.Sprintf("time() - %s > %d", tc.created, seconds)) {
+				t.Errorf("the age/existence term is missing or uses a different duration from the "+
+					"lookback; a young object would fire early and a deleted one would keep "+
+					"firing:\n%s", r.Expr)
+			}
+		})
+	}
+}
+
+// TestPauseIsGuardedAndAlsoAlerted is the invariant the second paused-too-long rule was added for,
+// stated once so it cannot be half-satisfied again.
+//
+// Guarding a rule on a pause and leaving it at that trades a false page for permanent silence. That
+// is the right trade for the page and the wrong one for the operator: the whole reason
+// schedule_active and externalsync_active emit 0 rather than nothing is that a backup tool cannot
+// have a state where silence and health are indistinguishable. So every `_active` series that
+// SILENCES a rule must also FEED one — and this test is what notices when a third family gets a
+// pause guard and no companion.
+func TestPauseIsGuardedAndAlsoAlerted(t *testing.T) {
+	guards := map[string]string{} // active series -> the rule it silences
+	alerts := map[string]string{} // active series -> the rule that reports a long pause
+
+	for _, r := range Rules() {
+		for _, active := range []string{metrics.NameScheduleActive, metrics.NameExternalSyncActive} {
+			switch {
+			case strings.Contains(r.Expr, "and on") && strings.Contains(r.Expr, active+" == 1"):
+				guards[active] = r.Name
+			case strings.Contains(r.Expr, "max_over_time("+active+"["):
+				alerts[active] = r.Name
+			}
+		}
+	}
+
+	for active, guarded := range guards {
+		if alerts[active] == "" {
+			t.Errorf("%s guards %s into silence, and no rule reports a pause that outlives its "+
+				"reason.\n    A pause that nothing can observe is the blind spot the 0 semantics "+
+				"exist to remove; add the paused-too-long companion.", guarded, active)
+		}
+	}
+	if len(guards) != 2 || len(alerts) != 2 {
+		t.Errorf("expected both _active families to be guarded and alerted; guards=%v alerts=%v",
+			guards, alerts)
 	}
 }
 

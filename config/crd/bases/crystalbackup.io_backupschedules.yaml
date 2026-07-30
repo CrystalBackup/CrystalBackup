@@ -20,6 +20,9 @@ spec:
     - jsonPath: .spec.schedule
       name: Schedule
       type: string
+    - jsonPath: .spec.paused
+      name: Paused
+      type: boolean
     - jsonPath: .spec.locationRef.name
       name: Location
       type: string
@@ -310,6 +313,9 @@ spec:
                       for a smaller blast radius if that key is ever compromised.
                     type: boolean
                 type: object
+              paused:
+                description: paused suspends new runs.
+                type: boolean
               pvcSelector:
                 description: pvcSelector selects PVCs (default all).
                 properties:

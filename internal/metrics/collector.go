@@ -188,6 +188,8 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- externalSyncSnapshotsCopiedDesc
 	ch <- externalSyncLagDesc
 	ch <- externalSyncFailuresDesc
+	ch <- externalSyncActiveDesc
+	ch <- externalSyncCreatedDesc
 }
 
 // Collect implements prometheus.Collector. It reads the live objects once and emits

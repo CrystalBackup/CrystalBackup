@@ -92,6 +92,20 @@ func (r *BackupScheduleReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	// nothing changed or it re-triggers its own watch and spins.
 	originalStatus := sched.Status.DeepCopy()
 
+	// Paused: stamp nothing, and TOUCH NOTHING ELSE. lastSuccessTime and lastRunName survive the
+	// pause untouched, which is the entire reason this field exists on a tenant-facing type — before
+	// it, the only way a namespace could suspend its own backups was to delete the BackupSchedule,
+	// and that took its history and its baseline tick with it (see baselineTick: a recreated
+	// schedule restarts from its new creationTimestamp).
+	//
+	// Checked BEFORE listBackups, unlike the cluster plane which lists first: nothing below this
+	// branch reads the list, and a paused schedule should not pay for a List every requeue. The
+	// cluster plane keeps its ordering because gcHistory sits in the same reconcile there.
+	if sched.Spec.Paused {
+		return r.writeStatus(ctx, &sched, originalStatus, "Paused", metav1.ConditionFalse, "Paused",
+			"schedule is paused; no backups are stamped", ctrl.Result{})
+	}
+
 	backups, err := r.listBackups(ctx, &sched)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("list backups for schedule %s/%s: %w", sched.Namespace, sched.Name, err)

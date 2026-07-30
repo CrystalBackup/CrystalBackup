@@ -119,6 +119,20 @@ func (r *BackupExternalSyncReconciler) Reconcile(ctx context.Context, req ctrl.R
 		return r.write(ctx, &bs, res, err)
 	}
 
+	// Paused: start no NEW copy, and leave lastSuccessTime, snapshotsCopied and lagSnapshots exactly
+	// where they are. The check sits AFTER hasInflight for the same reason it does on the cluster
+	// plane — a copy already moving data finishes on its own terms, because abandoning it leaves a
+	// half-populated destination with no record of how far it got.
+	//
+	// Note that endpoints are deliberately NOT resolved here: a sync is very often paused precisely
+	// because one of its locations is being retired, and parking on LocationNotFound would overwrite
+	// the pause with a failure the operator has already decided to stop caring about.
+	if bs.Spec.Paused {
+		*view.Phase = syncPhasePending
+		setSyncCondition(view, metav1.ConditionFalse, "Paused", "sync is paused; no new copy is started")
+		return r.write(ctx, &bs, ctrl.Result{}, nil)
+	}
+
 	run, res, done, err := r.resolveRun(ctx, &bs, view, rec)
 	if done {
 		return r.write(ctx, &bs, res, err)

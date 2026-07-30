@@ -73,6 +73,9 @@ spec:
                 - Mirror
                 - AppendOnly
                 type: string
+              paused:
+                description: paused suspends new syncs.
+                type: boolean
               schedule:
                 description: schedule is a cron expression; empty ⇒ on-demand only.
                 type: string

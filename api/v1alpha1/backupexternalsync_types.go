@@ -43,6 +43,10 @@ type BackupExternalSyncSpec struct {
 	// +optional
 	Timezone string `json:"timezone,omitempty"`
 
+	// paused suspends new syncs.
+	// +optional
+	Paused bool `json:"paused,omitempty"`
+
 	// mode tracks the source (Mirror) or only adds (AppendOnly, forced on Immutable destinations).
 	// +optional
 	// +kubebuilder:default=Mirror

@@ -17,12 +17,18 @@ limitations under the License.
 package controller
 
 import (
+	"context"
 	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	cbv1 "github.com/CrystalBackup/CrystalBackup/api/v1alpha1"
 	"github.com/CrystalBackup/CrystalBackup/internal/mover"
@@ -492,5 +498,89 @@ func TestSyncReconcilersCarryAMoverImageForMirrorsForget(t *testing.T) {
 	}
 	if got := namespaced.driver.SyncImage; got != syncImage {
 		t.Errorf("namespace-plane driver sync image = %q, want %q", got, syncImage)
+	}
+}
+
+// TestNamespacedSyncPauseStartsNothingAndResolvesNothing is the namespace plane's half of the
+// pause the cluster plane has had since M5.
+//
+// Two things are asserted, and the second is the one that is easy to get wrong. Obviously a paused
+// sync must start no copy. Less obviously it must not RESOLVE its endpoints either: a sync is very
+// often paused precisely because one of its locations is being retired, and resolving would park
+// the CR on LocationNotFound — overwriting the operator's deliberate pause with a failure about the
+// very thing they were in the middle of removing. Here neither BackupLocation exists at all, so a
+// reconcile that resolved anything would say so loudly.
+func TestNamespacedSyncPauseStartsNothingAndResolvesNothing(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme(clientgo): %v", err)
+	}
+	if err := cbv1.AddToScheme(scheme); err != nil {
+		t.Fatalf("AddToScheme(cbv1): %v", err)
+	}
+
+	lastSuccess := metav1.NewTime(time.Date(2026, 7, 20, 2, 0, 0, 0, time.UTC))
+	bs := &cbv1.BackupExternalSync{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "team-a", Name: "offsite"},
+		Spec: cbv1.BackupExternalSyncSpec{
+			SourceLocationRef:      cbv1.LocalObjectReference{Name: "primary"},
+			DestinationLocationRef: cbv1.LocalObjectReference{Name: "cold"},
+			Schedule:               "0 4 * * *",
+			Paused:                 true,
+		},
+		Status: cbv1.BackupExternalSyncStatus{
+			Phase: "Completed", LastSuccessTime: &lastSuccess,
+			SnapshotsCopied: 42, LagSnapshots: 3,
+		},
+	}
+	c := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(bs).WithStatusSubresource(&cbv1.BackupExternalSync{}).Build()
+
+	r := NewBackupExternalSyncReconciler(
+		c, scheme, nil, nil, nil, nil, "crystal-backup-system", "mover:test", "sync:test", nil, nil)
+
+	res, err := r.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: client.ObjectKey{Namespace: "team-a", Name: "offsite"},
+	})
+	if err != nil {
+		t.Fatalf("reconcile a paused sync: %v", err)
+	}
+	if res.RequeueAfter != 0 {
+		t.Errorf("RequeueAfter = %s; a paused sync has nothing to wake up for", res.RequeueAfter)
+	}
+
+	var got cbv1.BackupExternalSync
+	if err := c.Get(context.Background(),
+		client.ObjectKey{Namespace: "team-a", Name: "offsite"}, &got); err != nil {
+		t.Fatalf("get the sync back: %v", err)
+	}
+	if got.Status.Phase != syncPhasePending {
+		t.Errorf("phase = %q, want %q", got.Status.Phase, syncPhasePending)
+	}
+
+	// The measurements from the last real run survive: pausing is not forgetting, and an operator
+	// deciding whether it is safe to resume needs to know how far behind the destination already is.
+	if got.Status.LastSuccessTime == nil || !got.Status.LastSuccessTime.Equal(&lastSuccess) {
+		t.Errorf("lastSuccessTime = %v, want it untouched at %v", got.Status.LastSuccessTime, lastSuccess)
+	}
+	if got.Status.SnapshotsCopied != 42 || got.Status.LagSnapshots != 3 {
+		t.Errorf("copied/lag = %d/%d, want 42/3 preserved across the pause",
+			got.Status.SnapshotsCopied, got.Status.LagSnapshots)
+	}
+
+	// The condition says Paused, not LocationNotFound — neither location exists here, so anything
+	// else would prove the endpoints were resolved.
+	var ready *metav1.Condition
+	for i := range got.Status.Conditions {
+		if got.Status.Conditions[i].Type == ConditionReady {
+			ready = &got.Status.Conditions[i]
+		}
+	}
+	if ready == nil {
+		t.Fatal("no Ready condition was written")
+	}
+	if ready.Reason != "Paused" {
+		t.Errorf("Ready reason = %q, want %q — a paused sync must not resolve its endpoints, or "+
+			"retiring a location would overwrite the pause with a failure about it", ready.Reason, "Paused")
 	}
 }

@@ -58,21 +58,41 @@ of millions of objects is neither.
 
 ### 1.1 Stop everything that writes to it
 
-**Cluster plane.** Pause the schedules pointing at this location:
+**Cluster plane.** Pause the schedules and syncs pointing at this location:
 
 ```bash
 kubectl patch clusterbackupschedule <name> --type=merge -p '{"spec":{"paused":true}}'
+kubectl patch clusterbackupexternalsync <name> --type=merge -p '{"spec":{"paused":true}}'
 ```
 
-**Namespace plane.** There is **no `spec.paused` on `BackupSchedule`** — only the cluster-plane types
-carry one (`ClusterBackupSchedule`, `ClusterBackupExternalSync`). Repoint the tenant's schedule at
-another `BackupLocation`, or delete it:
+A paused sync no longer trips `CrystalbackupExternalSyncStale`. That guard arrived in M6; before it,
+following this step paged you 26 hours later about the copy you had just deliberately stopped. It is
+silence with a deadline, not silence forever: if the pause is still there in seven days,
+`CrystalbackupExternalSyncPausedTooLong` says so, because a secondary that quietly stopped being fed
+is only discovered on the day you need it.
+
+**Namespace plane.** `spec.paused` is on `BackupSchedule` and `BackupExternalSync` as well since M6,
+so a tenant schedule is suspended exactly like a cluster one — and, unlike deleting it, the pause
+keeps `status.lastSuccessTime` and `status.lastRunName`, which is what someone will want if the
+decommission is called off:
 
 ```bash
+kubectl patch backupschedule <name> -n <ns> --type=merge -p '{"spec":{"paused":true}}'
+kubectl patch backupexternalsync <name> -n <ns> --type=merge -p '{"spec":{"paused":true}}'
+```
+
+If the namespace is being retired along with the repository, delete the schedule (and the sync)
+instead — that is the difference the two operations are there to express, and the monitoring reads
+it: `CrystalbackupSchedulePausedTooLong` and `CrystalbackupExternalSyncPausedTooLong` fire on an
+object left paused for more than seven days, and never on a deleted one. Finish the decommission
+here and neither will ever be heard from.
+
+```bash
+# retiring the namespace as well:
+kubectl delete backupschedule <name> -n <ns>
+# or keeping the tenant backed up somewhere else:
 kubectl patch backupschedule <name> -n <ns> --type=merge \
   -p '{"spec":{"locationRef":{"name":"<another-location>"}}}'
-# or, if the namespace is being retired along with the repository:
-kubectl delete backupschedule <name> -n <ns>
 ```
 
 Leaving it alone does not endanger the decommission: once [§1.2](#12-delete-the-location) removes the

@@ -61,6 +61,28 @@ const (
 // GroupName is the PrometheusRule group every rule below belongs to.
 const GroupName = "crystalbackup"
 
+// Every alert name, as a constant, beside the table that declares them.
+//
+// They are constants because the names are read in three places — the table's Name field, the
+// predicates' thresholdOf() lookups, and Fidelity()'s switch — and a rule name that appears in
+// three places is a rule name that will eventually appear in three spellings. Against string
+// literals a misspelling costs a rule that cannot resolve its bound and a fidelity caveat that
+// silently returns "", neither of which a compiler would have caught; against constants both are
+// build failures.
+const (
+	ruleBackupMissed              = "CrystalbackupBackupMissed"
+	ruleBackupFailed              = "CrystalbackupBackupFailed"
+	ruleRepositoryCheckFailed     = "CrystalbackupRepositoryCheckFailed"
+	ruleStaleLocks                = "CrystalbackupStaleLocks"
+	ruleMaintenanceStalled        = "CrystalbackupMaintenanceStalled"
+	ruleDiscoveryFailed           = "CrystalbackupDiscoveryFailed"
+	ruleErasureBlocked            = "CrystalbackupErasureBlocked"
+	rulePVCSnapshotPileup         = "CrystalbackupPVCSnapshotPileup"
+	ruleExternalSyncStale         = "CrystalbackupExternalSyncStale"
+	ruleSchedulePausedTooLong     = "CrystalbackupSchedulePausedTooLong"
+	ruleExternalSyncPausedTooLong = "CrystalbackupExternalSyncPausedTooLong"
+)
+
 // ThresholdKind says what shape a rule's bound has, so a consumer that is not Prometheus can act
 // on it without re-parsing PromQL.
 type ThresholdKind string
@@ -119,10 +141,21 @@ type Rule struct {
 	// deciding whether to silence an alert at 03:00 is reading the rule file, not the spec.
 	Rationale string
 	// Predicate answers the same question as Expr from live object state instead of from
-	// Prometheus — the half lot J (exportable self-check) consumes, so an operator with no
-	// monitoring stack can still get a verdict. Nil means "not yet implemented for this rule":
-	// the two below are the worked shape, not a complete set. Any implementation MUST read its
-	// bound from Threshold rather than restating a number.
+	// Prometheus — the half the exportable self-check consumes, so an operator with no monitoring
+	// stack still gets a verdict.
+	//
+	// EVERY rule carries one, and this field is the ONLY place a rule and its predicate are
+	// associated. They were briefly associated twice — here and in an exported map — because the
+	// two halves landed in parallel and this file was owned by the other one; that map needed a
+	// test to hold it against this table, which is the tell that a second declaration site is a
+	// drift risk rather than a convenience. There is one site now.
+	//
+	// A nil Predicate is reported by the self-check as "not evaluated", never as a pass. That is
+	// the honest outcome for a question object state cannot answer — but no rule is in that
+	// position today, and predicates_test.go fails if one appears without somebody deciding so.
+	//
+	// Any implementation MUST read its bound from Threshold rather than restating a number, and
+	// MUST declare a Fidelity() caveat if it cannot reproduce its PromQL exactly.
 	Predicate Predicate
 }
 
@@ -137,7 +170,27 @@ const (
 	labelLocation  = "location"
 	labelCluster   = "cluster"
 	labelScope     = "scope"
+
+	// The external-sync family's own identity (§2.12). `sync` is the CR name, `source` and
+	// `destination` the two location names.
+	labelSync        = "sync"
+	labelSource      = "source"
+	labelDestination = "destination"
 )
+
+// syncJoinKeys is the identity the ExternalSyncStale guard matches on: the FULL label set of the
+// §2.12 family, with nothing dropped.
+//
+// That is the opposite choice from missedJoinKeys, and it is not an inconsistency. BackupMissed
+// drops `tenant` because its two sides resolve it from different objects and can legitimately
+// disagree mid-edit. Here both sides — last_success and active — are emitted from one loop over one
+// map in collectExternalSyncs, keyed by exactly this struct, so there is no label that could
+// disagree and no reason to weaken the key. Spelling all six out rather than writing a bare `and`
+// says which identity the rule means, which is what makes a later divergence a visible edit rather
+// than a silent behaviour change.
+var syncJoinKeys = []string{
+	labelSync, labelSource, labelDestination, labelScope, labelNamespace, labelCluster,
+}
 
 // missedJoinKeys is the identity BackupMissed matches on, for EVERY term of the expression: the
 // full label set of a (namespace, schedule) series MINUS `tenant`.
@@ -203,11 +256,34 @@ var (
 	externalSyncStaleThreshold  = Threshold{Kind: ThresholdAge, Age: 26 * time.Hour}
 )
 
+// schedulePausedTooLongThreshold: seven days of a schedule existing and protecting nothing.
+//
+// A week is chosen against the pause people actually take. "Pause it while I migrate the storage
+// class", "pause it for the release freeze", "pause it over the weekend" all end well inside seven
+// days, so the alert says nothing about any of them; what it catches is the pause that outlived the
+// reason for it, which is the only kind nobody is going to notice on their own. There is no shorter
+// threshold that does not page a maintenance window, and no longer one that beats a monthly
+// backup-coverage review to the answer.
+//
+// It is an Age rather than a Count because the quantity really is a duration, and it is read TWICE
+// in the expression — as the lookback window and as the minimum age of the schedule itself. See
+// pausedTooLongExpr for why the second reading is not redundant.
+var schedulePausedTooLongThreshold = Threshold{Kind: ThresholdAge, Age: 7 * 24 * time.Hour}
+
+// externalSyncPausedTooLongThreshold: the same week, for the same reason, on the other family.
+//
+// Declared separately rather than shared with the schedule's, following maintenanceStalled and
+// externalSyncStale which both hold 26h and both say so themselves. The two bounds answer to
+// different things — one to how long a namespace may go unprotected, the other to how long a
+// secondary may go unfed — and collapsing them into one constant would mean a future change to
+// either silently moved the other.
+var externalSyncPausedTooLongThreshold = Threshold{Kind: ThresholdAge, Age: 7 * 24 * time.Hour}
+
 // Rules is the table. Order is the order rules appear in the generated file.
 func Rules() []Rule {
 	return []Rule{
 		{
-			Name:      "CrystalbackupBackupMissed",
+			Name:      ruleBackupMissed,
 			Severity:  SeverityWarning,
 			For:       15 * time.Minute,
 			Threshold: backupMissedThreshold,
@@ -228,10 +304,11 @@ func Rules() []Rule {
 				"  * the `and` guard on " + metrics.NameScheduleActive + " is what stops a deleted or",
 				"    paused schedule from paging forever on a last_success that will never advance again.",
 			}, "\n"),
-			Expr: backupMissedExpr(),
+			Expr:      backupMissedExpr(),
+			Predicate: backupMissed,
 		},
 		{
-			Name:     "CrystalbackupBackupFailed",
+			Name:     ruleBackupFailed,
 			Severity: SeverityWarning,
 			// No `for`: increase() over an hour IS the over-time aggregation, and adding a hold
 			// would only delay a signal that is already an hour old by construction.
@@ -244,10 +321,11 @@ func Rules() []Rule {
 				"The gauge sibling crystalbackup_backup_failures counts wreckage that still EXISTS — a",
 				"different and also useful question, but not one increase() can ask.",
 			}, "\n"),
-			Expr: fmt.Sprintf("increase(%s[1h]) > 0", metrics.NameBackupFailuresTotal),
+			Expr:      fmt.Sprintf("increase(%s[1h]) > 0", metrics.NameBackupFailuresTotal),
+			Predicate: backupFailed,
 		},
 		{
-			Name:      "CrystalbackupRepositoryCheckFailed",
+			Name:      ruleRepositoryCheckFailed,
 			Severity:  SeverityCritical,
 			For:       5 * time.Minute,
 			Threshold: Threshold{Kind: ThresholdState},
@@ -264,7 +342,7 @@ func Rules() []Rule {
 			Predicate: repositoryCheckFailed,
 		},
 		{
-			Name:      "CrystalbackupStaleLocks",
+			Name:      ruleStaleLocks,
 			Severity:  SeverityWarning,
 			For:       30 * time.Minute,
 			Threshold: Threshold{Kind: ThresholdCount, Count: 0},
@@ -276,10 +354,11 @@ func Rules() []Rule {
 				"The 30m hold is the reaper's own budget: a lock is only stale after 30 minutes by restic's",
 				"definition, and the reaper gets a full cycle to clear it before this says anything.",
 			}, "\n"),
-			Expr: fmt.Sprintf("%s > 0", metrics.NameRepositoryStaleLocks),
+			Expr:      fmt.Sprintf("%s > 0", metrics.NameRepositoryStaleLocks),
+			Predicate: staleLocks,
 		},
 		{
-			Name:      "CrystalbackupMaintenanceStalled",
+			Name:      ruleMaintenanceStalled,
 			Severity:  SeverityWarning,
 			For:       time.Hour,
 			Threshold: maintenanceStalledThreshold,
@@ -299,7 +378,7 @@ func Rules() []Rule {
 			Predicate: maintenanceStalled,
 		},
 		{
-			Name:      "CrystalbackupDiscoveryFailed",
+			Name:      ruleDiscoveryFailed,
 			Severity:  SeverityWarning,
 			For:       30 * time.Minute,
 			Threshold: Threshold{Kind: ThresholdState},
@@ -311,10 +390,11 @@ func Rules() []Rule {
 				"Tenant-visible: at scope=namespace with a non-empty namespace this routes to the tenant,",
 				"who is the one whose list of restore points has silently gone stale (spec §2.5).",
 			}, "\n"),
-			Expr: fmt.Sprintf("%s == 0", metrics.NameDiscoveryLastSuccess),
+			Expr:      fmt.Sprintf("%s == 0", metrics.NameDiscoveryLastSuccess),
+			Predicate: discoveryFailed,
 		},
 		{
-			Name:      "CrystalbackupErasureBlocked",
+			Name:      ruleErasureBlocked,
 			Severity:  SeverityWarning,
 			For:       time.Hour,
 			Threshold: Threshold{Kind: ThresholdCount, Count: 0},
@@ -327,10 +407,11 @@ func Rules() []Rule {
 				"impossible. It is an alert because a right-to-erasure request quietly parked for weeks is",
 				"a compliance problem regardless of whose fault it is.",
 			}, "\n"),
-			Expr: fmt.Sprintf("%s > 0", metrics.NameErasureBlocked),
+			Expr:      fmt.Sprintf("%s > 0", metrics.NameErasureBlocked),
+			Predicate: erasureBlocked,
 		},
 		{
-			Name:      "CrystalbackupPVCSnapshotPileup",
+			Name:      rulePVCSnapshotPileup,
 			Severity:  SeverityWarning,
 			For:       30 * time.Minute,
 			Threshold: Threshold{Kind: ThresholdCount, Count: 20},
@@ -344,10 +425,11 @@ func Rules() []Rule {
 				"no-per-PVC-label rule (spec §2.9): cardinality is bounded by the live PVC count, and this",
 				"alert is the reason that cost is worth paying.",
 			}, "\n"),
-			Expr: fmt.Sprintf("%s > 20", metrics.NamePVCVolumeSnapshotting),
+			Expr:      fmt.Sprintf("%s > 20", metrics.NamePVCVolumeSnapshotting),
+			Predicate: pvcSnapshotPileup,
 		},
 		{
-			Name:      "CrystalbackupExternalSyncStale",
+			Name:      ruleExternalSyncStale,
 			Severity:  SeverityWarning,
 			For:       time.Hour,
 			Threshold: externalSyncStaleThreshold,
@@ -360,11 +442,85 @@ func Rules() []Rule {
 				"the repository family), so a secondary that never worked from day one fires here instead of",
 				"being the one case the rule misses.",
 				"The 26h stays fixed, unlike BackupMissed's: a sync's schedule is optional, so a manual sync",
-				"has no period to derive a deadline from. The pause guard this rule also wants waits on",
-				"crystalbackup_externalsync_active, which does not exist yet — and a rule referencing a series",
-				"nobody emits is the exact defect this table was built to make impossible.",
+				"has no period to derive a deadline from.",
+				"The `or` branch onto " + metrics.NameExternalSyncCreated + " is not decoration. The 0 above",
+				"is a SENTINEL, and on a real clock time()-0 is fifty-four years — so without this branch the",
+				"rule was past its 26h bound on the first scrape after ANY sync was created, and only the 1h",
+				"hold stood between `kubectl apply` and a page claiming a ninety-minute-old sync had not",
+				"completed in 26h. Age is measured from the last success when there was one, and from the",
+				"object's creation when there was not.",
+				"The `and` guard on " + metrics.NameExternalSyncActive + " closes a defect that was latent",
+				"rather than theoretical: spec.paused has existed on ClusterBackupExternalSync since M5 and",
+				"nothing read it, so pausing a sync — the documented first step of decommissioning a location",
+				"(docs/DECOMMISSION.md §1.1) — would have paged 26h later, about the thing the operator had",
+				"just deliberately stopped.",
 			}, "\n"),
-			Expr: staleTimestampExpr(metrics.NameExternalSyncLastSuccess, externalSyncStaleThreshold.Age),
+			Expr:      externalSyncStaleExpr(),
+			Predicate: externalSyncStale,
+		},
+		{
+			Name:      ruleSchedulePausedTooLong,
+			Severity:  SeverityWarning,
+			For:       time.Hour,
+			Threshold: schedulePausedTooLongThreshold,
+			Summary: "Schedule {{ $labels.namespace }}/{{ $labels.schedule }} ({{ $labels.origin }}) " +
+				"has been paused for over 7 days — nothing is backing this namespace up",
+			Description: "A paused schedule protects nothing, and no other alert can say so: BackupMissed is " +
+				"guarded on the same pause. Unpause it (spec.paused=false), or delete it if the namespace is " +
+				"genuinely no longer being protected — an intent nobody has to re-check in a month.",
+			Rationale: strings.Join([]string{
+				"This rule exists because of the blind spot the M6 semantics change opened up and then closed.",
+				"A paused schedule used to emit NO " + metrics.NameScheduleActive + " series at all, which",
+				"suppressed BackupMissed correctly and made the pause itself unobservable: someone suspends a",
+				"schedule 'for the migration', the migration ends, nobody unpauses, and the namespace is",
+				"unprotected while every rule and every dashboard reports perfect health. For a backup tool,",
+				"silence that is indistinguishable from safety is the one failure mode that must not exist.",
+				"Two terms, and the second is doing three jobs at once:",
+				"  * max_over_time == 0 over the window means the schedule was not active at ANY point in it —",
+				"    robust to an operator restart in a way a 7d `for` would not be, since it reads history",
+				"    rather than accumulating pending state;",
+				"  * the age term excludes a schedule younger than the window, which would otherwise fire",
+				"    simply because there is no `1` in a lookback longer than its life;",
+				"  * and because " + metrics.NameScheduleCreated + " is an instant vector, that same term",
+				"    requires the schedule to still EXIST. A deleted schedule leaves samples in the lookback",
+				"    window for a week; without this it would keep alerting about an object that is gone.",
+				"Deleting a schedule is a decision someone made. Leaving one paused is usually a decision",
+				"nobody finished making, and that is the difference this alert is about.",
+				"CAVEAT: reading history means the lookback is only as long as your retention. Under 7d of",
+				"retention max_over_time sees a shorter window than it asks for, and a schedule that was",
+				"active six days ago can look like it never was. Raise retention or raise this threshold;",
+				"do not silence the rule.",
+			}, "\n"),
+			Expr: pausedTooLongExpr(metrics.NameScheduleActive, metrics.NameScheduleCreated,
+				missedJoinKeys, schedulePausedTooLongThreshold.Age),
+			Predicate: schedulePausedTooLong,
+		},
+		{
+			Name:      ruleExternalSyncPausedTooLong,
+			Severity:  SeverityWarning,
+			For:       time.Hour,
+			Threshold: externalSyncPausedTooLongThreshold,
+			Summary: "External sync {{ $labels.sync }} " +
+				"({{ $labels.source }}→{{ $labels.destination }}) has been paused for over 7 days — " +
+				"the secondary is no longer being fed",
+			Description: "The destination has stopped receiving copies and ExternalSyncStale is guarded " +
+				"on the same pause, so nothing else will say so. Resume it (spec.paused=false), or delete " +
+				"the sync if this secondary is genuinely being retired.",
+			Rationale: strings.Join([]string{
+				"SchedulePausedTooLong's twin, and it exists because the pause guard added to",
+				"ExternalSyncStale in this same lot re-opened, for syncs, precisely the blind spot that",
+				"rule closes for schedules: with the guard in place, pausing a sync is silent forever.",
+				"The stakes are arguably higher here than on a schedule. A secondary is INSURANCE. Somebody",
+				"pauses replication 'while we migrate the bucket', leaves, and nothing anywhere reports that",
+				"the safety copy stopped being fed — the silence is indistinguishable from a destination",
+				"that is perfectly up to date, and the difference only becomes visible on the day the",
+				"primary is gone, which is the worst possible moment to find out.",
+				"Same shape as its twin, same three jobs in the second term (see pausedTooLongExpr), and the",
+				"same retention caveat: max_over_time cannot look further back than your Prometheus keeps.",
+			}, "\n"),
+			Expr: pausedTooLongExpr(metrics.NameExternalSyncActive, metrics.NameExternalSyncCreated,
+				syncJoinKeys, externalSyncPausedTooLongThreshold.Age),
+			Predicate: externalSyncPausedTooLong,
 		},
 	}
 }
@@ -374,6 +530,62 @@ func Rules() []Rule {
 // never a number typed twice.
 func staleTimestampExpr(series string, age time.Duration) string {
 	return fmt.Sprintf("time() - %s > %d", series, int64(age.Seconds()))
+}
+
+// externalSyncStaleExpr: age since the last copy, the never-copied fallback, and the pause guard.
+//
+// The fallback is the same shape as BackupMissed's and it fixes a sharper bug. §2.12 has
+// last_success emit 0 rather than nothing for a sync that has never completed, so that a secondary
+// broken from day one is not the one case the rule cannot see — good reasoning, and it makes 0 a
+// SENTINEL rather than a timestamp. On a real clock `time() - 0` is about 1.77e9 seconds, so a
+// pure staleness test is past a 26 h bound on the FIRST scrape after any sync is created, and only
+// the 1 h hold separates `kubectl apply` from a page telling the operator their ninety-minute-old
+// sync "has not completed in 26h".
+//
+// promtool's clock starts at the epoch, which is precisely why the unit tests looked fine: there,
+// the sentinel and "created just now" are the same instant, and the bug is invisible.
+//
+//	(time() - (last_success > 0))            <- a real success, measured honestly
+//	or on (...) (time() - created)           <- never succeeded: age since somebody asked for it
+//
+// `> 0` is what separates the two branches, and `or` only supplies the right side for series the
+// left has dropped — so a sync that HAS copied is never measured from its creation. Both branches
+// name the same six labels as the guard below; see syncJoinKeys.
+func externalSyncStaleExpr() string {
+	on := "on (" + strings.Join(syncJoinKeys, ", ") + ")"
+	age := fmt.Sprintf(
+		"(\n    (time() - (%s > 0))\n    or %s\n    (time() - %s)\n  )",
+		metrics.NameExternalSyncLastSuccess, on, metrics.NameExternalSyncCreated)
+
+	return fmt.Sprintf("(\n  %s > %d\n)\nand %s\n  (%s == 1)",
+		age, int64(externalSyncStaleThreshold.Age.Seconds()),
+		on, metrics.NameExternalSyncActive)
+}
+
+// pausedTooLongExpr asks "was this thing active at any point in the last <age>", and answers from
+// HISTORY rather than from a multi-day `for`. Written once and used by both paused-too-long rules,
+// because two copies of this shape would eventually stop being the same shape.
+//
+// The `for` form would have been shorter and is worse: Prometheus rebuilds pending-alert state
+// after a restart only within its outage-tolerance window, so a week-long hold is reset by any
+// meaningful outage — and these alerts' whole job is to notice something nobody is watching, which
+// makes "quietly restarted the clock" the exact failure they cannot have.
+//
+// The window and the minimum age are ONE duration, read twice from the Threshold. They have to
+// agree: a lookback longer than the age bound would fire on objects too young to have a `1` in the
+// window, and a shorter one would let something paused since creation slip through the gap.
+//
+// The created term does a third job beyond declaring the bound and excluding the young: it is an
+// INSTANT vector, so it is empty for a deleted object — while max_over_time keeps finding that
+// object's old zeros in the lookback for a full week. Deletion is a decision somebody finished
+// making; these rules are about the other kind.
+func pausedTooLongExpr(activeSeries, createdSeries string, joinKeys []string, age time.Duration) string {
+	seconds := int64(age.Seconds())
+	return fmt.Sprintf(
+		"(\n  max_over_time(%s[%ds]) == 0\n)\nand on (%s)\n  (time() - %s > %d)",
+		activeSeries, seconds,
+		strings.Join(joinKeys, ", "),
+		createdSeries, seconds)
 }
 
 // backupMissedExpr assembles the one rule that is not a one-liner. See the Rationale on the rule
