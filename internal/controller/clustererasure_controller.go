@@ -33,6 +33,7 @@ import (
 
 	cbv1 "github.com/CrystalBackup/CrystalBackup/api/v1alpha1"
 	"github.com/CrystalBackup/CrystalBackup/internal/client/secrets"
+	"github.com/CrystalBackup/CrystalBackup/internal/metrics"
 	"github.com/CrystalBackup/CrystalBackup/internal/mover"
 	"github.com/CrystalBackup/CrystalBackup/internal/repo/queue"
 	"github.com/CrystalBackup/CrystalBackup/internal/restic"
@@ -194,7 +195,7 @@ func (r *ClusterErasureReconciler) drive(ctx context.Context, er *cbv1.ClusterEr
 		}
 		er.Status.SnapshotsForgotten = int32(len(snaps)) //nolint:gosec // a repository's snapshot count is not int32-overflow territory
 		if len(snaps) == 0 {
-			return r.complete(ctx, er, "nothing matched the target; no snapshot was removed")
+			return r.complete(ctx, er, loc, "nothing matched the target; no snapshot was removed")
 		}
 		er.Status.Phase = erasurePhaseRunning
 		status.SetCondition(&er.Status.Conditions, ConditionReady, metav1.ConditionFalse, "Erasing",
@@ -270,7 +271,7 @@ func (r *ClusterErasureReconciler) drive(ctx context.Context, er *cbv1.ClusterEr
 		if e := h.Err(); e != nil {
 			return r.fail(ctx, er, "ErasureFailed", e.Error())
 		}
-		return r.complete(ctx, er, fmt.Sprintf("%d snapshot(s) forgotten and their space pruned",
+		return r.complete(ctx, er, loc, fmt.Sprintf("%d snapshot(s) forgotten and their space pruned",
 			er.Status.SnapshotsForgotten))
 	default:
 		return ctrl.Result{RequeueAfter: erasureRequeueInterval}, nil
@@ -303,13 +304,31 @@ func (r *ClusterErasureReconciler) fail(ctx context.Context, er *cbv1.ClusterEra
 }
 
 // complete records the terminal success.
-func (r *ClusterErasureReconciler) complete(ctx context.Context, er *cbv1.ClusterErasure, message string) (ctrl.Result, error) {
+func (r *ClusterErasureReconciler) complete(ctx context.Context, er *cbv1.ClusterErasure,
+	loc *cbv1.ClusterBackupLocation, message string,
+) (ctrl.Result, error) {
+	justCompleted := er.Status.Phase != erasurePhaseCompleted
 	er.Status.Phase = erasurePhaseCompleted
 	status.SetCondition(&er.Status.Conditions, ConditionReady, metav1.ConditionTrue, "Erased", message, er.Generation)
 	status.SetCondition(&er.Status.Conditions, conditionErasureComplete, metav1.ConditionTrue, "Erased", message, er.Generation)
 	r.Recorder.Eventf(er, nil, corev1.EventTypeNormal, "ErasureCompleted", "Erase", "%s", message)
 	if err := r.Status().Update(ctx, er); err != nil {
 		return ctrl.Result{}, fmt.Errorf("update status for ClusterErasure %s: %w", er.Name, err)
+	}
+	// The counters go up only once the Completed phase is durable, and only on the transition
+	// into it. They are the compliance record's metric half — "how much was physically destroyed
+	// on this location" — and they are true counters for the plainest of reasons: the snapshots
+	// they count no longer exist to be counted again.
+	//
+	// A Completed erasure that matched nothing adds zero, which the recorder skips: it is a
+	// legitimate outcome, not an erasure event.
+	if justCompleted {
+		clusterID := ""
+		if loc != nil {
+			clusterID = loc.Spec.ClusterID
+		}
+		metrics.RecordErasureCompleted(er.Spec.LocationRef.Name, clusterID,
+			er.Status.SnapshotsForgotten, er.Status.ReclaimedBytes)
 	}
 	return ctrl.Result{}, nil
 }

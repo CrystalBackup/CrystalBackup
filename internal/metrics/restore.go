@@ -36,15 +36,15 @@ var (
 	restoreLabels = []string{namespaceLabel, tenantLabel, originLabel, locationLabel, clusterLabel}
 
 	restoreLastSuccessDesc = prometheus.NewDesc(
-		"crystalbackup_restore_last_success_timestamp_seconds",
+		NameRestoreLastSuccess,
 		"Unix time of the last Completed Restore/ClusterRestore for this series.",
 		restoreLabels, nil)
 	restoreLastBytesDesc = prometheus.NewDesc(
-		"crystalbackup_restore_last_restored_bytes",
+		NameRestoreLastBytes,
 		"status.restoredBytes of the last Completed Restore/ClusterRestore for this series.",
 		restoreLabels, nil)
 	restoreFailuresDesc = prometheus.NewDesc(
-		"crystalbackup_restore_failures",
+		NameRestoreFailures,
 		"Number of Restores/ClusterRestores currently in a failed terminal phase (Failed or PartiallyFailed) for this series.",
 		restoreLabels, nil)
 )
@@ -66,19 +66,15 @@ func terminalTime(conds []metav1.Condition) float64 {
 	return float64(c.LastTransitionTime.Unix())
 }
 
-// restoreSeriesKey / restoreSeries accumulate one series across its restores.
-type restoreSeriesKey struct {
-	namespace, tenant, origin, location, cluster string
-}
+// restoreSeriesKey / restoreSeries accumulate one series across its restores. The key is an
+// ALIAS of the exported RestoreSeries (events.go) so the gauges here and the duration/failure
+// counters there can never drift apart on label order.
+type restoreSeriesKey = RestoreSeries
 
 type restoreSeries struct {
 	lastSuccessUnix float64
 	lastBytes       float64
 	failures        float64
-}
-
-func (k restoreSeriesKey) values() []string {
-	return []string{k.namespace, k.tenant, k.origin, k.location, k.cluster}
 }
 
 // collectRestores derives the unified restore family from BOTH kinds. resolveSource maps a
@@ -113,11 +109,11 @@ func collectRestores(ch chan<- prometheus.Metric, restores []cbv1.Restore, clust
 			src = resolveSource(r.Namespace, r.Spec.Source.Backup)
 		}
 		tally(restoreSeriesKey{
-			namespace: r.Namespace,
-			tenant:    src.tenant,
-			origin:    src.origin,
-			location:  src.location,
-			cluster:   src.cluster,
+			Namespace: r.Namespace,
+			Tenant:    src.tenant,
+			Origin:    src.origin,
+			Location:  src.location,
+			Cluster:   src.cluster,
 		}, r.Status.Phase, r.Status.Conditions, r.Status.RestoredBytes)
 	}
 
@@ -129,11 +125,11 @@ func collectRestores(ch chan<- prometheus.Metric, restores []cbv1.Restore, clust
 	for i := range clusterRestores {
 		cr := &clusterRestores[i]
 		tally(restoreSeriesKey{
-			namespace: cr.Spec.Source.Namespace,
-			tenant:    cr.Spec.Source.Namespace,
-			origin:    apiconst.OriginCluster,
-			location:  cr.Spec.Source.LocationRef.Name,
-			cluster:   clusterByLocation[cr.Spec.Source.LocationRef.Name],
+			Namespace: cr.Spec.Source.Namespace,
+			Tenant:    cr.Spec.Source.Namespace,
+			Origin:    apiconst.OriginCluster,
+			Location:  cr.Spec.Source.LocationRef.Name,
+			Cluster:   clusterByLocation[cr.Spec.Source.LocationRef.Name],
 		}, cr.Status.Phase, cr.Status.Conditions, cr.Status.RestoredBytes)
 	}
 

@@ -31,6 +31,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	cbv1 "github.com/CrystalBackup/CrystalBackup/api/v1alpha1"
+	"github.com/CrystalBackup/CrystalBackup/internal/apiconst"
 	"github.com/CrystalBackup/CrystalBackup/internal/client/secrets"
 	"github.com/CrystalBackup/CrystalBackup/internal/mover"
 	"github.com/CrystalBackup/CrystalBackup/internal/nsselector"
@@ -113,8 +114,10 @@ func (r *ClusterBackupExternalSyncReconciler) Reconcile(ctx context.Context, req
 	// A run already in flight keeps going regardless of pause or schedule: pausing a sync means
 	// "start no NEW copies", not "abandon the one moving data right now", and abandoning it would
 	// leave a half-populated destination with no record of how far it got.
+	ident := syncIdentity{Name: cs.Name, Scope: apiconst.OriginCluster, Namespace: ""}
+
 	if r.driver.hasInflight(key) {
-		res, err := r.driver.drive(ctx, key, nil, view, syncJobPrefixCluster, cs.Name, rec)
+		res, err := r.driver.drive(ctx, key, nil, view, syncJobPrefixCluster, cs.Name, rec, ident)
 		return r.write(ctx, &cs, res, err)
 	}
 
@@ -141,7 +144,7 @@ func (r *ClusterBackupExternalSyncReconciler) Reconcile(ctx context.Context, req
 		return r.write(ctx, &cs, idleSyncResult(view, act, cs.Spec.Schedule), nil)
 	}
 
-	res, err = r.driver.drive(ctx, key, run, view, syncJobPrefixCluster, cs.Name, rec)
+	res, err = r.driver.drive(ctx, key, run, view, syncJobPrefixCluster, cs.Name, rec, ident)
 	return r.write(ctx, &cs, res, err)
 }
 

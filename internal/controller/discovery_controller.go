@@ -157,6 +157,18 @@ func (r *DiscoveryReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		log.Error(res.err, "discovery: inventory failed; will retry", "repository", repo.Name)
 		r.Recorder.Eventf(&repo, nil, corev1.EventTypeWarning, "InventoryFailed", "InventoryRepository",
 			"repository inventory failed: %v", res.err)
+		// A failed listing measured nothing, so the inventory counts and lastDiscoveryTime keep
+		// their previous values — but the OUTCOME is recorded, because that is what
+		// crystalbackup_discovery_last_success reports and what DiscoveryFailed alerts on. A
+		// discovery that has been failing for an hour is exactly the state where every other
+		// field on this status is stale and no longer says so.
+		// Logged, not returned: the pass is already scheduled to retry in discoveryRetryInterval,
+		// and turning a status conflict on a health FLAG into a reconcile error would replace that
+		// steady cadence with exponential backoff — slowing down the recovery of the very thing
+		// the flag is reporting on.
+		if err := r.recordDiscoveryOutcome(ctx, &repo, false); err != nil {
+			log.Error(err, "discovery: could not record the failed outcome", "repository", repo.Name)
+		}
 		return ctrl.Result{RequeueAfter: discoveryRetryInterval}, nil
 	}
 	snaps := res.snaps
@@ -179,12 +191,25 @@ func (r *DiscoveryReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	// refusing a projection must cost that namespace — not the other groups, and not the inventory
 	// (docs/audit-m3.1-throughput.md, the flakiness chain).
 	var failures []error
+	// projected / orphans are the census crystalbackup_discovery_projected_backups and
+	// _orphan_snapshots report. They are counted HERE, from the pass that actually resolved each
+	// namespace, rather than re-derived later: projectGroup already performs the namespace lookup
+	// that decides which of the two a group is, and a second pass would both pay for the lookups
+	// twice and be able to disagree with the projections that were just written.
+	var projected, orphans int32
 	for key, groupSnaps := range groups {
 		if key.Namespace == "" {
 			continue // a cluster-manifests group has no namespace to project into (admin ClusterRestore only).
 		}
-		if err := r.projectGroup(ctx, &repo, key, groupSnaps); err != nil {
+		outcome, err := r.projectGroup(ctx, &repo, key, groupSnaps)
+		if err != nil {
 			failures = append(failures, err)
+			continue
+		}
+		if outcome == groupOrphan {
+			orphans++
+		} else {
+			projected++
 		}
 	}
 
@@ -201,7 +226,14 @@ func (r *DiscoveryReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	// landed, and it is stamped with the time the pass actually ran (res.at) rather than now, so a
 	// reused inventory never claims to be fresher than it is. A failure to PERSIST it is the one
 	// error worth returning: nothing downstream can trust a pass whose result was never written.
-	if err := r.updateInventoryStatus(ctx, &repo, snaps, res.at); err != nil {
+	if err := r.updateInventoryStatus(ctx, &repo, snaps, res.at, discoveryCensus{
+		projected: projected,
+		orphans:   orphans,
+		// A pass that could not reconcile every group did not succeed, even though its inventory
+		// is sound. The question discovery_last_success answers is "are the Backup projections
+		// current with the repository", and after a partial pass some of them are not.
+		success: len(failures) == 0,
+	}); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -210,6 +242,21 @@ func (r *DiscoveryReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	}
 
 	return ctrl.Result{RequeueAfter: interval}, nil
+}
+
+// recordDiscoveryOutcome writes ONLY the success flag, for the path where the inventory listing
+// itself failed and there is no census to record. It re-reads nothing: the caller holds the
+// repository it just reconciled, and a conflict simply costs the next pass a retry — this field
+// is a health signal, not a lock.
+func (r *DiscoveryReconciler) recordDiscoveryOutcome(ctx context.Context, repo *cbv1.BackupRepository, success bool) error {
+	if repo.Status.LastDiscoverySuccess != nil && *repo.Status.LastDiscoverySuccess == success {
+		return nil // already says this; writing it again is pure API churn.
+	}
+	repo.Status.LastDiscoverySuccess = &success
+	if err := r.Status().Update(ctx, repo); err != nil {
+		return fmt.Errorf("record discovery outcome on repository %s: %w", repo.Name, err)
+	}
+	return nil
 }
 
 // reportPartialPass handles a pass that inventoried the repository but could not project (or GC)
@@ -240,13 +287,13 @@ func (r *DiscoveryReconciler) reportPartialPass(ctx context.Context, repo *cbv1.
 // in progress). Otherwise it server-side-applies the projection — creating it, refreshing a prior
 // projection, or ADOPTING a now-terminal execution Backup into a projection — under discovery's own
 // field manager.
-func (r *DiscoveryReconciler) projectGroup(ctx context.Context, repo *cbv1.BackupRepository, key restic.NamespaceRun, snaps []restic.Snapshot) error {
+func (r *DiscoveryReconciler) projectGroup(ctx context.Context, repo *cbv1.BackupRepository, key restic.NamespaceRun, snaps []restic.Snapshot) (groupOutcome, error) {
 	var ns corev1.Namespace
 	if err := r.Get(ctx, client.ObjectKey{Name: key.Namespace}, &ns); err != nil {
 		if apierrors.IsNotFound(err) {
-			return nil // namespace gone: do not fabricate a Backup for it.
+			return groupOrphan, nil // namespace gone: do not fabricate a Backup for it.
 		}
-		return fmt.Errorf("get namespace %s: %w", key.Namespace, err)
+		return groupProjected, fmt.Errorf("get namespace %s: %w", key.Namespace, err)
 	}
 	// A TERMINATING namespace still resolves through the Get above, but the API server rejects
 	// every create in it ("unable to create new content in namespace X because it is being
@@ -257,7 +304,10 @@ func (r *DiscoveryReconciler) projectGroup(ctx context.Context, repo *cbv1.Backu
 	// situation as a namespace that is already gone: skip it, and let the next pass (or the GC)
 	// settle it once the deletion completes.
 	if ns.Status.Phase == corev1.NamespaceTerminating || ns.DeletionTimestamp != nil {
-		return nil
+		// Counted as projected, not orphaned: the namespace still exists and its Backups are
+		// still listed, so this is the census `kubectl get backups` would agree with right now.
+		// The next pass, once the deletion completes, moves it to orphan.
+		return groupProjected, nil
 	}
 
 	var existing cbv1.Backup
@@ -266,11 +316,13 @@ func (r *DiscoveryReconciler) projectGroup(ctx context.Context, repo *cbv1.Backu
 	case apierrors.IsNotFound(err):
 		// no object yet → create the projection below.
 	case err != nil:
-		return fmt.Errorf("get Backup %s/%s: %w", key.Namespace, key.Run, err)
+		return groupProjected, fmt.Errorf("get Backup %s/%s: %w", key.Namespace, key.Run, err)
 	default:
 		projected := existing.Annotations[apiconst.AnnotationProjected] == apiconst.AnnotationProjectedValue
 		if !projected && !isTerminalBackupPhase(existing.Status.Phase) {
-			return nil // an execution Backup is still running here — never touch it.
+			// An execution Backup is still running here — never touch it. It IS a Backup the
+			// repository's data is visible through, so it counts as projected.
+			return groupProjected, nil
 		}
 	}
 
@@ -302,11 +354,11 @@ func (r *DiscoveryReconciler) projectGroup(ctx context.Context, repo *cbv1.Backu
 	}
 	u, err := runtime.DefaultUnstructuredConverter.ToUnstructured(proj)
 	if err != nil {
-		return fmt.Errorf("convert projected Backup %s/%s to unstructured: %w", key.Namespace, key.Run, err)
+		return groupProjected, fmt.Errorf("convert projected Backup %s/%s to unstructured: %w", key.Namespace, key.Run, err)
 	}
 	if err := r.Apply(ctx, client.ApplyConfigurationFromUnstructured(&unstructured.Unstructured{Object: u}),
 		client.FieldOwner(discoveryFieldManager), client.ForceOwnership); err != nil {
-		return fmt.Errorf("project Backup %s/%s: %w", key.Namespace, key.Run, err)
+		return groupProjected, fmt.Errorf("project Backup %s/%s: %w", key.Namespace, key.Run, err)
 	}
 
 	// Apply the derived status (one Completed volume per data snapshot) as a separate status-scoped
@@ -321,14 +373,24 @@ func (r *DiscoveryReconciler) projectGroup(ctx context.Context, repo *cbv1.Backu
 	}
 	su, err := runtime.DefaultUnstructuredConverter.ToUnstructured(statusObj)
 	if err != nil {
-		return fmt.Errorf("convert projected Backup status %s/%s to unstructured: %w", key.Namespace, key.Run, err)
+		return groupProjected, fmt.Errorf("convert projected Backup status %s/%s to unstructured: %w", key.Namespace, key.Run, err)
 	}
 	if err := r.Status().Apply(ctx, client.ApplyConfigurationFromUnstructured(&unstructured.Unstructured{Object: su}),
 		client.FieldOwner(discoveryFieldManager), client.ForceOwnership); err != nil {
-		return fmt.Errorf("project Backup status %s/%s: %w", key.Namespace, key.Run, err)
+		return groupProjected, fmt.Errorf("project Backup status %s/%s: %w", key.Namespace, key.Run, err)
 	}
-	return nil
+	return groupProjected, nil
 }
+
+// groupOutcome is what one snapshot (namespace, run) group resolved to. The two values ARE the
+// two discovery census gauges: a group is visible in the API as a Backup, or its namespace is
+// gone and it is reachable only through a ClusterRestore (spec/05-observability.md §2.5).
+type groupOutcome int
+
+const (
+	groupProjected groupOutcome = iota
+	groupOrphan
+)
 
 // gcProjections deletes every projected (cluster-origin, AnnotationProjected) Backup of THIS
 // location's repository whose (namespace, run) group is no longer in the repository — its snapshots
@@ -375,13 +437,25 @@ func (r *DiscoveryReconciler) gcProjections(ctx context.Context, locationName st
 // is reused by the retry (inventoryTracker.retain) must not keep stamping a fresher time onto data
 // it did not re-measure — and re-writing the identical timestamp makes that retry's status update a
 // server-side no-op instead of pointless churn.
+// discoveryCensus is what one pass learned about the SHAPE of the repository's projection into
+// the cluster, as opposed to the raw snapshot inventory: how many groups became visible Backups,
+// how many have no namespace left to become one in, and whether the pass was clean.
+type discoveryCensus struct {
+	projected, orphans int32
+	success            bool
+}
+
 func (r *DiscoveryReconciler) updateInventoryStatus(ctx context.Context, repo *cbv1.BackupRepository,
-	snaps []restic.Snapshot, at time.Time,
+	snaps []restic.Snapshot, at time.Time, census discoveryCensus,
 ) error {
 	discovered := metav1.NewTime(at)
 	repo.Status.SnapshotCount = int32(len(snaps))
 	repo.Status.NamespacesPresent = int32(discovery.DistinctNamespaces(snaps))
 	repo.Status.LastDiscoveryTime = &discovered
+	repo.Status.ProjectedBackups = census.projected
+	repo.Status.OrphanSnapshots = census.orphans
+	success := census.success
+	repo.Status.LastDiscoverySuccess = &success
 	if err := r.Status().Update(ctx, repo); err != nil {
 		return fmt.Errorf("update repository inventory status %s: %w", repo.Name, err)
 	}
@@ -452,6 +526,9 @@ func inventoryChurnPredicate() predicate.Predicate {
 				s.SnapshotCount = 0
 				s.NamespacesPresent = 0
 				s.LastDiscoveryTime = nil
+				s.ProjectedBackups = 0
+				s.OrphanSnapshots = 0
+				s.LastDiscoverySuccess = nil
 
 				s.LastMaintenanceTime = nil
 				s.LastCheckTime = nil

@@ -373,6 +373,11 @@ func (in *BackupRepositoryStatus) DeepCopyInto(out *BackupRepositoryStatus) {
 		in, out := &in.LastDiscoveryTime, &out.LastDiscoveryTime
 		*out = (*in).DeepCopy()
 	}
+	if in.LastDiscoverySuccess != nil {
+		in, out := &in.LastDiscoverySuccess, &out.LastDiscoverySuccess
+		*out = new(bool)
+		**out = **in
+	}
 	if in.LastMaintenanceTime != nil {
 		in, out := &in.LastMaintenanceTime, &out.LastMaintenanceTime
 		*out = (*in).DeepCopy()

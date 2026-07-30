@@ -562,7 +562,7 @@ func main() {
 
 	// The crystalbackup_ metric collector derives its series from live Backup/ClusterBackup state on
 	// each scrape (restart-safe), served on the controller-runtime metrics endpoint.
-	if err := ctrlmetrics.Registry.Register(metrics.NewCollector(mgr.GetClient())); err != nil {
+	if err := ctrlmetrics.Registry.Register(metrics.NewCollector(mgr.GetClient(), operatorNamespace)); err != nil {
 		setupLog.Error(err, "Unable to register the crystalbackup metrics collector")
 		os.Exit(1)
 	}

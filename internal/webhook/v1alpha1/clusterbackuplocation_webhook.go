@@ -41,6 +41,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	crystalbackupiov1alpha1 "github.com/CrystalBackup/CrystalBackup/api/v1alpha1"
+	"github.com/CrystalBackup/CrystalBackup/internal/metrics"
 )
 
 // nolint:unused
@@ -102,6 +103,14 @@ func (v *ClusterBackupLocationCustomValidator) validateSingleDefault(ctx context
 	for i := range locations.Items {
 		other := &locations.Items[i]
 		if other.Name != obj.Name && other.Spec.Default {
+			// The ONLY denial this operator emits from its own admission path
+			// (05-observability.md §2.8). Everything else that blocks a write is a
+			// ValidatingAdmissionPolicy, and the API server counts those itself under
+			// apiserver_validating_admission_policy_check_total{policy} — duplicating them here
+			// would produce two numbers for one event that could disagree after a VAP is
+			// disabled. Both label values are compile-time constants: a reason taken from the
+			// request would be an unbounded-cardinality hole an attacker could widen at will.
+			metrics.RecordWebhookDenial("clusterbackuplocation", "multiple_defaults")
 			return nil, errors.NewInvalid(
 				schema.GroupKind{Group: crystalbackupiov1alpha1.GroupVersion.Group, Kind: "ClusterBackupLocation"},
 				obj.Name,

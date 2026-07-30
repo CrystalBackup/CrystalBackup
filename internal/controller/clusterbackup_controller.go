@@ -36,6 +36,7 @@ import (
 	cbv1 "github.com/CrystalBackup/CrystalBackup/api/v1alpha1"
 	"github.com/CrystalBackup/CrystalBackup/internal/apiconst"
 	"github.com/CrystalBackup/CrystalBackup/internal/client/secrets"
+	"github.com/CrystalBackup/CrystalBackup/internal/metrics"
 	"github.com/CrystalBackup/CrystalBackup/internal/nsselector"
 	"github.com/CrystalBackup/CrystalBackup/internal/status"
 )
@@ -189,7 +190,7 @@ func (r *ClusterBackupReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// terminal phase: a run whose namespaces are all done but whose cluster capture is still
 	// running must NOT go terminal, or the already-terminal guard at the top of Reconcile would
 	// stop the pass that records the capture's snapshot.
-	res, err := r.aggregateAndWrite(ctx, &cb, matched, fanoutFailures, captureDone)
+	res, err := r.aggregateAndWrite(ctx, &cb, &loc, matched, fanoutFailures, captureDone)
 	if err != nil {
 		return res, err
 	}
@@ -306,8 +307,8 @@ func childBackupLabels(cb *cbv1.ClusterBackup, ns string) map[string]string {
 // namespace whose child has not yet appeared in cache counts as in-flight, which keeps the run
 // Running until every matched namespace has a reporting child.
 func (r *ClusterBackupReconciler) aggregateAndWrite(
-	ctx context.Context, cb *cbv1.ClusterBackup, matched []string, fanoutFailures []cbv1.FailureRecord,
-	captureDone bool,
+	ctx context.Context, cb *cbv1.ClusterBackup, loc *cbv1.ClusterBackupLocation, matched []string,
+	fanoutFailures []cbv1.FailureRecord, captureDone bool,
 ) (ctrl.Result, error) {
 	var children cbv1.BackupList
 	if err := r.List(ctx, &children, client.MatchingLabels{apiconst.LabelClusterBackup: cb.Name}); err != nil {
@@ -397,6 +398,10 @@ func (r *ClusterBackupReconciler) aggregateAndWrite(
 		st.StartTime = &now
 	}
 	terminal := isTerminalClusterBackupPhase(string(phase))
+	// completionTime being unset is the durable "this run's terminal transition has not been
+	// counted yet" marker, exactly as backupTime is for a Backup. aggregateAndWrite recomputes
+	// every tally from scratch on each pass, so nothing else here distinguishes the first arrival.
+	justTerminal := terminal && st.CompletionTime == nil
 	if terminal && st.CompletionTime == nil {
 		now := metav1.Now()
 		st.CompletionTime = &now
@@ -405,6 +410,21 @@ func (r *ClusterBackupReconciler) aggregateAndWrite(
 
 	if err := r.Status().Update(ctx, cb); err != nil {
 		return ctrl.Result{}, fmt.Errorf("update status for ClusterBackup %s: %w", cb.Name, err)
+	}
+	if justTerminal {
+		// Run duration is fan-out start to every child settling — startTime, not the object's
+		// creation, because a run that waited on a concurrencyPolicy or a gated location did not
+		// spend that time moving data and folding it in would make the histogram describe queueing
+		// rather than throughput.
+		var duration time.Duration
+		if st.StartTime != nil && st.CompletionTime != nil {
+			duration = st.CompletionTime.Sub(st.StartTime.Time)
+		}
+		metrics.RecordClusterBackupTerminal(metrics.ClusterBackupSeries{
+			Schedule: cb.Spec.ScheduleRef,
+			Location: cb.Spec.LocationRef.Name,
+			Cluster:  loc.Spec.ClusterID,
+		}, string(phase), duration)
 	}
 	if terminal {
 		return ctrl.Result{}, nil

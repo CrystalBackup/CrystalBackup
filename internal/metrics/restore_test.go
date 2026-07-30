@@ -111,7 +111,7 @@ crystalbackup_restore_last_restored_bytes{cluster="prod-eu-1",location="dr-prima
 crystalbackup_restore_failures{cluster="prod-eu-1",location="dr-primary",namespace="tenant-a",origin="cluster",tenant="team-a"} 1
 crystalbackup_restore_failures{cluster="prod-eu-1",location="dr-primary",namespace="gone",origin="cluster",tenant="gone"} 0
 `
-	if err := testutil.CollectAndCompare(NewCollector(c), strings.NewReader(want),
+	if err := testutil.CollectAndCompare(NewCollector(c, testOperatorNamespace), strings.NewReader(want),
 		"crystalbackup_restore_last_success_timestamp_seconds",
 		"crystalbackup_restore_last_restored_bytes",
 		"crystalbackup_restore_failures",

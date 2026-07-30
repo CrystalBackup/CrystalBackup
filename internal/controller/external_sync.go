@@ -31,6 +31,8 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 
 	cbv1 "github.com/CrystalBackup/CrystalBackup/api/v1alpha1"
+	"github.com/CrystalBackup/CrystalBackup/internal/apiconst"
+	"github.com/CrystalBackup/CrystalBackup/internal/metrics"
 	"github.com/CrystalBackup/CrystalBackup/internal/mover"
 	"github.com/CrystalBackup/CrystalBackup/internal/repo/queue"
 	"github.com/CrystalBackup/CrystalBackup/internal/restic"
@@ -557,6 +559,11 @@ type syncDriver struct {
 type syncInflight struct {
 	handle *queue.Handle
 	run    *syncRun
+	// startedAt is when the copy was enqueued, and it is the ONLY record of it: neither sync CRD
+	// carries a start time, and the queue hands back no timestamp. It lives in memory, so an
+	// operator restart mid-copy loses the observation rather than reporting a duration measured
+	// from a start it did not witness — which is the right trade for a latency histogram.
+	startedAt time.Time
 	// copied records that the COPY finished successfully and only the accounting after it is
 	// outstanding.
 	//
@@ -632,7 +639,7 @@ func (d *syncDriver) hasInflight(key string) bool {
 // key identifies this CR across reconciles (kind + namespace + name); it is the in-flight map's
 // key, so two CRs syncing the same pair never share a handle.
 func (d *syncDriver) drive(ctx context.Context, key string, run *syncRun, view syncStatusView,
-	jobPrefix, name string, rec syncRecorder,
+	jobPrefix, name string, rec syncRecorder, ident syncIdentity,
 ) (ctrl.Result, error) {
 	d.mu.Lock()
 	f := d.inflight[key]
@@ -652,7 +659,7 @@ func (d *syncDriver) drive(ctx context.Context, key string, run *syncRun, view s
 			return ctrl.Result{RequeueAfter: syncRequeueInterval}, nil
 		}
 		d.mu.Lock()
-		d.inflight[key] = &syncInflight{handle: handle, run: run}
+		d.inflight[key] = &syncInflight{handle: handle, run: run, startedAt: d.Clock.Now()}
 		d.mu.Unlock()
 		*view.Phase = syncPhaseRunning
 		setSyncCondition(view, metav1.ConditionFalse, "Copying",
@@ -666,7 +673,7 @@ func (d *syncDriver) drive(ctx context.Context, key string, run *syncRun, view s
 
 	// The copy is already done and only its accounting is outstanding: retry THAT, and nothing else.
 	if f.copied {
-		return d.finish(ctx, key, f.run, view, jobPrefix, name, rec)
+		return d.finish(ctx, key, f, view, jobPrefix, name, rec, ident)
 	}
 
 	select {
@@ -678,13 +685,18 @@ func (d *syncDriver) drive(ctx context.Context, key string, run *syncRun, view s
 			*view.Phase = syncPhaseFailed
 			setSyncCondition(view, metav1.ConditionFalse, "SyncFailed", err.Error())
 			rec.event(corev1.EventTypeWarning, "SyncFailed", "%s", err.Error())
+			// A failed copy is still a run that took time, and how long a sync runs before giving
+			// up is exactly what an operator sizing a window needs. Recording only successes would
+			// hide the pathology (a copy that grinds for six hours and dies) behind an empty
+			// histogram.
+			d.recordSyncDuration(f, ident)
 			return ctrl.Result{RequeueAfter: syncRequeueInterval}, nil
 		}
 		d.mu.Lock()
 		f.copied = true
 		d.mu.Unlock()
 		// f.run, not the caller's run: the accounting must describe the copy that ran.
-		return d.finish(ctx, key, f.run, view, jobPrefix, name, rec)
+		return d.finish(ctx, key, f, view, jobPrefix, name, rec, ident)
 	default:
 		return ctrl.Result{RequeueAfter: syncRequeueInterval}, nil
 	}
@@ -695,16 +707,55 @@ func (d *syncDriver) drive(ctx context.Context, key string, run *syncRun, view s
 // The entry is what stops a retry from re-copying, so it must outlive a partial failure and must
 // not outlive a success — a retained entry after Completed would make the NEXT scheduled tick
 // think a copy it never started is still running.
-func (d *syncDriver) finish(ctx context.Context, key string, run *syncRun, view syncStatusView,
-	jobPrefix, name string, rec syncRecorder,
+func (d *syncDriver) finish(ctx context.Context, key string, f *syncInflight, view syncStatusView,
+	jobPrefix, name string, rec syncRecorder, ident syncIdentity,
 ) (ctrl.Result, error) {
-	res, err := d.settle(ctx, run, view, jobPrefix, name, rec)
+	res, err := d.settle(ctx, f.run, view, jobPrefix, name, rec)
 	if err == nil && *view.Phase == syncPhaseCompleted {
 		d.mu.Lock()
 		delete(d.inflight, key)
 		d.mu.Unlock()
+		// Recorded exactly where the in-flight entry dies, which is the one point that happens
+		// once per run: a PartiallyFailed settle KEEPS the entry and retries the accounting, and
+		// observing there would add a sample per retry for a copy that ran once.
+		d.recordSyncDuration(f, ident)
 	}
 	return res, err
+}
+
+// syncIdentity is what the METRIC needs and the driver otherwise has no business knowing: which
+// CR this run belongs to and where it sits. The locations and the cluster come off the run itself,
+// so the two controllers supply only the part that differs between the planes.
+type syncIdentity struct {
+	// Name is the sync CR's own name.
+	Name string
+	// Scope is apiconst.OriginCluster or apiconst.OriginNamespace; Namespace is empty for the
+	// former — a cluster sync belongs to the platform, not to a tenant.
+	Scope, Namespace string
+}
+
+// recordSyncDuration observes one finished sync run against the external-sync histogram.
+//
+// The `cluster` label is resolved from the SOURCE binding and only for a cluster-plane sync,
+// matching how the state-derived collector resolves it: a namespaced sync's locations are
+// namespaced, the collector cannot resolve a clusterID for them, and emitting one here would
+// split every namespace-plane sync into two series that no dashboard could rejoin.
+func (d *syncDriver) recordSyncDuration(f *syncInflight, ident syncIdentity) {
+	if f == nil || f.run == nil || f.startedAt.IsZero() {
+		return
+	}
+	clusterID := ""
+	if ident.Scope == apiconst.OriginCluster {
+		clusterID = f.run.Source.Binding.ClusterID
+	}
+	metrics.RecordExternalSyncDuration(metrics.ExternalSyncSeries{
+		Sync:        ident.Name,
+		Source:      f.run.Source.Binding.Name,
+		Destination: f.run.Dest.Binding.Name,
+		Scope:       ident.Scope,
+		Namespace:   ident.Namespace,
+		Cluster:     clusterID,
+	}, d.Clock.Now().Sub(f.startedAt))
 }
 
 // settle measures both sides after a successful copy and, in Mirror mode, forgets the destination

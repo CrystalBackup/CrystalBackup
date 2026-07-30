@@ -24,6 +24,7 @@ import (
 	dto "github.com/prometheus/client_model/go"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -69,11 +70,20 @@ func labelsEqual(m *dto.Metric, want map[string]string) bool {
 	return true
 }
 
+// testOperatorNamespace stands in for the operator's own namespace, where the mover census looks
+// for Jobs.
+const testOperatorNamespace = "crystal-backup-system"
+
 func newFakeClient(t *testing.T, objs ...client.Object) client.Client {
 	t.Helper()
 	scheme := runtime.NewScheme()
 	if err := cbv1.AddToScheme(scheme); err != nil {
 		t.Fatalf("add scheme: %v", err)
+	}
+	// corev1 (namespaces, for the schedule selection) and batchv1 (mover Jobs, for the
+	// concurrency census) are as much a part of the collector's inputs as the CRDs are.
+	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		t.Fatalf("add client-go scheme: %v", err)
 	}
 	return fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
 }
@@ -117,7 +127,7 @@ func TestCollectorBackupSeries(t *testing.T) {
 	}
 
 	reg := prometheus.NewRegistry()
-	reg.MustRegister(NewCollector(newFakeClient(t, loc, older, newer, failed)))
+	reg.MustRegister(NewCollector(newFakeClient(t, loc, older, newer, failed), testOperatorNamespace))
 
 	want := map[string]string{"namespace": "c-db", "tenant": "c-db", "schedule": "daily", "origin": "cluster", "location": "dr", "cluster": "c1"}
 
@@ -142,7 +152,7 @@ func TestCollectorBuildInfoAlwaysPresent(t *testing.T) {
 	// With no CRs at all, crystalbackup_build_info must still be emitted, so /metrics always carries
 	// a crystalbackup_ series (the M1 hard-assertion exit criterion).
 	reg := prometheus.NewRegistry()
-	reg.MustRegister(NewCollector(newFakeClient(t)))
+	reg.MustRegister(NewCollector(newFakeClient(t), testOperatorNamespace))
 	if got, ok := gatherValue(t, reg, "crystalbackup_build_info", map[string]string{"version": Version}); !ok || got != 1 {
 		t.Fatalf("build_info = %v (found=%v), want 1 even with no backups", got, ok)
 	}
@@ -166,7 +176,7 @@ func TestCollectorClusterBackupSeries(t *testing.T) {
 	}
 
 	reg := prometheus.NewRegistry()
-	reg.MustRegister(NewCollector(newFakeClient(t, loc, run)))
+	reg.MustRegister(NewCollector(newFakeClient(t, loc, run), testOperatorNamespace))
 
 	want := map[string]string{"schedule": "daily", "location": "dr", "cluster": "c1"}
 	if got, ok := gatherValue(t, reg, "crystalbackup_clusterbackup_last_success_timestamp_seconds", want); !ok || got != float64(completion.Unix()) {

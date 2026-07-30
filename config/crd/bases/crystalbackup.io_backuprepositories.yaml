@@ -152,6 +152,19 @@ spec:
                   it was bad" from "not verified in weeks", which are different incidents.
                 format: date-time
                 type: string
+              lastDiscoverySuccess:
+                description: |-
+                  lastDiscoverySuccess records whether the last discovery attempt finished cleanly: it
+                  listed the repository AND reconciled every snapshot group into a Backup projection. A
+                  partial pass — inventory recorded, some namespaces refusing their projection — is FALSE,
+                  because what a reader of this field wants to know is whether `kubectl get backups` can
+                  still be trusted against the repository, and after a partial pass it cannot.
+
+                  A POINTER, so that "never attempted" is distinguishable from "attempted and failed". The
+                  distinction is load-bearing: the DiscoveryFailed alert fires on the metric derived from
+                  this field being 0, and a bool defaulting to false would page for every location between
+                  its creation and its first scan.
+                type: boolean
               lastDiscoveryTime:
                 description: lastDiscoveryTime is when the repository was last inventoried.
                 format: date-time
@@ -187,9 +200,25 @@ spec:
                   tags found.
                 format: int32
                 type: integer
+              orphanSnapshots:
+                description: |-
+                  orphanSnapshots is how many snapshot (namespace, run) groups the last scan found whose
+                  namespace does NOT exist. They are not projected and are restorable only through a
+                  ClusterRestore. A non-zero value is DR data for gone namespaces — the repository outliving
+                  the cluster is the design (adr/0009), not a fault — so nothing alerts on it; it is here so
+                  an admin can see how much of the repository has no in-cluster representation.
+                format: int32
+                type: integer
               ownerNamespace:
                 description: ownerNamespace is set for a namespaced (tenant) repository.
                 type: string
+              projectedBackups:
+                description: |-
+                  projectedBackups is how many snapshot (namespace, run) groups the last scan projected into
+                  namespaces that exist — i.e. exactly what `kubectl get backups` lists for this repository
+                  (CR lifetime = data lifetime, R26).
+                format: int32
+                type: integer
               recentMaintenance:
                 description: |-
                   recentMaintenance is a capped, NEWEST-FIRST history of maintenance attempts. The

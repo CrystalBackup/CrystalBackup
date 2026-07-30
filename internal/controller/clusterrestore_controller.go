@@ -40,6 +40,7 @@ import (
 	cbv1 "github.com/CrystalBackup/CrystalBackup/api/v1alpha1"
 	"github.com/CrystalBackup/CrystalBackup/internal/apiconst"
 	"github.com/CrystalBackup/CrystalBackup/internal/client/secrets"
+	"github.com/CrystalBackup/CrystalBackup/internal/metrics"
 	"github.com/CrystalBackup/CrystalBackup/internal/repo/queue"
 	"github.com/CrystalBackup/CrystalBackup/internal/restic"
 	"github.com/CrystalBackup/CrystalBackup/internal/rexposer"
@@ -226,6 +227,18 @@ func (r *ClusterRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	if err := r.Status().Update(ctx, &cr); err != nil {
 		return ctrl.Result{}, fmt.Errorf("update status for ClusterRestore %s: %w", cr.Name, err)
 	}
+	// Recorded under the SOURCE namespace, not the target — the same rule the state-derived
+	// restore gauges follow (05-observability §2.3): the admin restored THAT namespace's data,
+	// wherever it landed, and a tenant looking at their own restore history has to see it. Tenant
+	// defaults to the source namespace for the same reason it does there: the namespace, and its
+	// tenant label, may no longer exist.
+	metrics.RecordRestoreTerminal(metrics.RestoreSeries{
+		Namespace: cr.Spec.Source.Namespace,
+		Tenant:    cr.Spec.Source.Namespace,
+		Origin:    apiconst.OriginCluster,
+		Location:  cr.Spec.Source.LocationRef.Name,
+		Cluster:   rc.clusterID,
+	}, string(cr.Spec.Mode), string(phase), time.Since(cr.CreationTimestamp.Time))
 
 	// (6) The terminal result is durable: reclaim the operator-side residue. The cluster-scoped
 	// half goes first because part of its residue is a live create/update/delete grant on CRDs and

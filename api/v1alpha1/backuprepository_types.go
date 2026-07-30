@@ -71,6 +71,30 @@ type BackupRepositoryStatus struct {
 	// lastDiscoveryTime is when the repository was last inventoried.
 	// +optional
 	LastDiscoveryTime *metav1.Time `json:"lastDiscoveryTime,omitempty"`
+	// lastDiscoverySuccess records whether the last discovery attempt finished cleanly: it
+	// listed the repository AND reconciled every snapshot group into a Backup projection. A
+	// partial pass — inventory recorded, some namespaces refusing their projection — is FALSE,
+	// because what a reader of this field wants to know is whether `kubectl get backups` can
+	// still be trusted against the repository, and after a partial pass it cannot.
+	//
+	// A POINTER, so that "never attempted" is distinguishable from "attempted and failed". The
+	// distinction is load-bearing: the DiscoveryFailed alert fires on the metric derived from
+	// this field being 0, and a bool defaulting to false would page for every location between
+	// its creation and its first scan.
+	// +optional
+	LastDiscoverySuccess *bool `json:"lastDiscoverySuccess,omitempty"`
+	// projectedBackups is how many snapshot (namespace, run) groups the last scan projected into
+	// namespaces that exist — i.e. exactly what `kubectl get backups` lists for this repository
+	// (CR lifetime = data lifetime, R26).
+	// +optional
+	ProjectedBackups int32 `json:"projectedBackups,omitempty"`
+	// orphanSnapshots is how many snapshot (namespace, run) groups the last scan found whose
+	// namespace does NOT exist. They are not projected and are restorable only through a
+	// ClusterRestore. A non-zero value is DR data for gone namespaces — the repository outliving
+	// the cluster is the design (adr/0009), not a fault — so nothing alerts on it; it is here so
+	// an admin can see how much of the repository has no in-cluster representation.
+	// +optional
+	OrphanSnapshots int32 `json:"orphanSnapshots,omitempty"`
 	// lastMaintenanceTime is when prune last SUCCEEDED. A failed prune deliberately leaves it
 	// alone: the field answers "how long since this repository was actually reclaimed", and the
 	// staleness alert depends on a failure not refreshing it.

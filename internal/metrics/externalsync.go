@@ -58,31 +58,27 @@ var (
 	externalSyncLabels = []string{syncLabel, sourceLabel, destinationLabel, scopeLabel, namespaceLabel, clusterLabel}
 
 	externalSyncLastSuccessDesc = prometheus.NewDesc(
-		"crystalbackup_externalsync_last_success_timestamp_seconds",
+		NameExternalSyncLastSuccess,
 		"Unix time of the last Completed external sync for this series.",
 		externalSyncLabels, nil)
 	externalSyncSnapshotsCopiedDesc = prometheus.NewDesc(
-		"crystalbackup_externalsync_snapshots_copied",
+		NameExternalSyncCopied,
 		"Snapshots present at the destination as copies of the source, as of the last completed sync.",
 		externalSyncLabels, nil)
 	externalSyncLagDesc = prometheus.NewDesc(
-		"crystalbackup_externalsync_lag_snapshots",
+		NameExternalSyncLag,
 		"Source snapshots NOT yet at the destination, as of the last completed sync. Zero is the property a secondary exists for.",
 		externalSyncLabels, nil)
 	externalSyncFailuresDesc = prometheus.NewDesc(
-		"crystalbackup_externalsync_failures",
+		NameExternalSyncFailures,
 		"External syncs currently in a failed terminal phase (Failed or PartiallyFailed) for this series.",
 		externalSyncLabels, nil)
 )
 
-// externalSyncSeriesKey identifies one sync: the CR, the pair it copies between, and where it sits.
-type externalSyncSeriesKey struct {
-	sync, source, destination, scope, namespace, cluster string
-}
-
-func (k externalSyncSeriesKey) values() []string {
-	return []string{k.sync, k.source, k.destination, k.scope, k.namespace, k.cluster}
-}
+// externalSyncSeriesKey identifies one sync: the CR, the pair it copies between, and where it
+// sits. An ALIAS of the exported ExternalSyncSeries (events.go), which the duration histogram is
+// recorded against — one declaration, one label order.
+type externalSyncSeriesKey = ExternalSyncSeries
 
 type externalSyncSeries struct {
 	lastSuccessUnix float64
@@ -107,7 +103,7 @@ func collectExternalSyncs(ch chan<- prometheus.Metric,
 			series[key] = s
 		}
 		switch phase {
-		case "Completed":
+		case phaseCompleted:
 			// Last one wins on timestamp, so several CRs sharing a series (two schedules onto the
 			// same pair) report the most recent state rather than an arbitrary one.
 			if lastSuccess >= s.lastSuccessUnix {
@@ -115,7 +111,7 @@ func collectExternalSyncs(ch chan<- prometheus.Metric,
 				s.snapshotsCopied = float64(copied)
 				s.lag = float64(lag)
 			}
-		case "Failed", "PartiallyFailed":
+		case phaseFailed, phasePartiallyFailed:
 			s.failures++
 			// A PartiallyFailed run still measured the lag it could — and that measurement is
 			// exactly what an operator needs when something is wrong. Keep it if it is fresher.
@@ -128,13 +124,13 @@ func collectExternalSyncs(ch chan<- prometheus.Metric,
 	for i := range clusterSyncs {
 		cs := &clusterSyncs[i]
 		tally(externalSyncSeriesKey{
-			sync:        cs.Name,
-			source:      cs.Spec.SourceLocationRef.Name,
-			destination: cs.Spec.DestinationLocationRef.Name,
-			scope:       apiconst.OriginCluster,
+			Sync:        cs.Name,
+			Source:      cs.Spec.SourceLocationRef.Name,
+			Destination: cs.Spec.DestinationLocationRef.Name,
+			Scope:       apiconst.OriginCluster,
 			// No namespace: a cluster sync belongs to the platform, not to a tenant. An empty
 			// label is the honest rendering — inventing one would make it group with a namespace.
-			cluster: clusterByLocation[cs.Spec.SourceLocationRef.Name],
+			Cluster: clusterByLocation[cs.Spec.SourceLocationRef.Name],
 		}, cs.Status.Phase, unixOrZero(cs.Status.LastSuccessTime),
 			cs.Status.SnapshotsCopied, cs.Status.LagSnapshots)
 	}
@@ -142,11 +138,11 @@ func collectExternalSyncs(ch chan<- prometheus.Metric,
 	for i := range syncs {
 		bs := &syncs[i]
 		tally(externalSyncSeriesKey{
-			sync:        bs.Name,
-			source:      bs.Spec.SourceLocationRef.Name,
-			destination: bs.Spec.DestinationLocationRef.Name,
-			scope:       apiconst.OriginNamespace,
-			namespace:   bs.Namespace,
+			Sync:        bs.Name,
+			Source:      bs.Spec.SourceLocationRef.Name,
+			Destination: bs.Spec.DestinationLocationRef.Name,
+			Scope:       apiconst.OriginNamespace,
+			Namespace:   bs.Namespace,
 		}, bs.Status.Phase, unixOrZero(bs.Status.LastSuccessTime),
 			bs.Status.SnapshotsCopied, bs.Status.LagSnapshots)
 	}

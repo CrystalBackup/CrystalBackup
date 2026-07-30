@@ -19,6 +19,7 @@ package exposer
 import (
 	"context"
 	"fmt"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -231,3 +232,25 @@ func mergeLabels(obj *unstructured.Unstructured, add map[string]string) bool {
 // the *string fields the k8s API insists on (TypedLocalObjectReference.APIGroup) where v is a
 // constant or another non-addressable value.
 func ptrTo[T any](v T) *T { return &v }
+
+// StartedAt reports when this exposure BEGAN: the creation timestamp of the dynamic
+// VolumeSnapshot Expose cut in the origin namespace. It is the only durable record of the start
+// of the wait — the exposure carries no state of its own between reconciles, by design — and it
+// is what makes crystalbackup_exposure_ready_wait_seconds measurable across an operator restart
+// rather than only within one process's lifetime.
+//
+// ok=false when the snapshot cannot be read (already cleaned up, RBAC, no snapshot CRDs). A
+// caller must then skip the measurement rather than substitute now(): an observation of zero
+// seconds in a latency histogram is not a missing sample, it is a wrong one, and it drags every
+// quantile down exactly on the clusters where the wait is worth looking at.
+func StartedAt(ctx context.Context, c client.Client, ex *Exposure) (time.Time, bool) {
+	vs := newUnstructured(volumeSnapshotGVK())
+	if err := c.Get(ctx, client.ObjectKey{Namespace: ex.OriginNamespace, Name: ex.OriginVSName}, vs); err != nil {
+		return time.Time{}, false
+	}
+	created := vs.GetCreationTimestamp()
+	if created.IsZero() {
+		return time.Time{}, false
+	}
+	return created.Time, true
+}

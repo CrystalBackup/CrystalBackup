@@ -34,28 +34,44 @@ var (
 	repositoryLabels = []string{locationLabel, scopeLabel, namespaceLabel, clusterLabel}
 
 	repositorySizeDesc = prometheus.NewDesc(
-		"crystalbackup_repository_size_bytes",
+		NameRepositorySize,
 		"Physical size of the repository in object storage, post-dedup and post-compression (status.approximateSizeBytes).",
 		repositoryLabels, nil)
 	repositorySnapshotCountDesc = prometheus.NewDesc(
-		"crystalbackup_repository_snapshot_count",
+		NameRepositorySnapshots,
 		"Snapshots present in the repository (status.snapshotCount).",
 		repositoryLabels, nil)
 	repositoryLastCheckDesc = prometheus.NewDesc(
-		"crystalbackup_repository_last_check_timestamp_seconds",
+		NameRepositoryLastCheck,
 		"Unix time of the last completed restic check, whether it passed or failed (status.lastCheckTime).",
 		repositoryLabels, nil)
 	repositoryLastCheckSuccessDesc = prometheus.NewDesc(
-		"crystalbackup_repository_last_check_success",
+		NameRepositoryCheckSuccess,
 		"1 if the last restic check passed, 0 if it found repository damage. Drives RepositoryCheckFailed.",
 		repositoryLabels, nil)
 	repositoryLastMaintenanceDesc = prometheus.NewDesc(
-		"crystalbackup_repository_last_maintenance_timestamp_seconds",
+		NameRepositoryLastPrune,
 		"Unix time of the last SUCCESSFUL prune (status.lastMaintenanceTime). Absent on Immutable locations, which never prune.",
 		repositoryLabels, nil)
 	repositoryStaleLocksDesc = prometheus.NewDesc(
-		"crystalbackup_repository_stale_locks",
+		NameRepositoryStaleLocks,
 		"Repository lock objects older than restic's 30-minute staleness threshold (status.staleLocks).",
+		repositoryLabels, nil)
+	// repositoryStoredBytes is the accounting name for the repository's footprint (§2.11): the
+	// figure a downstream billing pipeline reads, as opposed to the inventory figure an operator
+	// watches grow.
+	//
+	// It is currently the SAME measurement as crystalbackup_repository_size_bytes, and that is
+	// worth being explicit about rather than hiding behind two Help strings. §2.11 specifies its
+	// source as `restic stats --mode raw-data`; the operator runs no such op today, and
+	// status.approximateSizeBytes comes from summing the objects actually stored under the
+	// repository's S3 prefix. For a BILL those are not equivalent and the listing is the better
+	// of the two: it counts the index, config and lock objects raw-data omits, and it counts
+	// space a not-yet-pruned repository is really occupying. Publishing the number under both
+	// names is a deliberate choice over inventing a second one — see the report on this lot.
+	repositoryStoredBytesDesc = prometheus.NewDesc(
+		NameRepositoryStoredBytes,
+		"Physically stored bytes of the repository, deduplicated and compressed: the sum of the objects under its prefix in object storage.",
 		repositoryLabels, nil)
 )
 
@@ -68,7 +84,7 @@ var (
 // one is a real counter, incremented where the reaping happens. A restart resets it, which is
 // exactly what Prometheus counters are designed to survive (rate/increase handle the reset).
 var locksReaped = prometheus.NewCounterVec(prometheus.CounterOpts{
-	Name: "crystalbackup_repository_locks_reaped_total",
+	Name: NameRepositoryLocksReaped,
 	Help: "Stale repository locks removed by an unlock operation.",
 }, repositoryLabels)
 
@@ -105,6 +121,7 @@ func collectRepositories(ch chan<- prometheus.Metric, repos []cbv1.BackupReposit
 			ch <- prometheus.MustNewConstMetric(desc, prometheus.GaugeValue, v, labels...)
 		}
 		gauge(repositorySizeDesc, float64(repo.Status.ApproximateSizeBytes))
+		gauge(repositoryStoredBytesDesc, float64(repo.Status.ApproximateSizeBytes))
 		gauge(repositorySnapshotCountDesc, float64(repo.Status.SnapshotCount))
 		gauge(repositoryStaleLocksDesc, float64(repo.Status.StaleLocks))
 

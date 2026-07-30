@@ -48,6 +48,7 @@ import (
 	"github.com/CrystalBackup/CrystalBackup/internal/exposer"
 	"github.com/CrystalBackup/CrystalBackup/internal/hooks"
 	"github.com/CrystalBackup/CrystalBackup/internal/keys"
+	"github.com/CrystalBackup/CrystalBackup/internal/metrics"
 	"github.com/CrystalBackup/CrystalBackup/internal/mover"
 	"github.com/CrystalBackup/CrystalBackup/internal/repo/queue"
 	"github.com/CrystalBackup/CrystalBackup/internal/restic"
@@ -337,7 +338,7 @@ func (r *BackupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 
 	// (9b) The freeze window opens here (R16), before any VolumeSnapshot exists.
 	hookSt := hookState(&backup)
-	if res, done, err := r.openFreezeWindow(ctx, &backup, hookSt, run.Hooks); done {
+	if res, done, err := r.openFreezeWindow(ctx, &backup, rc, hookSt, run.Hooks); done {
 		return res, err
 	}
 
@@ -369,7 +370,7 @@ func (r *BackupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 
 	// (11) Single status writer: roll the per-volume phases up, record a terminal condition +
 	// backupTime once, and write status exactly once.
-	res, err := r.writeStatus(ctx, &backup, manifestsDone)
+	res, err := r.writeStatus(ctx, &backup, rc, manifestsDone)
 	if err != nil {
 		// A status-write ERROR is not proof the status was not WRITTEN. A clean Conflict is (the
 		// server rejected it), but a cancellation or connection reset in flight — SIGTERM cancels
@@ -433,7 +434,7 @@ func includeManifests(run *cbv1.BackupRunSpec) bool {
 // writeStatus rolls the per-volume phases up into the Backup phase, records the headline
 // condition (and backupTime on first reaching a terminal phase), writes status once, and returns
 // the requeue decision: none once terminal, a short poll while volumes are still in flight.
-func (r *BackupReconciler) writeStatus(ctx context.Context, backup *cbv1.Backup, manifestsDone bool) (ctrl.Result, error) {
+func (r *BackupReconciler) writeStatus(ctx context.Context, backup *cbv1.Backup, rc *backupRunContext, manifestsDone bool) (ctrl.Result, error) {
 	phase := string(status.RollUpVolumePhases(backup.Status.Volumes))
 	// A Backup is not finished while its manifest half is still running, even when every volume
 	// is. Letting the roll-up go terminal here would trip the already-terminal short-circuit at
@@ -448,6 +449,11 @@ func (r *BackupReconciler) writeStatus(ctx context.Context, backup *cbv1.Backup,
 	backup.Status.Phase = phase
 
 	terminal := isTerminalBackupPhase(phase)
+	// justTerminal is the FIRST arrival at a terminal phase, and it is the guard the event
+	// metrics hang off: backupTime being nil is the only durable marker of "this transition has
+	// not been recorded yet". Everything else re-runs — a conflict retry, a re-list, the
+	// already-terminal sweep — and a counter incremented on any of those would inflate.
+	justTerminal := terminal && backup.Status.BackupTime == nil
 	if terminal {
 		if backup.Status.BackupTime == nil {
 			now := metav1.Now()
@@ -462,10 +468,75 @@ func (r *BackupReconciler) writeStatus(ctx context.Context, backup *cbv1.Backup,
 	if err := r.Status().Update(ctx, backup); err != nil {
 		return ctrl.Result{}, fmt.Errorf("update status for Backup %s/%s: %w", backup.Namespace, backup.Name, err)
 	}
+	// AFTER the write, never before. A counter incremented against a status the API server
+	// rejected records a backup that, as far as every other observer is concerned, has not
+	// finished — and unlike a status field there is no way to take it back.
+	//
+	// The one gap this leaves is the ambiguous-write path the caller handles
+	// (terminalPhaseCommitted): a SIGTERM that cancels the request mid-flight while the server
+	// commits anyway loses this observation. Recording there instead would mean recording on a
+	// path that cannot tell success from failure, which trades a rare undercount for a
+	// systematic one.
+	if justTerminal {
+		recordBackupTerminalMetrics(backup, rc)
+	}
 	if terminal {
 		return ctrl.Result{}, nil
 	}
 	return ctrl.Result{RequeueAfter: backupPollInterval}, nil
+}
+
+// recordBackupTerminalMetrics emits the event half of the backup catalogue for ONE Backup that
+// has just reached a terminal phase and had that phase persisted (05-observability.md §2.1/§2.11).
+func recordBackupTerminalMetrics(backup *cbv1.Backup, rc *backupRunContext) {
+	var added int64
+	for _, v := range backup.Status.Volumes {
+		added += v.AddedBytes
+	}
+	// Measured creation→backupTime, identical to crystalbackup_backup_last_duration_seconds, so
+	// the gauge and the histogram's quantiles describe the same quantity.
+	var duration time.Duration
+	if backup.Status.BackupTime != nil {
+		duration = backup.Status.BackupTime.Sub(backup.CreationTimestamp.Time)
+	}
+	metrics.RecordBackupTerminal(backupMetricSeries(backup, rc), backup.Status.Phase, duration, added)
+}
+
+// moverMetricClusterID resolves the `cluster` label for the platform-scope families, which carry
+// it without the rest of the backup identity. It is also backupMetricSeries' cluster resolution,
+// so the two can never disagree about what cluster a Backup belongs to.
+//
+// The label is dropped for a namespace-plane Backup even though rc.clusterID holds a perfectly
+// good value for it: the collector resolves `cluster` by looking the location name up among the
+// ClusterBackupLocations, finds nothing for a namespaced BackupLocation, and emits an empty
+// label. Emitting the real ID here would split every namespace-plane series in two. (Teaching the
+// collector to resolve namespaced locations is the better fix, and a change to already-published
+// series — not this lot's to make.)
+func moverMetricClusterID(backup *cbv1.Backup, rc *backupRunContext) string {
+	if rc != nil && backup.Spec.LocationRef.Kind == kindClusterBackupLocation {
+		return rc.clusterID
+	}
+	return ""
+}
+
+// backupMetricSeries derives a Backup's metric identity, matching internal/metrics' own
+// state-derived resolution field for field — the counters here and the gauges the collector
+// computes have to carry IDENTICAL label sets or a dashboard cannot put a failure rate next to
+// the last success it belongs to.
+func backupMetricSeries(backup *cbv1.Backup, rc *backupRunContext) metrics.BackupSeries {
+	tenant := backup.Labels[apiconst.LabelTenant]
+	if tenant == "" {
+		tenant = backup.Namespace
+	}
+	clusterID := moverMetricClusterID(backup, rc)
+	return metrics.BackupSeries{
+		Namespace: backup.Namespace,
+		Tenant:    tenant,
+		Schedule:  backup.Labels[apiconst.LabelSchedule],
+		Origin:    backup.Labels[apiconst.LabelOrigin],
+		Location:  backup.Spec.LocationRef.Name,
+		Cluster:   clusterID,
+	}
 }
 
 // failHooks terminates a Backup whose pre-snapshot quiesce failed with onError=Fail.
@@ -474,8 +545,9 @@ func (r *BackupReconciler) writeStatus(ctx context.Context, backup *cbv1.Backup,
 // trustworthy, so capturing anyway would produce a backup that LOOKS application-consistent and is
 // not — the one outcome worse than having no backup, because it is discovered at restore time.
 // It never requeues: Failed is terminal, so the caller's pass simply ends here.
-func (r *BackupReconciler) failHooks(ctx context.Context, backup *cbv1.Backup, message string) error {
+func (r *BackupReconciler) failHooks(ctx context.Context, backup *cbv1.Backup, rc *backupRunContext, message string) error {
 	backup.Status.Phase = string(status.BackupPhaseFailed)
+	justTerminal := backup.Status.BackupTime == nil
 	if backup.Status.BackupTime == nil {
 		now := metav1.Now()
 		backup.Status.BackupTime = &now
@@ -484,6 +556,12 @@ func (r *BackupReconciler) failHooks(ctx context.Context, backup *cbv1.Backup, m
 		"PreHookFailed", message, backup.Generation)
 	if err := r.Status().Update(ctx, backup); err != nil {
 		return fmt.Errorf("update status for Backup %s/%s: %w", backup.Namespace, backup.Name, err)
+	}
+	// A hook-aborted Backup is a Failed Backup and belongs in the same counters as any other:
+	// the tenant asked for a restore point and does not have one. It carries no uploaded bytes
+	// and a duration that is essentially the hook timeout, both of which are the truth about it.
+	if justTerminal {
+		recordBackupTerminalMetrics(backup, rc)
 	}
 	r.Recorder.Eventf(backup, nil, corev1.EventTypeWarning, "BackupFailed", "PreHookFailed",
 		"no snapshot was taken: %s", message)
@@ -952,6 +1030,15 @@ func (r *BackupReconciler) advanceSnapshotting(ctx context.Context, backup *cbv1
 		return nil // stay in Snapshotting; a requeue picks a clean slot once the unlock resolves.
 	}
 
+	// The exposure has done its job: the snapshot is readyToUse, the static VS/VSC re-bind is
+	// done, the temp PVC is bound, and a mover now exists to mount it. This line is reached
+	// EXACTLY ONCE per volume — every earlier return leaves the volume in Snapshotting for
+	// another pass — which is what makes it the one honest place to close the timer.
+	if start, ok := exposer.StartedAt(ctx, r.Client, exposure); ok {
+		metrics.RecordExposureReadyWait(backup.Namespace, rc.tenant, ex.Kind(),
+			moverMetricClusterID(backup, rc), time.Since(start))
+	}
+
 	vol.Phase = status.VolumePhaseUploading
 	return nil
 }
@@ -1059,6 +1146,13 @@ func (r *BackupReconciler) advanceUploading(ctx context.Context, backup *cbv1.Ba
 	if !complete && !failed {
 		return "", nil // still running; requeue
 	}
+
+	// The Job is terminal, so status.failed is final: it is the number of pods that died before
+	// one succeeded (or gave up), i.e. the retries this mover consumed against its backoffLimit.
+	// Read once, here, rather than tracked incrementally — see metrics.RecordMoverJobRetries for
+	// why the terminal read is the one that cannot double-count. This is the only pass that sees
+	// the volume go terminal (the caller persists that phase and never re-enters).
+	metrics.RecordMoverJobRetries(backup.Namespace, rc.tenant, moverMetricClusterID(backup, rc), job.Status.Failed)
 
 	result, node, rerr := readMoverResult(ctx, r.Client, r.OperatorNamespace, moverName)
 	vol.Node = node

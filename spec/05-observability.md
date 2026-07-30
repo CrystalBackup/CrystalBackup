@@ -24,6 +24,15 @@ model of R25/R26/R21; metric names below canonicalize the shorthand used in
 - **Tenant-attributable everything** (R19): every tenant-relevant metric carries
   `{namespace, tenant, location, cluster}`; alert rules therefore route per tenant with the
   platform Alertmanager, and tenant dashboards filter on `namespace`.
+  **Known gap, being closed in 0.6.0**: the collector resolves `cluster` by looking a metric's
+  location name up among the `ClusterBackupLocation`s, so every NAMESPACE-plane series (whose
+  location is a namespaced `BackupLocation`) carries `cluster=""`. The controllers know the real
+  value — `BackupLocation.status.clusterID` — so this is a resolution gap, not missing data. Two
+  consequences worth naming, because they are why it must be fixed in ONE place: filling it in
+  only at the recording sites would split every namespace-plane family into two label sets, one
+  from the counter and one from the gauge; and the lookup being keyed by BARE NAME means a
+  namespaced location that happens to share a name with a cluster one currently borrows its
+  `clusterID`, which is worse than an empty label — it is a wrong one.
 - **Restart-safe gauges**: on operator start, `*_last_*` and boolean state gauges are
   rebuilt from CR/repo state (`BackupSchedule.status.lastSuccessTime`,
   `ClusterBackupSchedule.status.lastRunName`, `BackupRepository.status.*`,
@@ -140,10 +149,19 @@ Cluster plane only (targets a `ClusterBackupLocation`). Physical deletion —
 
 | Metric | Type | Labels | Description |
 |---|---|---|---|
-| `crystalbackup_erasure_snapshots_forgotten_total` | counter | location, cluster | Snapshots removed by `ClusterErasure` (`restic forget --tag`; Σ `status.snapshotsForgotten`). |
-| `crystalbackup_erasure_reclaimed_bytes_total` | counter | location, cluster | Bytes physically reclaimed by the post-erasure `prune` (Σ `status.reclaimedBytes`). |
+| `crystalbackup_erasure_snapshots_forgotten_total` | counter | location, cluster | Snapshots removed by `ClusterErasure` (`restic forget --tag`), counted at completion. |
+| `crystalbackup_erasure_reclaimed_bytes_total` | counter | location, cluster | Bytes physically reclaimed by the post-erasure `prune`, counted at completion. |
 | `crystalbackup_erasure_blocked` | gauge | location, cluster | `ClusterErasure` objects currently `Blocked` (Immutable object-lock not yet expired). Restart-safe from CR status; drives `ErasureBlocked`. |
 | `crystalbackup_erasure_last_completion_timestamp_seconds` | gauge | location, cluster | Unix time of the last `Completed` erasure. |
+
+**The two counters here are the one family that CANNOT be state-derived** (clarified M6; this
+section first phrased them as "Σ `status.snapshotsForgotten`", which reads like a scrape-time sum
+over live objects). It cannot work that way, and the reason is the point of the feature: a
+completed erasure exists to make data gone, and the `ClusterErasure` object is itself
+garbage-collected by the run-history limit. Summing live objects would make the running total of
+what has been erased silently *decrease* — the one number a GDPR audit would ask for, drifting
+downward. They are true counters, incremented once at completion, and they reset on restart like
+every other counter (§1).
 
 ### 2.7 Concurrency & queueing (R12)
 
@@ -171,7 +189,7 @@ emitted here). The operator's webhook metric counts only the dynamic rule(s).
 
 | Metric | Type | Labels | Description |
 |---|---|---|---|
-| `crystalbackup_exposure_ready_wait_seconds` | histogram | namespace, tenant, exposer, cluster | Wait from snapshot exposure start (VSC re-bind + temp PVC creation) until the exposed PVC is bound and the mover can start. |
+| `crystalbackup_exposure_ready_wait_seconds` | histogram | namespace, tenant, exposer, cluster | Wait from snapshot exposure start (VSC re-bind + temp PVC creation) until the exposed PVC is bound and the mover can start. **Backup path only** — `internal/rexposer`, which exposes a RESTORE target, is a different mechanism and is not instrumented here (M6 note; a restore's wait shows up inside `crystalbackup_restore_duration_seconds`). |
 | `crystalbackup_pvc_volumesnapshot_count` | gauge | namespace, pvc, cluster | VolumeSnapshot objects per source PVC (includes an incumbent tool's, e.g. Velero's, cf. [ADR 0006](adr/0006-coexistence-with-backup-tools.md)). **Documented exception to the §1 no-per-PVC-label rule**: cardinality is bounded by the live PVC count, the series is deleted with the PVC, and the ceph-csi flatten-threshold risk during coexistence justifies per-PVC visibility. |
 
 ### 2.10 Inherited controller-runtime metrics
@@ -195,9 +213,24 @@ system needs. Most exist above; this names the accounting view and fills the gap
 
 | Metric | Type | Labels | Description |
 |---|---|---|---|
-| `crystalbackup_backup_total` | counter | namespace, tenant, schedule, origin, location, cluster, result | Completed `Backup`s by terminal `result` (`completed`\|`partiallyfailed`\|`failed`) — the backup **count** per tenant. |
+| `crystalbackup_backup_total` | counter | namespace, tenant, schedule, origin, location, cluster, result | Completed `Backup`s by terminal `result` (`completed`\|`partiallycompleted`\|`partiallyfailed`\|`failed`) — the backup **count** per tenant. |
 | `crystalbackup_backup_protected_bytes` | gauge | namespace, tenant, origin, location, cluster | Logical bytes currently protected for the namespace (Σ newest `status.volumes[].sizeBytes` of its live backups) — "how much data is being backed up". Exact, per-namespace, dedup-independent. |
-| `crystalbackup_repository_stored_bytes` | gauge | location, scope, namespace, cluster | Physically stored, **deduplicated + compressed** bytes of the repository (`restic stats --mode raw-data`), refreshed with maintenance — the exact bill for that bucket (companion to `crystalbackup_repository_size_bytes`). |
+
+**`result` has four values, not three** (amended M6). `PartiallyCompleted` — volumes skipped because
+their CSI cannot snapshot, none failed — is a distinct terminal phase, and folding it into
+`completed` would erase the single signal that says a storage class quietly stopped being
+snapshottable. It is a success with a hole in it, and the hole is the thing worth counting.
+
+**There is no separate `repository_stored_bytes`** (amended M6; the name was specified and is
+withdrawn before it ever shipped). It was to carry `restic stats --mode raw-data` as "the exact
+bill", beside `crystalbackup_repository_size_bytes`. Two problems, found while implementing it.
+The operator runs no `stats` operation, so the only number available to fill it was
+`status.approximateSizeBytes` — which §2.4 already publishes. Two names, one reading, is a lie by
+implication: a reader who sees both assumes they were measured differently and reasons about the
+gap. And the withdrawn name was the *worse* of the two for its stated purpose, because
+`--mode raw-data` counts data the repository still REFERENCES, excluding packs that are garbage
+but not yet pruned. The bucket charges for those. `crystalbackup_repository_size_bytes` — the sum
+of the objects actually stored under the prefix — is the bill.
 
 Already-present inputs to accounting: `crystalbackup_backup_last_size_bytes` (logical, per
 namespace), `crystalbackup_backup_last_added_bytes` + `crystalbackup_backup_added_bytes_total`

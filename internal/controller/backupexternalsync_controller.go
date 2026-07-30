@@ -30,6 +30,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	cbv1 "github.com/CrystalBackup/CrystalBackup/api/v1alpha1"
+	"github.com/CrystalBackup/CrystalBackup/internal/apiconst"
 	"github.com/CrystalBackup/CrystalBackup/internal/client/secrets"
 	"github.com/CrystalBackup/CrystalBackup/internal/keys"
 	"github.com/CrystalBackup/CrystalBackup/internal/mover"
@@ -111,8 +112,10 @@ func (r *BackupExternalSyncReconciler) Reconcile(ctx context.Context, req ctrl.R
 	key := "bes/" + bs.Namespace + "/" + bs.Name
 
 	// An in-flight copy finishes on its own terms; see the cluster-plane controller for why.
+	ident := syncIdentity{Name: bs.Name, Scope: apiconst.OriginNamespace, Namespace: bs.Namespace}
+
 	if r.driver.hasInflight(key) {
-		res, err := r.driver.drive(ctx, key, nil, view, syncJobPrefixNamespaced, bs.Name, rec)
+		res, err := r.driver.drive(ctx, key, nil, view, syncJobPrefixNamespaced, bs.Name, rec, ident)
 		return r.write(ctx, &bs, res, err)
 	}
 
@@ -131,7 +134,7 @@ func (r *BackupExternalSyncReconciler) Reconcile(ctx context.Context, req ctrl.R
 		return r.write(ctx, &bs, idleSyncResult(view, act, bs.Spec.Schedule), nil)
 	}
 
-	res, err = r.driver.drive(ctx, key, run, view, syncJobPrefixNamespaced, bs.Name, rec)
+	res, err = r.driver.drive(ctx, key, run, view, syncJobPrefixNamespaced, bs.Name, rec, ident)
 	return r.write(ctx, &bs, res, err)
 }
 

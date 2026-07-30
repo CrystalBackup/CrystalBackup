@@ -14,18 +14,28 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package metrics publishes the crystalbackup_ Prometheus series. It is a
-// state-derived collector: on every scrape it reads the current Backup and
-// ClusterBackup objects and computes the gauges from their status, rather than
-// having the controllers imperatively increment counters. That makes the series
-// RESTART-SAFE — an operator restart cannot lose or double-count a gauge that is
-// simply recomputed from the objects that survive the restart — and it keeps the
-// hot reconcile path free of metrics bookkeeping. Cumulative views (a failure or
-// upload RATE) are obtained with PromQL increase()/rate() over these gauges.
+// Package metrics publishes the crystalbackup_ Prometheus series specified in
+// spec/05-observability.md §2. It has two halves, and which half a family belongs to is a
+// question about the family, not a matter of taste.
 //
-// The v1 series and their labels follow spec/05-observability.md. This M1 subset
-// covers backup health (last success, size, dedup delta, duration, failures) and
-// cluster-DR fleet health (run success, fan-out width).
+// The COLLECTOR half (this file and its neighbours) is state-derived: on every scrape it reads
+// the current objects and computes gauges from their status, rather than having controllers
+// imperatively track them. That makes those series RESTART-SAFE — an operator restart cannot
+// lose or double-count a value that is simply recomputed from objects that survive the restart —
+// and it keeps the hot reconcile path free of metrics bookkeeping. "What is true right now"
+// questions live here: last success, current size, how many failed Backups still exist, whether a
+// schedule is expected to run, how many movers are live.
+//
+// The EVENT half (events.go) is real in-process counters and histograms, incremented at the site
+// of the event. It exists because the state-derived trick has a hard limit: an object deleted by
+// a history limit takes its contribution with it, so a count of surviving failures is not a total
+// and increase() over it under-reports. Duration has no state to be derived from at all. §1 of
+// the spec blesses the trade explicitly — counters restart at zero and alerts use increase().
+//
+// One rule spans both: A NEVER-MEASURED SERIES IS ABSENT, NOT ZERO. A zero is a measurement, and
+// publishing one for something nobody has measured yet is how a fresh location pages the platform
+// team for the crime of existing. The one deliberate exception is documented at its emission site
+// (crystalbackup_externalsync_last_success_timestamp_seconds, externalsync.go).
 package metrics
 
 import (
@@ -33,6 +43,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	cbv1 "github.com/CrystalBackup/CrystalBackup/api/v1alpha1"
@@ -54,7 +65,7 @@ var Version = "dev"
 // the operator's own metric surface hard-assertable (M1 exit criterion) without first running a
 // backup, and gives dashboards a version to join on.
 var buildInfoDesc = prometheus.NewDesc(
-	"crystalbackup_build_info",
+	NameBuildInfo,
 	"A constant 1, labelled with the operator build version; always present.",
 	[]string{"version"}, nil)
 
@@ -75,38 +86,46 @@ const (
 var (
 	backupLabels        = []string{namespaceLabel, tenantLabel, scheduleLabel, originLabel, locationLabel, clusterLabel}
 	clusterBackupLabels = []string{scheduleLabel, locationLabel, clusterLabel}
+	// protectedLabels drops `schedule` from backupLabels: "how much data is protected for this
+	// namespace" is a question about the namespace, and summing the same PVC once per schedule
+	// that happens to cover it would double-count the volume, not describe it.
+	protectedLabels = []string{namespaceLabel, tenantLabel, originLabel, locationLabel, clusterLabel}
 
 	backupLastSuccessDesc = prometheus.NewDesc(
-		"crystalbackup_backup_last_success_timestamp_seconds",
+		NameBackupLastSuccess,
 		"Unix time of the last Completed or PartiallyCompleted Backup for this series.",
 		backupLabels, nil)
 	backupLastSizeDesc = prometheus.NewDesc(
-		"crystalbackup_backup_last_size_bytes",
+		NameBackupLastSize,
 		"Logical size of the last successful Backup (sum of status.volumes[].sizeBytes).",
 		backupLabels, nil)
 	backupLastAddedDesc = prometheus.NewDesc(
-		"crystalbackup_backup_last_added_bytes",
+		NameBackupLastAdded,
 		"Deduplicated bytes added by the last successful Backup (sum of status.volumes[].addedBytes).",
 		backupLabels, nil)
 	backupLastDurationDesc = prometheus.NewDesc(
-		"crystalbackup_backup_last_duration_seconds",
+		NameBackupLastDuration,
 		"Wall-clock duration of the last successful Backup (backupTime - creationTimestamp).",
 		backupLabels, nil)
 	backupFailuresDesc = prometheus.NewDesc(
-		"crystalbackup_backup_failures",
+		NameBackupFailures,
 		"Number of Backups currently in a failed terminal phase (Failed or PartiallyFailed) for this series.",
 		backupLabels, nil)
+	backupProtectedBytesDesc = prometheus.NewDesc(
+		NameBackupProtectedBytes,
+		"Logical bytes currently protected for the namespace: the newest recorded size of every PVC that has a live restore point.",
+		protectedLabels, nil)
 
 	clusterBackupLastSuccessDesc = prometheus.NewDesc(
-		"crystalbackup_clusterbackup_last_success_timestamp_seconds",
+		NameClusterBackupLastSuccess,
 		"Unix time of the last Completed ClusterBackup run for this series.",
 		clusterBackupLabels, nil)
 	clusterBackupNamespacesMatchedDesc = prometheus.NewDesc(
-		"crystalbackup_clusterbackup_namespaces_matched",
+		NameClusterBackupNamespacesMatched,
 		"Namespaces matched by the last ClusterBackup run for this series (status.namespacesMatched).",
 		clusterBackupLabels, nil)
 	clusterBackupNamespacesFailedDesc = prometheus.NewDesc(
-		"crystalbackup_clusterbackup_namespaces_failed",
+		NameClusterBackupNamespacesFailed,
 		"Namespaces with a failed child Backup in the last ClusterBackup run for this series (status.namespacesFailed).",
 		clusterBackupLabels, nil)
 )
@@ -116,11 +135,17 @@ var (
 // metrics registry (see cmd/main.go) so it is served on the operator's /metrics.
 type Collector struct {
 	reader client.Reader
+	// operatorNamespace is where the mover Jobs live. The mover family (§2.7) is a census of
+	// those Jobs, and there is no label or owner reference that identifies them cluster-wide —
+	// the namespace IS the scope.
+	operatorNamespace string
 }
 
 // NewCollector builds a Collector over reader (the manager's cached client in
-// production; a fake client in tests).
-func NewCollector(reader client.Reader) *Collector { return &Collector{reader: reader} }
+// production; a fake client in tests) and the namespace holding the mover Jobs.
+func NewCollector(reader client.Reader, operatorNamespace string) *Collector {
+	return &Collector{reader: reader, operatorNamespace: operatorNamespace}
+}
 
 // Describe implements prometheus.Collector.
 func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
@@ -130,6 +155,8 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- backupLastAddedDesc
 	ch <- backupLastDurationDesc
 	ch <- backupFailuresDesc
+	ch <- backupProtectedBytesDesc
+	ch <- scheduleActiveDesc
 	ch <- clusterBackupLastSuccessDesc
 	ch <- clusterBackupNamespacesMatchedDesc
 	ch <- clusterBackupNamespacesFailedDesc
@@ -142,6 +169,17 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- repositoryLastCheckSuccessDesc
 	ch <- repositoryLastMaintenanceDesc
 	ch <- repositoryStaleLocksDesc
+	ch <- repositoryStoredBytesDesc
+	ch <- discoveryLastTimestampDesc
+	ch <- discoveryLastSuccessDesc
+	ch <- discoveryProjectedDesc
+	ch <- discoveryOrphansDesc
+	ch <- erasureBlockedDesc
+	ch <- erasureLastCompletionDesc
+	ch <- moverActiveDesc
+	ch <- moverQueueDepthDesc
+	ch <- moverConcurrencyLimitDesc
+	ch <- pvcVolumeSnapshotCountDesc
 	ch <- externalSyncLastSuccessDesc
 	ch <- externalSyncSnapshotsCopiedDesc
 	ch <- externalSyncLagDesc
@@ -157,7 +195,7 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 	ctx, cancel := context.WithTimeout(context.Background(), collectTimeout)
 	defer cancel()
 
-	clusterByLocation := c.locationClusterIDs(ctx)
+	clusterByLocation, clusterID := c.locationClusterIDs(ctx)
 
 	var backups cbv1.BackupList
 	backupsListed := c.reader.List(ctx, &backups) == nil
@@ -197,11 +235,40 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 	}
 
 	// The repository family (M4, 05-observability §2.4). Per-repository, not per-namespace: a
-	// check or prune result on the shared cluster repository is a platform-wide signal.
+	// check or prune result on the shared cluster repository is a platform-wide signal. The
+	// discovery family (§2.5) rides the same objects — discovery records its outcome on the
+	// repository status, so one listing answers both.
 	var repos cbv1.BackupRepositoryList
 	if err := c.reader.List(ctx, &repos); err == nil {
 		collectRepositories(ch, repos.Items, clusterByLocation)
+		collectDiscovery(ch, repos.Items, clusterByLocation)
 	}
+
+	// schedule_active (§2.1) — the series BackupMissed joins against. It needs the namespaces
+	// too, because a ClusterBackupSchedule declares a SELECTION and the metric has to be one
+	// series per namespace that selection resolves to.
+	var namespaces corev1.NamespaceList
+	var schedules cbv1.BackupScheduleList
+	var clusterSchedules cbv1.ClusterBackupScheduleList
+	namespacesListed := c.reader.List(ctx, &namespaces) == nil
+	schedulesListed := c.reader.List(ctx, &schedules) == nil
+	clusterSchedulesListed := c.reader.List(ctx, &clusterSchedules) == nil
+	if schedulesListed || (clusterSchedulesListed && namespacesListed) {
+		collectSchedules(ch, schedules.Items, clusterSchedules.Items, namespaces.Items, clusterByLocation)
+	}
+
+	// The erasure family's two gauges (§2.6). Their counter siblings are recorded at the event.
+	var erasures cbv1.ClusterErasureList
+	if err := c.reader.List(ctx, &erasures); err == nil {
+		collectErasures(ch, erasures.Items, clusterByLocation)
+	}
+
+	// Concurrency and queueing (§2.7): a census of the live mover Jobs against the configured cap.
+	c.collectMovers(ctx, ch, backups.Items, clusterSchedules.Items, runs.Items, clusterID)
+
+	// pvc_volumesnapshot_count (§2.9): the one per-PVC label in the catalogue, and the one that
+	// makes coexistence with an incumbent tool visible.
+	c.collectPVCSnapshots(ctx, ch, clusterID)
 
 	// The external-sync family (M5, R28). One family, both planes — an operator asking whether
 	// their secondary is current is asking the same question on either.
@@ -217,28 +284,53 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 // locationClusterIDs maps each ClusterBackupLocation name to its clusterID, so a
 // backup's `cluster` label can be resolved from the location it references. A read
 // failure yields an empty map (the cluster label is then empty — a gap, not a crash).
-func (c *Collector) locationClusterIDs(ctx context.Context) map[string]string {
+//
+// The second return is THE cluster's identity, for the handful of platform-scope families
+// (§2.7, §2.9) that carry `cluster` and nothing else to resolve it from: they describe mover Jobs
+// and VolumeSnapshots, which belong to no location. It is the DEFAULT location's clusterID, or —
+// when no location claims default — the single value every location agrees on. Disagreement
+// yields an empty label rather than an arbitrary pick: clusterID is the identity the platform
+// Prometheus also stamps at federation (§8 open question 2), and guessing wrong here would create
+// a duplicate series under a second cluster name that nobody could reconcile with the first.
+func (c *Collector) locationClusterIDs(ctx context.Context) (map[string]string, string) {
 	out := map[string]string{}
 	var locs cbv1.ClusterBackupLocationList
 	if err := c.reader.List(ctx, &locs); err != nil {
-		return out
+		return out, ""
 	}
+	var defaultID, consensus string
+	agreed := true
 	for i := range locs.Items {
-		out[locs.Items[i].Name] = locs.Items[i].Spec.ClusterID
+		loc := &locs.Items[i]
+		out[loc.Name] = loc.Spec.ClusterID
+		if loc.Spec.Default && loc.Spec.ClusterID != "" {
+			defaultID = loc.Spec.ClusterID
+		}
+		switch {
+		case loc.Spec.ClusterID == "":
+		case consensus == "":
+			consensus = loc.Spec.ClusterID
+		case consensus != loc.Spec.ClusterID:
+			agreed = false
+		}
 	}
-	return out
+	if defaultID != "" {
+		return out, defaultID
+	}
+	if agreed {
+		return out, consensus
+	}
+	return out, ""
 }
 
 // backupSeriesKey is the 6-tuple that identifies one Backup metric series. Many
 // Backups (successive runs in a namespace) collapse to one series, so the collector
 // groups by this key and emits the latest/aggregate — never a duplicate series.
-type backupSeriesKey struct {
-	namespace, tenant, schedule, origin, location, cluster string
-}
-
-func (k backupSeriesKey) values() []string {
-	return []string{k.namespace, k.tenant, k.schedule, k.origin, k.location, k.cluster}
-}
+//
+// It is an ALIAS of the exported BackupSeries (events.go), not a second declaration: the gauges
+// here and the counters there must agree on the label order for the rest of eternity, and an
+// alias makes disagreement impossible rather than merely unlikely.
+type backupSeriesKey = BackupSeries
 
 // backupSeries accumulates the state of one series across its Backups.
 type backupSeries struct {
@@ -249,8 +341,30 @@ type backupSeries struct {
 	failures        float64
 }
 
+// protectedSeriesKey identifies one crystalbackup_backup_protected_bytes series: the Backup series
+// minus its schedule.
+type protectedSeriesKey struct {
+	namespace, tenant, origin, location, cluster string
+}
+
+func (k protectedSeriesKey) values() []string {
+	return []string{k.namespace, k.tenant, k.origin, k.location, k.cluster}
+}
+
+// protectedVolume is the newest recorded logical size of ONE PVC, with the time that reading was
+// taken so a later run supersedes an earlier one.
+type protectedVolume struct {
+	atUnix float64
+	size   float64
+}
+
 func collectBackups(ch chan<- prometheus.Metric, backups []cbv1.Backup, clusterByLocation map[string]string) {
 	series := map[backupSeriesKey]*backupSeries{}
+	// protected is keyed by series, then by PVC: "how much data is protected" is a sum over
+	// DISTINCT volumes, not over backups. Two runs of the same PVC are one protected volume, and
+	// a PVC that only the weekly schedule covers is still protected between the dailies — which
+	// is exactly why this cannot be read off last_size_bytes.
+	protected := map[protectedSeriesKey]map[string]protectedVolume{}
 	for i := range backups {
 		b := &backups[i]
 		key := backupKey(b, clusterByLocation)
@@ -260,6 +374,7 @@ func collectBackups(ch chan<- prometheus.Metric, backups []cbv1.Backup, clusterB
 			series[key] = s
 		}
 		accumulateBackup(s, b)
+		accumulateProtected(protected, key, b)
 	}
 	for key, s := range series {
 		vals := key.values()
@@ -271,6 +386,44 @@ func collectBackups(ch chan<- prometheus.Metric, backups []cbv1.Backup, clusterB
 			ch <- prometheus.MustNewConstMetric(backupLastDurationDesc, prometheus.GaugeValue, s.lastDuration, vals...)
 		}
 		ch <- prometheus.MustNewConstMetric(backupFailuresDesc, prometheus.GaugeValue, s.failures, vals...)
+	}
+	for key, volumes := range protected {
+		var total float64
+		for _, v := range volumes {
+			total += v.size
+		}
+		ch <- prometheus.MustNewConstMetric(backupProtectedBytesDesc, prometheus.GaugeValue, total, key.values()...)
+	}
+}
+
+// accumulateProtected folds one Backup's volumes into the protected-bytes view: for every PVC it
+// captured successfully, the newest recorded logical size wins.
+//
+// Only successful terminal phases contribute. A Failed run's volumes carry no size, and a
+// PartiallyFailed one's failed volumes carry none either — the per-volume Completed check is what
+// keeps a half-finished run from erasing the last known good size of a volume it did not capture.
+func accumulateProtected(protected map[protectedSeriesKey]map[string]protectedVolume, key backupSeriesKey, b *cbv1.Backup) {
+	if b.Status.BackupTime == nil {
+		return
+	}
+	at := float64(b.Status.BackupTime.Unix())
+	pk := protectedSeriesKey{
+		namespace: key.Namespace, tenant: key.Tenant,
+		origin: key.Origin, location: key.Location, cluster: key.Cluster,
+	}
+	for _, v := range b.Status.Volumes {
+		if v.Phase != status.VolumePhaseCompleted || v.SizeBytes <= 0 {
+			continue
+		}
+		byPVC := protected[pk]
+		if byPVC == nil {
+			byPVC = map[string]protectedVolume{}
+			protected[pk] = byPVC
+		}
+		if prev, ok := byPVC[v.Pvc]; ok && prev.atUnix >= at {
+			continue
+		}
+		byPVC[v.Pvc] = protectedVolume{atUnix: at, size: float64(v.SizeBytes)}
 	}
 }
 
@@ -313,21 +466,18 @@ func backupKey(b *cbv1.Backup, clusterByLocation map[string]string) backupSeries
 	}
 	location := b.Spec.LocationRef.Name
 	return backupSeriesKey{
-		namespace: b.Namespace,
-		tenant:    tenant,
-		schedule:  b.Labels[apiconst.LabelSchedule],
-		origin:    b.Labels[apiconst.LabelOrigin],
-		location:  location,
-		cluster:   clusterByLocation[location],
+		Namespace: b.Namespace,
+		Tenant:    tenant,
+		Schedule:  b.Labels[apiconst.LabelSchedule],
+		Origin:    b.Labels[apiconst.LabelOrigin],
+		Location:  location,
+		Cluster:   clusterByLocation[location],
 	}
 }
 
-// clusterBackupSeriesKey identifies one ClusterBackup (fleet-DR) metric series.
-type clusterBackupSeriesKey struct {
-	schedule, location, cluster string
-}
-
-func (k clusterBackupSeriesKey) values() []string { return []string{k.schedule, k.location, k.cluster} }
+// clusterBackupSeriesKey identifies one ClusterBackup (fleet-DR) metric series. An alias of the
+// exported ClusterBackupSeries, for the reason backupSeriesKey is one.
+type clusterBackupSeriesKey = ClusterBackupSeries
 
 type clusterBackupSeries struct {
 	lastSuccessUnix   float64
@@ -342,9 +492,9 @@ func collectClusterBackups(ch chan<- prometheus.Metric, runs []cbv1.ClusterBacku
 		run := &runs[i]
 		location := run.Spec.LocationRef.Name
 		key := clusterBackupSeriesKey{
-			schedule: run.Spec.ScheduleRef,
-			location: location,
-			cluster:  clusterByLocation[location],
+			Schedule: run.Spec.ScheduleRef,
+			Location: location,
+			Cluster:  clusterByLocation[location],
 		}
 		s := series[key]
 		if s == nil {

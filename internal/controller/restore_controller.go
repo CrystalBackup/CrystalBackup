@@ -43,6 +43,7 @@ import (
 	cbv1 "github.com/CrystalBackup/CrystalBackup/api/v1alpha1"
 	"github.com/CrystalBackup/CrystalBackup/internal/apiconst"
 	"github.com/CrystalBackup/CrystalBackup/internal/client/secrets"
+	"github.com/CrystalBackup/CrystalBackup/internal/metrics"
 	"github.com/CrystalBackup/CrystalBackup/internal/repo/queue"
 	"github.com/CrystalBackup/CrystalBackup/internal/restic"
 	"github.com/CrystalBackup/CrystalBackup/internal/rexposer"
@@ -248,6 +249,12 @@ func (r *RestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		// per-volume state) survive and the next pass re-derives the same terminal result.
 		return ctrl.Result{}, fmt.Errorf("update status for Restore %s/%s: %w", restore.Namespace, restore.Name, err)
 	}
+	// One observation per restore: the terminal phase is now persisted, and the already-terminal
+	// short-circuit at the top of Reconcile bars re-entry. A namespaced Restore's identity is its
+	// SOURCE Backup's — the collector resolves it the same way, through the same object — so the
+	// counter and the last_success gauge land on one series.
+	metrics.RecordRestoreTerminal(restoreMetricSeries(restore.Namespace, source, rc.clusterID),
+		string(restore.Spec.Mode), string(phase), time.Since(restore.CreationTimestamp.Time))
 
 	// (6) The terminal result is durable: reclaim the operator-side residue. The manifest half
 	// goes first because part of its residue is a live write grant in a tenant namespace.
@@ -611,6 +618,24 @@ func (r *RestoreReconciler) mapJobToRestore(_ context.Context, obj client.Object
 // ---------------------------------------------------------------------------
 // Shared restore helpers (used by both restore controllers).
 // ---------------------------------------------------------------------------
+
+// restoreMetricSeries derives a namespaced Restore's metric identity from its SOURCE Backup,
+// mirroring internal/metrics' own resolution: the restore belongs to the data it restored, not to
+// the object that asked for it. A source whose labels are missing leaves the identity fields empty
+// — a gap, matching the collector's best-effort join, rather than a fabricated tenant.
+func restoreMetricSeries(namespace string, source *cbv1.Backup, clusterID string) metrics.RestoreSeries {
+	s := metrics.RestoreSeries{Namespace: namespace}
+	if source == nil {
+		return s
+	}
+	s.Tenant = source.Labels[apiconst.LabelTenant]
+	s.Origin = source.Labels[apiconst.LabelOrigin]
+	s.Location = source.Spec.LocationRef.Name
+	if source.Spec.LocationRef.Kind == kindClusterBackupLocation {
+		s.Cluster = clusterID
+	}
+	return s
+}
 
 // kindClusterBackupLocationRef is the LocationReference.Kind value naming the cluster plane.
 const kindClusterBackupLocationRef = "ClusterBackupLocation"

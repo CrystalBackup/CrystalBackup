@@ -50,7 +50,7 @@ func TestCollectorRepositorySeries(t *testing.T) {
 	}
 
 	reg := prometheus.NewRegistry()
-	reg.MustRegister(NewCollector(newFakeClient(t, loc, repo)))
+	reg.MustRegister(NewCollector(newFakeClient(t, loc, repo), testOperatorNamespace))
 
 	// namespace is EMPTY for the shared cluster repository: these are per-repository series, and a
 	// check result on the shared repo is a platform-wide signal, not one tenant's (05-obs §2.4).
@@ -89,7 +89,7 @@ func TestCollectorRepositoryNeverCheckedEmitsNoCheckSeries(t *testing.T) {
 	}
 
 	reg := prometheus.NewRegistry()
-	reg.MustRegister(NewCollector(newFakeClient(t, loc, repo)))
+	reg.MustRegister(NewCollector(newFakeClient(t, loc, repo), testOperatorNamespace))
 
 	want := map[string]string{"location": "dr", "scope": "Cluster", "namespace": "", "cluster": "prod-eu-1"}
 	for _, m := range []string{
@@ -124,7 +124,7 @@ func TestCollectorRepositoryFailedCheck(t *testing.T) {
 	}
 
 	reg := prometheus.NewRegistry()
-	reg.MustRegister(NewCollector(newFakeClient(t, loc, repo)))
+	reg.MustRegister(NewCollector(newFakeClient(t, loc, repo), testOperatorNamespace))
 
 	want := map[string]string{"location": "dr", "scope": "Cluster", "namespace": "", "cluster": "prod-eu-1"}
 	got, ok := gatherValue(t, reg, "crystalbackup_repository_last_check_success", want)

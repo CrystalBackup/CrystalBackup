@@ -132,11 +132,14 @@ func snapshotsCut(volumes []cbv1.VolumeStatus) bool {
 // When the hooks ran it persists the record and stops the pass deliberately: the snapshots must
 // not start until the quiesce is durable in status, because a controller that died between the two
 // has no other way to come back knowing it froze something.
-func (r *BackupReconciler) openFreezeWindow(ctx context.Context, backup *cbv1.Backup,
+func (r *BackupReconciler) openFreezeWindow(ctx context.Context, backup *cbv1.Backup, rc *backupRunContext,
 	st hookPhaseState, spec cbv1.HooksSpec,
 ) (res ctrl.Result, done bool, err error) {
 	if st.aborted {
-		return ctrl.Result{}, true, r.failHooks(ctx, backup, st.abortMessage)
+		// rc rides along solely so the Failed terminal transition can be recorded with the same
+		// metric identity writeStatus would have given it — a hook abort is the one terminal path
+		// that never reaches the status writer.
+		return ctrl.Result{}, true, r.failHooks(ctx, backup, rc, st.abortMessage)
 	}
 	if st.preRan {
 		return ctrl.Result{}, false, nil
