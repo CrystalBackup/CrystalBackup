@@ -370,14 +370,27 @@ var crdGVK = schema.GroupVersionKind{
 	Group: "apiextensions.k8s.io", Version: "v1", Kind: "CustomResourceDefinitionList",
 }
 
+// READ-ONLY, and it must stay that way: an operator able to WRITE a CustomResourceDefinition could
+// rewrite the schema of the very objects it is trusted to back up. get/list/watch is the whole
+// requirement, and it exists solely so `crystal-backup selfcheck` can report which CRDs are
+// installed with their storage version and provenance.
+//
+// This block is deliberately FREE-STANDING, separated by a blank line from the doc comment below.
+// +kubebuilder:rbac is a PACKAGE-scoped marker: attached to a declaration's doc comment it is a
+// declaration comment, controller-gen does not collect it, and `make manifests` regenerates a role
+// without the rule — silently, with no error and no diff. Written the wrong way first, and found
+// only by checking the generated file rather than the exit code.
+//
+// +kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,verbs=get;list;watch
+
 // crds inventories the operator's own CRDs, from the richest source available.
 //
-// The operator's ClusterRole does NOT currently grant read on customresourcedefinitions, so the
-// first attempt is expected to fail on a chart install — which is exactly why there is a fallback
-// and why the report states which source answered. Discovery gives the SERVED versions of the API
-// group and nothing else: no storage version, no per-CRD annotation. That is a genuinely weaker
-// answer, and calling it by a different name is the difference between a degraded report and a
-// misleading one.
+// The discovery fallback stays even with the grant above. A self-check runs on clusters whose RBAC
+// nobody has audited, including ones installed by a chart that predates this rule, and the honest
+// behaviour there is a weaker answer rather than an error. Discovery gives the SERVED versions of
+// the API group and nothing else: no storage version, no per-CRD provenance annotation. Reporting
+// which source produced the answer is the difference between a degraded report and a misleading
+// one.
 func (c *collector) crds(ctx context.Context) CRDInventory {
 	list := &unstructured.UnstructuredList{}
 	list.SetGroupVersionKind(crdGVK)

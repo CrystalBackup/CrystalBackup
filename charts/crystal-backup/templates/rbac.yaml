@@ -98,6 +98,16 @@ rules:
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["get", "list", "watch"]
+  # CustomResourceDefinitions: READ-ONLY, and it must stay that way. This is what lets
+  # `crystal-backup selfcheck` report which CRDs are installed with their storage version and
+  # controller-gen provenance — the answer to "are my CRDs from an older chart than my
+  # operator", which is the first question worth asking on a confusing bug report. Without it
+  # the report falls back to API discovery, which knows only the served versions.
+  # An operator able to WRITE a CRD could rewrite the schema of the objects it is trusted to
+  # back up, so no write verb belongs here, ever.
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources: ["customresourcedefinitions"]
+    verbs: ["get", "list", "watch"]
   # Namespaces: read + create (ClusterRestore targets).
   - apiGroups: [""]
     resources: ["namespaces"]
