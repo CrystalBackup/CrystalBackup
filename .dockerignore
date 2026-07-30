@@ -13,5 +13,13 @@
 # Re-include files consumed by //go:embed. These are Go SOURCE as far as the compiler is
 # concerned — a missing one fails the build with "pattern <file>: no matching files found" —
 # but the allowlist above only re-includes *.go, so an embedded non-Go file is invisible here
-# while building fine everywhere else. Add every new embed target to this list.
+# while building fine everywhere else.
+#
+# This list used to end with "Add every new embed target to this list", and M6 added two without
+# doing so: the comment was right, and being right is not the same as being enforced. The build
+# stayed green locally (the files are on disk) and failed only inside the container. It is now
+# checked by TestDockerignoreCoversEveryEmbed in internal/sanitize — a comment asking to be
+# remembered is a defect waiting for the next person in a hurry.
 !internal/sanitize/rules.yaml
+!internal/selfcheck/report.css
+!internal/selfcheck/report.html.tmpl
