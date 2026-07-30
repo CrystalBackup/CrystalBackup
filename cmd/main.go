@@ -56,6 +56,7 @@ import (
 	"github.com/CrystalBackup/CrystalBackup/internal/repo/queue"
 	"github.com/CrystalBackup/CrystalBackup/internal/repo/s3stat"
 	"github.com/CrystalBackup/CrystalBackup/internal/rexposer"
+	"github.com/CrystalBackup/CrystalBackup/internal/selfcheck"
 	"github.com/CrystalBackup/CrystalBackup/internal/tracing"
 	webhookv1alpha1 "github.com/CrystalBackup/CrystalBackup/internal/webhook/v1alpha1"
 	// +kubebuilder:scaffold:imports
@@ -83,6 +84,29 @@ func init() {
 
 // nolint:gocyclo
 func main() {
+	// The two out-of-band subcommands, dispatched before any flag is defined.
+	//
+	// They are subcommands of the OPERATOR binary rather than a new artifact on purpose: `selfcheck`
+	// has to read what the collectors read, with the RBAC the operator already holds, and shipping
+	// a second image to do that would mean a second supply chain to sign, scan and get wrong. This
+	// is also NOT the beginning of a `crystalctl` — that is a later milestone with a different
+	// audience (a tenant, from outside the cluster); these two run as the operator, and `report`
+	// runs nowhere near a cluster at all.
+	//
+	// The dispatch is a bare os.Args switch and not a CLI framework because the manager path below
+	// owns flag.CommandLine — zap's BindFlags registers onto it — and a subcommand router that
+	// touched the global FlagSet would change the operator's own command line as a side effect.
+	// Everything else lives in internal/selfcheck; `go build cmd/main.go` compiles ONE file, so a
+	// second file in this package would break the Dockerfile and `make build`.
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case selfcheck.CommandSelfcheck:
+			os.Exit(selfcheck.RunSelfcheck(context.Background(), os.Args[2:], os.Stdout, os.Stderr))
+		case selfcheck.CommandReport:
+			os.Exit(selfcheck.RunReport(os.Args[2:], os.Stdout, os.Stderr))
+		}
+	}
+
 	var metricsAddr string
 	var metricsCertPath, metricsCertName, metricsCertKey string
 	var webhookCertPath, webhookCertName, webhookCertKey string
