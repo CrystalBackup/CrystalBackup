@@ -67,8 +67,8 @@ func drLocation() *cbv1.ClusterBackupLocation {
 // TestScheduleActiveResolvesClusterSelection is the test this whole family exists for: a
 // ClusterBackupSchedule declares a SELECTION, and crystalbackup_schedule_active has to be one
 // series per namespace that selection resolves to — otherwise the BackupMissed rule's
-// `and on (namespace, schedule, cluster)` join finds no partner and the alert can never fire,
-// which is precisely the state 0.5.x shipped in.
+// `and on (namespace, schedule, origin, location, cluster)` join finds no partner and the alert can
+// never fire, which is precisely the state 0.5.x shipped in.
 func TestScheduleActiveResolvesClusterSelection(t *testing.T) {
 	protectedLabel := map[string]string{apiconst.LabelProtect: "true"}
 	cbs := &cbv1.ClusterBackupSchedule{
@@ -155,7 +155,8 @@ func TestScheduleActiveInvalidSelectorEmitsNothing(t *testing.T) {
 // TestScheduleActiveNamespacePlane: a BackupSchedule has no paused field, so its mere existence
 // is the signal. Its location is namespaced and carries no clusterID, so the cluster label is
 // empty — matching what the Backup gauges emit for the same series, which is what keeps the
-// BackupMissed join (on namespace, schedule, cluster) intact on the namespace plane.
+// BackupMissed join (on namespace, schedule, origin, location, cluster) intact on the namespace
+// plane.
 func TestScheduleActiveNamespacePlane(t *testing.T) {
 	bs := &cbv1.BackupSchedule{
 		ObjectMeta: metav1.ObjectMeta{Namespace: "team-a", Name: "nightly"},
@@ -257,7 +258,7 @@ func TestDiscoveryFamilyAfterScan(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(NewCollector(newFakeClient(t, drLocation(), repositoryWithDiscovery(&failed, 12, 3)), testOperatorNamespace))
 
-	want := map[string]string{"location": "dr", "scope": "Cluster", "cluster": "c1"}
+	want := map[string]string{"location": "dr", "scope": "cluster", "namespace": "", "cluster": "c1"}
 	if got, ok := gatherValue(t, reg, NameDiscoveryLastSuccess, want); !ok || got != 0 {
 		t.Fatalf("discovery_last_success = %v (found=%v), want 0 after a failing scan", got, ok)
 	}
@@ -458,9 +459,9 @@ func TestRepositoryStoredBytesIsNotShipped(t *testing.T) {
 
 func TestRecordBackupTerminalCountsFailuresAndResults(t *testing.T) {
 	s := BackupSeries{Namespace: "ev-a", Tenant: "ev-a", Schedule: "daily", Origin: "cluster", Location: "dr", Cluster: "c1"}
-	RecordBackupTerminal(s, "Completed", 120*time.Second, 1024)
-	RecordBackupTerminal(s, "PartiallyFailed", 300*time.Second, 512)
-	RecordBackupTerminal(s, "Failed", 60*time.Second, 0)
+	RecordBackupTerminal(t.Context(), s, "Completed", 120*time.Second, 1024)
+	RecordBackupTerminal(t.Context(), s, "PartiallyFailed", 300*time.Second, 512)
+	RecordBackupTerminal(t.Context(), s, "Failed", 60*time.Second, 0)
 
 	vals := s.values()
 	if got := testutil.ToFloat64(backupFailuresTotal.WithLabelValues(vals...)); got != 2 {
@@ -490,8 +491,8 @@ func TestResultOfKeepsPartiallyCompletedDistinct(t *testing.T) {
 
 func TestRecordRestoreTerminalCarriesMode(t *testing.T) {
 	s := RestoreSeries{Namespace: "ev-r", Tenant: "ev-r", Origin: "cluster", Location: "dr", Cluster: "c1"}
-	RecordRestoreTerminal(s, "Recreate", "Failed", 90*time.Second)
-	RecordRestoreTerminal(s, "Overwrite", "Completed", 30*time.Second)
+	RecordRestoreTerminal(t.Context(), s, "Recreate", "Failed", 90*time.Second)
+	RecordRestoreTerminal(t.Context(), s, "Overwrite", "Completed", 30*time.Second)
 
 	recreate := append(append([]string{}, s.values()...), "Recreate")
 	overwrite := append(append([]string{}, s.values()...), "Overwrite")
@@ -508,7 +509,7 @@ func TestRecordRestoreTerminalCarriesMode(t *testing.T) {
 
 func TestRecordClusterBackupTerminal(t *testing.T) {
 	s := ClusterBackupSeries{Schedule: "ev-dr", Location: "dr", Cluster: "c1"}
-	RecordClusterBackupTerminal(s, "PartiallyFailed", 45*time.Minute)
+	RecordClusterBackupTerminal(t.Context(), s, "PartiallyFailed", 45*time.Minute)
 	if got := testutil.ToFloat64(clusterBackupRunsTotal.WithLabelValues("ev-dr", "dr", "c1", "partiallyfailed")); got != 1 {
 		t.Fatalf("clusterbackup_runs_total{result=partiallyfailed} = %v, want 1", got)
 	}
@@ -539,8 +540,8 @@ func TestRecordMoverJobRetriesAndWebhookDenials(t *testing.T) {
 }
 
 func TestRecordExposureReadyWaitClampsSkew(t *testing.T) {
-	RecordExposureReadyWait("ev-x", "ev-x", "csi-generic", "c1", -5*time.Second)
-	RecordExposureReadyWait("ev-x", "ev-x", "csi-generic", "c1", 12*time.Second)
+	RecordExposureReadyWait(t.Context(), "ev-x", "ev-x", "csi-generic", "c1", -5*time.Second)
+	RecordExposureReadyWait(t.Context(), "ev-x", "ev-x", "csi-generic", "c1", 12*time.Second)
 	if got := testutil.CollectAndCount(exposureReadyWait, NameExposureReadyWait); got == 0 {
 		t.Fatal("exposure_ready_wait_seconds recorded no series")
 	}

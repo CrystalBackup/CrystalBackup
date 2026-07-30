@@ -54,7 +54,7 @@ func TestCollectorRepositorySeries(t *testing.T) {
 
 	// namespace is EMPTY for the shared cluster repository: these are per-repository series, and a
 	// check result on the shared repo is a platform-wide signal, not one tenant's (05-obs §2.4).
-	want := map[string]string{"location": "dr", "scope": "Cluster", "namespace": "", "cluster": "prod-eu-1"}
+	want := map[string]string{"location": "dr", "scope": "cluster", "namespace": "", "cluster": "prod-eu-1"}
 
 	cases := []struct {
 		metric string
@@ -91,7 +91,7 @@ func TestCollectorRepositoryNeverCheckedEmitsNoCheckSeries(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(NewCollector(newFakeClient(t, loc, repo), testOperatorNamespace))
 
-	want := map[string]string{"location": "dr", "scope": "Cluster", "namespace": "", "cluster": "prod-eu-1"}
+	want := map[string]string{"location": "dr", "scope": "cluster", "namespace": "", "cluster": "prod-eu-1"}
 	for _, m := range []string{
 		"crystalbackup_repository_last_check_timestamp_seconds",
 		"crystalbackup_repository_last_check_success",
@@ -126,7 +126,7 @@ func TestCollectorRepositoryFailedCheck(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(NewCollector(newFakeClient(t, loc, repo), testOperatorNamespace))
 
-	want := map[string]string{"location": "dr", "scope": "Cluster", "namespace": "", "cluster": "prod-eu-1"}
+	want := map[string]string{"location": "dr", "scope": "cluster", "namespace": "", "cluster": "prod-eu-1"}
 	got, ok := gatherValue(t, reg, "crystalbackup_repository_last_check_success", want)
 	if !ok {
 		t.Fatal("last_check_success was not emitted for a failed check — the alert would never fire")

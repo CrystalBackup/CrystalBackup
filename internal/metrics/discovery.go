@@ -30,12 +30,20 @@ import (
 // metric about discovery that could not be rebuilt on a fresh cluster from the repository's own
 // BackupRepository status would be undermining the property it reports on.
 //
-// No `namespace` label, unlike the repository family. §2.5 keys these on the repository alone,
-// and rightly: projected and orphaned counts are properties of a SCAN, which covers every
-// namespace in the repository at once. Splitting them per namespace would also make
-// orphan_snapshots unrepresentable — an orphan's defining feature is that its namespace is gone.
+// The `namespace` label carries the repository's OWNER — empty for the shared cluster repository,
+// the tenant's namespace for a scope=namespace one — exactly as the repository family uses it
+// (§2.4). It does NOT split a scan per namespace: a scan covers every namespace in its repository
+// at once, and orphan_snapshots would be unrepresentable if it did, since an orphan's defining
+// feature is that its namespace is gone.
+//
+// It was added in M6 (§2.5 amended to match) for a gap a tenant could not otherwise see. Their
+// dashboard already shows whether their repository is INTACT — check result, prune recency, stale
+// locks. None of that answers whether `kubectl get backups` still corresponds to what is in the
+// repository, and a failing discovery means exactly that: their list of restore points is
+// silently stale, either short of what exists or naming snapshots that no longer do. It is
+// actionable by them, and until now it was visible only to the platform.
 var (
-	discoveryLabels = []string{locationLabel, scopeLabel, clusterLabel}
+	discoveryLabels = []string{locationLabel, scopeLabel, namespaceLabel, clusterLabel}
 
 	discoveryLastTimestampDesc = prometheus.NewDesc(
 		NameDiscoveryLastTimestamp,
@@ -76,11 +84,7 @@ func collectDiscovery(ch chan<- prometheus.Metric, repos []cbv1.BackupRepository
 		if location == "" {
 			location = repo.Name // the repository is named after its location
 		}
-		scope := repo.Status.Scope
-		if scope == "" {
-			scope = scopeCluster
-		}
-		labels := []string{location, scope, clusterByLocation[location]}
+		labels := []string{location, metricScope(repo.Status.Scope), repo.Status.OwnerNamespace, clusterByLocation[location]}
 
 		gauge := func(desc *prometheus.Desc, v float64) {
 			ch <- prometheus.MustNewConstMetric(desc, prometheus.GaugeValue, v, labels...)

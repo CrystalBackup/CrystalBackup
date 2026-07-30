@@ -77,12 +77,35 @@ func init() { ctrlmetrics.Registry.MustRegister(locksReaped) }
 // RecordLockReaped counts one successful stale-lock removal on the shared cluster repository.
 // Called from the unlock path, which runs after a hard-killed mover left a lock behind.
 func RecordLockReaped(location, cluster string) {
-	locksReaped.WithLabelValues(location, string(scopeCluster), "", cluster).Inc()
+	locksReaped.WithLabelValues(location, scopeCluster, "", cluster).Inc()
 }
 
-// scopeCluster mirrors BackupRepositoryStatus.Scope's cluster value. Declared here rather than
-// imported so this package keeps depending only on the API types.
-const scopeCluster = "Cluster"
+// The `scope` LABEL VALUES, which are deliberately not the API's enum values.
+//
+// BackupRepositoryStatus.Scope is a kubebuilder enum of `Cluster;Namespaced`. Publishing it
+// verbatim is what this collector used to do, and it made `scope` mean two different things
+// depending on which family you read: repository and discovery emitted `Cluster|Namespaced`
+// while external sync emitted `cluster|namespace` (it derives from apiconst.Origin*). An
+// operator writing one alert expression across both had to know which vocabulary each family
+// spoke — and the mismatch is invisible until a rule silently matches nothing.
+//
+// One vocabulary, lowercase, matching what §2.4/§2.5 always specified and what the `origin`
+// label — the parallel dimension that `scope` REPLACES on these families (§2) — already uses.
+// Lowercase is also the Prometheus convention for enumerated label values.
+const (
+	scopeCluster   = "cluster"
+	scopeNamespace = "namespace"
+)
+
+// metricScope maps a BackupRepository's API scope onto the label vocabulary above. An empty
+// status scope means the shared cluster repository: it is the one that exists before anything
+// sets the field.
+func metricScope(apiScope string) string {
+	if apiScope == "Namespaced" {
+		return scopeNamespace
+	}
+	return scopeCluster
+}
 
 // collectRepositories emits one series per repository per gauge. A repository that has never been
 // checked emits no check series at all — deliberately: a zero timestamp would render as 1970 on a
@@ -95,11 +118,7 @@ func collectRepositories(ch chan<- prometheus.Metric, repos []cbv1.BackupReposit
 		if location == "" {
 			location = repo.Name // the repository is named after its location
 		}
-		scope := repo.Status.Scope
-		if scope == "" {
-			scope = scopeCluster
-		}
-		labels := []string{location, scope, repo.Status.OwnerNamespace, clusterByLocation[location]}
+		labels := []string{location, metricScope(repo.Status.Scope), repo.Status.OwnerNamespace, clusterByLocation[location]}
 
 		gauge := func(desc *prometheus.Desc, v float64) {
 			ch <- prometheus.MustNewConstMetric(desc, prometheus.GaugeValue, v, labels...)

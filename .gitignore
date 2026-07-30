@@ -45,3 +45,7 @@ charts/crystal-backup/crds/*.yaml
 /sbom/
 /apko.lock.json
 /image-refs.txt
+
+# Python bytecode from hack/ scripts (check-dashboard-metrics.py).
+__pycache__/
+*.pyc
