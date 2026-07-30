@@ -633,3 +633,36 @@ observability-docs-verify: ## Fail if the committed Metrics/Alerts reference pag
 		fi; \
 	done; \
 	echo "the Metrics and Alerts reference pages are up to date."
+
+## The preflight script (website/public/preflight.sh) tells an administrator, per StorageClass,
+## which exposer CrystalBackup would choose and which volumes it would skip. That answer belongs to
+## internal/exposer.Registry.For and to nothing else. A shell re-implementation of the routing is a
+## second copy in a language no compiler checks, handed to strangers as an authoritative preview —
+## and it drifts silently, because the script keeps printing confident verdicts either way. So the
+## routing block is generated, and the generator does not merely restate the constants: it also
+## executes the real Registry.For against a fake cluster and refuses to emit a rule that disagrees
+## with it, and it fails outright when internal/exposer declares an exposer Kind it has no verdict
+## for. The SHA-256 sidecar is written in the same pass and held by the same guard — a checksum
+## regenerated separately goes stale one commit after the script, and it fails in the hands of the
+## one administrator who bothered to verify.
+PREFLIGHT_OUT ?= website/public/preflight.sh website/public/preflight.sh.sha256
+
+.PHONY: preflight-table
+preflight-table: ## Regenerate the exposer-selection block and checksum of website/public/preflight.sh from internal/exposer.
+	go run ./hack/gen-preflight-table --root .
+
+.PHONY: preflight-table-verify
+preflight-table-verify: ## Fail if preflight.sh's exposer table or checksum is stale (CI guard).
+	@tmp="$$(mktemp -d)"; trap 'rm -rf "$$tmp"' EXIT; \
+	go run ./hack/gen-preflight-table --root . --out "$$tmp/preflight.sh" >/dev/null; \
+	if ! diff -u website/public/preflight.sh "$$tmp/preflight.sh"; then \
+		echo "ERROR: website/public/preflight.sh is out of date with internal/exposer."; \
+		echo "       Run 'make preflight-table' and commit the result."; \
+		exit 1; \
+	fi; \
+	if ! diff -u website/public/preflight.sh.sha256 "$$tmp/preflight.sh.sha256"; then \
+		echo "ERROR: website/public/preflight.sh.sha256 does not match the script it claims to check."; \
+		echo "       Run 'make preflight-table' and commit the result."; \
+		exit 1; \
+	fi; \
+	echo "the preflight script and its checksum are up to date."

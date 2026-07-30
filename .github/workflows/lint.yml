@@ -84,6 +84,21 @@ jobs:
       - name: Verify the Metrics and Alerts reference pages are regenerated
         run: make observability-docs-verify
 
+      # The preflight script an administrator runs BEFORE installing anything answers, per
+      # StorageClass, which exposer would be chosen and which volumes would be skipped. That
+      # answer belongs to internal/exposer.Registry.For alone, so the script's routing block is
+      # generated from it — and the generator does more than restate the constants: it executes
+      # the real Registry.For against a fake cluster and refuses to emit a rule that disagrees,
+      # and it fails outright on an exposer Kind it has no verdict for. A stale block here is the
+      # worst-placed drift in the project: it is the one artefact strangers run against their own
+      # clusters, and it would keep printing confident verdicts while being wrong.
+      #
+      # The published SHA-256 sidecar is checked by the same target. A checksum that no longer
+      # matches the script does not fail quietly — it fails in the hands of the one administrator
+      # who followed the documentation and verified before running.
+      - name: Verify the preflight script and its checksum are regenerated
+        run: make preflight-table-verify
+
   alert-rules:
     name: Alert rules parse and fire
     runs-on: ubuntu-latest

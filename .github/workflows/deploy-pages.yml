@@ -21,6 +21,32 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # website/public/preflight.sh is published for administrators to download and run against
+      # their own clusters. This project signs its images, publishes SBOMs and SLSA provenance,
+      # and has already been bitten once by a signature that failed verification for four
+      # releases while the pipeline stayed green — so the script gets the same treatment as the
+      # images: a checksum the docs tell people to check, and a keyless cosign blob signature
+      # they can actually verify.
+      - uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
+
+      # Sign what is published, and refuse to publish a checksum that does not describe it. The
+      # committed sidecar is regenerated and diffed by `make preflight-table-verify` in the Lint
+      # workflow; re-checking it HERE, against the bytes about to be uploaded, is the cheap half
+      # of the same lesson — verify the artefact, not the job that produced it.
+      - name: Verify the committed checksum matches the script being published
+        working-directory: ./website/public
+        run: sha256sum -c preflight.sh.sha256
+
+      - name: cosign — keyless-sign the preflight script
+        env:
+          COSIGN_YES: "true"
+        working-directory: ./website/public
+        run: cosign sign-blob --yes --bundle preflight.sh.cosign.bundle preflight.sh
+
+      # Sign-then-build, never build-then-sign: Astro copies website/public/ into the site at
+      # build time, so the bundle must exist before the build or it never reaches the published
+      # site — and its absence would be invisible, the deploy succeeding with an unsigned script.
       - name: Build Astro site
         uses: withastro/action@v3
         with:

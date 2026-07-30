@@ -3,6 +3,67 @@ title: Requirements
 description: What your cluster, your storage and your object storage need to provide before installing Crystal Backup.
 ---
 
+## Check your cluster before you install
+
+Everything on this page can be checked automatically, against the cluster you actually have, by
+a script that **installs nothing and changes nothing**. It creates no objects, writes no files —
+not even temporary ones — and only ever issues `kubectl get`, `kubectl version` and
+`kubectl auth can-i`.
+
+It exists mainly to answer one question this page can only describe in the abstract: **which of
+your StorageClasses will actually have their data backed up, and which will be skipped.** For
+each StorageClass it resolves the exposer CrystalBackup would choose — `cephfs-shallow`,
+`csi-generic`, or *skipped* with reason `CSISnapshotUnsupported` — and tells you how many PVCs
+sit on each. Discovering three weeks in that a namespace was never protected because its CSI
+driver cannot snapshot is a bad way to find out.
+
+That routing table is not written by hand. It is **generated from the operator's own selection
+code** (`internal/exposer`) and held to it by a CI guard, so the script cannot drift into
+describing a version of the logic that no longer exists.
+
+### Download it, read it, run it
+
+```bash
+BASE=https://crystalbackup.github.io/CrystalBackup
+curl -fsSLO "$BASE/preflight.sh"
+curl -fsSLO "$BASE/preflight.sh.sha256"
+curl -fsSLO "$BASE/preflight.sh.cosign.bundle"
+
+# 1. the checksum
+sha256sum -c preflight.sh.sha256          # macOS: shasum -a 256 -c preflight.sh.sha256
+
+# 2. the signature — keyless, the same Sigstore trust root as our container images
+cosign verify-blob preflight.sh \
+  --bundle preflight.sh.cosign.bundle \
+  --certificate-identity-regexp '^https://github\.com/CrystalBackup/CrystalBackup/' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+
+# 3. read it — plain POSIX shell, and its header states exactly what it does
+less preflight.sh
+
+# 4. run it
+sh preflight.sh
+```
+
+`--json` gives the same findings as a machine-readable document for automation. `jq` is used if
+present and is not required; without it the script says so and falls back to a built-in encoder.
+
+Exit codes: **0** ready, **1** ready with reservations, **2** blocking, **3** could not be
+assessed at all. A check that could *not be made* — a permission you lack, a CRD it could not
+read — is reported as such and lands in exit 1. It is never counted as a pass.
+
+### Or, the one-liner
+
+```bash
+curl -fsSL https://crystalbackup.github.io/CrystalBackup/preflight.sh | sh
+```
+
+This is a shortcut, and it is a real trade: piping a URL into a shell runs whatever the server
+returns, and neither the checksum nor the signature is checked. It is fine for a scratch cluster
+and a reasonable thing to want. For anything you care about, use the four steps above — they
+take about twenty seconds longer and they are the reason we publish the checksum and the
+signature at all.
+
 ## Kubernetes
 
 **Version 1.30 or later.** This is a hard floor, not a recommendation: the admission model
