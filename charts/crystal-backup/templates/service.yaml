@@ -35,6 +35,21 @@ spec:
     - path: /metrics
       port: https
       scheme: https
+      # honorLabels is REQUIRED here, and its absence silently defeated the whole tenancy story.
+      #
+      # A ServiceMonitor attaches the target's own labels — namespace, pod, service, container —
+      # and with honorLabels false (the default) the TARGET wins every collision: the operator's
+      # namespace overwrites the metric's, and the real value survives only as
+      # `exported_namespace`. So every crystalbackup_ series arrived carrying
+      # namespace="crystal-backup-system", for every tenant on the cluster.
+      #
+      # Nothing looked broken, which is why this needed a real Prometheus to find. The alert
+      # expressions still joined — both sides of `on (namespace, …)` carried the same wrong value
+      # — so BackupMissed fired correctly and then named the operator's namespace in its summary,
+      # routing every tenant's page to the same place. The tenant dashboard's $namespace variable
+      # offered exactly one choice. Every metric this project emits is specified to be
+      # tenant-attributable (R19, spec/05-observability.md §1); at the scrape, none of them were.
+      honorLabels: true
       interval: {{ .Values.metrics.serviceMonitor.interval }}
       scrapeTimeout: {{ .Values.metrics.serviceMonitor.scrapeTimeout }}
       bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
