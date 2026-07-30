@@ -167,6 +167,13 @@ var _ = Describe("Crystal Backup operator (M0)", Ordered, func() {
 	})
 
 	// Clean up everything this container created.
+	//
+	// This is the container that removes the CRDs, so it is the one that must not leave a single
+	// finalized object behind: `kubectl delete crd` waits for every instance, and an instance
+	// whose finalizer only the operator can clear becomes unfinalizable the moment `make
+	// undeploy` takes the operator down — in the SAME command, since config/default bundles the
+	// Deployment, its namespace and the CRDs. That race cost this suite 35 minutes of dead wait
+	// before Ginkgo's own timeout cut it. Drain first, undeploy second, and bound both.
 	AfterAll(func() {
 		By("removing the metrics ClusterRoleBinding")
 		_, _ = kubectl("delete", "clusterrolebinding", metricsRoleBindingName, "--ignore-not-found")
@@ -176,11 +183,19 @@ var _ = Describe("Crystal Backup operator (M0)", Ordered, func() {
 			_, _ = kubectl("delete", "pod", "curl-metrics", "-n", operatorNamespace, "--ignore-not-found")
 		}
 
+		// Cluster-wide, not just this container's objects: Ginkgo randomizes container order, so
+		// whatever a previously-run container left standing is exactly what would wedge the CRD
+		// deletion below. Asserted at the END of this teardown so a defect goes red without
+		// costing us the rest of the cleanup.
+		defect := teardownCustomResources(3 * time.Minute)
+
 		By("undeploying the controller-manager")
-		_, _ = utils.Run(exec.Command("make", "undeploy"))
+		_, _ = utils.RunWithTimeout(exec.Command("make", "undeploy", "ignore-not-found=true"), 5*time.Minute)
 
 		By("uninstalling CRDs")
-		_, _ = utils.Run(exec.Command("make", "uninstall"))
+		_, _ = utils.RunWithTimeout(exec.Command("make", "uninstall", "ignore-not-found=true"), 5*time.Minute)
+
+		Expect(defect).To(BeEmpty(), defect)
 	})
 
 	// On failure, collect logs, events and pod description for debugging.

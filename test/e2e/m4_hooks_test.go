@@ -281,18 +281,20 @@ var _ = Describe("M4 — consistency hooks (R16)", Ordered, func() {
 	AfterAll(func() {
 		// Order matters and is not cosmetic: the CRs carry finalizers only the operator clears, so
 		// uninstalling it first would strand the location and leave the namespace Terminating
-		// forever (the M3.2 failure mode). Delete while the operator is still up, wait for the
-		// location to actually go, and only then remove the release.
-		By("deleting this container's CRs while the operator is still running")
-		_, _ = kubectl("delete", "clusterbackuplocation", m4Location, "--ignore-not-found", "--wait=false")
+		// forever (the M3.2 failure mode). Delete while the operator is still up, wait for EVERY
+		// object to actually go, and only then remove the release.
+		//
+		// Waiting on the location alone — what this did before — is precisely how the demo
+		// namespace kept four Backups holding crystalbackup.io/backup past the uninstall, and how
+		// the next container's `kubectl delete crd` then blocked for 35 minutes on objects nobody
+		// was left to release.
+		defect := teardownCustomResources(3 * time.Minute)
 		_, _ = kubectl("delete", "namespace", m4DemoNS, "--ignore-not-found", "--wait=false")
-		Eventually(func(g Gomega) {
-			out, _ := kubectl("get", "clusterbackuplocation", m4Location, "--ignore-not-found", "-o", "name")
-			g.Expect(strings.TrimSpace(out)).To(BeEmpty(), "location still terminating")
-		}, 2*time.Minute, 5*time.Second).Should(Succeed())
 
 		By("uninstalling the Helm release")
 		m4UninstallOperator()
+
+		Expect(defect).To(BeEmpty(), defect)
 	})
 
 	It("execs the quiesce into the pod holding the backed-up data — and only that pod", func() {

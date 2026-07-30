@@ -522,17 +522,17 @@ var _ = Describe("Crystal Backup external sync (M5)", Ordered, func() {
 	})
 
 	AfterAll(func() {
-		By("deleting this container's CRs and the tenant namespace (operator still up to drain finalizers)")
-		m5ForceCleanupCRs()
+		// Drain every CR with the operator still up — it is the only process that clears their
+		// finalizers — and wait for the whole set, not just the tenant locations. Asserted at the
+		// end so the release still gets uninstalled when a defect is found.
+		defect := teardownCustomResources(3 * time.Minute)
 		_, _ = kubectl("delete", "namespace", m5TenantNS, "--ignore-not-found", "--wait=false")
-		Eventually(func(g Gomega) {
-			out, _ := kubectl("get", "backuplocation", "-n", m5TenantNS, "--ignore-not-found", "-o", "name")
-			g.Expect(strings.TrimSpace(out)).To(BeEmpty(), "a location is still terminating")
-		}, 2*time.Minute, 5*time.Second).Should(Succeed())
 
 		By("uninstalling the Helm release (it owns the admission policies this container enabled)")
 		_, _ = utils.RunWithTimeout(exec.Command("helm", "uninstall", m5Release,
 			"--namespace", m5OperatorNS, "--wait", "--timeout", "2m"), 3*time.Minute)
+
+		Expect(defect).To(BeEmpty(), defect)
 	})
 
 	AfterEach(func() {

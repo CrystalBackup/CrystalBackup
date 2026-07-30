@@ -672,19 +672,20 @@ var _ = Describe("Crystal Backup manifest round-trip (M3)", Ordered, func() {
 	})
 
 	AfterAll(func() {
-		By("deleting the demo namespace and this run's CRs (finalizers cleared, operator still up)")
-		m3ForceCleanupCRs()
+		// Drain the CRs while the operator is still up, and WAIT for them: it is the only process
+		// that clears their finalizers, so anything left when the release goes strands its
+		// namespace in Terminating for good. The previous form waited on the location alone,
+		// which says nothing about the Backups in the demo namespace. Asserted at the very end so
+		// a genuine defect fails the suite without skipping the rest of the teardown.
+		defect := teardownCustomResources(3 * time.Minute)
 		_, _ = kubectl("delete", "namespace", m3DemoNS, "--ignore-not-found", "--wait=false")
-		// Give the operator a beat to drain finalizers before it is uninstalled.
-		Eventually(func(g Gomega) {
-			out, _ := kubectl("get", "clusterbackuplocation", m3Location, "--ignore-not-found", "-o", "name")
-			g.Expect(strings.TrimSpace(out)).To(BeEmpty(), "location still terminating")
-		}, 2*time.Minute, 5*time.Second).Should(Succeed())
 
 		By("uninstalling the Helm release")
 		_, _ = utils.RunWithTimeout(exec.Command("helm", "uninstall", m3Release,
 			"--namespace", m3OperatorNS, "--wait", "--timeout", "2m"), 3*time.Minute)
 		_, _ = kubectl("delete", "secret", m3KEKSecret, m3S3Secret, "-n", m3OperatorNS, "--ignore-not-found")
+
+		Expect(defect).To(BeEmpty(), defect)
 	})
 
 	AfterEach(func() {

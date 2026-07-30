@@ -324,6 +324,19 @@ ifndef ignore-not-found
   ignore-not-found = false
 endif
 
+# KUBECTL_DELETE_TIMEOUT bounds the waits in `uninstall` and `undeploy`. `kubectl delete` waits
+# FOREVER by default, and both of these delete objects whose disappearance depends on a controller:
+# the CRDs (a delete waits for every custom resource instance) and, through config/default, the
+# operator's own namespace (a delete waits for everything inside it). Six of the twelve kinds carry
+# a finalizer that only the operator removes — so `make undeploy` with a single live Backup left
+# takes the operator down and then waits, in the same command, on an object nobody can release any
+# more. Unbounded that is a permanent hang: it cost this project a 35-minute e2e run before Ginkgo
+# cut it. Bounded, it fails in minutes with a message you can act on.
+#
+# This does NOT make the uninstall safe — it makes it terminate. The safe order is in
+# docs/DECOMMISSION.md §3: delete the custom resources first, with the operator still running.
+KUBECTL_DELETE_TIMEOUT ?= 3m
+
 .PHONY: install
 install: manifests kustomize ## Install CRDs into the K8s cluster specified in ~/.kube/config.
 	@out="$$( "$(KUSTOMIZE)" build config/crd 2>/dev/null || true )"; \
@@ -332,7 +345,7 @@ install: manifests kustomize ## Install CRDs into the K8s cluster specified in ~
 .PHONY: uninstall
 uninstall: manifests kustomize ## Uninstall CRDs from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
 	@out="$$( "$(KUSTOMIZE)" build config/crd 2>/dev/null || true )"; \
-	if [ -n "$$out" ]; then echo "$$out" | "$(KUBECTL)" delete --ignore-not-found=$(ignore-not-found) -f -; else echo "No CRDs to delete; skipping."; fi
+	if [ -n "$$out" ]; then echo "$$out" | "$(KUBECTL)" delete --ignore-not-found=$(ignore-not-found) --timeout=$(KUBECTL_DELETE_TIMEOUT) -f -; else echo "No CRDs to delete; skipping."; fi
 
 .PHONY: deploy
 deploy: manifests kustomize ## Deploy controller to the K8s cluster specified in ~/.kube/config.
@@ -340,8 +353,8 @@ deploy: manifests kustomize ## Deploy controller to the K8s cluster specified in
 	"$(KUSTOMIZE)" build config/default | "$(KUBECTL)" apply -f -
 
 .PHONY: undeploy
-undeploy: kustomize ## Undeploy controller from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
-	"$(KUSTOMIZE)" build config/default | "$(KUBECTL)" delete --ignore-not-found=$(ignore-not-found) -f -
+undeploy: kustomize ## Undeploy controller from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion. Delete the custom resources FIRST (docs/DECOMMISSION.md §3) — this target takes the operator and the CRDs down together.
+	"$(KUSTOMIZE)" build config/default | "$(KUBECTL)" delete --ignore-not-found=$(ignore-not-found) --timeout=$(KUBECTL_DELETE_TIMEOUT) -f -
 
 ##@ Dependencies
 

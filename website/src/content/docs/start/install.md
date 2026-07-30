@@ -141,13 +141,104 @@ GHCR will not pull.
 
 ## Uninstall
 
+**Uninstalling is ordered, and the order is not a preference.** Six of the twelve kinds
+carry a finalizer — `crystalbackup.io/location`, `/repository`, `/backup`,
+`/restore-teardown`, `/cluster-restore-teardown` — and the operator is the only process
+that removes one. Delete the operator while any such object is still alive and that object
+can never be deleted: its namespace stops at `Terminating` **permanently**, and a later
+`kubectl delete crd` waits on it forever. `helm uninstall` will not warn you; it succeeds,
+and the damage appears afterwards.
+
+Every command below is bounded with `--timeout` on purpose. An unbounded `kubectl delete`
+in this sequence is a terminal you end up killing, with nothing to show for it.
+
+**1. Stop what creates new work.**
+
+```bash
+kubectl delete clusterbackupschedule --all --timeout=2m
+kubectl delete clusterbackupexternalsync --all --timeout=2m
+kubectl delete backupschedule --all --all-namespaces --timeout=2m
+kubectl delete backupexternalsync --all --all-namespaces --timeout=2m
+```
+
+**2. Delete the finalized objects, with the operator still running** — restores and backups
+before the locations that address their repository:
+
+```bash
+kubectl delete restore        --all --all-namespaces --timeout=5m
+kubectl delete clusterrestore --all --timeout=5m
+kubectl delete clusterbackup  --all --timeout=5m
+kubectl delete backup         --all --all-namespaces --timeout=5m
+kubectl delete backuplocation --all --all-namespaces --timeout=5m
+kubectl delete clusterbackuplocation --all --timeout=5m
+```
+
+Nothing in the object storage is touched — deleting a location never erases repository
+objects. That is deliberate: erasure is an explicit, confirmed operation. See
+[The right to erasure](/CrystalBackup/docs/guides/erasure/).
+
+**3. Verify before going further.** This is the gate; do not continue while it prints
+anything:
+
+```bash
+for r in restores clusterrestores backups clusterbackups backuplocations \
+         clusterbackuplocations backuprepositories; do
+  kubectl get "$r.crystalbackup.io" --all-namespaces --no-headers 2>/dev/null
+done
+```
+
+Silence means every finalizer has been cleared by the operator that owns it. Output means
+something is still finalizing — investigate it **now**, while the operator that can still
+fix it is running (`kubectl logs -n crystal-backup-system deploy/crystal-backup`).
+
+**4. Remove the operator.**
+
 ```bash
 helm uninstall crystal-backup -n crystal-backup-system
 ```
 
-Helm does **not** delete CRDs on uninstall, so your `Backup` projections and locations
-survive. Nothing in the object storage is touched — deleting a location never erases
-repository objects. That is deliberate: erasure is an explicit, confirmed operation. See
-[The right to erasure](/CrystalBackup/docs/guides/erasure/).
+Helm does **not** delete the CRDs, so your `Backup` projections survive. Keep the
+`crystal-backup-system` namespace unless you also mean to destroy the cluster KEK and the
+wrapped DEKs it holds — deleting those makes every repository they protect permanently
+unreadable.
+
+**5. Remove the CRDs, only if you mean it.** This deletes every remaining object of those
+kinds:
+
+```bash
+kubectl get crd -o name | grep crystalbackup.io | xargs -r kubectl delete --timeout=5m
+```
+
+After step 3 passes, this returns in seconds. Run it before, and it blocks forever.
+
+### Already stuck in Terminating?
+
+```bash
+kubectl get ns <ns> -o jsonpath='{.status.phase}{"\n"}'
+kubectl get backup -A -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{" "}{.metadata.finalizers}{"\n"}{end}'
+```
+
+**Reinstall the operator — that is the fix.** The objects are still served (a CRD stuck in
+`Terminating` keeps serving its instances), so an operator brought back at the same version
+picks up the pending deletions, runs the teardown it owed, and clears the finalizers. Then
+restart the sequence above, in order.
+
+```bash
+helm install crystal-backup oci://ghcr.io/crystalbackup/charts/crystal-backup \
+  --version <the version you removed> -n crystal-backup-system --create-namespace
+```
+
+Only if you cannot reinstall, strip the finalizer by hand — this unblocks the namespace and
+**leaks** the mover Jobs and the `Retain`-parked `VolumeSnapshotContent` objects the
+teardown would have collected, which you then have to sweep yourself:
+
+```bash
+kubectl patch backup <name> -n <ns> --type=merge -p '{"metadata":{"finalizers":null}}'
+kubectl -n crystal-backup-system delete job -l app.kubernetes.io/managed-by=crystal-backup
+kubectl get volumesnapshotcontent -l app.kubernetes.io/managed-by=crystal-backup
+```
+
+Do **not** blanket-delete Secrets by that label in the operator namespace: the wrapped DEKs
+carry it too, and deleting one makes its repository unreadable for good.
 
 Next: [Quickstart](/CrystalBackup/docs/start/quickstart/).

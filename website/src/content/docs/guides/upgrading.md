@@ -103,6 +103,11 @@ If you have to go back: uninstall, re-apply the older CRDs, reinstall the older 
 re-create your custom resources. The **repositories are unaffected** — that is the point of
 the repository being the source of truth. Discovery will project the backups again.
 
+Follow the ordered [uninstall procedure](/CrystalBackup/docs/start/install/#uninstall) for
+that first step. Removing the operator while a `Backup`, `Restore` or location still carries
+its finalizer strands the namespace in `Terminating` permanently, and a downgrade is exactly
+the moment you will be deleting objects in a hurry.
+
 ## Upgrading across several minors
 
 Go one minor at a time (`0.3` → `0.4` → `0.5`), applying each release's CRDs and letting

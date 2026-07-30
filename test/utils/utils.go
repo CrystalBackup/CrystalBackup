@@ -82,6 +82,14 @@ func RunWithTimeout(cmd *exec.Cmd, timeout time.Duration) (string, error) {
 	run.Dir = dir
 	run.Stdin = cmd.Stdin
 	run.Env = append(os.Environ(), "GO111MODULE=on")
+	// The deadline above kills the CHILD, not its descendants — and that was not enough. Several
+	// helpers spawn `make`, which spawns `kubectl`; SIGKILLing make leaves kubectl running with
+	// the inherited stdout/stderr pipe still open, and CombinedOutput's Wait blocks until every
+	// writer closes it. The deadline fired and the call returned anyway: `make undeploy` blocked
+	// on a CRD delete for 35 minutes with a 5-minute budget nominally in force. WaitDelay caps
+	// how long Wait may spend on that I/O after the process is gone, then closes the pipes and
+	// returns — which is what actually makes the budget above binding.
+	run.WaitDelay = 10 * time.Second
 
 	command := strings.Join(cmd.Args, " ")
 	_, _ = fmt.Fprintf(GinkgoWriter, "running: %q\n", command)

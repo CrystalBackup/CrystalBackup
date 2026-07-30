@@ -268,7 +268,7 @@ lead the code and are worth reading if you want the reasoning rather than the in
 |---|---|
 | [docs/RESTORE.md](docs/RESTORE.md) | Restore guide: self-service, cluster DR, bare-cluster runbook |
 | [docs/HOOKS.md](docs/HOOKS.md) | Consistency hooks: the tenant ServiceAccount the operator impersonates, and how to grant it |
-| [docs/DECOMMISSION.md](docs/DECOMMISSION.md) | Runbook: retiring a repository by destroying its key, and re-encrypting one after a key leak |
+| [docs/DECOMMISSION.md](docs/DECOMMISSION.md) | Runbook: retiring a repository by destroying its key, re-encrypting one after a key leak, and uninstalling the operator in the order that does not strand a namespace |
 | [spec/00-requirements.md](spec/00-requirements.md) | Requirements R1–R28, personas, scope, priorities |
 | [spec/01-architecture.md](spec/01-architecture.md) | Components, two-plane model, cascade, flows, concurrency |
 | [spec/02-api.md](spec/02-api.md) | CRD naming & field contract, validation, RBAC |
