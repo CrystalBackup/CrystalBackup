@@ -156,13 +156,21 @@ func (c *collector) identity(ctx context.Context) (Operator, Cluster) {
 			}
 		}
 	}
-	// The disagreement worth naming. crystalbackup_build_info's version is set by an -X link flag
-	// that the release workflow does not currently pass, so a shipped operator reports "dev" while
-	// the chart around it knows the real version. Saying so here keeps a reader from concluding
-	// they are running an unreleased build.
+	// The disagreement worth naming, still — but it means something different since 0.6.0.
+	//
+	// crystalbackup_build_info's version comes from an -X link flag. NOTHING passed it until M6,
+	// so every image up to and including 0.5.1 reports "dev" no matter which release it is. From
+	// 0.6.0 the release workflow, the Makefile and the Dockerfile all stamp it, and "dev" now
+	// means one of two honest things: an operator from a pre-0.6.0 image, or a local build that
+	// was never told what it is (a bare `docker build .` takes the Dockerfile's ARG default).
+	//
+	// Either way the reader needs the same steer — believe appVersion and the digests — so the
+	// note stays. Dropping it would leave a bare "dev" next to a real chart version, which is the
+	// reading most likely to be mistaken for an unreleased build.
 	if op.BuildVersion == "dev" && op.AppVersion != "" {
-		op.VersionNote = "buildVersion is the compiled-in default (\"dev\"): the binary was linked " +
-			"without -X internal/metrics.Version. Trust appVersion and the image digests below."
+		op.VersionNote = "buildVersion is the compiled-in default (\"dev\"): this binary was linked " +
+			"without -X internal/metrics.Version — either a pre-0.6.0 image, which never stamped it, " +
+			"or a local build. Trust appVersion and the image digests below."
 	}
 
 	if c.Discovery != nil {

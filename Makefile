@@ -3,6 +3,18 @@ IMG ?= controller:latest
 # YEAR defines the year value used for substituting the YEAR placeholder in the boilerplate header.
 YEAR ?= $(shell date +%Y)
 
+# BUILD_VERSION is stamped into crystalbackup_build_info at link time. Until M6 nothing passed
+# -X anywhere, so every binary — released images included — reported version="dev": the one
+# series that exists so a dashboard can join a metric to the build that produced it named no
+# build at all.
+#
+# The release pipeline derives it from the tag, the same source charts/crystal-backup/Chart.yaml's
+# appVersion comes from (.github/workflows/images.yml). Locally `git describe` is the closest
+# honest equivalent, and --dirty matters: a binary built from an edited tree is NOT the tag it is
+# nearest to, and a version that quietly claims otherwise is worse than "dev".
+BUILD_VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+VERSION_LDFLAGS := -X github.com/CrystalBackup/CrystalBackup/internal/metrics.Version=$(BUILD_VERSION)
+
 # Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
 ifeq (,$(shell go env GOBIN))
 GOBIN=$(shell go env GOPATH)/bin
@@ -270,7 +282,7 @@ alert-rules-covered: ## Fail if any shipped alert rule has no promtool test case
 
 .PHONY: build
 build: manifests generate fmt vet ## Build manager binary.
-	go build -o bin/manager cmd/main.go
+	go build -ldflags="$(VERSION_LDFLAGS)" -o bin/manager cmd/main.go
 
 .PHONY: run
 run: manifests generate fmt vet ## Run a controller from your host.
@@ -281,7 +293,9 @@ run: manifests generate fmt vet ## Run a controller from your host.
 # More info: https://docs.docker.com/develop/develop-images/build_enhancements/
 .PHONY: docker-build
 docker-build: ## Build docker image with the manager.
-	$(CONTAINER_TOOL) build -t ${IMG} .
+	# .dockerignore keeps .git out of the build context, so the Dockerfile cannot run
+	# `git describe` itself — the version has to be handed in.
+	$(CONTAINER_TOOL) build --build-arg BUILD_VERSION="$(BUILD_VERSION)" -t ${IMG} .
 
 .PHONY: docker-build-mover
 docker-build-mover: ## Build the mover image (crystal-mover + pinned restic) for the kind e2e data path.
