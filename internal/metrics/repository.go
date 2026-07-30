@@ -57,22 +57,6 @@ var (
 		NameRepositoryStaleLocks,
 		"Repository lock objects older than restic's 30-minute staleness threshold (status.staleLocks).",
 		repositoryLabels, nil)
-	// repositoryStoredBytes is the accounting name for the repository's footprint (§2.11): the
-	// figure a downstream billing pipeline reads, as opposed to the inventory figure an operator
-	// watches grow.
-	//
-	// It is currently the SAME measurement as crystalbackup_repository_size_bytes, and that is
-	// worth being explicit about rather than hiding behind two Help strings. §2.11 specifies its
-	// source as `restic stats --mode raw-data`; the operator runs no such op today, and
-	// status.approximateSizeBytes comes from summing the objects actually stored under the
-	// repository's S3 prefix. For a BILL those are not equivalent and the listing is the better
-	// of the two: it counts the index, config and lock objects raw-data omits, and it counts
-	// space a not-yet-pruned repository is really occupying. Publishing the number under both
-	// names is a deliberate choice over inventing a second one — see the report on this lot.
-	repositoryStoredBytesDesc = prometheus.NewDesc(
-		NameRepositoryStoredBytes,
-		"Physically stored bytes of the repository, deduplicated and compressed: the sum of the objects under its prefix in object storage.",
-		repositoryLabels, nil)
 )
 
 // locksReaped backs crystalbackup_repository_locks_reaped_total.
@@ -121,7 +105,6 @@ func collectRepositories(ch chan<- prometheus.Metric, repos []cbv1.BackupReposit
 			ch <- prometheus.MustNewConstMetric(desc, prometheus.GaugeValue, v, labels...)
 		}
 		gauge(repositorySizeDesc, float64(repo.Status.ApproximateSizeBytes))
-		gauge(repositoryStoredBytesDesc, float64(repo.Status.ApproximateSizeBytes))
 		gauge(repositorySnapshotCountDesc, float64(repo.Status.SnapshotCount))
 		gauge(repositoryStaleLocksDesc, float64(repo.Status.StaleLocks))
 

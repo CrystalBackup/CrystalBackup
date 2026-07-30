@@ -417,9 +417,18 @@ func TestPVCVolumeSnapshotCount(t *testing.T) {
 	}
 }
 
-// TestRepositoryStoredBytesAccompaniesSize pins the §2.11 accounting name to the same reading as
-// the inventory one, which is what this lot ships and what the report calls out.
-func TestRepositoryStoredBytesAccompaniesSize(t *testing.T) {
+// TestRepositoryStoredBytesIsNotShipped guards a WITHDRAWAL, and exists so that re-adding the
+// name for completeness fails here rather than quietly shipping.
+//
+// spec/05-observability.md §2.11 specified crystalbackup_repository_stored_bytes as the accounting
+// figure, sourced from `restic stats --mode raw-data`. The operator runs no such operation, so the
+// only number available to fill it was status.approximateSizeBytes — which §2.4 already publishes
+// as crystalbackup_repository_size_bytes. Two names for one reading is a lie by implication: a
+// reader who sees both assumes they were measured differently and reasons about the gap. And the
+// withdrawn name was the worse of the two for the billing it claimed to serve, because raw-data
+// counts only data the repository still REFERENCES and excludes packs that are garbage but not yet
+// pruned — which the bucket charges for regardless. See the M6 amendment in §2.11.
+func TestRepositoryStoredBytesIsNotShipped(t *testing.T) {
 	repo := &cbv1.BackupRepository{
 		ObjectMeta: metav1.ObjectMeta{Name: "dr"},
 		Status: cbv1.BackupRepositoryStatus{
@@ -430,9 +439,15 @@ func TestRepositoryStoredBytesAccompaniesSize(t *testing.T) {
 	}
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(NewCollector(newFakeClient(t, drLocation(), repo), testOperatorNamespace))
-	want := map[string]string{"location": "dr", "scope": "Cluster", "namespace": "", "cluster": "c1"}
-	if got, ok := gatherValue(t, reg, NameRepositoryStoredBytes, want); !ok || got != 4096 {
-		t.Fatalf("repository_stored_bytes = %v (found=%v), want 4096", got, ok)
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	for _, f := range families {
+		if f.GetName() == "crystalbackup_repository_stored_bytes" {
+			t.Fatal("crystalbackup_repository_stored_bytes is emitted again — it was withdrawn " +
+				"because it duplicates crystalbackup_repository_size_bytes (spec §2.11, M6 amendment)")
+		}
 	}
 }
 
@@ -576,7 +591,7 @@ func TestDescribeCoversEveryName(t *testing.T) {
 	for _, name := range []string{
 		NameBuildInfo, NameBackupLastSuccess, NameBackupProtectedBytes, NameScheduleActive,
 		NameClusterBackupLastSuccess, NameRestoreLastSuccess,
-		NameRepositorySize, NameRepositoryStoredBytes,
+		NameRepositorySize,
 		NameDiscoveryLastSuccess, NameDiscoveryProjected, NameDiscoveryOrphans, NameDiscoveryLastTimestamp,
 		NameErasureBlocked, NameErasureLastCompletion,
 		NameMoverActive, NameMoverQueueDepth, NameMoverConcurrencyLimit,

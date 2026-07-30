@@ -71,7 +71,6 @@ const (
 	NameRepositoryLastPrune    = "crystalbackup_repository_last_maintenance_timestamp_seconds"
 	NameRepositoryStaleLocks   = "crystalbackup_repository_stale_locks"
 	NameRepositoryLocksReaped  = "crystalbackup_repository_locks_reaped_total"
-	NameRepositoryStoredBytes  = "crystalbackup_repository_stored_bytes"
 
 	// §2.5 Discovery, the repository→Backup projection.
 	NameDiscoveryLastTimestamp = "crystalbackup_discovery_last_timestamp_seconds"

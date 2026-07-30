@@ -169,7 +169,6 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- repositoryLastCheckSuccessDesc
 	ch <- repositoryLastMaintenanceDesc
 	ch <- repositoryStaleLocksDesc
-	ch <- repositoryStoredBytesDesc
 	ch <- discoveryLastTimestampDesc
 	ch <- discoveryLastSuccessDesc
 	ch <- discoveryProjectedDesc
