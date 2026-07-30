@@ -37,7 +37,12 @@ func Catalogue() map[string][]string {
 		NameBuildInfo: {versionLabel},
 
 		// §2.1 backup, per namespace.
-		NameBackupLastSuccess:    backupLabels,
+		NameBackupLastSuccess: backupLabels,
+		// The SAME label set as NameBackupFailures and NameBackupFailuresTotal, and not by
+		// coincidence: BackupFailed `or`s this series against the counter, so an alert instance
+		// has to come out with identical labels whichever disjunct produced it. A label added to
+		// one of the three and not the others would split the alert in two.
+		NameBackupLastFailure:    backupLabels,
 		NameBackupLastSize:       backupLabels,
 		NameBackupLastAdded:      backupLabels,
 		NameBackupLastDuration:   backupLabels,

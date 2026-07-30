@@ -369,6 +369,31 @@ spec:
                 description: backupTime is the point-in-time of the snapshot set.
                 format: date-time
                 type: string
+              completionTime:
+                description: |-
+                  completionTime is when the run reached a terminal phase — succeeded or failed alike. Absent
+                  while it is still running.
+
+                  It exists because there was no honest answer to "when did this Backup FAIL", and an alert
+                  that has to ask that question was reading a timestamp that means something else. Neither of
+                  the two candidates works:
+
+                    - status.backupTime is the point-in-time of the SNAPSHOT SET, and every consumer reads it
+                      that way — the last_success gauge, the schedule's lastSuccessTime roll-up, the restore
+                      controller's point-in-time selection. It is only meaningful for a run that produced
+                      something, and reusing it as a failure clock would make "when was this namespace last
+                      captured" and "when did it last break" the same field.
+                    - the Ready condition's lastTransitionTime is the run's START, not its end. A failing run
+                      goes False(reason=InProgress) → False(reason=Failed), and meta.SetStatusCondition only
+                      refreshes lastTransitionTime when the STATUS changes, not when the reason does. On a
+                      forty-minute backup that is forty minutes of skew — enough to put a failure outside a
+                      one-hour alert window it belongs inside, or inside one it has already left.
+
+                  Written ONCE, on first arrival at a terminal phase, and never moved afterwards: a
+                  re-reconcile of an already-terminal object must not restate when it finished.
+                  ClusterBackupStatus.completionTime is the run-level sibling and means the same thing.
+                format: date-time
+                type: string
               conditions:
                 description: conditions represent the current state.
                 items:

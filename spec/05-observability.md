@@ -36,8 +36,30 @@ model of R25/R26/R21; metric names below canonicalize the shorthand used in
 - **Restart-safe gauges**: on operator start, `*_last_*` and boolean state gauges are
   rebuilt from CR/repo state (`BackupSchedule.status.lastSuccessTime`,
   `ClusterBackupSchedule.status.lastRunName`, `BackupRepository.status.*`,
-  `ClusterErasure.status.phase`), so alerts do not flap on operator restarts. Counters
-  restart at zero; alert expressions use `increase()`.
+  `ClusterErasure.status.phase`), so alerts do not flap on operator restarts.
+  **Counters do not restart at zero — they DISAPPEAR, and `increase()` does not cope.**
+  This bullet used to end "counters restart at zero; alert expressions use `increase()`",
+  and the second clause does not follow from the first because the first is not what
+  happens. A `prometheus.CounterVec` child is created by its first `Inc()`: before that
+  there is no series, and after a restart there is no series again until something fails
+  anew. `increase()` handles a counter RESET (a series that dips and continues); it has
+  nothing to say about a series that simply ENDS, and a series whose samples in the window
+  are all the same value has no rise to measure either. That second half is the wider
+  defect and it needs no restart at all: because the child is created BY the first `Inc()`,
+  it appears at **1** rather than stepping `0 → 1`, so the **first failure a series ever
+  records cannot move `increase()`**. Only a second one can. An alert built on the counter
+  alone was therefore blind to exactly the incident an operator most wants paged — a
+  namespace that was fine yesterday and failed once tonight. Measured on a live cluster after
+  the operator pod was replaced: `crystalbackup_backup_failures_total` returned **zero
+  series**, `increase(...[1h])` returned three series all equal to **0**, and a `Backup`
+  had genuinely failed. `CrystalbackupBackupFailed` was silent.
+  The correction is not to abandon counters — a counter is still the only thing that can
+  count an event whose object was deleted — but to give any counter an alert depends on a
+  **state-derived companion**, and to `or` the two. `crystalbackup_backup_last_failure_timestamp_seconds`
+  (§2.1) is that companion for the backup-failure family. What survives neither is a
+  failure whose operator restarted AND whose `Backup` object was garbage-collected inside
+  the alert window; that residual hole is named in the rule's own rationale rather than
+  papered over.
 - **The repository is the source of truth** ([adr/0009](adr/0009-shared-cluster-repo-tag-tenancy.md)):
   discovery and inventory gauges (`crystalbackup_discovery_*`, `crystalbackup_repository_*`)
   are derived from `restic snapshots` / `BackupRepository.status`, so they survive a lost
@@ -77,7 +99,8 @@ matching the Prometheus convention for enumerated label values.
 | `crystalbackup_backup_last_size_bytes` | gauge | namespace, tenant, schedule, origin, location, cluster | Logical size of the last backup (Σ `status.volumes[].sizeBytes`) — per-namespace even in the shared repo (unaffected by cross-namespace dedup). |
 | `crystalbackup_backup_last_added_bytes` | gauge | namespace, tenant, schedule, origin, location, cluster | Dedup delta of the last backup (Σ `status.volumes[].addedBytes`). |
 | `crystalbackup_backup_added_bytes_total` | counter | namespace, tenant, schedule, origin, location, cluster | Cumulative bytes uploaded to the repository (S3 egress estimation). |
-| `crystalbackup_backup_failures_total` | counter | namespace, tenant, schedule, origin, location, cluster | `Backup`s ending `Failed` or `PartiallyFailed`. |
+| `crystalbackup_backup_failures_total` | counter | namespace, tenant, schedule, origin, location, cluster | `Backup`s ending `Failed` or `PartiallyFailed`. In-process, so the series is **absent** until the first failure and absent again after a restart — see §1, and see the companion below. |
+| `crystalbackup_backup_last_failure_timestamp_seconds` | gauge | namespace, tenant, schedule, origin, location, cluster | Unix time of the last `Backup` that reached `Failed` or `PartiallyFailed`. Derived from the `Backup` objects at scrape time (`status.completionTime`, falling back to `metadata.creationTimestamp` for objects that predate that field and for projections), so it is **absent** until one has failed and is rebuilt intact across an operator restart. The restart-safe half of `CrystalbackupBackupFailed`. |
 | `crystalbackup_schedule_active` | gauge | namespace, tenant, schedule, origin, location, cluster | 1 when an unpaused schedule is expected to back up this `(namespace, schedule)`: a namespaced `BackupSchedule` (`origin=namespace`), **or** a `ClusterBackupSchedule` whose namespace selection matches this namespace (`origin=cluster` — the operator resolves the selection and emits one series per matched namespace). **0** when that schedule exists but is paused; **absent** when it does not exist. Drives per-namespace `BackupMissed` across the cluster-plane fan-out. |
 | `crystalbackup_schedule_period_seconds` | gauge | namespace, tenant, schedule, origin, location, cluster | Longest gap between two consecutive activations of the schedule's cron expression. **Absent** when the expression cannot be parsed. Added in M6; it is what lets `BackupMissed` carry a per-schedule deadline instead of a flat 26 h (§8 q3). |
 | `crystalbackup_schedule_created_timestamp_seconds` | gauge | namespace, tenant, schedule, origin, location, cluster | Unix time the schedule object was created — the instant from which backups started being expected. Added in M6; see the note below. |
@@ -217,8 +240,13 @@ over live objects). It cannot work that way, and the reason is the point of the 
 completed erasure exists to make data gone, and the `ClusterErasure` object is itself
 garbage-collected by the run-history limit. Summing live objects would make the running total of
 what has been erased silently *decrease* — the one number a GDPR audit would ask for, drifting
-downward. They are true counters, incremented once at completion, and they reset on restart like
-every other counter (§1).
+downward. They are true counters, incremented once at completion, and like every other counter here
+they do not survive an operator restart — the series disappears rather than resetting (§1).
+Nothing alerts on them today, and that is fortunate: the state-derived companion
+`CrystalbackupBackupFailed` grew to close the restart hole cannot be built here, because
+the object a completed erasure would be derived from is exactly the one that has been
+deleted. Any future rule on these has to be written knowing it can miss an erasure whose
+operator restarted inside the alert window.
 
 ### 2.7 Concurrency & queueing (R12)
 
@@ -399,7 +427,7 @@ needs.
 | Alert | Severity | For | Fires when |
 |---|---|---|---|
 | `CrystalbackupBackupMissed` | warning | 15m | An active schedule has gone past **its own** deadline (1.1 × the cron period + 1 h) with no successful `Backup`. Falls back to the schedule's creation time when nothing has ever succeeded, and to a fixed 26 h when the cron expression cannot be parsed. |
-| `CrystalbackupBackupFailed` | warning | — | A `Backup` reached `Failed` or `PartiallyFailed` in the last hour. |
+| `CrystalbackupBackupFailed` | warning | — | A `Backup` reached `Failed` or `PartiallyFailed` in the last hour — read from the counter with `increase()`, **or** from `crystalbackup_backup_last_failure_timestamp_seconds` being less than an hour old. The second disjunct is what makes the rule survive an operator restart, which the counter alone does not (§1). |
 | `CrystalbackupRepositoryCheckFailed` | **critical** | 5m | `restic check` found repository damage. The only critical rule: it is the only one that says the RESTORE PATH is compromised rather than that a backup is late. |
 | `CrystalbackupStaleLocks` | warning | 30m | Stale restic locks persist past the reaper's own cycle. |
 | `CrystalbackupMaintenanceStalled` | warning | 1h | No successful prune for 26 h. Cannot fire on an `Immutable` location, which emits no series (§2.4). |

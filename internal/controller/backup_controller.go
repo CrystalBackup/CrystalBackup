@@ -468,6 +468,7 @@ func (r *BackupReconciler) writeStatus(ctx context.Context, backup *cbv1.Backup,
 			now := metav1.Now()
 			backup.Status.BackupTime = &now
 		}
+		setCompletionTime(backup)
 		setTerminalCondition(backup, phase)
 	} else {
 		status.SetCondition(&backup.Status.Conditions, ConditionReady, metav1.ConditionFalse, "InProgress",
@@ -616,6 +617,11 @@ func (r *BackupReconciler) failHooks(ctx context.Context, backup *cbv1.Backup, r
 		now := metav1.Now()
 		backup.Status.BackupTime = &now
 	}
+	// The other door into a terminal phase, and it has to stamp completionTime too. A pre-hook
+	// abort is a Failed Backup like any other; leaving it unstamped would send the failure clock
+	// back to the object's creation for exactly the runs whose hooks timed out — the ones where
+	// creation and failure are furthest apart.
+	setCompletionTime(backup)
 	status.SetCondition(&backup.Status.Conditions, ConditionReady, metav1.ConditionFalse,
 		"PreHookFailed", message, backup.Generation)
 	if err := r.Status().Update(ctx, backup); err != nil {
@@ -1831,6 +1837,22 @@ func isTerminalBackupPhase(phase string) bool {
 	default:
 		return false
 	}
+}
+
+// setCompletionTime stamps status.completionTime on a Backup that has just reached a terminal
+// phase, IDEMPOTENTLY: an already-stamped object keeps the instant it first finished.
+//
+// The idempotence is the whole of it. Every other path through this controller re-runs — a
+// conflict retry, a re-list, the already-terminal sweep — and a timestamp rewritten on any of
+// them would keep sliding forward, which is worse than having none at all: the metric derived
+// from it (crystalbackup_backup_last_failure_timestamp_seconds) would report a failure as having just happened
+// every time the object was touched, and an alert on a one-hour window would never clear.
+func setCompletionTime(backup *cbv1.Backup) {
+	if backup.Status.CompletionTime != nil {
+		return
+	}
+	now := metav1.Now()
+	backup.Status.CompletionTime = &now
 }
 
 // setTerminalCondition records the headline Ready condition for a terminal Backup: True for a

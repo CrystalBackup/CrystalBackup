@@ -46,6 +46,11 @@ import (
 // It is written out here rather than parsed from Expr on purpose: a regex over PromQL that picked
 // the wrong series would silently weaken the very assertion this table exists to make. Every value
 // is a metrics constant, so a renamed series is a compile error here exactly as it is in rules.go.
+//
+// BackupFailed reads TWO series (a counter and its state-derived companion) and this table names
+// only one of them. That is not a gap: the entry is about the LABEL SET an alert instance carries,
+// the two series carry the same one by construction, and
+// TestBackupFailedNamesBothOfItsSeries is what holds them to it.
 var seriesOfRule = map[string]string{
 	ruleBackupMissed:              metrics.NameScheduleActive,
 	ruleBackupFailed:              metrics.NameBackupFailuresTotal,
@@ -203,29 +208,96 @@ func TestEveryPredicateReportsItsSeriesLabelSet(t *testing.T) {
 	}
 }
 
-// TestBackupFailedWindowMatchesTheExpression keeps the one duration this package types outside a
-// Threshold honest against the expression it came from. The `[1h]` range is not a Threshold field
-// (the rule's Threshold is the count), so nothing else would notice the two diverging.
-func TestBackupFailedWindowMatchesTheExpression(t *testing.T) {
-	var expr string
+// backupFailedExprText is CrystalbackupBackupFailed's assembled PromQL, for the three tests below
+// that each check a different property of it.
+func backupFailedExprText(t *testing.T) string {
+	t.Helper()
 	for _, r := range Rules() {
 		if r.Name == ruleBackupFailed {
-			expr = r.Expr
+			return r.Expr
 		}
 	}
-	if expr == "" {
-		t.Fatal("no CrystalbackupBackupFailed rule")
+	t.Fatal("no CrystalbackupBackupFailed rule")
+	return ""
+}
+
+// TestBackupFailedWindowMatchesTheExpression keeps the one duration this package types outside a
+// Threshold honest against the expression it came from. The range is not a Threshold field (the
+// rule's Threshold is the count), so nothing else would notice the two diverging.
+//
+// It insists on finding EXACTLY ONE range selector. The expression grew a second disjunct when the
+// restart hole was closed, and a FindStringSubmatch that silently takes the first of several
+// matches is how a test keeps passing while checking the wrong half of a rule — the same shape of
+// silence this whole package exists to remove. If a future edit legitimately adds a second range,
+// this fails loudly and whoever adds it has to say which one the window is.
+func TestBackupFailedWindowMatchesTheExpression(t *testing.T) {
+	expr := backupFailedExprText(t)
+	m := regexp.MustCompile(`\[(\d+[smhdw])\]`).FindAllStringSubmatch(expr, -1)
+	if len(m) != 1 {
+		t.Fatalf("expected exactly one range selector in %q, found %d", expr, len(m))
 	}
-	m := regexp.MustCompile(`\[(\d+[smhdw])\]`).FindStringSubmatch(expr)
-	if m == nil {
-		t.Fatalf("no range selector in %q", expr)
-	}
-	want, err := time.ParseDuration(m[1])
+	want, err := time.ParseDuration(m[0][1])
 	if err != nil {
-		t.Fatalf("range %q: %v", m[1], err)
+		t.Fatalf("range %q: %v", m[0][1], err)
 	}
 	if want != backupFailedWindow {
 		t.Errorf("backupFailedWindow = %s but the expression ranges over %s", backupFailedWindow, want)
+	}
+}
+
+// TestBackupFailedRecencyBoundMatchesTheWindow is the other half of the same coupling, and the
+// reason backupFailedExpr is a function.
+//
+// The rule reads one window in two units: `[3600s]` as the counter's range and a bare `3600` as
+// the last_failure recency bound. Written by hand they would eventually describe two different
+// hours — a counter looking back further than the state series, or the reverse — and the resulting
+// rule would fire on one branch and not the other with nothing to say why.
+func TestBackupFailedRecencyBoundMatchesTheWindow(t *testing.T) {
+	expr := backupFailedExprText(t)
+	pattern := regexp.MustCompile(`time\(\) - ` + regexp.QuoteMeta(metrics.NameBackupLastFailure) + ` < (\d+)\)`)
+	m := pattern.FindStringSubmatch(expr)
+	if m == nil {
+		t.Fatalf("no last_failure recency term in %q", expr)
+	}
+	want, err := time.ParseDuration(m[1] + "s")
+	if err != nil {
+		t.Fatalf("bound %q: %v", m[1], err)
+	}
+	if want != backupFailedWindow {
+		t.Errorf("the recency term bounds at %s but backupFailedWindow is %s", want, backupFailedWindow)
+	}
+}
+
+// TestBackupFailedNamesBothOfItsSeries pins the shape of the fix, not just its arithmetic.
+//
+// The rule is a disjunction over an EVENT counter and a STATE gauge, and it is a disjunction
+// because neither survives what the other does: the counter's series disappears with the process
+// that owned it, and the gauge cannot see a failure whose Backup object has been collected. A
+// future edit that dropped either branch would leave a rule that still parses, still fires in the
+// common case, and is silent again on exactly the restart this lot was written for. Both names
+// must also be in the catalogue — a disjunct on a series nobody emits is the M6 defect verbatim.
+func TestBackupFailedNamesBothOfItsSeries(t *testing.T) {
+	expr := backupFailedExprText(t)
+	catalogue := metrics.Catalogue()
+	for _, name := range []string{metrics.NameBackupFailuresTotal, metrics.NameBackupLastFailure} {
+		if !strings.Contains(expr, name) {
+			t.Errorf("%s does not appear in the expression %q", name, expr)
+		}
+		if _, ok := catalogue[name]; !ok {
+			t.Errorf("%s is not in the metrics catalogue, so nothing emits it", name)
+		}
+	}
+	// Identical label sets, because the alert `or`s across the two: an instance produced by the
+	// counter branch and one produced by the gauge branch have to be the SAME alert, or an
+	// operator watching a page across an operator restart sees it resolve and re-fire under a
+	// different identity.
+	counter := slices.Clone(catalogue[metrics.NameBackupFailuresTotal])
+	state := slices.Clone(catalogue[metrics.NameBackupLastFailure])
+	slices.Sort(counter)
+	slices.Sort(state)
+	if !slices.Equal(counter, state) {
+		t.Errorf("%s carries %v but %s carries %v; the two disjuncts would produce two different alerts",
+			metrics.NameBackupFailuresTotal, counter, metrics.NameBackupLastFailure, state)
 	}
 }
 

@@ -317,11 +317,34 @@ func Rules() []Rule {
 			Description: "At least one Backup reached Failed or PartiallyFailed in the last hour. " +
 				"kubectl get backups -n {{ $labels.namespace }} shows which.",
 			Rationale: strings.Join([]string{
-				"Counter, so increase(): it survives the operator restart that resets it to zero (spec §1).",
-				"The gauge sibling crystalbackup_backup_failures counts wreckage that still EXISTS — a",
-				"different and also useful question, but not one increase() can ask.",
+				"Two disjuncts, because the counter alone was measured to be SILENT on a real failure.",
+				"The first is the ordinary reading, and increase() over an hour is also why there is no",
+				"`for` hold: the range IS the hold.",
+				"It is also, alone, unable to page the FIRST failure a series ever records — no restart",
+				"required. A CounterVec child materialises AT ONE (RecordBackupTerminal touches it only on",
+				"the failure branch, so nothing pre-registers a zero), and a window whose samples all read 1",
+				"holds no rise for increase() to measure. Only a SECOND failure moves it. That is the",
+				"widest form of this defect and the likeliest incident in production: a namespace that was",
+				"fine yesterday and failed once tonight.",
+				"The second disjunct also exists because an operator restart does not RESET " + metrics.NameBackupFailuresTotal + " to",
+				"zero — it makes the series DISAPPEAR. The same materialisation rule says a fresh process",
+				"publishes no such series at all until something fails again, and increase() cannot see",
+				"across a disappearance the way it sees across a reset. Measured on a",
+				"live cluster: after the operator pod was replaced the counter returned ZERO series, the",
+				"increase() returned 0, and a Backup had genuinely failed. Nothing fired.",
+				metrics.NameBackupLastFailure + " is derived from the Backup objects at scrape time, so it is",
+				"restart-safe by construction, and it is ABSENT for a series that has never failed — which is",
+				"what keeps this rule silent on a healthy install rather than merely below a bound.",
+				"The recency test is what stops it paging forever. The plain gauge crystalbackup_backup_failures",
+				"survives a restart too, but it has no notion of WHEN: a Backup kept for diagnosis after failing",
+				"three days ago would page every evaluation until somebody deleted it.",
+				"RESIDUAL BLIND SPOT, accepted rather than hidden: if the operator restarts AND the failed",
+				"Backup object is garbage-collected by its schedule's history limit inside the same hour, the",
+				"counter series is gone and no object is left to derive a timestamp from. That failure is",
+				"unrecoverable from either source and this rule will not fire for it. The remedy is a history",
+				"limit greater than one, not a third disjunct.",
 			}, "\n"),
-			Expr:      fmt.Sprintf("increase(%s[1h]) > 0", metrics.NameBackupFailuresTotal),
+			Expr:      backupFailedExpr(),
 			Predicate: backupFailed,
 		},
 		{
@@ -523,6 +546,33 @@ func Rules() []Rule {
 			Predicate: externalSyncPausedTooLong,
 		},
 	}
+}
+
+// backupFailedExpr: "a Backup failed in the last hour", asked twice, of two different kinds of
+// series, because neither kind can answer it alone.
+//
+//	increase(<counter>[<w>]) > 0                <- the event, while the process that saw it lives
+//	or (time() - <last_failure> < <w>)          <- the state, which outlives the process
+//
+// The two branches read ONE window. That is the whole reason this is a function rather than two
+// numbers typed into a format string: `[1h]` and `3600` are the same quantity expressed in
+// different units, and a pair like that drifts the first time somebody widens the window and edits
+// only the half they were looking at. Both come from backupFailedWindow, which the state predicate
+// also reads — so the alert, its self-check twin and the range selector move together or not at
+// all. The window is rendered in SECONDS on both sides for the same reason staleTimestampExpr does
+// it: it is the one form that survives being derived from a time.Duration without a bespoke
+// formatter.
+//
+// A bare `or` is right here where the other rules need `or on (...)`: both sides carry the
+// IDENTICAL label set (metrics.Catalogue() has last_failure on backupLabels, exactly like the
+// counter), and both are derived from the same Backups, so there is no label that could disagree
+// and nothing to drop from the key. The alert instance comes out the same whichever branch
+// produced it — which is what lets an operator correlate a page across an operator restart instead
+// of seeing it resolve and re-fire under a different identity.
+func backupFailedExpr() string {
+	seconds := int64(backupFailedWindow.Seconds())
+	return fmt.Sprintf("increase(%s[%ds]) > 0\nor (time() - %s < %d)",
+		metrics.NameBackupFailuresTotal, seconds, metrics.NameBackupLastFailure, seconds)
 }
 
 // staleTimestampExpr builds `time() - <series> > <seconds>`, the shape every "has not happened

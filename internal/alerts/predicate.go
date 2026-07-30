@@ -218,9 +218,12 @@ const (
 func Fidelity(ruleName string) string {
 	switch ruleName {
 	case ruleBackupFailed:
-		return "Derived from Backup objects that still exist. The alert reads a COUNTER " +
-			"(increase over 1h), which survives the schedule history limit deleting a failed run; " +
-			"this predicate cannot. A failure already garbage-collected is not counted here."
+		return "Derived from Backup objects that still exist. The alert's first disjunct reads a " +
+			"COUNTER (increase over 1h), which survives the schedule history limit deleting a " +
+			"failed run; this predicate cannot, and a failure already garbage-collected is not " +
+			"counted here. Its second disjunct is derived from the same objects this predicate " +
+			"reads, so on that half the two agree exactly — including the blind spot they share, " +
+			"which is precisely the deleted run."
 	case ruleSchedulePausedTooLong:
 		return "The alert asks whether the schedule was active at any point in a 7-day lookback, " +
 			"which is a question about metric HISTORY and has no equivalent in object state. This " +
@@ -395,14 +398,28 @@ func backupMissed(ctx context.Context, r client.Reader, now time.Time) ([]Breach
 	return sorted(out), nil
 }
 
-// backupFailed mirrors `increase(crystalbackup_backup_failures_total[1h]) > 0` as closely as
-// object state allows — see Fidelity for the part it cannot reach.
+// backupFailed mirrors CrystalbackupBackupFailed as closely as object state allows — see Fidelity
+// for the part it cannot reach.
 //
-// The window is the rule's own: one hour, taken from the Expr's range rather than retyped, which
-// is why backupFailedWindow sits next to the parse that reads it. A Backup carries no completion
-// timestamp for a failure (status.backupTime is written on success only), so the terminal
-// transition of its Ready condition is the time — the same source metrics/restore.go uses for the
-// same missing field.
+// The window is the rule's own: one hour, read from backupFailedWindow, which is also what the
+// expression's range selector and its recency term are built from. One duration, three readers.
+//
+// WHEN a Backup failed is resolved in three steps, and the order is the point:
+//
+//   - status.completionTime, the field added for exactly this question. It is stamped once, on
+//     first arrival at a terminal phase, and never moved.
+//   - the Ready condition's lastTransitionTime, for objects that reached a terminal phase before
+//     that field existed. It is BIASED EARLY and knowingly so: a failing run goes
+//     False(reason=InProgress) → False(reason=Failed), and meta.SetStatusCondition refreshes the
+//     transition time only when the Status changes, not the Reason — so what it reports is when the
+//     run STARTED. On a forty-minute backup that is forty minutes of skew.
+//   - the object's creation, when there is no Ready condition at all (a phase written without one,
+//     and discovery projections).
+//
+// Both fallbacks read EARLIER than the truth, which pushes a failure out of the window rather than
+// into it — the wrong direction for a predicate whose known weakness is already under-reporting,
+// but the only honest one available for an object that does not carry the answer. Skipping such
+// objects would drop a real failure outright, which is worse.
 func backupFailed(ctx context.Context, r client.Reader, now time.Time) ([]Breach, error) {
 	var backups cbv1.BackupList
 	if err := r.List(ctx, &backups); err != nil {
@@ -426,14 +443,7 @@ func backupFailed(ctx context.Context, r client.Reader, now time.Time) ([]Breach
 		default:
 			continue
 		}
-		c := status.FindCondition(b.Status.Conditions, conditionReady)
-		// No Ready condition means the phase was written without one; fall back to the object's
-		// creation. Skipping it instead would drop a real failure, which is the wrong direction
-		// for a predicate whose known weakness is already under-reporting.
-		at := b.CreationTimestamp.Time
-		if c != nil {
-			at = c.LastTransitionTime.Time
-		}
+		at := failedAt(b)
 		if now.Sub(at) > backupFailedWindow {
 			continue
 		}
@@ -455,10 +465,26 @@ func backupFailed(ctx context.Context, r client.Reader, now time.Time) ([]Breach
 	return sorted(out), nil
 }
 
-// backupFailedWindow is the `[1h]` of CrystalbackupBackupFailed's expression. It is a constant
-// rather than a Threshold field because the Threshold of that rule is the COUNT (`> 0`); the range
-// belongs to the expression. rules_test-style coupling is kept by predicates_test.go, which reads
-// the range back out of the Expr and fails if the two stop agreeing.
+// failedAt resolves when a failed Backup finished, in the order backupFailed's doc comment sets
+// out: the stamped completion, then the Ready condition's transition, then the object's creation.
+// It always returns something — a failure with no usable timestamp is still a failure, and the
+// caller's job is to decide whether it lands in the window, not whether it happened.
+func failedAt(b *cbv1.Backup) time.Time {
+	if b.Status.CompletionTime != nil {
+		return b.Status.CompletionTime.Time
+	}
+	if c := status.FindCondition(b.Status.Conditions, conditionReady); c != nil {
+		return c.LastTransitionTime.Time
+	}
+	return b.CreationTimestamp.Time
+}
+
+// backupFailedWindow is the one hour of CrystalbackupBackupFailed. It is a constant rather than a
+// Threshold field because the Threshold of that rule is the COUNT (`> 0`); the window belongs to
+// the expression — where it now appears TWICE, as the counter's range selector and as the bound of
+// the last_failure recency test. backupFailedExpr builds both from this constant so the two halves
+// of one disjunction cannot end up describing two different hours, and predicates_test.go reads
+// the range back out of the generated Expr and fails if it ever stops agreeing with this.
 const backupFailedWindow = time.Hour
 
 // staleLocks mirrors `crystalbackup_repository_stale_locks > 0`.

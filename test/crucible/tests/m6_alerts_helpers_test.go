@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -263,6 +264,65 @@ func m6Query(expr string) ([]m6Sample, error) {
 		return nil, fmt.Errorf("query %q returned %s, expected a vector", expr, data.ResultType)
 	}
 	return data.Result, nil
+}
+
+// m6PositiveSamples keeps only the samples whose value is strictly greater than zero.
+//
+// It exists because "the query returned something" and "the query returned a number that means
+// yes" are different questions, and PromQL makes it very easy to ask the first while believing you
+// asked the second. An `increase()` over a series that EXISTS in the window but never incremented
+// yields a sample — value 0. A `Expect(samples).NotTo(BeEmpty())` written over that is satisfied by
+// zero, so it certifies the counter moved at the exact moment it provably did not.
+//
+// That is not hypothetical: it is how the 0.6.0 campaign's alert lane reported "And the counter
+// series moves" as passing, immediately before CrystalbackupBackupFailed timed out ten minutes
+// later. Every value assertion in this file goes through here or compares the value explicitly.
+func m6PositiveSamples(samples []m6Sample) []m6Sample {
+	var out []m6Sample
+	for _, s := range samples {
+		v, err := m6SampleValue(s)
+		if err != nil || v <= 0 {
+			continue
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
+// m6SampleValue parses the numeric half of a sample. Prometheus encodes it as a STRING (so that
+// NaN and ±Inf survive JSON), which is why this cannot be a type assertion on a float64.
+func m6SampleValue(s m6Sample) (float64, error) {
+	if len(s.Value) != 2 {
+		return 0, fmt.Errorf("sample has %d value fields, expected [timestamp, value]", len(s.Value))
+	}
+	raw, ok := s.Value[1].(string)
+	if !ok {
+		return 0, fmt.Errorf("sample value is %T, expected the string Prometheus encodes", s.Value[1])
+	}
+	v, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		return 0, fmt.Errorf("sample value %q is not a number: %w", raw, err)
+	}
+	return v, nil
+}
+
+// m6DescribeSamples renders a result vector for a failure message: the values, with the labels that
+// distinguish them. A bare "no positive sample" leaves the reader unable to tell "the series is
+// absent" from "the series is there and reads zero" — which are opposite diagnoses.
+func m6DescribeSamples(samples []m6Sample) string {
+	if len(samples) == 0 {
+		return "an EMPTY vector (no such series at all)"
+	}
+	parts := make([]string, 0, len(samples))
+	for _, s := range samples {
+		v, err := m6SampleValue(s)
+		if err != nil {
+			parts = append(parts, fmt.Sprintf("%v=<unparseable: %v>", s.Metric, err))
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%v=%g", s.Metric, v))
+	}
+	return strings.Join(parts, ", ")
 }
 
 // m6RequirePrometheus fails the spec unless Prometheus answers and is scraping the operator.

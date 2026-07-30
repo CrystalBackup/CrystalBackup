@@ -418,6 +418,11 @@ var _ = Describe("BackupReconciler", func() {
 			b := getBackupG(g, ns, run)
 			g.Expect(b.Status.Phase).To(Equal("Completed"))
 			g.Expect(b.Status.BackupTime).NotTo(BeNil())
+			// completionTime is stamped on ANY terminal phase, not only a failing one. It is
+			// asserted here rather than only on a failure path because the field's whole value is
+			// that it means the same thing on both — a metric that only appeared for failures
+			// would be a metric nobody could sanity-check against a run they watched succeed.
+			g.Expect(b.Status.CompletionTime).NotTo(BeNil())
 			vol := volumeByPVC(b, pvcName)
 			g.Expect(vol).NotTo(BeNil())
 			g.Expect(string(vol.Phase)).To(Equal("Completed"))

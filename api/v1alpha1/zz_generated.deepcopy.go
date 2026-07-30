@@ -581,6 +581,10 @@ func (in *BackupStatus) DeepCopyInto(out *BackupStatus) {
 		in, out := &in.BackupTime, &out.BackupTime
 		*out = (*in).DeepCopy()
 	}
+	if in.CompletionTime != nil {
+		in, out := &in.CompletionTime, &out.CompletionTime
+		*out = (*in).DeepCopy()
+	}
 	if in.Manifests != nil {
 		in, out := &in.Manifests, &out.Manifests
 		*out = new(ManifestsStatus)

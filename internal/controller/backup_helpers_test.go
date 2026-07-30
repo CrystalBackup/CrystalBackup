@@ -20,7 +20,39 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	cbv1 "github.com/CrystalBackup/CrystalBackup/api/v1alpha1"
 )
+
+// TestSetCompletionTimeNeverMovesAnExistingStamp is the guard on the one property
+// status.completionTime has to have to be usable as a failure clock.
+//
+// Everything else in this controller re-runs: a conflict retry, a re-list, the already-terminal
+// sweep at the top of Reconcile. A stamp rewritten on any of those would creep forward every time
+// the object was touched — and the metric derived from it, crystalbackup_backup_last_failure_timestamp_seconds,
+// would report a week-old failure as having happened moments ago. The alert reading it over a
+// one-hour window would then never clear, which is the failure mode that gets a rule silenced
+// permanently rather than fixed.
+func TestSetCompletionTimeNeverMovesAnExistingStamp(t *testing.T) {
+	first := metav1.NewTime(time.Date(2026, 7, 17, 2, 0, 0, 0, time.UTC))
+	b := &cbv1.Backup{Status: cbv1.BackupStatus{CompletionTime: &first}}
+
+	setCompletionTime(b)
+	if !b.Status.CompletionTime.Equal(&first) {
+		t.Errorf("completionTime moved to %s; a re-reconcile of a terminal Backup must not restate "+
+			"when it finished", b.Status.CompletionTime)
+	}
+
+	// The other half: an unstamped Backup does get one, or the field would never be written at all.
+	fresh := &cbv1.Backup{}
+	setCompletionTime(fresh)
+	if fresh.Status.CompletionTime == nil {
+		t.Fatal("completionTime was not set on a Backup reaching a terminal phase for the first time")
+	}
+}
 
 // dns1123Label is the Kubernetes label/name shape the derived mover Job name must satisfy.
 var dns1123Label = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`)

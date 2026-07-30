@@ -50,12 +50,20 @@ var sections = []section{
 	{
 		title:    "Backup and schedules",
 		prefixes: []string{"crystalbackup_backup_", "crystalbackup_schedule_"},
-		note: "`crystalbackup_backup_failures` and `crystalbackup_backup_failures_total` are not " +
-			"two spellings of one number. The gauge counts failed Backup objects that still " +
-			"EXIST, so it falls back to zero when a schedule's history limit deletes them; the " +
-			"counter records every Backup that ever reached a failed phase, and only a restart " +
-			"resets it. Alert on the counter with `increase()`; put the gauge on a dashboard when " +
-			"the question is what wreckage is lying around right now.\n\n" +
+		note: "Three series carry the word `failure` and none of them is a spelling of another. " +
+			"`crystalbackup_backup_failures` is a gauge counting failed Backup objects that still " +
+			"EXIST, so it drops back to zero when a schedule's history limit deletes them — the " +
+			"question it answers is what wreckage is lying around right now, which is a dashboard " +
+			"question. `crystalbackup_backup_failures_total` is an in-process counter of every " +
+			"Backup that reached a failed phase; read it with `increase()`, and know that an " +
+			"operator restart does not zero it but makes it VANISH (a counter series only exists " +
+			"once something has incremented it), which `increase()` cannot see across. " +
+			"`crystalbackup_backup_last_failure_timestamp_seconds` is the Unix time of the most recent failure, " +
+			"derived from the Backup objects at scrape time and therefore rebuilt intact after a " +
+			"restart; it is ABSENT for a series that has never failed. " +
+			"`CrystalbackupBackupFailed` reads the last two together, because the counter cannot " +
+			"survive a restart and the timestamp cannot survive the object being " +
+			"garbage-collected.\n\n" +
 			"`crystalbackup_schedule_active` is `1` for an unpaused schedule and `0` for one that " +
 			"exists and is paused — it is not absent while paused, which is what makes " +
 			"`CrystalbackupSchedulePausedTooLong` possible at all.",

@@ -148,6 +148,82 @@ func TestCollectorBackupSeries(t *testing.T) {
 	}
 }
 
+// TestCollectorBackupLastFailure covers the series that exists because the failure COUNTER cannot
+// survive the operator process that owns it.
+//
+// Three properties, and each of them is load-bearing for CrystalbackupBackupFailed:
+//
+//   - the newest failure wins, mirroring last_success — the alert asks when this series last broke,
+//     not when it first did;
+//   - status.completionTime is preferred, and creationTimestamp is the fallback for the objects
+//     that cannot have one (terminal before the field existed, and discovery projections). The
+//     fallback reads EARLY, never late, which is the safe direction for a recency test;
+//   - a series that has never failed emits NOTHING. That is what keeps the alert silent on a
+//     healthy install: publishing a 0 would put the Unix epoch on the wire, and the rule's
+//     `time() - last_failure < 3600` would then be comparing against 1970 for every namespace in
+//     the fleet.
+func TestCollectorBackupLastFailure(t *testing.T) {
+	loc := &cbv1.ClusterBackupLocation{
+		ObjectMeta: metav1.ObjectMeta{Name: "dr"},
+		Spec:       cbv1.ClusterBackupLocationSpec{ClusterID: "c1"},
+	}
+	older := metav1.Date(2026, 7, 17, 1, 0, 0, 0, time.UTC)
+	newer := metav1.Date(2026, 7, 17, 3, 0, 0, 0, time.UTC)
+	// A run whose completionTime is absent: only its creation is available, and it is deliberately
+	// EARLIER than the newest failure so that preferring it would be visible as a wrong answer.
+	projected := metav1.Date(2026, 7, 17, 2, 0, 0, 0, time.UTC)
+
+	failedLabels := func(name string) map[string]string {
+		return map[string]string{
+			apiconst.LabelOrigin: apiconst.OriginNamespace, apiconst.LabelSchedule: "nightly",
+			apiconst.LabelNamespace: "team-a", apiconst.LabelClusterBackup: name,
+		}
+	}
+	mk := func(name string, phase status.BackupPhase, created metav1.Time, completed *metav1.Time) *cbv1.Backup {
+		return &cbv1.Backup{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "team-a", Name: name, Labels: failedLabels(name), CreationTimestamp: created,
+			},
+			Spec:   cbv1.BackupSpec{LocationRef: cbv1.LocationReference{Name: "dr"}},
+			Status: cbv1.BackupStatus{Phase: string(phase), CompletionTime: completed},
+		}
+	}
+
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(NewCollector(newFakeClient(t, loc,
+		mk("old-fail", status.BackupPhaseFailed, older, &older),
+		mk("new-fail", status.BackupPhasePartiallyFailed, older, &newer),
+		mk("no-completion", status.BackupPhaseFailed, projected, nil),
+	), testOperatorNamespace))
+
+	want := map[string]string{"namespace": "team-a", "tenant": "team-a", "schedule": "nightly", "origin": "namespace", "location": "dr", "cluster": "c1"}
+	if got, ok := gatherValue(t, reg, "crystalbackup_backup_last_failure_timestamp_seconds", want); !ok || got != float64(newer.Unix()) {
+		t.Fatalf("last_failure = %v (found=%v), want %d (the NEWEST failure, from status.completionTime)",
+			got, ok, newer.Unix())
+	}
+
+	// The same three objects, minus the two that carry a completionTime: what is left must fall
+	// back to the object's creation rather than contributing nothing.
+	fallbackReg := prometheus.NewRegistry()
+	fallbackReg.MustRegister(NewCollector(newFakeClient(t, loc,
+		mk("no-completion", status.BackupPhaseFailed, projected, nil),
+	), testOperatorNamespace))
+	if got, ok := gatherValue(t, fallbackReg, "crystalbackup_backup_last_failure_timestamp_seconds", want); !ok || got != float64(projected.Unix()) {
+		t.Fatalf("last_failure with no completionTime = %v (found=%v), want the creation timestamp %d — "+
+			"a failed Backup that predates the field must still be visible to the alert", got, ok, projected.Unix())
+	}
+
+	// The healthy series: one Completed Backup, and NO last_failure series at all.
+	healthy := mk("good", status.BackupPhaseCompleted, older, &newer)
+	healthy.Status.BackupTime = &newer
+	healthyReg := prometheus.NewRegistry()
+	healthyReg.MustRegister(NewCollector(newFakeClient(t, loc, healthy), testOperatorNamespace))
+	if got, ok := gatherValue(t, healthyReg, "crystalbackup_backup_last_failure_timestamp_seconds", want); ok {
+		t.Fatalf("last_failure = %v was emitted for a series that has never failed; absence is the "+
+			"contract, and a 0 here would make time() - last_failure read as fifty-four years", got)
+	}
+}
+
 func TestCollectorBuildInfoAlwaysPresent(t *testing.T) {
 	// With no CRs at all, crystalbackup_build_info must still be emitted, so /metrics always carries
 	// a crystalbackup_ series (the M1 hard-assertion exit criterion).

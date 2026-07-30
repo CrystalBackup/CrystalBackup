@@ -5,11 +5,17 @@
 # one of these is a strict `>`, and off-by-one on a `>` is a rule that pages a bucket early or a day
 # late), and one that crosses the threshold but recovers inside the `for:` hold.
 #
-# BackupFailed is the odd one out and gets the most attention: it is a counter read through
-# increase(), which is a different failure mode from every other rule here. It has no `for:`,
-# because the 1h range IS the hold; and it has to survive the operator restart that resets the
-# counter to zero, which is the entire reason spec §1 made it a counter instead of the gauge
-# sibling that was there before.
+# BackupFailed is the odd one out and gets the most attention: it is the only rule here that reads
+# two series, and it does because neither could carry it alone. It has no `for:` — the 1h range IS
+# the hold — and it has to survive an operator restart, which is where the interesting cases are.
+#
+# The restart is NOT a counter reset. That belief was written into this file as a design
+# justification and it was wrong: a CounterVec child only exists once something increments it, so a
+# restarted operator publishes no `crystalbackup_backup_failures_total` series at all until the
+# next failure. The series does not return to zero, it stops — and increase() sees across a reset
+# but not across a disappearance. `crystalbackup_backup_last_failure_timestamp_seconds` is the state-derived
+# companion that closes it, and the cases below model the disappearance faithfully rather than as
+# a dip.
 rule_files:
   - ../../../charts/crystal-backup/rules/crystalbackup.rules.yaml
 
@@ -203,15 +209,42 @@ tests:
         alertname: CrystalbackupBackupFailed
         exp_alerts: []
 
-  # The reason this is a counter and not the gauge. The operator restarts, the counter goes back to
-  # zero, and increase() must still account for the failures that happened before the restart
-  # rather than reading the drop as "nothing happened". A `crystalbackup_backup_failures` gauge —
-  # which also exists, and counts wreckage that still EXISTS — cannot answer this question at all.
+  # An operator restart, modelled the way one actually happens.
+  #
+  # This case used to assert the opposite of the truth. It fed the counter "0x10 1x10 0x40" — a
+  # series that DIPS back to zero and carries on — and concluded that increase() had covered the
+  # restart. It had covered a counter RESET, which is a different event and the only one increase()
+  # handles. A restarted operator does not publish a zero: a CounterVec child does not exist until
+  # something increments it, so the new process publishes NO failures_total series at all until the
+  # next failure. The series does not dip, it ENDS.
+  #
+  # Measured on a real cluster with a real Prometheus, after the operator pod was replaced:
+  # `crystalbackup_backup_failures_total` returned zero series, and
+  # `increase(crystalbackup_backup_failures_total[1h])` returned three series all equal to 0, while
+  # a Backup had genuinely failed. The alert stayed silent, and this test said it would not.
+  #
+  # So the counter below simply runs out at t=20m and never resumes. That alone is the case the
+  # first disjunct cannot see; promtool has no way to assert "this rule would be silent without
+  # part of its expression", so what is asserted here is the fix — the alert fires anyway, carried
+  # by crystalbackup_backup_last_failure_timestamp_seconds, which is state-derived and therefore rebuilt from the
+  # surviving Backup object on the very first scrape of the new process. Delete the second disjunct
+  # from rules.go and this case goes red; that is the check.
   - interval: 1m
     name: a failure that straddles an operator restart still counts
     input_series:
+      # The counter does not exist until the failure — a CounterVec child materialises on its first
+      # Inc(), so the series APPEARS at 1 rather than stepping up from 0. Then the process it lived
+      # in is replaced and the series stops. Nothing publishes it again.
+      #
+      # Both halves of that are why increase() reads 0 here. A series whose samples in the window
+      # are all 1 has no rise to measure, and there is nothing after t=20m to compare against.
       - series: 'crystalbackup_backup_failures_total{namespace="team-a",tenant="acme",schedule="nightly",origin="namespace",location="dr",cluster="prod"}'
-        values: "0x10 1x10 0x40"
+        values: "_x10 1x10"
+      # The state-derived companion, present across the restart because it is recomputed from the
+      # Backup object rather than remembered. 600 is the failure's completionTime in promtool's
+      # epoch-based clock: t=10m, the same instant the counter moved.
+      - series: 'crystalbackup_backup_last_failure_timestamp_seconds{namespace="team-a",tenant="acme",schedule="nightly",origin="namespace",location="dr",cluster="prod"}'
+        values: "600x70"
     alert_rule_test:
       - eval_time: 55m
         alertname: CrystalbackupBackupFailed
@@ -227,6 +260,111 @@ tests:
             exp_annotations:
               summary: "Backup failed for team-a/nightly"
               description: "At least one Backup reached Failed or PartiallyFailed in the last hour. kubectl get backups -n team-a shows which."
+
+  # The widest case, and the one that has nothing to do with restarts.
+  #
+  # A CounterVec child materialises AT ONE. There is no pre-registered zero: RecordBackupTerminal
+  # only touches the child on the failure branch, so the very first failure of a (namespace,
+  # schedule) series does not step 0 -> 1, it appears at 1 and stays there. increase() measures a
+  # RISE between samples, and a window whose samples all read 1 contains no rise. The extrapolation
+  # that rescues a partially-covered range does not help either: it scales a delta, and the delta
+  # is zero.
+  #
+  # So the counter disjunct has never been able to page the FIRST failure a series ever records,
+  # with the process up the whole time and nothing restarted. Only the second failure moves it.
+  # That is the common shape of the incident an operator actually wants — a namespace that was fine
+  # yesterday and failed once tonight — and it was silent.
+  #
+  # Both halves are pinned below. The first is the defect, still true of the counter and now
+  # covered by the state-derived disjunct; the second proves the counter is not simply inert and
+  # that the first case is about the rise, not about the series being unreadable.
+  - interval: 1m
+    name: the first failure a series ever records — carried by last_failure, not by the counter
+    input_series:
+      - series: 'crystalbackup_backup_failures_total{namespace="team-a",tenant="acme",schedule="nightly",origin="namespace",location="dr",cluster="prod"}'
+        values: "_x10 1x50"
+      - series: 'crystalbackup_backup_last_failure_timestamp_seconds{namespace="team-a",tenant="acme",schedule="nightly",origin="namespace",location="dr",cluster="prod"}'
+        values: "600x60"
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: CrystalbackupBackupFailed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              namespace: team-a
+              tenant: acme
+              schedule: nightly
+              origin: namespace
+              location: dr
+              cluster: prod
+            exp_annotations:
+              summary: "Backup failed for team-a/nightly"
+              description: "At least one Backup reached Failed or PartiallyFailed in the last hour. kubectl get backups -n team-a shows which."
+
+  # The counter alone, on a SECOND failure — the one shape it can see. Remove the last_failure
+  # series from the case above and it goes silent; keep the rise here and the counter carries it
+  # unaided. The pair is what distinguishes "increase() cannot read this series" (false) from
+  # "increase() needs a rise and a first failure has none" (true).
+  - interval: 1m
+    name: a second failure moves the counter, and the counter alone is enough
+    input_series:
+      - series: 'crystalbackup_backup_failures_total{namespace="team-a",tenant="acme",schedule="nightly",origin="namespace",location="dr",cluster="prod"}'
+        values: "_x10 1x10 2x40"
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: CrystalbackupBackupFailed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              namespace: team-a
+              tenant: acme
+              schedule: nightly
+              origin: namespace
+              location: dr
+              cluster: prod
+            exp_annotations:
+              summary: "Backup failed for team-a/nightly"
+              description: "At least one Backup reached Failed or PartiallyFailed in the last hour. kubectl get backups -n team-a shows which."
+
+  # The other half of the restart fix, and the reason the second disjunct is a RECENCY test rather
+  # than the plain `crystalbackup_backup_failures > 0` gauge.
+  #
+  # That gauge also survives a restart, and it was rejected: it counts failed Backups that still
+  # exist, with no notion of when they failed. A Backup deliberately retained for diagnosis after
+  # failing three days ago would page on every evaluation until somebody deleted it — which trains
+  # an operator to silence the rule, the worst outcome an alert can have. Here the Backup failed at
+  # t=10m and is still there, the counter series is long gone with the process that owned it, and
+  # from 90 minutes on the alert says nothing — for as long as the object is kept.
+  - interval: 1m
+    name: a retained failure older than the window — silent, and does not page forever
+    input_series:
+      - series: 'crystalbackup_backup_last_failure_timestamp_seconds{namespace="team-a",tenant="acme",schedule="nightly",origin="namespace",location="dr",cluster="prod"}'
+        values: "600x200"
+    alert_rule_test:
+      - eval_time: 100m
+        alertname: CrystalbackupBackupFailed
+        exp_alerts: []
+      - eval_time: 180m
+        alertname: CrystalbackupBackupFailed
+        exp_alerts: []
+
+  # The healthy fleet, which is every series most of the time, and the case an `or` is most likely
+  # to break. The collector emits NO last_failure series for a namespace that has never failed —
+  # absence, not a zero — precisely because a zero would put the Unix epoch on the wire and
+  # `time() - 0` is fifty-four years. What is pinned here is that shape: a counter sitting flat at
+  # zero, no last_failure series at all, and silence.
+  - interval: 1m
+    name: a series that has never failed emits no last_failure at all — silent
+    input_series:
+      - series: 'crystalbackup_backup_failures_total{namespace="team-a",tenant="acme",schedule="nightly",origin="namespace",location="dr",cluster="prod"}'
+        values: "0x200"
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: CrystalbackupBackupFailed
+        exp_alerts: []
+      - eval_time: 180m
+        alertname: CrystalbackupBackupFailed
+        exp_alerts: []
 
   # A cluster-plane schedule reaches the same namespace with origin=cluster. Both planes have to
   # page, and they have to be distinguishable — the operator's first question on a missed backup is

@@ -344,15 +344,50 @@ var _ = Describe("Milestone M6 — alert rules fire on real conditions", Ordered
 						"cannot reach the repository; check the Jobs in %s", failNS, operatorNS)
 			}, 25*time.Minute, 15*time.Second).Should(Succeed())
 
-			By("And the counter series moves")
+			By("And both halves of the alert's input are on the wire")
+			// What this asserts changed after the 0.6.0 campaign, and the reason is worth stating
+			// because the obvious assertion is wrong in two different ways.
+			//
+			// It used to be `Expect(samples).NotTo(BeEmpty())` over `increase(...[1h])`. That is
+			// satisfied by a sample reading ZERO — a series present in the window that never rose —
+			// so it reported "the counter series moves" as passing during the campaign, ten minutes
+			// before CrystalbackupBackupFailed timed out. An intermediate assertion whose whole job
+			// is to disambiguate the failure underneath it must not be satisfiable by the value
+			// that means "no".
+			//
+			// But hardening it to demand a POSITIVE increase would be just as wrong, and red on
+			// every run. A CounterVec child materialises AT ONE: the first failure a series records
+			// appears at 1 rather than stepping 0 -> 1, and increase() measures a rise, so a first
+			// failure NEVER moves it. This lane provokes exactly one. The counter is therefore
+			// expected to read 1 with an increase of 0, and that is not a defect of this run —
+			// it is the defect the second disjunct exists for, pinned in
+			// internal/alerts/testdata/count_rules_test.yaml.
+			//
+			// So: the counter must EXIST (the terminal path recorded the failure at all), and
+			// last_failure must exist and be recent (the disjunct that actually carries the page
+			// here). Asserting only the alert would leave a green lane compatible with the metric
+			// never being emitted and the alert firing off something else entirely.
 			Eventually(func(g Gomega) {
-				samples, err := m6Query(fmt.Sprintf(
-					`increase(crystalbackup_backup_failures_total{namespace=%q}[1h])`, failNS))
+				counter := fmt.Sprintf(`crystalbackup_backup_failures_total{namespace=%q}`, failNS)
+				samples, err := m6Query(counter)
 				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(samples).NotTo(BeEmpty(),
-					"crystalbackup_backup_failures_total has no increase for %s — the Backup failed "+
-						"but the counter did not move, which is the exact gap the counter replaced the "+
-						"gauge to close", failNS)
+				g.Expect(m6PositiveSamples(samples)).NotTo(BeEmpty(),
+					"the failure counter was never recorded for %s — %s returned %s. A Backup here "+
+						"has already reached a failed phase (asserted above), so the terminal path "+
+						"did not reach RecordBackupTerminal", failNS, counter, m6DescribeSamples(samples))
+
+				// The state-derived companion, and the recency the rule reads. Queried as the
+				// rule's own second disjunct so a green here means the rule's input is true, not
+				// merely that a series with that name exists somewhere.
+				recent := fmt.Sprintf(
+					`(time() - crystalbackup_backup_last_failure_timestamp_seconds{namespace=%q}) < 3600`, failNS)
+				fresh, err := m6Query(recent)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(fresh).NotTo(BeEmpty(),
+					"crystalbackup_backup_last_failure_timestamp_seconds is absent or older than the window for %s — "+
+						"%s returned %s. This is the disjunct carrying the alert below: the counter "+
+						"cannot page a first failure, so without this the rule is silent",
+					failNS, recent, m6DescribeSamples(fresh))
 			}, 5*time.Minute, 15*time.Second).Should(Succeed())
 
 			By("And CrystalbackupBackupFailed fires, naming the namespace")

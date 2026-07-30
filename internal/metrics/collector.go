@@ -114,6 +114,15 @@ var (
 		NameBackupFailures,
 		"Number of Backups currently in a failed terminal phase (Failed or PartiallyFailed) for this series.",
 		backupLabels, nil)
+	// The restart-safe half of CrystalbackupBackupFailed. Its counter sibling
+	// crystalbackup_backup_failures_total is a real in-process CounterVec, and a CounterVec child
+	// does not exist until something increments it — so after an operator restart the series is
+	// gone, not zeroed, and increase() over a range where the series simply ENDS reports nothing.
+	// This one is recomputed from the Backup objects on the first scrape of the new process.
+	backupLastFailureDesc = prometheus.NewDesc(
+		NameBackupLastFailure,
+		"Unix time of the last Backup that reached Failed or PartiallyFailed for this series.",
+		backupLabels, nil)
 	backupProtectedBytesDesc = prometheus.NewDesc(
 		NameBackupProtectedBytes,
 		"Logical bytes currently protected for the namespace: the newest recorded size of every PVC that has a live restore point.",
@@ -158,6 +167,7 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- backupLastAddedDesc
 	ch <- backupLastDurationDesc
 	ch <- backupFailuresDesc
+	ch <- backupLastFailureDesc
 	ch <- backupProtectedBytesDesc
 	ch <- scheduleActiveDesc
 	ch <- schedulePeriodDesc
@@ -341,6 +351,7 @@ type backupSeriesKey = BackupSeries
 // backupSeries accumulates the state of one series across its Backups.
 type backupSeries struct {
 	lastSuccessUnix float64
+	lastFailureUnix float64
 	lastSize        float64
 	lastAdded       float64
 	lastDuration    float64
@@ -392,6 +403,15 @@ func collectBackups(ch chan<- prometheus.Metric, backups []cbv1.Backup, clusterB
 			ch <- prometheus.MustNewConstMetric(backupLastDurationDesc, prometheus.GaugeValue, s.lastDuration, vals...)
 		}
 		ch <- prometheus.MustNewConstMetric(backupFailuresDesc, prometheus.GaugeValue, s.failures, vals...)
+		// Gated exactly as last_success is, and for the same reason stated at the top of this
+		// file: a series that has NEVER failed must emit no last_failure at all. Publishing a 0
+		// would put the Unix epoch on the wire, and `time() - 0` is fifty-four years — the alert's
+		// recency test would then be false for every healthy series in the fleet, which is the
+		// right answer reached by an accident nobody should rely on. Absence is the honest form,
+		// and it is what keeps a fresh install silent.
+		if s.lastFailureUnix > 0 {
+			ch <- prometheus.MustNewConstMetric(backupLastFailureDesc, prometheus.GaugeValue, s.lastFailureUnix, vals...)
+		}
 	}
 	for key, volumes := range protected {
 		var total float64
@@ -459,6 +479,25 @@ func accumulateBackup(s *backupSeries, b *cbv1.Backup) {
 		}
 	case string(status.BackupPhaseFailed), string(status.BackupPhasePartiallyFailed):
 		s.failures++
+		// Newest failure wins, mirroring lastSuccessUnix above — the series answers "when did this
+		// last break", not "when did it first".
+		//
+		// status.completionTime is the honest reading and is what a run terminated by this
+		// operator carries. The fallback to creationTimestamp covers the two populations that do
+		// not have one: Backups that reached a terminal phase before the field existed, and
+		// discovery projections, which are reconstructed from restic snapshots and were never
+		// executed by a controller. Falling back rather than skipping is deliberate — the
+		// alternative is a failed Backup that contributes to no timestamp at all, and silently
+		// dropping a real failure is the one direction this family must not err in. Creation is
+		// earlier than the true completion, so the fallback can only make a failure look OLDER
+		// than it was, never newer.
+		at := float64(b.CreationTimestamp.Unix())
+		if b.Status.CompletionTime != nil {
+			at = float64(b.Status.CompletionTime.Unix())
+		}
+		if at > s.lastFailureUnix {
+			s.lastFailureUnix = at
+		}
 	}
 }
 

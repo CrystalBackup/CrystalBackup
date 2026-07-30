@@ -37,7 +37,14 @@ const (
 	NameBuildInfo = "crystalbackup_build_info"
 
 	// §2.1 Backup, per namespace, from Backup objects.
-	NameBackupLastSuccess    = "crystalbackup_backup_last_success_timestamp_seconds"
+	NameBackupLastSuccess = "crystalbackup_backup_last_success_timestamp_seconds"
+	// NameBackupLastFailure is last_success's mirror, and it exists for one reason: the
+	// BackupFailed alert could not survive an operator restart on the counter alone. A CounterVec
+	// child only materialises on its first Inc(), so after a restart the failures_total series is
+	// ABSENT rather than reset — and increase() cannot see across a disappearance the way it sees
+	// across a reset. Being state-derived, this one is rebuilt from the Backup objects on the very
+	// first scrape of the new process.
+	NameBackupLastFailure    = "crystalbackup_backup_last_failure_timestamp_seconds"
 	NameBackupLastSize       = "crystalbackup_backup_last_size_bytes"
 	NameBackupLastAdded      = "crystalbackup_backup_last_added_bytes"
 	NameBackupLastDuration   = "crystalbackup_backup_last_duration_seconds"

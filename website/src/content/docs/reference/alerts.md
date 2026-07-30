@@ -143,15 +143,16 @@ The deadline is the schedule's OWN period (1.1x + 1h), not a fixed 26h: a flat t
 **What to do.** At least one Backup reached Failed or PartiallyFailed in the last hour. kubectl get backups -n {{ $labels.namespace }} shows which.
 
 ```promql
-increase(crystalbackup_backup_failures_total[1h]) > 0
+increase(crystalbackup_backup_failures_total[3600s]) > 0
+or (time() - crystalbackup_backup_last_failure_timestamp_seconds < 3600)
 ```
 
 :::note[Why this threshold]
-Counter, so increase(): it survives the operator restart that resets it to zero (spec §1). The gauge sibling `crystalbackup_backup_failures` counts wreckage that still EXISTS — a different and also useful question, but not one increase() can ask.
+Two disjuncts, because the counter alone was measured to be SILENT on a real failure. The first is the ordinary reading, and increase() over an hour is also why there is no `for` hold: the range IS the hold. It is also, alone, unable to page the FIRST failure a series ever records — no restart required. A CounterVec child materialises AT ONE (RecordBackupTerminal touches it only on the failure branch, so nothing pre-registers a zero), and a window whose samples all read 1 holds no rise for increase() to measure. Only a SECOND failure moves it. That is the widest form of this defect and the likeliest incident in production: a namespace that was fine yesterday and failed once tonight. The second disjunct also exists because an operator restart does not RESET `crystalbackup_backup_failures_total` to zero — it makes the series DISAPPEAR. The same materialisation rule says a fresh process publishes no such series at all until something fails again, and increase() cannot see across a disappearance the way it sees across a reset. Measured on a live cluster: after the operator pod was replaced the counter returned ZERO series, the increase() returned 0, and a Backup had genuinely failed. Nothing fired. `crystalbackup_backup_last_failure_timestamp_seconds` is derived from the Backup objects at scrape time, so it is restart-safe by construction, and it is ABSENT for a series that has never failed — which is what keeps this rule silent on a healthy install rather than merely below a bound. The recency test is what stops it paging forever. The plain gauge `crystalbackup_backup_failures` survives a restart too, but it has no notion of WHEN: a Backup kept for diagnosis after failing three days ago would page every evaluation until somebody deleted it. RESIDUAL BLIND SPOT, accepted rather than hidden: if the operator restarts AND the failed Backup object is garbage-collected by its schedule's history limit inside the same hour, the counter series is gone and no object is left to derive a timestamp from. That failure is unrecoverable from either source and this rule will not fire for it. The remedy is a history limit greater than one, not a third disjunct.
 :::
 
 :::caution[The offline self-check answers this one approximately]
-Derived from Backup objects that still exist. The alert reads a COUNTER (increase over 1h), which survives the schedule history limit deleting a failed run; this predicate cannot. A failure already garbage-collected is not counted here.
+Derived from Backup objects that still exist. The alert's first disjunct reads a COUNTER (increase over 1h), which survives the schedule history limit deleting a failed run; this predicate cannot, and a failure already garbage-collected is not counted here. Its second disjunct is derived from the same objects this predicate reads, so on that half the two agree exactly — including the blind spot they share, which is precisely the deleted run.
 :::
 
 ## CrystalbackupRepositoryCheckFailed
