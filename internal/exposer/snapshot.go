@@ -254,3 +254,29 @@ func StartedAt(ctx context.Context, c client.Client, ex *Exposure) (time.Time, b
 	}
 	return created.Time, true
 }
+
+// CutAt reports the instant the STORAGE SYSTEM took the point-in-time copy: the CSI driver's
+// `status.creationTime` on the dynamic VolumeSnapshot. It is the boundary between the two halves
+// of an exposure — waiting for the driver to cut the snapshot, and the re-bind/clone dance that
+// makes the cut mountable by a mover in another namespace — which spec/05-observability.md §5
+// draws as two separate spans (`snapshot` and `expose`) and the controller drives as one phase.
+//
+// ok=false is the ordinary answer, not an error: `creation_time` is OPTIONAL in the CSI spec and
+// several drivers never set it. A caller that cannot get it must not guess — it collapses the two
+// spans into one covering the whole wait, which is honest, rather than inventing a boundary that
+// would put a made-up number on how slow someone's storage is.
+func CutAt(ctx context.Context, c client.Client, ex *Exposure) (time.Time, bool) {
+	vs := newUnstructured(volumeSnapshotGVK())
+	if err := c.Get(ctx, client.ObjectKey{Namespace: ex.OriginNamespace, Name: ex.OriginVSName}, vs); err != nil {
+		return time.Time{}, false
+	}
+	raw, found, err := unstructured.NestedString(vs.Object, "status", "creationTime")
+	if err != nil || !found || raw == "" {
+		return time.Time{}, false
+	}
+	cut, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return cut, true
+}

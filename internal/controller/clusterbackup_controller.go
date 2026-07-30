@@ -39,6 +39,8 @@ import (
 	"github.com/CrystalBackup/CrystalBackup/internal/metrics"
 	"github.com/CrystalBackup/CrystalBackup/internal/nsselector"
 	"github.com/CrystalBackup/CrystalBackup/internal/status"
+	"github.com/CrystalBackup/CrystalBackup/internal/tracing"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 // clusterBackupPollInterval paces re-reconciles while a run is still Running. The child-Backup
@@ -113,12 +115,16 @@ func NewClusterBackupReconciler(
 // selector, ensure one child Backup per matched namespace (idempotent, label-linked), then
 // aggregate the children into the run's status exactly once.
 func (r *ClusterBackupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	log := logf.FromContext(ctx)
-
 	var cb cbv1.ClusterBackup
 	if err := r.Get(ctx, req.NamespacedName, &cb); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
+
+	// The RUN's own trace anchor (spec/05-observability.md §5), and the `traceID` log key that
+	// goes with it (§4). Every child Backup derives a LINK to this same UID, which is why the run
+	// gets a root span of its own rather than being the parent of two hundred namespaces' spans.
+	ctx, _ = traced(ctx, cb.UID)
+	log := logf.FromContext(ctx)
 
 	// A terminal run is frozen: a stray child-watch event on a finished run must not re-run it or
 	// re-open its aggregate record. (First reconcile has an empty phase and falls through.)
@@ -420,11 +426,12 @@ func (r *ClusterBackupReconciler) aggregateAndWrite(
 		if st.StartTime != nil && st.CompletionTime != nil {
 			duration = st.CompletionTime.Sub(st.StartTime.Time)
 		}
-		metrics.RecordClusterBackupTerminal(metrics.ClusterBackupSeries{
+		metrics.RecordClusterBackupTerminal(ctx, metrics.ClusterBackupSeries{
 			Schedule: cb.Spec.ScheduleRef,
 			Location: cb.Spec.LocationRef.Name,
 			Cluster:  loc.Spec.ClusterID,
 		}, string(phase), duration)
+		emitClusterBackupRootSpan(ctx, cb, loc, phase, st)
 	}
 	if terminal {
 		return ctrl.Result{}, nil
@@ -522,4 +529,48 @@ func (r *ClusterBackupReconciler) mapChildToRun(_ context.Context, obj client.Ob
 		return nil
 	}
 	return []reconcile.Request{{NamespacedName: types.NamespacedName{Name: run}}}
+}
+
+// emitClusterBackupRootSpan emits the RUN's root span (spec/05-observability.md §5): one span
+// covering a whole fleet DR run, from fan-out start to the last child settling.
+//
+// It is a root of its OWN trace, and every per-namespace Backup carries a span LINK to it rather
+// than being parented by it. That is the shape §5 specifies and the arithmetic is the reason: a
+// nightly run over two hundred namespaces, each with a handful of PVCs, parents into a single
+// trace of tens of thousands of spans — past what Tempo renders, well past what anyone reads, and
+// it would bury the one namespace that failed among the hundred and ninety-nine that did not.
+// Linked, each namespace gets a human-sized trace and the run stays one click away from all of
+// them.
+//
+// The run's own span therefore has few children of its own: it is a fan-out marker carrying the
+// aggregate verdict, which is exactly what a fleet operator opens it for.
+func emitClusterBackupRootSpan(
+	ctx context.Context, cb *cbv1.ClusterBackup, loc *cbv1.ClusterBackupLocation,
+	phase status.ClusterBackupPhase, st *cbv1.ClusterBackupStatus,
+) {
+	anchor := tracing.AnchorFor(string(cb.UID))
+	if !anchor.Valid() {
+		return
+	}
+	attrs := make([]attribute.KeyValue, 0, 8)
+	attrs = append(attrs,
+		attribute.Int("crystalbackup.namespaces_matched", int(st.NamespacesMatched)),
+		attribute.Int("crystalbackup.namespaces_failed", int(st.NamespacesFailed)))
+	attrs = append(attrs, tracing.StringAttr(tracing.AttrClusterBackup, cb.Name)...)
+	attrs = append(attrs, tracing.StringAttr(tracing.AttrSchedule, cb.Spec.ScheduleRef)...)
+	attrs = append(attrs, tracing.StringAttr(tracing.AttrLocation, cb.Spec.LocationRef.Name)...)
+	attrs = append(attrs, tracing.StringAttr(tracing.AttrCluster, loc.Spec.ClusterID)...)
+	attrs = append(attrs, tracing.StringAttr(tracing.AttrOrigin, apiconst.OriginCluster)...)
+	attrs = append(attrs, tracing.StringAttr(tracing.AttrPhase, string(phase))...)
+
+	var spanErr error
+	if st.NamespacesFailed > 0 {
+		spanErr = fmt.Errorf("run %s ended %s: %d of %d namespace(s) failed",
+			cb.Name, phase, st.NamespacesFailed, st.NamespacesMatched)
+	}
+	// startTime, not the object's creation, exactly as the run-duration histogram measures it: a
+	// run that waited on a concurrencyPolicy or a gated location did not spend that time moving
+	// data, and a span that included the wait would describe queueing rather than throughput.
+	anchor.EmitRoot(ctx, "clusterbackup",
+		timeOrZero(st.StartTime), timeOrZero(st.CompletionTime), spanErr, nil, attrs...)
 }

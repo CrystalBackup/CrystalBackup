@@ -17,10 +17,12 @@ limitations under the License.
 package metrics
 
 import (
+	"context"
 	"strings"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"go.opentelemetry.io/otel/trace"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 )
 
@@ -218,6 +220,40 @@ func init() {
 	)
 }
 
+// exemplarTraceIDLabel is the label name a Prometheus exemplar carries a trace id under. It is
+// `trace_id` — the name Grafana's exemplar-to-Tempo link looks for by default and the one
+// OpenMetrics conventions settled on — and it is NOT a metric label: exemplars live beside the
+// bucket, not in the series, so this adds no cardinality whatsoever (spec/05-observability.md §1).
+const exemplarTraceIDLabel = "trace_id"
+
+// observe records one histogram sample, attaching the CURRENT trace as an exemplar when there is
+// one (spec/05-observability.md §5).
+//
+// This is the click-through that makes a latency histogram actionable. A p99 spike in
+// crystalbackup_backup_duration_seconds says a backup somewhere took twenty minutes; the exemplar
+// says WHICH one, and lands the reader in the trace that shows the eleven minutes it spent
+// waiting for one CSI driver. Without it the same investigation is a manual join across a time
+// range, a namespace guess and a log search.
+//
+// With tracing inactive — the default, and the overwhelming majority of installations — this is a
+// plain Observe: no exemplar, no allocation, and the same samples that were being recorded before
+// this lot existed. The recorded span must be SAMPLED as well as valid; hanging an exemplar on a
+// trace id that was dropped at the head would produce a link to a trace the backend never
+// received, which is worse than no link at all.
+func observe(ctx context.Context, o prometheus.Observer, v float64) {
+	sc := trace.SpanContextFromContext(ctx)
+	if !sc.IsValid() || !sc.IsSampled() {
+		o.Observe(v)
+		return
+	}
+	ex, ok := o.(prometheus.ExemplarObserver)
+	if !ok {
+		o.Observe(v)
+		return
+	}
+	ex.ObserveWithExemplar(v, prometheus.Labels{exemplarTraceIDLabel: sc.TraceID().String()})
+}
+
 // resultOf renders a terminal phase as the `result` label value: the phase, lowercased.
 //
 // spec/05-observability.md §2.11 enumerates three values for a Backup — completed,
@@ -235,7 +271,7 @@ func resultOf(phase string) string { return strings.ToLower(phase) }
 // duration is measured the same way crystalbackup_backup_last_duration_seconds is (creation to
 // backupTime) so a dashboard can put the gauge and the histogram's quantiles on one axis without
 // explaining why they disagree.
-func RecordBackupTerminal(s BackupSeries, phase string, duration time.Duration, addedBytes int64) {
+func RecordBackupTerminal(ctx context.Context, s BackupSeries, phase string, duration time.Duration, addedBytes int64) {
 	vals := s.values()
 	backupTotal.WithLabelValues(append(append([]string{}, vals...), resultOf(phase))...).Inc()
 
@@ -246,7 +282,7 @@ func RecordBackupTerminal(s BackupSeries, phase string, duration time.Duration, 
 	if duration < 0 {
 		duration = 0
 	}
-	backupDuration.WithLabelValues(vals...).Observe(duration.Seconds())
+	observe(ctx, backupDuration.WithLabelValues(vals...), duration.Seconds())
 
 	if addedBytes > 0 {
 		backupAddedTotal.WithLabelValues(vals...).Add(float64(addedBytes))
@@ -264,24 +300,24 @@ func backupPhaseFailed(phase string) bool {
 }
 
 // RecordClusterBackupTerminal records ONE ClusterBackup run reaching a terminal phase.
-func RecordClusterBackupTerminal(s ClusterBackupSeries, phase string, duration time.Duration) {
+func RecordClusterBackupTerminal(ctx context.Context, s ClusterBackupSeries, phase string, duration time.Duration) {
 	vals := s.values()
 	clusterBackupRunsTotal.WithLabelValues(append(append([]string{}, vals...), resultOf(phase))...).Inc()
 	if duration < 0 {
 		duration = 0
 	}
-	clusterBackupDuration.WithLabelValues(vals...).Observe(duration.Seconds())
+	observe(ctx, clusterBackupDuration.WithLabelValues(vals...), duration.Seconds())
 }
 
 // RecordRestoreTerminal records ONE Restore/ClusterRestore reaching a terminal phase. mode is the
 // restore's spec.mode; an empty mode (an older object written before the field was required)
 // records as the empty label rather than being guessed into one of the two.
-func RecordRestoreTerminal(s RestoreSeries, mode, phase string, duration time.Duration) {
+func RecordRestoreTerminal(ctx context.Context, s RestoreSeries, mode, phase string, duration time.Duration) {
 	vals := append(append([]string{}, s.values()...), mode)
 	if duration < 0 {
 		duration = 0
 	}
-	restoreDuration.WithLabelValues(vals...).Observe(duration.Seconds())
+	observe(ctx, restoreDuration.WithLabelValues(vals...), duration.Seconds())
 	if phase == phaseFailed || phase == phasePartiallyFailed {
 		restoreFailuresTotal.WithLabelValues(vals...).Inc()
 	}
@@ -294,11 +330,11 @@ func RecordRestoreTerminal(s RestoreSeries, mode, phase string, duration time.Du
 // restic, adr/0013 amendment), so there is no byte count to read. A secondary's entire value rests
 // on its numbers being believable, and an estimate presented as a measurement is worse than the
 // absence — see spec/05-observability.md §2.12.
-func RecordExternalSyncDuration(s ExternalSyncSeries, duration time.Duration) {
+func RecordExternalSyncDuration(ctx context.Context, s ExternalSyncSeries, duration time.Duration) {
 	if duration < 0 {
 		duration = 0
 	}
-	externalSyncDuration.WithLabelValues(s.values()...).Observe(duration.Seconds())
+	observe(ctx, externalSyncDuration.WithLabelValues(s.values()...), duration.Seconds())
 }
 
 // RecordErasureCompleted records the physical deletion one completed ClusterErasure performed.
@@ -340,9 +376,9 @@ func RecordWebhookDenial(webhook, reason string) {
 // answering in four minutes instead of four seconds still completes every backup, just not inside
 // the night. It gets its own bucket scale (exposureBuckets) for that reason: on the shared
 // duration buckets every healthy exposure lands in the first bucket and the histogram says nothing.
-func RecordExposureReadyWait(namespace, tenant, exposerKind, cluster string, wait time.Duration) {
+func RecordExposureReadyWait(ctx context.Context, namespace, tenant, exposerKind, cluster string, wait time.Duration) {
 	if wait < 0 {
 		wait = 0
 	}
-	exposureReadyWait.WithLabelValues(namespace, tenant, exposerKind, cluster).Observe(wait.Seconds())
+	observe(ctx, exposureReadyWait.WithLabelValues(namespace, tenant, exposerKind, cluster), wait.Seconds())
 }

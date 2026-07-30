@@ -53,6 +53,8 @@ import (
 	"github.com/CrystalBackup/CrystalBackup/internal/repo/queue"
 	"github.com/CrystalBackup/CrystalBackup/internal/restic"
 	"github.com/CrystalBackup/CrystalBackup/internal/status"
+	"github.com/CrystalBackup/CrystalBackup/internal/tracing"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 // backupPollInterval paces re-reconciles while a Backup is still driving its volumes forward:
@@ -279,6 +281,13 @@ func (r *BackupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		return ctrl.Result{}, fmt.Errorf("get Backup %s/%s: %w", req.Namespace, req.Name, err)
 	}
 
+	// Join this pass to the Backup's trace (spec/05-observability.md §5) and stamp `traceID` on
+	// every log line it produces (§4). The anchor is DERIVED from the object's UID, so this pass
+	// lands in the same trace as the forty passes before it without either of them having been
+	// told — including across a process restart or a leader-election handover. Inert, and 4ns,
+	// when tracing is not configured.
+	ctx, _ = traced(ctx, backup.UID)
+
 	if !backup.DeletionTimestamp.IsZero() {
 		return r.finalize(ctx, &backup)
 	}
@@ -478,7 +487,8 @@ func (r *BackupReconciler) writeStatus(ctx context.Context, backup *cbv1.Backup,
 	// path that cannot tell success from failure, which trades a rare undercount for a
 	// systematic one.
 	if justTerminal {
-		recordBackupTerminalMetrics(backup, rc)
+		recordBackupTerminalMetrics(ctx, backup, rc)
+		r.emitBackupRootSpan(ctx, backup, rc)
 	}
 	if terminal {
 		return ctrl.Result{}, nil
@@ -486,9 +496,60 @@ func (r *BackupReconciler) writeStatus(ctx context.Context, backup *cbv1.Backup,
 	return ctrl.Result{RequeueAfter: backupPollInterval}, nil
 }
 
+// emitBackupRootSpan emits the `backup` span of spec/05-observability.md §5 — the ROOT of this
+// Backup's trace, and the last span of it to be produced.
+//
+// The ordering is the whole design. Its children (hooks, per-PVC snapshot/expose/mover, manifests)
+// were emitted one at a time over the preceding minutes or hours, by reconciles that had already
+// ended; each named a parent span id it computed from this object's UID. This call finally emits
+// that parent, pinned to the very id they were told, so the tree assembles at the collector rather
+// than in any process's memory.
+//
+// It rides on justTerminal — backupTime having just been set, after the status write that made it
+// durable — for exactly the reason the terminal counters do: everything else in this controller
+// re-runs (a conflict retry, the already-terminal sweep), and a re-run here would publish a second
+// root span for the same backup, which a backend renders as two conflicting versions of one trace.
+func (r *BackupReconciler) emitBackupRootSpan(ctx context.Context, backup *cbv1.Backup, rc *backupRunContext) {
+	anchor := backupAnchor(backup)
+	if !anchor.Valid() {
+		return
+	}
+	attrs := backupSpanAttrs(backup, rc)
+	attrs = append(attrs, tracing.StringAttr(tracing.AttrPhase, backup.Status.Phase)...)
+
+	// A failed backup is a failed span. The message is the headline condition's, so the trace and
+	// `kubectl describe backup` give the same account of what went wrong.
+	var spanErr error
+	if backupPhaseIsFailure(backup.Status.Phase) {
+		spanErr = fmt.Errorf("backup %s/%s ended %s: %s", backup.Namespace, backup.Name,
+			backup.Status.Phase, terminalConditionMessage(backup))
+	}
+
+	anchor.EmitRoot(ctx, "backup",
+		backup.CreationTimestamp.Time, timeOrZero(backup.Status.BackupTime), spanErr,
+		runLink(ctx, r.Client, backup), attrs...)
+}
+
+// backupPhaseIsFailure reports whether a terminal phase should mark the root span errored.
+// PartiallyFailed does: some of this namespace's data did not reach the repository, and a trace
+// that renders that as a success is a trace nobody will think to open. PartiallyCompleted does
+// NOT — volumes skipped for want of CSI snapshot support are a documented outcome, not a fault of
+// this run — and it is legible on the span through crystalbackup.phase.
+func backupPhaseIsFailure(phase string) bool {
+	return phase == string(status.BackupPhaseFailed) || phase == string(status.BackupPhasePartiallyFailed)
+}
+
+// terminalConditionMessage returns the headline condition's message, for the span's error status.
+func terminalConditionMessage(backup *cbv1.Backup) string {
+	if c := status.FindCondition(backup.Status.Conditions, ConditionReady); c != nil && c.Message != "" {
+		return c.Message
+	}
+	return "see the Backup's conditions"
+}
+
 // recordBackupTerminalMetrics emits the event half of the backup catalogue for ONE Backup that
 // has just reached a terminal phase and had that phase persisted (05-observability.md §2.1/§2.11).
-func recordBackupTerminalMetrics(backup *cbv1.Backup, rc *backupRunContext) {
+func recordBackupTerminalMetrics(ctx context.Context, backup *cbv1.Backup, rc *backupRunContext) {
 	var added int64
 	for _, v := range backup.Status.Volumes {
 		added += v.AddedBytes
@@ -499,7 +560,10 @@ func recordBackupTerminalMetrics(backup *cbv1.Backup, rc *backupRunContext) {
 	if backup.Status.BackupTime != nil {
 		duration = backup.Status.BackupTime.Sub(backup.CreationTimestamp.Time)
 	}
-	metrics.RecordBackupTerminal(backupMetricSeries(backup, rc), backup.Status.Phase, duration, added)
+	// ctx carries the Backup's trace anchor (installed at the top of Reconcile), so this
+	// observation lands in the histogram with an exemplar pointing at the trace that produced it:
+	// a click from a p99 spike in Grafana to the eleven minutes one CSI driver spent thinking.
+	metrics.RecordBackupTerminal(ctx, backupMetricSeries(backup, rc), backup.Status.Phase, duration, added)
 }
 
 // moverMetricClusterID resolves the `cluster` label for the platform-scope families, which carry
@@ -561,7 +625,8 @@ func (r *BackupReconciler) failHooks(ctx context.Context, backup *cbv1.Backup, r
 	// the tenant asked for a restore point and does not have one. It carries no uploaded bytes
 	// and a duration that is essentially the hook timeout, both of which are the truth about it.
 	if justTerminal {
-		recordBackupTerminalMetrics(backup, rc)
+		recordBackupTerminalMetrics(ctx, backup, rc)
+		r.emitBackupRootSpan(ctx, backup, rc)
 	}
 	r.Recorder.Eventf(backup, nil, corev1.EventTypeWarning, "BackupFailed", "PreHookFailed",
 		"no snapshot was taken: %s", message)
@@ -999,6 +1064,14 @@ func (r *BackupReconciler) advanceSnapshotting(ctx context.Context, backup *cbv1
 		BackoffLimit: rc.backoffLimit,
 		TTLSeconds:   moverJobTTLSeconds,
 		Labels:       labels,
+		// The W3C handover (spec/05-observability.md §5). The parent it names is the `mover` span
+		// for THIS PVC — a span that does not exist yet and will not until the Job finishes, at
+		// which point advanceUploading emits it with the very id derived here. Both sides compute
+		// that id from the Backup's UID and the PVC name, so they agree without communicating,
+		// which is the only way they could: the env var has to be written before the span it
+		// points at can be emitted. Nil, and therefore absent from the pod spec entirely, when
+		// tracing is off.
+		TraceEnv: tracing.JobEnv(backupAnchor(backup).StepContext(ctx, tracing.StepPVC(tracing.StepMover, vol.Pvc))),
 		// Soft-spread the cascade's movers across nodes so a wide fan-out does not pile its data
 		// movement onto one kubelet.
 		SpreadOverLabels: map[string]string{apiconst.LabelManagedBy: apiconst.ManagedByValue},
@@ -1035,12 +1108,49 @@ func (r *BackupReconciler) advanceSnapshotting(ctx context.Context, backup *cbv1
 	// EXACTLY ONCE per volume — every earlier return leaves the volume in Snapshotting for
 	// another pass — which is what makes it the one honest place to close the timer.
 	if start, ok := exposer.StartedAt(ctx, r.Client, exposure); ok {
-		metrics.RecordExposureReadyWait(backup.Namespace, rc.tenant, ex.Kind(),
+		metrics.RecordExposureReadyWait(ctx, backup.Namespace, rc.tenant, ex.Kind(),
 			moverMetricClusterID(backup, rc), time.Since(start))
+		r.emitExposureSpans(ctx, backup, rc, vol.Pvc, ex.Kind(), exposure, start)
 	}
 
 	vol.Phase = status.VolumePhaseUploading
 	return nil
+}
+
+// emitExposureSpans emits the `snapshot` and `expose` spans of spec/05-observability.md §5 for one
+// volume, from the same exactly-once point the exposure histogram is closed at.
+//
+// §5 draws them as two nodes; the controller drives them as one phase (Snapshotting), because
+// there is no reconcile boundary between "the driver has cut the snapshot" and "the cut is
+// mountable by a mover in another namespace". The only observable boundary is the CSI driver's own
+// status.creationTime on the VolumeSnapshot — and that field is OPTIONAL in the CSI spec, so
+// several drivers never write it.
+//
+// So: with the cut time, two spans, split where the storage system says the copy was taken. Without
+// it, ONE `expose` span covering the whole wait. Inventing the boundary would be worse than
+// merging: it would put a fabricated number on how long someone's storage took, which is exactly
+// the question the two spans exist to answer.
+func (r *BackupReconciler) emitExposureSpans(
+	ctx context.Context, backup *cbv1.Backup, rc *backupRunContext,
+	pvc, exposerKind string, exposure *exposer.Exposure, start time.Time,
+) {
+	anchor := backupAnchor(backup)
+	if !anchor.Valid() {
+		return
+	}
+	attrs := backupSpanAttrs(backup, rc)
+	attrs = append(attrs, tracing.StringAttr(tracing.AttrPVC, pvc)...)
+	attrs = append(attrs, tracing.StringAttr(tracing.AttrExposer, exposerKind)...)
+
+	end := time.Now()
+	exposeFrom := start
+	if cut, ok := exposer.CutAt(ctx, r.Client, exposure); ok && cut.After(start) && cut.Before(end) {
+		anchor.EmitStep(ctx, tracing.StepPVC(tracing.StepSnapshot, pvc), "snapshot",
+			start, cut, nil, attrs...)
+		exposeFrom = cut
+	}
+	anchor.EmitStep(ctx, tracing.StepPVC(tracing.StepExpose, pvc), "expose",
+		exposeFrom, end, nil, attrs...)
 }
 
 // moverSlotBlocked is the admission gate for one PVC's mover. It combines the per-repo backup⇄unlock
@@ -1176,7 +1286,39 @@ func (r *BackupReconciler) advanceUploading(ctx context.Context, backup *cbv1.Ba
 			r.enqueueStaleLockUnlock(ctx, backup, rc)
 		}
 	}
+	emitMoverSpan(ctx, backup, rc, vol, &job)
 	return vol.Pvc, nil // request teardown once Reconcile has persisted this terminal result
+}
+
+// emitMoverSpan emits §5's per-PVC `mover` span, spanning the Job's whole execution — which no
+// single reconcile witnessed, and which for a large volume may have outlived the process that
+// started it. Its window comes off the Job's own status, written by the Job controller and
+// therefore durable; the mover shim's `restic.backup` span nests inside it, having been handed
+// this span's id in TRACEPARENT when the Job was created.
+//
+// Emitted from the pass that first observes the Job terminal — the same exactly-once point
+// RecordMoverJobRetries fires at, and for the same reason: the caller persists this volume's
+// terminal phase and the top-of-Reconcile short-circuit bars re-entry, so this line is reached
+// once per volume per Backup.
+func emitMoverSpan(ctx context.Context, backup *cbv1.Backup, rc *backupRunContext, vol *cbv1.VolumeStatus, job *batchv1.Job) {
+	anchor := backupAnchor(backup)
+	if !anchor.Valid() {
+		return
+	}
+	attrs := backupSpanAttrs(backup, rc)
+	attrs = append(attrs, tracing.StringAttr(tracing.AttrPVC, vol.Pvc)...)
+	attrs = append(attrs, tracing.StringAttr(tracing.AttrNode, vol.Node)...)
+	attrs = append(attrs, tracing.StringAttr(tracing.AttrSnapshotID, vol.SnapshotID)...)
+	if vol.AddedBytes > 0 {
+		attrs = append(attrs, attribute.Int64(tracing.AttrBytesAdded, vol.AddedBytes))
+	}
+
+	var spanErr error
+	if vol.Phase == status.VolumePhaseFailed {
+		spanErr = fmt.Errorf("mover for PVC %s failed: %s", vol.Pvc, vol.Reason)
+	}
+	start, end := jobWindow(job)
+	anchor.EmitStep(ctx, tracing.StepPVC(tracing.StepMover, vol.Pvc), "mover", start, end, spanErr, attrs...)
 }
 
 // teardownVolume tears an exposure + mover Job + creds Secret down after its terminal result has

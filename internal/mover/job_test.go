@@ -453,3 +453,76 @@ func derefBool(p *bool) bool {
 func isFalse(p *bool) bool {
 	return p != nil && !*p
 }
+
+// TestBuildJobWithoutTraceEnvIsUnchanged is the byte-reproducibility half of the tracing lot's
+// no-op promise (spec/05-observability.md §5): an install with no OTLP collector must get EXACTLY
+// the Job spec it got before tracing existed. Two blank variables in every mover pod would be a
+// small thing that is nonetheless a change to a spec this package promises is a pure function of
+// its request.
+func TestBuildJobWithoutTraceEnvIsUnchanged(t *testing.T) {
+	req := dataRequest()
+	req.TraceEnv = nil
+	withoutField := BuildJob(req).Spec.Template.Spec.Containers[0].Env
+
+	req.TraceEnv = map[string]string{} // an empty map must behave exactly like nil
+	withEmptyMap := BuildJob(req).Spec.Template.Spec.Containers[0].Env
+
+	if len(withoutField) != len(withEmptyMap) {
+		t.Fatalf("an empty TraceEnv changed the env length: %d vs %d", len(withoutField), len(withEmptyMap))
+	}
+	for _, e := range withoutField {
+		if e.Name == "TRACEPARENT" || e.Name == "TRACESTATE" {
+			t.Errorf("%s is present on a Job built with no trace context", e.Name)
+		}
+	}
+}
+
+// TestBuildJobTraceEnvIsSortedAndPrecedesExtraEnv pins the two properties the handover depends on.
+//
+// SORTED, because a mover Job spec must be byte-reproducible across releases and across builds,
+// and ranging a Go map is deliberately not. BEFORE ExtraEnv, because a duplicate env var is
+// resolved by the kubelet in favour of the LAST occurrence — so an operator who sets one of these
+// through their own chart values overrides what the controller injected, rather than being
+// silently overridden by it.
+func TestBuildJobTraceEnvIsSortedAndPrecedesExtraEnv(t *testing.T) {
+	req := dataRequest()
+	req.TraceEnv = map[string]string{
+		"TRACEPARENT":                 "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+		"OTEL_SERVICE_NAME":           "crystal-backup-mover",
+		"OTEL_EXPORTER_OTLP_ENDPOINT": "http://collector.observability:4317",
+	}
+	req.ExtraEnv = []corev1.EnvVar{{Name: "OTEL_SERVICE_NAME", Value: "operator-override"}}
+	env := BuildJob(req).Spec.Template.Spec.Containers[0].Env
+
+	idx := func(name string) []int {
+		var out []int
+		for i, e := range env {
+			if e.Name == name {
+				out = append(out, i)
+			}
+		}
+		return out
+	}
+
+	// Sorted among themselves.
+	endpoint, service, traceparent := idx("OTEL_EXPORTER_OTLP_ENDPOINT"), idx("OTEL_SERVICE_NAME"), idx("TRACEPARENT")
+	if len(endpoint) != 1 || len(traceparent) != 1 || len(service) != 2 {
+		t.Fatalf("unexpected occurrences: endpoint=%v service=%v traceparent=%v", endpoint, service, traceparent)
+	}
+	if endpoint[0] >= service[0] || service[0] >= traceparent[0] {
+		t.Errorf("TraceEnv is not emitted in sorted key order: endpoint=%d service=%d traceparent=%d",
+			endpoint[0], service[0], traceparent[0])
+	}
+	// And the caller's ExtraEnv wins the duplicate, by coming last.
+	if service[1] <= traceparent[0] {
+		t.Errorf("ExtraEnv's OTEL_SERVICE_NAME at %d does not follow the trace block ending at %d",
+			service[1], traceparent[0])
+	}
+	if env[service[1]].Value != "operator-override" {
+		t.Errorf("the last OTEL_SERVICE_NAME is %q, want the caller's override", env[service[1]].Value)
+	}
+	// The fixed protocol variables still come first.
+	if env[0].Name != envRepository {
+		t.Errorf("env[0] = %s, want %s", env[0].Name, envRepository)
+	}
+}

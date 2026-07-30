@@ -35,6 +35,7 @@ import (
 	"github.com/CrystalBackup/CrystalBackup/internal/repo/queue"
 	"github.com/CrystalBackup/CrystalBackup/internal/restic"
 	"github.com/CrystalBackup/CrystalBackup/internal/status"
+	"github.com/CrystalBackup/CrystalBackup/internal/tracing"
 )
 
 // This file holds the Backup controller's two REPOSITORY MAINTENANCE ops — retention forget after a
@@ -148,6 +149,33 @@ func (r *BackupReconciler) maybeEnqueueRetentionForget(ctx context.Context, back
 	if !ok {
 		return // no keep policy set: never run a forget that would delete everything.
 	}
+	// §5's `forget` span. The retention pass is fire-and-forget on the repository's EXCLUSIVE
+	// queue, so its span covers the enqueue-to-done window — the queue wait included, deliberately:
+	// from this backup's point of view, "retention took forty minutes" is the true statement, and
+	// the forty minutes were spent behind a prune on the same repository, which is precisely what
+	// the operator reading the trace needs to see.
+	//
+	// The window is timed in-process because there is no object to read it back from: the
+	// maintenance Job is created and deleted inside the queue's run func, and a run that a SIGTERM
+	// interrupts simply produces no span, which is honest — nobody knows how it ended either.
+	//
+	// Guarded rather than left to the inert Anchor: this is the one emit site whose arguments
+	// OUTLIVE the call. The closure below holds the attribute slice for the whole time the op sits
+	// on the repository's lane, which can be hours behind a prune, and building one per backup for
+	// an install that traces nothing is a retention this operator does not need.
+	var onForgetDone func(error)
+	if anchor := backupAnchor(backup); anchor.Valid() {
+		attrs := backupSpanAttrs(backup, rc)
+		enqueuedAt := time.Now()
+		// Emitted from the QUEUE WORKER goroutine, on a context detached from this reconcile —
+		// which has long since returned. The anchor is a value derived from the Backup's UID, so
+		// it is safe to close over: it holds no client, no object and no cancellable state.
+		spanCtx := context.WithoutCancel(ctx)
+		onForgetDone = func(err error) {
+			anchor.EmitStep(spanCtx, tracing.StepForget, "forget", enqueuedAt, time.Now(), err, attrs...)
+		}
+	}
+
 	enqueueRepoMaintenance(ctx, r.Queue, r.maintenanceDeps(), repoMaintenanceRequest{
 		RepoName:       rc.repoName,
 		Kind:           queue.OpForget,
@@ -158,6 +186,12 @@ func (r *BackupReconciler) maybeEnqueueRetentionForget(ctx context.Context, back
 		DEK:            rc.dek,
 		S3CredsSecret:  rc.s3CredsSecret,
 		CredsNamespace: rc.credsNamespace,
+		// nil when tracing is off, which is what the queue already expects of this field.
+		//
+		// crystalbackup.snapshots_removed, which §5 asks for on this span, is NOT set: the
+		// termination-message protocol carries no forgotten-snapshot count, and `restic forget`
+		// reports its removals only as human-readable stdout, so there is no number to put there.
+		OnDone: onForgetDone,
 	})
 	r.Recorder.Eventf(backup, nil, corev1.EventTypeNormal, "RetentionEnqueued", "EnqueueRetention",
 		"retention forget enqueued on repository %s", rc.repoName)

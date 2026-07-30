@@ -253,7 +253,7 @@ func (r *RestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// short-circuit at the top of Reconcile bars re-entry. A namespaced Restore's identity is its
 	// SOURCE Backup's — the collector resolves it the same way, through the same object — so the
 	// counter and the last_success gauge land on one series.
-	metrics.RecordRestoreTerminal(restoreMetricSeries(restore.Namespace, source, rc.clusterID),
+	metrics.RecordRestoreTerminal(ctx, restoreMetricSeries(restore.Namespace, source, rc.clusterID),
 		string(restore.Spec.Mode), string(phase), time.Since(restore.CreationTimestamp.Time))
 
 	// (6) The terminal result is durable: reclaim the operator-side residue. The manifest half

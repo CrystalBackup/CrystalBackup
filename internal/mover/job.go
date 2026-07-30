@@ -22,6 +22,8 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"github.com/CrystalBackup/CrystalBackup/internal/tracing"
 )
 
 // Internal names for the mover container and its volumes. They are stable identifiers, not
@@ -123,6 +125,17 @@ type JobRequest struct {
 	// ExtraEnv is appended AFTER the fixed env (e.g. AWS_DEFAULT_REGION, RESTIC_COMPRESSION),
 	// so a caller can add knobs without displacing the protocol variables.
 	ExtraEnv []corev1.EnvVar
+	// TraceEnv is the OpenTelemetry handover: the W3C TRACEPARENT/TRACESTATE of the span this
+	// Job's work belongs to, plus the OTLP settings the shim needs to export to the same
+	// collector (internal/tracing.JobEnv). Emitted in sorted key order, so the Job spec stays
+	// byte-reproducible.
+	//
+	// EMPTY IS THE NORMAL CASE and it must produce a Job spec identical to the one this builder
+	// produced before tracing existed: an install with no collector has no business carrying two
+	// blank variables into every mover pod. It sits BEFORE ExtraEnv so an operator who sets one
+	// of these through their own chart values overrides it — a later duplicate is the one the
+	// kubelet keeps.
+	TraceEnv map[string]string
 	// CredentialKeys are the per-Job Secret keys projected as environment variables of the SAME
 	// name (one constant naming both sides, as SecretKeyAWS* already does). Empty means the
 	// default S3 pair — AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY — which is what every
@@ -320,6 +333,11 @@ func moverEnv(req JobRequest) []corev1.EnvVar {
 	}
 	if req.GoMemLimit != "" {
 		env = append(env, corev1.EnvVar{Name: envGoMemLimit, Value: req.GoMemLimit})
+	}
+	// The trace handover, in sorted key order (a Go map's range order is not one). Nil when
+	// tracing is inactive, which is when this whole block adds nothing at all.
+	for _, name := range tracing.SortedEnvKeys(req.TraceEnv) {
+		env = append(env, corev1.EnvVar{Name: name, Value: req.TraceEnv[name]})
 	}
 	return append(env, req.ExtraEnv...)
 }

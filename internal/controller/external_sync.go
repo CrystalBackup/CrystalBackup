@@ -689,7 +689,7 @@ func (d *syncDriver) drive(ctx context.Context, key string, run *syncRun, view s
 			// up is exactly what an operator sizing a window needs. Recording only successes would
 			// hide the pathology (a copy that grinds for six hours and dies) behind an empty
 			// histogram.
-			d.recordSyncDuration(f, ident)
+			d.recordSyncDuration(ctx, f, ident)
 			return ctrl.Result{RequeueAfter: syncRequeueInterval}, nil
 		}
 		d.mu.Lock()
@@ -718,7 +718,7 @@ func (d *syncDriver) finish(ctx context.Context, key string, f *syncInflight, vi
 		// Recorded exactly where the in-flight entry dies, which is the one point that happens
 		// once per run: a PartiallyFailed settle KEEPS the entry and retries the accounting, and
 		// observing there would add a sample per retry for a copy that ran once.
-		d.recordSyncDuration(f, ident)
+		d.recordSyncDuration(ctx, f, ident)
 	}
 	return res, err
 }
@@ -740,7 +740,7 @@ type syncIdentity struct {
 // matching how the state-derived collector resolves it: a namespaced sync's locations are
 // namespaced, the collector cannot resolve a clusterID for them, and emitting one here would
 // split every namespace-plane sync into two series that no dashboard could rejoin.
-func (d *syncDriver) recordSyncDuration(f *syncInflight, ident syncIdentity) {
+func (d *syncDriver) recordSyncDuration(ctx context.Context, f *syncInflight, ident syncIdentity) {
 	if f == nil || f.run == nil || f.startedAt.IsZero() {
 		return
 	}
@@ -748,7 +748,7 @@ func (d *syncDriver) recordSyncDuration(f *syncInflight, ident syncIdentity) {
 	if ident.Scope == apiconst.OriginCluster {
 		clusterID = f.run.Source.Binding.ClusterID
 	}
-	metrics.RecordExternalSyncDuration(metrics.ExternalSyncSeries{
+	metrics.RecordExternalSyncDuration(ctx, metrics.ExternalSyncSeries{
 		Sync:        ident.Name,
 		Source:      f.run.Source.Binding.Name,
 		Destination: f.run.Dest.Binding.Name,

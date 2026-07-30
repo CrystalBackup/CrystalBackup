@@ -232,7 +232,7 @@ func (r *ClusterRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	// wherever it landed, and a tenant looking at their own restore history has to see it. Tenant
 	// defaults to the source namespace for the same reason it does there: the namespace, and its
 	// tenant label, may no longer exist.
-	metrics.RecordRestoreTerminal(metrics.RestoreSeries{
+	metrics.RecordRestoreTerminal(ctx, metrics.RestoreSeries{
 		Namespace: cr.Spec.Source.Namespace,
 		Tenant:    cr.Spec.Source.Namespace,
 		Origin:    apiconst.OriginCluster,

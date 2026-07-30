@@ -119,6 +119,13 @@ func main() {
 		manifestIndex = idx
 	}
 
+	// Pick the operator's `mover` span up out of TRACEPARENT and bring this process's tracer
+	// provider up from its own OTEL_* environment — both injected into the pod template by the
+	// operator, and both absent when the operator is not tracing (spec/05-observability.md §5).
+	// Deliberately AFTER the flag and operation validation, so a malformed invocation still fails
+	// the fast way, and BEFORE the manifest dump so a manifest capture is inside the span too.
+	ctx, endResticSpan := startResticSpan(startTracing(context.Background()), *operation)
+
 	// For a backup or restore, guarantee restic emits a machine-readable summary we can parse;
 	// a no-op for every other operation and when the caller already passed --json.
 	resticArgv = ensureSummaryJSON(*operation, resticArgv)
@@ -126,7 +133,11 @@ func main() {
 	// Inherit the environment the Job set (RESTIC_REPOSITORY, RESTIC_PASSWORD_FILE, RESTIC_CACHE_DIR,
 	// AWS_*, ...): a nil cmd.Env means "use the current process environment", so the shim passes
 	// restic its repo, password file and credentials without ever naming them here.
-	cmd := exec.Command("restic", resticArgv...)
+	cmd := exec.CommandContext(ctx, "restic", resticArgv...)
+	// CommandContext's cancellation is not wanted here and cannot fire: ctx is derived from
+	// context.Background() and nothing cancels it. It is used only so the exec inherits the
+	// span's context, keeping the whole call inside one lexical scope.
+	cmd.Cancel = func() error { return nil }
 
 	// stdout is captured into a buffer for parsing/logging; the exact wiring differs by operation
 	// (see below). stderr is streamed live to the pod log AND tailed into a bounded buffer so the
@@ -158,6 +169,9 @@ func main() {
 	}
 
 	result := buildResult(*operation, stdout.Bytes(), runErr)
+	// Close the restic span with the outcome BEFORE the manifest-apply step and the exit path:
+	// its subject is the restic invocation, which is over.
+	endResticSpan(result, runErr)
 	// Fold the dump's accounting into the result the controller reads. Only on success: a
 	// resource count attached to a failed snapshot would claim a capture the repository does
 	// not hold.
@@ -196,6 +210,12 @@ func main() {
 // exits 0 on success / 1 on failure so the Job's restartPolicy:Never + backoffLimit see the
 // right pod phase. It never returns.
 func report(path string, result mover.MoverResult) {
+	// Export whatever spans are buffered before the process ends. It has to be here rather than
+	// deferred in main: this function calls os.Exit, so a deferred flush would never run. It is
+	// bounded (moverFlushTimeout) and it comes BEFORE the termination message is written — a
+	// collector that hangs must never be the reason the kubelet sees no result and the controller
+	// concludes the mover was hard-killed.
+	flushTracing()
 	if err := writeResult(path, result); err != nil {
 		// If we cannot write the termination log the controller will read a blank message and
 		// (correctly, per ParseMoverResult) treat the run as failed; log loudly so the pod log

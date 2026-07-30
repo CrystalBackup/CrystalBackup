@@ -17,9 +17,11 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"flag"
 	"os"
+	"time"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
@@ -54,6 +56,7 @@ import (
 	"github.com/CrystalBackup/CrystalBackup/internal/repo/queue"
 	"github.com/CrystalBackup/CrystalBackup/internal/repo/s3stat"
 	"github.com/CrystalBackup/CrystalBackup/internal/rexposer"
+	"github.com/CrystalBackup/CrystalBackup/internal/tracing"
 	webhookv1alpha1 "github.com/CrystalBackup/CrystalBackup/internal/webhook/v1alpha1"
 	// +kubebuilder:scaffold:imports
 )
@@ -62,6 +65,14 @@ var (
 	scheme   = runtime.NewScheme()
 	setupLog = ctrl.Log.WithName("setup")
 )
+
+// tracingFlushTimeout bounds the final span flush at shutdown.
+//
+// Five seconds against the kubelet's default 30-second termination grace, and the ratio is the
+// point: the operator's own teardown work — draining the repository queue, finishing detached
+// exposure deletes — has to fit in that grace period too, and it matters incomparably more than
+// a last batch of spans. If the collector cannot take them in five seconds it does not get them.
+const tracingFlushTimeout = 5 * time.Second
 
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
@@ -281,6 +292,31 @@ func main() {
 	// and shared by the repository queue and the manager: a SIGINT/SIGTERM cancels this context,
 	// which shuts the queue's workers down alongside the manager.
 	signalCtx := ctrl.SetupSignalHandler()
+
+	// OpenTelemetry (spec/05-observability.md §5), configured EXCLUSIVELY through the standard
+	// OTEL_* environment — there is no flag and no Helm value for it here on purpose. With no
+	// OTEL_EXPORTER_OTLP_ENDPOINT set, which is what the overwhelming majority of installations
+	// will have, this installs nothing at all: no exporter, no batch-processor goroutine, no
+	// connection. An error here means an operator ASKED for a collector and did not get one, which
+	// must be loud at startup rather than discovered as empty dashboards a week later.
+	tracingShutdown, err := tracing.Init(signalCtx, tracing.ServiceOperator)
+	if err != nil {
+		setupLog.Error(err, "Failed to initialise OpenTelemetry tracing")
+		os.Exit(1)
+	}
+	// Flush on the way out, on a BOUNDED context of its own. A batch span processor's final flush
+	// blocks on the collector, and signalCtx is already cancelled by the time this runs — so it
+	// gets a fresh budget, and a hard ceiling on it. Without the ceiling a collector that has gone
+	// away turns an orderly SIGTERM into the kubelet's SIGKILL thirty seconds later, which in this
+	// operator means a mover Job teardown that never ran. Telemetry does not get to cost a clean
+	// termination.
+	defer func() {
+		flushCtx, cancel := context.WithTimeout(context.WithoutCancel(signalCtx), tracingFlushTimeout)
+		defer cancel()
+		if err := tracingShutdown(flushCtx); err != nil {
+			setupLog.Error(err, "Flushing OpenTelemetry spans on shutdown")
+		}
+	}()
 
 	// One per-repository exclusive work queue for the whole process (adr/0010): it serialises
 	// init/forget/prune/check/erase per repository so a single leader never races itself (the

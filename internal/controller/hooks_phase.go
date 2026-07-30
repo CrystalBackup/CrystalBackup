@@ -29,6 +29,8 @@ import (
 	cbv1 "github.com/CrystalBackup/CrystalBackup/api/v1alpha1"
 	"github.com/CrystalBackup/CrystalBackup/internal/hooks"
 	"github.com/CrystalBackup/CrystalBackup/internal/status"
+	"github.com/CrystalBackup/CrystalBackup/internal/tracing"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 // This file is the Backup controller's CONSISTENCY-HOOK phase (R16): the pre-snapshot quiesce and
@@ -203,9 +205,40 @@ func (r *BackupReconciler) advancePreHooks(ctx context.Context, backup *cbv1.Bac
 
 	phaseCtx, cancel := context.WithTimeout(ctx, hookPhaseBudget)
 	defer cancel()
+	started := time.Now()
 	results := hooks.Run(phaseCtx, r.Hooks, resolved)
 	r.recordHookResults(backup, results)
+	emitHookSpan(ctx, backup, tracing.StepHooksPre, "hooks.pre", started, resolved, results)
 	return true, nil
+}
+
+// emitHookSpan emits §5's `hooks.pre` / `hooks.post` span.
+//
+// These two are the only spans in the operator's tree timed by a clock in this process rather than
+// read back off object state, and they can be: a hook phase runs to completion inside ONE
+// reconcile, under hookPhaseBudget, so there is no cross-reconcile window to reconstruct. It is
+// still emitted after the fact rather than held open, for uniformity — one shape for every span in
+// this codebase means one place to reason about what a dying process loses.
+//
+// step is qualified for post-hooks (see the caller): the release phase RETRIES, up to
+// postHookMaxAttempts, and a derived span id reused across attempts would publish several
+// different spans under one identity.
+func emitHookSpan(
+	ctx context.Context, backup *cbv1.Backup, step, name string,
+	started time.Time, resolved []hooks.Resolved, results []hooks.Result,
+) {
+	anchor := backupAnchor(backup)
+	if !anchor.Valid() {
+		return
+	}
+	attrs := backupSpanAttrs(backup, nil)
+	attrs = append(attrs, attribute.Int("crystalbackup.hooks", len(resolved)))
+
+	var spanErr error
+	if failed := failedResults(results); failed > 0 {
+		spanErr = fmt.Errorf("%d of %d %s hook(s) failed", failed, len(resolved), name)
+	}
+	anchor.EmitStep(ctx, step, name, started, time.Now(), spanErr, attrs...)
 }
 
 // advancePostHooks runs the release as soon as every snapshot is cut, whatever their outcome.
@@ -227,8 +260,15 @@ func (r *BackupReconciler) advancePostHooks(ctx context.Context, backup *cbv1.Ba
 
 	phaseCtx, cancel := context.WithTimeout(ctx, hookPhaseBudget)
 	defer cancel()
+	started := time.Now()
 	results := hooks.Run(phaseCtx, r.Hooks, resolved)
 	r.recordHookResults(backup, results)
+	// The attempt number is part of the step key: a retried release must produce a SECOND span,
+	// not overwrite the first with the same derived id — and a trace showing three attempts is
+	// exactly what an operator investigating a workload that will not unfreeze needs to see.
+	emitHookSpan(ctx, backup,
+		fmt.Sprintf("%s/%d", tracing.StepHooksPost, backup.Status.PostHookAttempts),
+		"hooks.post", started, resolved, results)
 
 	if failed := failedResults(results); failed > 0 {
 		if backup.Status.PostHookAttempts >= postHookMaxAttempts {

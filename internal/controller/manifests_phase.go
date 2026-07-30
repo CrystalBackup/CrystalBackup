@@ -32,6 +32,8 @@ import (
 	"github.com/CrystalBackup/CrystalBackup/internal/mover"
 	"github.com/CrystalBackup/CrystalBackup/internal/restic"
 	"github.com/CrystalBackup/CrystalBackup/internal/status"
+	"github.com/CrystalBackup/CrystalBackup/internal/tracing"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 // ConditionManifestsComplete reports whether the manifest dump enumerated everything it set out
@@ -148,6 +150,8 @@ func (r *BackupReconciler) advanceManifests(
 			"complete", !result.IncompleteManifests)
 	}
 
+	emitManifestsSpan(ctx, backup, rc, &job, result, readErr)
+
 	// The verdict is recorded in memory but not yet persisted, so hand the teardown back to the
 	// caller to run once the status write lands. The name stem is enough: the Job, its creds
 	// Secret and the grant are all derived from it.
@@ -223,6 +227,10 @@ func (r *BackupReconciler) startManifestsJob(
 		},
 		BackoffLimit: rc.backoffLimit,
 		TTLSeconds:   moverJobTTLSeconds,
+		// The W3C handover to the shim, naming the `manifests` span this Job's work belongs to —
+		// a span emitted only once the Job is terminal, whose id both sides derive independently
+		// (spec/05-observability.md §5).
+		TraceEnv: tracing.JobEnv(backupAnchor(backup).StepContext(ctx, tracing.StepManifests)),
 	})
 	if err := r.Create(ctx, job); err != nil && !apierrors.IsAlreadyExists(err) {
 		// Leave no grant behind for a Job that never started.
@@ -232,6 +240,43 @@ func (r *BackupReconciler) startManifestsJob(
 		return fmt.Errorf("create manifest mover Job %s/%s: %w", r.OperatorNamespace, jobName, err)
 	}
 	return nil
+}
+
+// emitManifestsSpan emits §5's `manifests` span, covering the capture Job's whole life and
+// carrying crystalbackup.resource_count — the count §5 names, and the one number that tells a
+// reader at a glance whether a namespace's manifests were captured or merely attempted.
+//
+// Reached once per Backup: every earlier return in advanceManifests leaves the capture in flight,
+// and the two terminal short-circuits at the top bar re-entry once a result is recorded.
+func emitManifestsSpan(
+	ctx context.Context, backup *cbv1.Backup, rc *backupRunContext,
+	job *batchv1.Job, result mover.MoverResult, readErr error,
+) {
+	anchor := backupAnchor(backup)
+	if !anchor.Valid() {
+		return
+	}
+	attrs := backupSpanAttrs(backup, rc)
+	if backup.Status.Manifests != nil {
+		attrs = append(attrs, attribute.Int(tracing.AttrResourceCount, int(backup.Status.Manifests.ResourceCount)))
+		attrs = append(attrs, tracing.StringAttr(tracing.AttrSnapshotID, backup.Status.Manifests.SnapshotID)...)
+		// A PARTIAL capture is a success with a hole in it. It is not an error status — the
+		// snapshot is real and restorable — but the hole has to be visible on the span, because
+		// the detail lives in an index.json inside the repository that nobody opens by accident.
+		if result.IncompleteManifests {
+			attrs = append(attrs, attribute.Bool("crystalbackup.manifests_incomplete", true))
+		}
+	}
+
+	var spanErr error
+	switch {
+	case readErr != nil:
+		spanErr = fmt.Errorf("could not read the manifest mover result: %w", readErr)
+	case !result.OK:
+		spanErr = fmt.Errorf("manifest capture failed: %s", result.Error)
+	}
+	start, end := jobWindow(job)
+	anchor.EmitStep(ctx, tracing.StepManifests, "manifests", start, end, spanErr, attrs...)
 }
 
 func (r *BackupReconciler) recordManifestsFailure(backup *cbv1.Backup, reason string) {
