@@ -7,8 +7,12 @@
 #   mise run test 'infra || m0'
 #
 # Env toggles:
-#   CRUCIBLE_VERBOSE=1               stream full Ginkgo output (debugging)
+#   CRUCIBLE_VERBOSE=1               stream full Ginkgo output, PASSING specs included (debugging)
 #   CRUCIBLE_TIMEOUT=3h              whole-suite go-test budget (default 90m)
+#
+# A filtered run reports itself as a PARTIAL PASS: it proves the checks it ran and says so,
+# and only an unfiltered run is allowed to call itself a non-regression gate. See the
+# "Green is not the same thing as covered" note in test/crucible/tests/report_test.go.
 #
 # Exits non-zero when any spec fails (so automation and the skill can detect it).
 set -uo pipefail
@@ -50,14 +54,29 @@ CRUCIBLE_TIMEOUT="${CRUCIBLE_TIMEOUT:-180m}"
 # specs run, the rest reported as failed/skipped when they were merely truncated. A truncated run
 # is worse than no run.
 ginkgo_args=(--ginkgo.label-filter="${LABELS}" --ginkgo.timeout="${CRUCIBLE_TIMEOUT}")
-[[ "${CRUCIBLE_VERBOSE:-}" == "1" ]] && ginkgo_args+=(--ginkgo.v)
 
-echo "==> running crucible suite  (labels: '${LABELS:-<all>}', timeout ${CRUCIBLE_TIMEOUT})"
+# BOTH flags, and `go test -v` is the load-bearing half. --ginkgo.v only tells Ginkgo to WRITE the
+# GinkgoWriter stream to stdout; `go test` then buffers a package's stdout and discards it when the
+# package PASSES. So the verbose mode was verbose only on failure — which is precisely backwards:
+# a run launched in verbose mode to capture a diagnostic went silent the moment the spec it was
+# diagnosing went green. Passing -v makes go test stream the package's output as it happens.
+#
+# It stays off by default on purpose: the plain-language report is the primary output of a normal
+# run, and 80 specs of Ginkgo trace would bury it.
+go_test_flags=()
+verbose_note=""
+if [[ "${CRUCIBLE_VERBOSE:-}" == "1" ]]; then
+  ginkgo_args+=(--ginkgo.v)
+  go_test_flags+=(-v)
+  verbose_note=", verbose"
+fi
+
+echo "==> running crucible suite  (labels: '${LABELS:-<all>}', timeout ${CRUCIBLE_TIMEOUT}${verbose_note})"
 cd "${REPO_ROOT}"
 # The go-test budget gets 5 extra minutes so Ginkgo's timeout always fires FIRST: Ginkgo
 # interrupts gracefully (per-spec verdicts, report written), while go test panics the whole
 # binary and loses the report.
-go test -tags crucible ./test/crucible/tests -timeout "$(awk -v t="${CRUCIBLE_TIMEOUT}" '
+go test -tags crucible "${go_test_flags[@]+"${go_test_flags[@]}"}" ./test/crucible/tests -timeout "$(awk -v t="${CRUCIBLE_TIMEOUT}" '
   BEGIN{
     mins=0
     if (t ~ /^[0-9]+h$/)      mins=int(t)*60
