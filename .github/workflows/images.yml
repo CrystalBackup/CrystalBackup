@@ -133,10 +133,21 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p stage-x86_64 stage-aarch64
+          # Stamp the build version into crystalbackup_build_info. Until M6 nothing did, so every
+          # published image reported version="dev" — the one series that exists so a dashboard has
+          # a build to join against named no build. On a tag this is the release; anywhere else
+          # (the PR dry-run) it is an explicit dev marker plus the sha, never an empty string.
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            BUILD_VERSION="${GITHUB_REF_NAME#v}"
+          else
+            BUILD_VERSION="dev-${GITHUB_SHA::12}"
+          fi
+          STAMP="-s -w -X github.com/CrystalBackup/CrystalBackup/internal/metrics.Version=${BUILD_VERSION}"
+          echo "stamping version=${BUILD_VERSION}"
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-            go build -trimpath -ldflags="-s -w" -o "stage-x86_64/${{ matrix.binary }}" "${{ matrix.source }}"
+            go build -trimpath -ldflags="${STAMP}" -o "stage-x86_64/${{ matrix.binary }}" "${{ matrix.source }}"
           CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
-            go build -trimpath -ldflags="-s -w" -o "stage-aarch64/${{ matrix.binary }}" "${{ matrix.source }}"
+            go build -trimpath -ldflags="${STAMP}" -o "stage-aarch64/${{ matrix.binary }}" "${{ matrix.source }}"
 
       - name: melange — build pinned restic apk from source (mover only)
         if: steps.gate.outputs.proceed == 'true' && matrix.with_restic == 'true'
@@ -321,10 +332,21 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p stage-x86_64 stage-aarch64
+          # Stamp the build version into crystalbackup_build_info. Until M6 nothing did, so every
+          # published image reported version="dev" — the one series that exists so a dashboard has
+          # a build to join against named no build. On a tag this is the release; anywhere else
+          # (the PR dry-run) it is an explicit dev marker plus the sha, never an empty string.
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            BUILD_VERSION="${GITHUB_REF_NAME#v}"
+          else
+            BUILD_VERSION="dev-${GITHUB_SHA::12}"
+          fi
+          STAMP="-s -w -X github.com/CrystalBackup/CrystalBackup/internal/metrics.Version=${BUILD_VERSION}"
+          echo "stamping version=${BUILD_VERSION}"
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-            go build -trimpath -ldflags="-s -w" -o "stage-x86_64/${{ matrix.binary }}" "${{ matrix.source }}"
+            go build -trimpath -ldflags="${STAMP}" -o "stage-x86_64/${{ matrix.binary }}" "${{ matrix.source }}"
           CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
-            go build -trimpath -ldflags="-s -w" -o "stage-aarch64/${{ matrix.binary }}" "${{ matrix.source }}"
+            go build -trimpath -ldflags="${STAMP}" -o "stage-aarch64/${{ matrix.binary }}" "${{ matrix.source }}"
 
       - name: Stamp the release version into the wrapper apk (SBOM accuracy)
         if: steps.gate.outputs.proceed == 'true'
