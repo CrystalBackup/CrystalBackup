@@ -81,8 +81,17 @@ var _ = Describe("M6 — restore-fidelity gate on Rook-Ceph RBD", Label("m6"), O
 		restoredNS = "m6-fidelity-restored"
 		pvcName    = "corpus"
 		capacity   = "8Gi"
-		runName    = "m6-fidelity-src"
-		restoreCR  = "m6-fidelity-restore"
+	)
+
+	// Per CAMPAIGN, not per milestone. These two were fixed strings, and that is what made the gate
+	// red on a cluster whose only fault was pointing at the bucket a previous campaign had used:
+	// discovery projected the older "m6-fidelity-src" snapshots into the namespace as a Completed
+	// Backup before this spec created anything, and the fan-out — correctly — refused to write over
+	// a coordinate it did not own. The run below wants a NEW restore point, never an existing one,
+	// so it must never ask for a coordinate the repository already knows.
+	var (
+		runName   = crucibleRunName("m6-fidelity-src")
+		restoreCR = crucibleRunName("m6-fidelity-restore")
 	)
 
 	// The two manifests and the classified diff between them. Computed once in BeforeAll; every

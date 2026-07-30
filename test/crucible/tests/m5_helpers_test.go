@@ -22,7 +22,6 @@ import (
 	"fmt"
 	"os"
 	"regexp"
-	"strconv"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -86,14 +85,13 @@ const (
 	m5TenantS3Secret = "m5-tenant-s3"
 )
 
-// m5RunID makes this run's repositories unique. Same rule and same reason as m3RunID/m4RunID: the
-// bucket is never reset between runs, and M5's specs FORGET and PRUNE — a reused path would meet a
-// previous run's snapshots and a previous run's deletions.
-var m5RunID = strconv.FormatInt(time.Now().Unix(), 36)
+// M5's repositories hang off crucibleRunID (crucible_suite_test.go), and here the stakes are the
+// highest in the suite: these specs FORGET and PRUNE. A reused path would meet a previous
+// campaign's snapshots — and a previous campaign's deletions.
 
 // m5ClusterIDFor returns an isolated repository path segment for one M5 scenario, distinct per
 // scenario AND per run so no two of them ever share a blast radius.
-func m5ClusterIDFor(scenario string) string { return "m5-" + scenario + "-" + m5RunID }
+func m5ClusterIDFor(scenario string) string { return "m5-" + scenario + "-" + crucibleRunID }
 
 // ---------------------------------------------------------------------------
 // Cluster-plane locations on an arbitrary prefix
@@ -301,7 +299,7 @@ func m5EnsureTenantS3Secret(namespace string) {
 // value neither side chose. Here the test holds the only other copy.
 func m5CreateUserKeySecret(namespace, name string) string {
 	GinkgoHelper()
-	password := "m5-user-key-" + m5RunID + "-" + name
+	password := "m5-user-key-" + crucibleRunID + "-" + name
 
 	// Replaced, not reconciled. A leftover Secret from an aborted run carries a DIFFERENT password
 	// (the run ID is in it), and reusing it would have the spec hold one key while the operator used

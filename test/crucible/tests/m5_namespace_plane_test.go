@@ -67,12 +67,17 @@ var _ = Describe("M5 — namespace plane (the user's own repository, under the u
 			locationName = "my-own-storage"
 			keySecret    = "my-own-restic-key"
 			pvcName      = "tenant-data"
-			backupName   = "m5-np-run"
 
 			// A real CSI snapshot plus a restic upload of the seeded volume, on a cluster that may be
 			// running other milestones' movers at the same time.
 			backupTimeout = 20 * time.Minute
 		)
+
+		// Per campaign, like every other run name in the suite. This one is already insulated by
+		// m5ClusterIDFor("nsplane"), which puts the tenant's repository on a path no previous
+		// campaign wrote to — but the insulation is the repository's, not the name's, and the next
+		// person to copy this block will not be copying the repository.
+		backupName := crucibleRunName("m5-np-run")
 
 		var (
 			clusterID    string

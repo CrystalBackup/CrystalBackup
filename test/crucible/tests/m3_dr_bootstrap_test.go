@@ -59,8 +59,8 @@ var _ = Describe("M3 — DR bootstrap (ClusterRestore into a fresh namespace)", 
 		sourceClass = "ceph-block"
 		targetClass = "longhorn"
 	)
-	// Unique per run so a re-run on the shared "dr" repo never collides with a prior snapshot (see m3RunID).
-	runName := "m3-dr-src-" + m3RunID
+	// Unique per run so a re-run on the shared "dr" repo never collides with a prior snapshot (see crucibleRunID).
+	runName := "m3-dr-src-" + crucibleRunID
 
 	BeforeAll(func() {
 		m3EnsureDRLocation()

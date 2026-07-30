@@ -85,8 +85,15 @@ var _ = Describe("M1 — discovery projects restorable backups", Label("m1"), Or
 		startPVCConsumer(m1DiscoveryGhostNS, "ghost-data", "ceph-block")
 
 		// A unique run name keeps each execution hermetic (its snapshots are distinct),
-		// while discovery's set semantics still hold across any accumulated runs.
-		m1DiscoveryRun = "m1-discovery-" + time.Now().UTC().Format(apiconst.RunTimestampLayout)
+		// while discovery's set semantics still hold across any accumulated runs — and
+		// accumulate they do: this is the one spec that WANTS the repository's history,
+		// because projecting what is already there is the feature under test (R26). It
+		// asserts its own run appears among the projections, never that it is alone.
+		//
+		// This used to mint its own timestamp; it now takes the suite's identity, so there
+		// is exactly one way to name a run in this package and one thing for the guard in
+		// runname_hermeticity_test.go to recognise.
+		m1DiscoveryRun = crucibleRunName("m1-discovery")
 
 		m1RunClusterBackup(m1DiscoveryRun, m1LocationName, cbv1.NamespaceSelector{
 			MatchNames: []string{"c-db", "c-media", m1DiscoveryGhostNS},

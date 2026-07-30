@@ -66,8 +66,8 @@ const (
 )
 
 // m3CSClusterBackupRun is unique per run so a re-run on the shared "dr" repo never collides with a
-// prior snapshot (see m3RunID). The source namespace stays fixed; only the run identity varies.
-var m3CSClusterBackupRun = "m3-cs-src-" + m3RunID
+// prior snapshot (see crucibleRunID). The source namespace stays fixed; only the run identity varies.
+var m3CSClusterBackupRun = "m3-cs-src-" + crucibleRunID
 
 var _ = Describe("M3 — cluster-scoped capture & selective restore", Label("m3"), Ordered, func() {
 	// include globs over the stored <group>/<Kind>[/<name>] path (adr/0011 §2; spec/04 §5.4).

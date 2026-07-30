@@ -74,7 +74,7 @@ var _ = Describe("Milestone M4 — repository maintenance & verification", Label
 			m2SeedVolume(seedNS, "m4-race-data", m4StorageClass, "1Gi")
 
 			By("When a backup is running and a prune becomes due on the same repository")
-			run := "m4-race-" + m4RunID
+			run := "m4-race-" + crucibleRunID
 			m1RunClusterBackup(run, m1LocationName, cbv1.NamespaceSelector{MatchNames: []string{seedNS}})
 			DeferCleanup(func() {
 				_ = k8s.Delete(ctx, &cbv1.ClusterBackup{ObjectMeta: metav1.ObjectMeta{Name: run}})
@@ -141,7 +141,7 @@ var _ = Describe("Milestone M4 — repository maintenance & verification", Label
 		const seedNS = "m4-killed-prune"
 
 		It("is absorbed by the Job retry: a terminal outcome is recorded and the repository is not wedged", func() {
-			locName := "m4-killed-" + m4RunID
+			locName := "m4-killed-" + crucibleRunID
 			repo := m4CreateIsolatedLocation(locName, m4DedicatedClusterID("killed"),
 				&cbv1.MaintenanceSpec{PruneSchedule: m4EverySecondCron})
 
@@ -149,7 +149,7 @@ var _ = Describe("Milestone M4 — repository maintenance & verification", Label
 			ensureNamespace(seedNS)
 			DeferCleanup(func() { deleteNamespaceAndWaitGone(seedNS, 5*time.Minute) })
 			m2SeedVolume(seedNS, "m4-killed-data", m4StorageClass, "1Gi")
-			run := "m4-killed-run-" + m4RunID
+			run := "m4-killed-run-" + crucibleRunID
 			m1RunClusterBackup(run, locName, cbv1.NamespaceSelector{MatchNames: []string{seedNS}})
 			DeferCleanup(func() {
 				_ = k8s.Delete(ctx, &cbv1.ClusterBackup{ObjectMeta: metav1.ObjectMeta{Name: run}})
@@ -216,7 +216,7 @@ var _ = Describe("Milestone M4 — repository maintenance & verification", Label
 		const seedNS = "m4-corrupt"
 
 		It("is caught by check --read-data-subset and surfaced on the repository", func() {
-			locName := "m4-corrupt-" + m4RunID
+			locName := "m4-corrupt-" + crucibleRunID
 			clusterID := m4DedicatedClusterID("corrupt")
 			// A structural check would pass: it only verifies that the index and the objects agree
 			// about what exists. Reading a sample of the pack data is the only thing that catches a
@@ -230,7 +230,7 @@ var _ = Describe("Milestone M4 — repository maintenance & verification", Label
 			ensureNamespace(seedNS)
 			DeferCleanup(func() { deleteNamespaceAndWaitGone(seedNS, 5*time.Minute) })
 			m2SeedVolume(seedNS, "m4-corrupt-data", m4StorageClass, "1Gi")
-			run := "m4-corrupt-run-" + m4RunID
+			run := "m4-corrupt-run-" + crucibleRunID
 			m1RunClusterBackup(run, locName, cbv1.NamespaceSelector{MatchNames: []string{seedNS}})
 			DeferCleanup(func() {
 				_ = k8s.Delete(ctx, &cbv1.ClusterBackup{ObjectMeta: metav1.ObjectMeta{Name: run}})

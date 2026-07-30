@@ -22,7 +22,6 @@ import (
 	"fmt"
 	"os"
 	"slices"
-	"strconv"
 	"strings"
 	"time"
 
@@ -70,7 +69,9 @@ import (
 // running for months.
 var _ = Describe("Milestone M6 — alert rules fire on real conditions", Ordered, Label("m6", "alerts"), func() {
 	var (
-		runID     = strconv.FormatInt(time.Now().Unix(), 36)
+		// This lane already named everything per run; it now shares the SUITE's identity
+		// (crucible_suite_test.go) instead of minting a second one a second apart.
+		runID     = crucibleRunID
 		pileupNS  = "m6-alerts-pileup"
 		failNS    = "m6-alerts-failed"
 		corruptNS = "m6-alerts-corrupt"

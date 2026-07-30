@@ -107,8 +107,8 @@ var _ = Describe("M5 — right to erasure (forget + prune, verified by re-scanni
 
 			// Two runs for the erased namespace and one for its neighbour: the count the erasure
 			// reports is then a number that could have been wrong (2, not "all" and not 1).
-			m5RunManifestBackup("m5-erase-seed-1-"+m5RunID, locationName, erasedNS, keptNS)
-			m5RunManifestBackup("m5-erase-seed-2-"+m5RunID, locationName, erasedNS)
+			m5RunManifestBackup("m5-erase-seed-1-"+crucibleRunID, locationName, erasedNS, keptNS)
+			m5RunManifestBackup("m5-erase-seed-2-"+crucibleRunID, locationName, erasedNS)
 
 			snaps := m5ResticSnapshotsOn(repoURL, dek)
 			Expect(m5SnapshotByNamespace(snaps, erasedNS)).To(HaveLen(2),
@@ -120,7 +120,7 @@ var _ = Describe("M5 — right to erasure (forget + prune, verified by re-scanni
 		It("Parks an unconfirmed erasure and names what it would remove (R23)", func() {
 			By("When an erasure is created with no confirmation")
 			er := &cbv1.ClusterErasure{
-				ObjectMeta: metav1.ObjectMeta{Name: "m5-erase-gate-" + m5RunID},
+				ObjectMeta: metav1.ObjectMeta{Name: "m5-erase-gate-" + crucibleRunID},
 				Spec: cbv1.ClusterErasureSpec{
 					LocationRef: cbv1.LocalObjectReference{Name: locationName},
 					Target:      cbv1.ErasureTarget{Namespace: erasedNS},
@@ -147,7 +147,7 @@ var _ = Describe("M5 — right to erasure (forget + prune, verified by re-scanni
 		It("Refuses a confirmation that does not name the target, at admission", func() {
 			By("When an erasure is created with a confirmation naming the WRONG namespace")
 			er := &cbv1.ClusterErasure{
-				ObjectMeta: metav1.ObjectMeta{Name: "m5-erase-wrong-" + m5RunID},
+				ObjectMeta: metav1.ObjectMeta{Name: "m5-erase-wrong-" + crucibleRunID},
 				Spec: cbv1.ClusterErasureSpec{
 					LocationRef:  cbv1.LocalObjectReference{Name: locationName},
 					Target:       cbv1.ErasureTarget{Namespace: erasedNS},
@@ -169,7 +169,7 @@ var _ = Describe("M5 — right to erasure (forget + prune, verified by re-scanni
 		It("Physically removes exactly the confirmed namespace, leaving its neighbour and the repository sound", func() {
 			By("When a confirmed erasure of " + erasedNS + " runs")
 			er := &cbv1.ClusterErasure{
-				ObjectMeta: metav1.ObjectMeta{Name: "m5-erase-run-" + m5RunID},
+				ObjectMeta: metav1.ObjectMeta{Name: "m5-erase-run-" + crucibleRunID},
 				Spec: cbv1.ClusterErasureSpec{
 					LocationRef:  cbv1.LocalObjectReference{Name: locationName},
 					Target:       cbv1.ErasureTarget{Namespace: erasedNS},
@@ -227,7 +227,7 @@ var _ = Describe("M5 — right to erasure (forget + prune, verified by re-scanni
 
 			By("When a fully confirmed erasure targets it")
 			er := &cbv1.ClusterErasure{
-				ObjectMeta: metav1.ObjectMeta{Name: "m5-erase-blocked-" + m5RunID},
+				ObjectMeta: metav1.ObjectMeta{Name: "m5-erase-blocked-" + crucibleRunID},
 				Spec: cbv1.ClusterErasureSpec{
 					LocationRef:  cbv1.LocalObjectReference{Name: immutableLocationName},
 					Target:       cbv1.ErasureTarget{Namespace: erasedNS},

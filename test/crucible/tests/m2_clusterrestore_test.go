@@ -51,8 +51,12 @@ var _ = Describe("M2 — ClusterRestore reconstitutes a deleted namespace", Labe
 		doomedNS = "m2-doomed"
 		rebornNS = "m2-reborn"
 		pvcName  = "data"
-		runName  = "m2-doomed-src"
 	)
+
+	// Per campaign: the shared "dr" repository is never emptied, so a fixed run name would meet the
+	// previous campaign's snapshots on the same coordinate — and this spec asserts the RESTORED
+	// content, which would then be last month's.
+	runName := crucibleRunName("m2-doomed-src")
 
 	BeforeAll(func() {
 		m1RequireS3()

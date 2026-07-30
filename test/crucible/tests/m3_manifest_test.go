@@ -62,8 +62,8 @@ var _ = Describe("M3 — manifest backup & restore round-trip", Label("m3"), Ord
 		svcName    = "web"
 		deployName = "web"
 	)
-	// Unique per run so a re-run on the shared "dr" repo never collides with a prior snapshot (see m3RunID).
-	runName := "m3-manifest-src-" + m3RunID
+	// Unique per run so a re-run on the shared "dr" repo never collides with a prior snapshot (see crucibleRunID).
+	runName := "m3-manifest-src-" + crucibleRunID
 
 	// Captured at seed time, asserted after a Service-recreating restore.
 	var origNodePort int32

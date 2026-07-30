@@ -22,6 +22,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -62,6 +63,41 @@ var (
 	k8sTyped *kubernetes.Clientset
 	ctx      = context.Background()
 )
+
+// ---------------------------------------------------------------------------
+// Hermeticity against PREVIOUS CAMPAIGNS — read this before naming anything.
+//
+// The object store outlives the cluster. `scripts/nuke.sh` destroys servers, volumes and the
+// kubeconfig, and says so explicitly about the bucket: it is never deleted. The shared "dr"
+// repository therefore accumulates every snapshot every campaign ever wrote, and a fresh cluster
+// pointed at it is NOT a fresh slate.
+//
+// What that costs, concretely. A restic snapshot is addressed by (namespace, run) — the run tag is
+// the ClusterBackup's name, verbatim. The discovery controller inventories the repository and
+// projects each (namespace, run) group back into the cluster as a read-only Backup, phase
+// Completed, annotated crystalbackup.io/projected: "true". So a spec that hard-codes its run name
+// finds LAST MONTH's snapshots already sitting on its coordinate, projected into the namespace,
+// before its own ClusterBackup exists. The fan-out then refuses the namespace with
+// RunNameCollision — correctly: it will not report success over data it did not write.
+//
+// The operator is right and the spec is wrong. The fix is never to weaken the collision check; it
+// is for the suite to stop reusing a name the repository already knows.
+//
+// crucibleRunID is that identity: one value per test BINARY, so every spec in a campaign shares it
+// (a failure names one campaign) and no two campaigns ever share it. Base-36 seconds keeps it short
+// enough to leave room under the 253-char object-name limit.
+//
+// USE crucibleRunName FOR EVERY ClusterBackup / Backup NAME. A const run name is a latent red
+// campaign six weeks from now, with the diagnosis to redo from scratch — which is exactly what
+// happened between 0.5.1 and 0.6.0, twice, despite a note in the project's memory. It is now
+// enforced: runname_hermeticity_test.go fails `make test` on a fixed run name, without touching
+// paid infrastructure. The two legitimate exceptions and how to declare them are documented there.
+var crucibleRunID = strconv.FormatInt(time.Now().Unix(), 36)
+
+// crucibleRunName suffixes a stable, readable base with this campaign's identity. The base still
+// says which spec owns the run — "m6-fidelity-src-mfa2k7q" reads as well in `restic snapshots` as
+// the fixed name did, and does not collide with the campaign before it.
+func crucibleRunName(base string) string { return base + "-" + crucibleRunID }
 
 func TestCrucible(t *testing.T) {
 	RegisterFailHandler(Fail)

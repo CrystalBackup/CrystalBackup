@@ -59,11 +59,15 @@ import (
 
 var _ = Describe("M1 — same-named PVCs across namespaces do not collide (0.2.1 regression)", Label("m1"), Ordered, func() {
 	const (
-		collisionRun = "crucible-collision"
 		collisionKey = "crystalbackup.io/crucible-collision"
 		collisionVal = "on"
 		homonymPVC   = "shared-data" // the SAME PVC name in both namespaces — the archetypal collision
 	)
+	// Per campaign. The collision this spec is about is between two NAMESPACES inside one run, and
+	// it needs a run of its own to happen in: a name the shared repository already knows would be
+	// refused by the fan-out before either namespace was reached, and the spec would fail on the
+	// wrong collision entirely.
+	collisionRun := crucibleRunName("crucible-collision")
 	// Two throwaway tenant namespaces matched by a selector unique to this spec (never the seed
 	// label), so nothing here perturbs the cascade run or its leak-check.
 	collisionNamespaces := []string{"c-collide-a", "c-collide-b"}

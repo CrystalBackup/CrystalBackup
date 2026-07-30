@@ -54,12 +54,27 @@ import (
 // (spec/03-security-and-tenancy.md).
 // ---------------------------------------------------------------------------
 
+// m1OffClusterRunBase is the run this spec makes of c-db, before the campaign suffix.
+//
+// Package-level because M2 CITES it: the storage-mediation negative in m2_restore_test.go
+// fabricates a tampered projection claiming THIS run from a different namespace, and proves the
+// restore refuses to borrow it. That cross-reference used to be the literal "crucible-restore"
+// copied into the other file, which is a cross-file constant pretending to be a coincidence — it
+// would have gone stale silently the moment either side was renamed. One base, both specs, both
+// suffixed with the same campaign id.
+const m1OffClusterRunBase = "crucible-restore"
+
 var _ = Describe("M1 — off-cluster restore with upstream restic", Label("m1"), Ordered, func() {
 	// restoreNS is c-db: an RWO StatefulSet whose seed init-container writes deterministic data
 	// ONCE and records a MANIFEST.sha256 at each volume root, then only sleeps — so the data is
 	// immutable and the manifest still matches at backup/restore time.
 	const restoreNS = "c-db"
-	const restoreRunName = "crucible-restore"
+
+	// Per campaign. c-db is a SEEDED namespace that survives every run, so a fixed run name here is
+	// the worst case of the trap: discovery projects the previous campaign's "crucible-restore"
+	// snapshots straight into c-db, the fan-out refuses the coordinate it does not own, and this
+	// spec then restores — successfully — data that nothing in this campaign wrote.
+	restoreRunName := crucibleRunName(m1OffClusterRunBase)
 
 	BeforeAll(func() {
 		m1RequireS3()

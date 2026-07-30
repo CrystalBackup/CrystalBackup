@@ -108,6 +108,29 @@ never rewrite: old labels stay green forever (non-regression), which is why
 `mise run test` with no argument is the real gate and a single label is only a
 debugging shortcut.
 
+### Never hard-code a run name
+
+`mise run down` destroys the cluster; it does **not** empty the bucket. The
+shared `dr` repository therefore carries every snapshot every past campaign
+wrote, and the discovery controller projects each `(namespace, run)` group it
+finds back into the cluster as a `Completed` Backup. A spec that names its run
+with a fixed string meets last month's snapshots sitting on its coordinate
+before it has created anything, and the fan-out refuses the namespace with
+`RunNameCollision` — correctly, because it will not report success over data it
+did not write.
+
+So name every `ClusterBackup` / `Backup` per campaign:
+
+```go
+runName := crucibleRunName("m7-something-src")   // → m7-something-src-<campaign id>
+```
+
+This is **enforced at build time**, not on the cluster:
+`tests/runname_hermeticity_test.go` runs inside `make test`, reads the suite as
+source, and fails on any run name that reduces to a fixed string. It documents
+the (rare, reasoned) opt-out. A new run-creating helper must be registered in
+its `runNameSinks` map, or that same test fails until it is.
+
 ### The alert lane (`alerts`, also `m6`)
 
 The eleven shipped alert rules are generated from `internal/alerts/rules.go` and

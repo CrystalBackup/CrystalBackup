@@ -71,9 +71,27 @@ var _ = Describe("M6 — a re-used run name fails loudly instead of reporting a 
 		const (
 			collideNS  = "m6-runname"
 			collidePVC = "payload"
-			collideRun = "m6-runname-collide"
 			capacity   = "1Gi"
 		)
+
+		// THE ONE SPEC IN THE SUITE THAT WANTS A COLLISION — and precisely why its run name must
+		// still be unique per campaign.
+		//
+		// The collision this scenario measures is BUILT, here, in this run: an honest run #1 writes
+		// a snapshot, then m6RecreateClusterBackup deletes the ClusterBackup and re-creates it under
+		// the same name, leaving run #1's child Backup on the coordinate. That is the whole
+		// reproduction, and it is self-contained.
+		//
+		// A fixed name imported a SECOND, uninvited collision from the campaign before: last month's
+		// "m6-runname-collide" snapshots, projected back by discovery, met run #1 — the honest one,
+		// which must succeed for anything below to mean anything — and made it fail. When it did get
+		// through, `ConsistOf(firstSnapshotID)` at the end saw last month's snapshot beside this
+		// month's and failed on the count. Both are the fixture leaking, not the product.
+		//
+		// So: unique per campaign, collided deliberately within it. A spec that needs a collision
+		// must MANUFACTURE one, never inherit it — an inherited one proves nothing about the code,
+		// only that the bucket is old.
+		collideRun := crucibleRunName("m6-runname-collide")
 
 		// firstRunUID is the identity of the honest run. The second run gets a fresh one, which is
 		// exactly what makes the distinction exact rather than heuristic.
@@ -93,6 +111,22 @@ var _ = Describe("M6 — a re-used run name fails loudly instead of reporting a 
 
 			By("And a Rook-Ceph RBD volume holding real data")
 			m2SeedVolume(collideNS, collidePVC, "ceph-block", capacity)
+
+			// The collision below is manufactured, so the starting position must be clean. Asserted
+			// rather than assumed: when this file's run name was fixed, the repository handed it a
+			// second collision from a previous campaign and the failures landed several minutes
+			// later, on assertions about the product. This one names the fixture instead.
+			By("And nothing already occupies this run's coordinate — the collision must be ours to build")
+			var preexisting cbv1.Backup
+			Expect(apierrors.IsNotFound(k8s.Get(ctx,
+				client.ObjectKey{Namespace: collideNS, Name: collideRun}, &preexisting))).To(BeTrue(),
+				"a Backup already sits at %s/%s before this run created anything (projected=%q). The run "+
+					"name is not unique to this campaign: the shared repository is never emptied, and "+
+					"discovery projects an older run's snapshots straight back onto the coordinate.",
+				collideNS, collideRun, preexisting.Annotations[apiconst.AnnotationProjected])
+			Expect(m6SnapshotIDsForRun(collideNS, collidePVC, collideRun)).To(BeEmpty(),
+				"the repository already holds data snapshots tagged run=%s — an inherited collision "+
+					"proves nothing about the operator, only that the bucket outlived the cluster", collideRun)
 
 			By("When an honest run backs it up")
 			m6RecreateClusterBackup(collideRun, collideNS)
@@ -163,18 +197,7 @@ sync`)
 			// capture is the run's other half and legitimately writes its own snapshot even when
 			// every namespace collided. What must not have moved is the tenant's volume.
 			By("And the repository holds no NEW data snapshot for the volume — which is why success was a lie")
-			snaps := m1ResticSnapshots(m1LocationName)
-			var forThisRun []string
-			for _, s := range snaps {
-				kind, _ := restic.TagValue(s.Tags, restic.TagKeyKind)
-				ns, _ := restic.TagValue(s.Tags, restic.TagKeyNamespace)
-				run, _ := restic.TagValue(s.Tags, restic.TagKeyRun)
-				pvc, _ := restic.TagValue(s.Tags, restic.TagKeyPVC)
-				if kind == restic.KindData && ns == collideNS && run == collideRun && pvc == collidePVC {
-					forThisRun = append(forThisRun, s.ID)
-				}
-			}
-			Expect(forThisRun).To(ConsistOf(firstSnapshotID),
+			Expect(m6SnapshotIDsForRun(collideNS, collidePVC, collideRun)).To(ConsistOf(firstSnapshotID),
 				"the second run wrote nothing (correct — it collided); the defect was reporting Completed anyway")
 
 			By("And the earlier run's child was never mutated or re-stamped by the second run")
@@ -184,6 +207,32 @@ sync`)
 				"the second run must never claim an object it did not create")
 		})
 	})
+
+// m6SnapshotIDsForRun reads the shared repository through the independent restic oracle and returns
+// the IDs of the DATA snapshots at the exact coordinate (namespace, pvc, run).
+//
+// Scoped to DATA on purpose: the run-level cluster-manifests capture is the run's other half and
+// legitimately writes its own snapshot even when every namespace collided. What must not have moved
+// is the tenant's volume.
+//
+// Used twice, and the second use is the point: once BEFORE anything runs, to prove the coordinate
+// starts empty, and once after, to prove the collided run added nothing to it. The same measurement
+// answers "is my fixture clean?" and "did the product write?" — so a dirty fixture cannot be read as
+// a product defect.
+func m6SnapshotIDsForRun(namespace, pvc, run string) []string {
+	GinkgoHelper()
+	var ids []string
+	for _, s := range m1ResticSnapshots(m1LocationName) {
+		kind, _ := restic.TagValue(s.Tags, restic.TagKeyKind)
+		ns, _ := restic.TagValue(s.Tags, restic.TagKeyNamespace)
+		gotRun, _ := restic.TagValue(s.Tags, restic.TagKeyRun)
+		gotPVC, _ := restic.TagValue(s.Tags, restic.TagKeyPVC)
+		if kind == restic.KindData && ns == namespace && gotRun == run && gotPVC == pvc {
+			ids = append(ids, s.ID)
+		}
+	}
+	return ids
+}
 
 // m6RecreateClusterBackup deletes any ClusterBackup of this name, waits for it to be gone, and
 // creates a fresh one over the given namespace. This IS the reproduction: GitOps prune-and-recreate

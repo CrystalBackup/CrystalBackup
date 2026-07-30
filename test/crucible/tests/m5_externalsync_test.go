@@ -185,8 +185,8 @@ var _ = Describe("M5 — external sync (restic copy, re-encrypted to the destina
 				"the two locations share a repository password; the re-encryption assertions would be vacuous")
 
 			By("And three snapshots at the source: two for " + selectedNS + ", one for " + excludedNS)
-			m5RunManifestBackup("m5-sync-seed-1-"+m5RunID, sourceLocation, selectedNS, excludedNS)
-			m5RunManifestBackup("m5-sync-seed-2-"+m5RunID, sourceLocation, selectedNS)
+			m5RunManifestBackup("m5-sync-seed-1-"+crucibleRunID, sourceLocation, selectedNS, excludedNS)
+			m5RunManifestBackup("m5-sync-seed-2-"+crucibleRunID, sourceLocation, selectedNS)
 
 			source := m5ResticSnapshotsOn(sourceURL, sourceDEK)
 			Expect(m5SnapshotByNamespace(source, selectedNS)).To(HaveLen(2),
@@ -197,7 +197,7 @@ var _ = Describe("M5 — external sync (restic copy, re-encrypted to the destina
 
 		It("A narrowed sync copies only the selected namespace, and the copies are re-encrypted to the destination's own key", func() {
 			By("When a Mirror sync copies namespace " + selectedNS + " from the source to the destination")
-			cs := runSync("m5-sync-select-"+m5RunID, []string{selectedNS})
+			cs := runSync("m5-sync-select-"+crucibleRunID, []string{selectedNS})
 
 			By("Then the sync reports both copies present and nothing lagging")
 			Expect(cs.Status.SnapshotsCopied).To(BeEquivalentTo(2),
@@ -282,7 +282,7 @@ var _ = Describe("M5 — external sync (restic copy, re-encrypted to the destina
 			Expect(ok).To(BeTrue(), "`restic forget %s` failed at the source: %s", forgotten.ID, out)
 
 			By("And a second Mirror sync runs over the same selection")
-			cs := runSync("m5-sync-mirror-"+m5RunID, []string{selectedNS})
+			cs := runSync("m5-sync-mirror-"+crucibleRunID, []string{selectedNS})
 			Expect(cs.Status.SnapshotsCopied).To(BeEquivalentTo(1),
 				"one source snapshot survives, so exactly one copy should remain accounted for; status says %d (%s)",
 				cs.Status.SnapshotsCopied, m5DescribeConditions(cs.Status.Conditions))
@@ -306,7 +306,7 @@ var _ = Describe("M5 — external sync (restic copy, re-encrypted to the destina
 			// guard has to hold even while the operator is down.
 			By("When a sync names one location as both its source and its destination")
 			cs := &cbv1.ClusterBackupExternalSync{
-				ObjectMeta: metav1.ObjectMeta{Name: "m5-sync-self-" + m5RunID},
+				ObjectMeta: metav1.ObjectMeta{Name: "m5-sync-self-" + crucibleRunID},
 				Spec: cbv1.ClusterBackupExternalSyncSpec{
 					SourceLocationRef:      cbv1.LocalObjectReference{Name: sourceLocation},
 					DestinationLocationRef: cbv1.LocalObjectReference{Name: sourceLocation},
@@ -345,7 +345,7 @@ var _ = Describe("M5 — external sync (restic copy, re-encrypted to the destina
 
 			By("When a sync names the source and its alias as the two ends")
 			cs := &cbv1.ClusterBackupExternalSync{
-				ObjectMeta: metav1.ObjectMeta{Name: "m5-sync-alias-" + m5RunID},
+				ObjectMeta: metav1.ObjectMeta{Name: "m5-sync-alias-" + crucibleRunID},
 				Spec: cbv1.ClusterBackupExternalSyncSpec{
 					SourceLocationRef:      cbv1.LocalObjectReference{Name: sourceLocation},
 					DestinationLocationRef: cbv1.LocalObjectReference{Name: aliasLocation},

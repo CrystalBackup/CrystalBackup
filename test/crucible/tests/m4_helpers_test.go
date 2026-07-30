@@ -23,7 +23,6 @@ import (
 	"crypto/rand"
 	"io"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 
@@ -60,15 +59,14 @@ import (
 // it anywhere else would test something weaker than what production does.
 // ---------------------------------------------------------------------------
 
-// m4RunID makes this run's repositories and object names unique. Same rule and same reason as
-// m3RunID: the bucket is never reset between runs, so a reused clusterID would meet a previous
-// run's snapshots — and, for these specs, a previous run's deliberately corrupted pack.
-var m4RunID = strconv.FormatInt(time.Now().Unix(), 36)
+// M4's repositories and object names hang off crucibleRunID (crucible_suite_test.go): the bucket
+// is never reset between campaigns, so a reused clusterID would meet a previous campaign's
+// snapshots — and, for these specs, a previous campaign's deliberately corrupted pack.
 
 // m4DedicatedClusterID returns the isolated repository path segment for one destructive spec.
 // Distinct per spec AND per run, so two specs never share a blast radius.
 func m4DedicatedClusterID(spec string) string {
-	return "m4-" + spec + "-" + m4RunID
+	return "m4-" + spec + "-" + crucibleRunID
 }
 
 // m4LocationObject builds a location on its own clusterID with an explicit maintenance block.

@@ -48,8 +48,12 @@ var _ = Describe("M2 — self-service restore (modes × selection × mediation)"
 	const (
 		nsName  = "m2-restore"
 		pvcName = "data"
-		runName = "m2-restore-src"
 	)
+
+	// Per campaign: the shared "dr" repository is never emptied, so a fixed run name would meet the
+	// previous campaign's snapshots on the same coordinate. Every restore below then resolves a
+	// source this run did not write.
+	runName := crucibleRunName("m2-restore-src")
 
 	BeforeAll(func() {
 		m1RequireS3()
@@ -179,7 +183,12 @@ exit 0`)
 		// storage mediation): the resolution lists the repository under namespace=m2-restore +
 		// run=crucible-restore — which holds NOTHING — so the restore gates on SnapshotNotFound
 		// and never borrows the foreign snapshot.
-		foreignRun := "crucible-restore" // the m1 off-cluster spec's run of c-db
+		// The m1 off-cluster spec's run of c-db, named the same way it names itself
+		// (m1OffClusterRunBase + this campaign's id) so it really is that run and not a string that
+		// used to be. What the assertion needs is only that the coordinate (m2-restore, foreignRun)
+		// holds nothing — true whether or not the m1 lane ran — but naming the genuine foreign run
+		// is what makes this a tamper rather than a typo.
+		foreignRun := crucibleRunName(m1OffClusterRunBase)
 		tampered := &cbv1.Backup{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      foreignRun,

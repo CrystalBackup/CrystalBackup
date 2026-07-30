@@ -20,7 +20,6 @@ package crucible
 
 import (
 	"os"
-	"strconv"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -49,14 +48,12 @@ import (
 // acceptance scenario, not be papered over here.
 // ---------------------------------------------------------------------------
 
-// m3RunID makes every M3 backup name unique per run. The "dr" repository is SHARED and never
-// reset between runs, so re-running the suite on the same cluster would otherwise reuse a prior
-// run's ClusterBackup name — and the discovery controller, projecting that prior run's snapshot
-// back into the namespace as an already-Completed Backup, short-circuits the new run's manifest
-// capture (child.status.manifests stays nil). Each `mise run test` is a fresh test binary, so this
-// is stable within a run and unique across runs — the crucible's equivalent of the kind e2e's
-// fresh-clusterID-per-run hermeticity.
-var m3RunID = strconv.FormatInt(time.Now().Unix(), 36)
+// M3 names its runs through crucibleRunName/crucibleRunID (crucible_suite_test.go) — the "dr"
+// repository is SHARED and never reset between campaigns, so reusing a prior run's ClusterBackup
+// name lets the discovery controller project that prior run's snapshot back into the namespace as
+// an already-Completed Backup, and the new run either short-circuits its manifest capture
+// (child.status.manifests stays nil) or is refused outright with RunNameCollision. M3 used to keep
+// its own m3RunID for this; there is one now, for the whole suite.
 
 // m3EnsureDRLocation is the shared Given of every M3 spec: skip if S3 is unconfigured,
 // provision the platform KEK/S3 Secrets, ensure the canonical "dr" ClusterBackupLocation
