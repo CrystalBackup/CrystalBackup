@@ -45,6 +45,24 @@ charts/crystal-backup/crds/*.yaml
 /sbom/
 /apko.lock.json
 /image-refs.txt
+# The `-baseline` variants and root-level SBOMs, from comparing a build against a
+# published one. Same class as the four above, and they were missed because they are
+# named after the comparison rather than after the tool.
+/apko-baseline.lock.json
+/packages-baseline/
+/sbom-*.spdx.json
+
+# Terraform state, ANYWHERE. test/crucible/.gitignore already covers the crucible's own
+# directory and says why — a populated state file holds the RKE2 token, and it would hold
+# the Hetzner API token and the S3 credentials with it. What it does not cover is a state
+# file written somewhere else, and one duly appeared at the repo root: `terraform` writes
+# state into the working directory it was invoked from, so running it one level up from
+# where anyone expected leaves an uncovered file with everything in it. The root copy that
+# prompted this rule was empty (0 resources, no outputs), so nothing leaked; the point is
+# that nothing would have stopped it.
+*.tfstate
+*.tfstate.*
+tfplan
 
 # Python bytecode from hack/ scripts (check-dashboard-metrics.py).
 __pycache__/
