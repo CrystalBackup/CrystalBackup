@@ -2,7 +2,7 @@
 title: Quand ne pas le choisir
 description: Les cas que Crystal Backup ne couvre pas, les coûts qu'il impose, et les situations où un autre outil est la meilleure réponse.
 sourceFile: src/content/docs/discover/when-not-to-use.md
-sourceHash: 5ccbd12fe3d636b136bf28f493f06d406905caf6
+sourceHash: cfcd9a6d3d5944a564bb2935dc42141f54965e4b
 ---
 
 Lisez ceci avant le démarrage rapide. Chaque point est une limitation réelle de la version
@@ -58,7 +58,6 @@ documents de conception, et l'implémentation n'est pas dans cette version.
 | **Locations immuables** (S3 Object Lock) | `spec.mode: Immutable` est accepté et quelques garde-fous existent autour, mais le support d'Object Lock, la rotation de fenêtre et l'expiration **ne sont pas implémentés**. N'utilisez pas `Immutable` en attendant du WORM. |
 | **La CLI `crystalctl` et l'UI de navigation** | Pas écrites. Il n'y a aucun outil en ligne de commande destiné aux utilisateurs dans cette version. |
 | **Credentials de mover limités au repository** | Les movers reçoivent aujourd'hui les credentials **racine** de stockage objet de la location. Un mover compromis peut atteindre tout le bucket. Des credentials restreints et à durée de vie courte sont prévus. |
-| **Catalogue de métriques et règles d'alerte** | Les métriques sont émises ; le catalogue documenté et les règles d'alerte livrées sont encore en cours de finalisation. |
 | **Manifests de namespace via `ClusterRestore`** | Un `ClusterRestore` restaure les objets cluster-scoped et les données de volume. Restaurer par ce chemin les manifests de workload propres au namespace viendra plus tard. |
 
 ## Les coûts que vous acceptez

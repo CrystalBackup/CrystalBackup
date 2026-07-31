@@ -4,6 +4,98 @@ All notable changes to Crystal Backup. Versioning follows
 [adr/0014](spec/adr/0014-versioning-and-release.md): milestone `Mn` → minor `0.n.z` on
 major 0; `1.0.0` is a deliberate post-M9 API-stability decision.
 
+## 0.6.1 — Every mover Job ran unbounded (2026-08-01)
+
+A patch release with one theme: the mover Jobs this operator creates had **no resource
+requests, no limits, an unbounded restic cache and no heap cap** — since M1, in every release.
+`JobRequest.Resources` existed and no caller ever assigned it; `JobRequest.GoMemLimit` existed,
+was consumed by `moverEnv`, was covered by tests, and no caller ever assigned that either.
+90-roadmap.md M1 lists `GOMEMLIMIT` among what the mover ships. It never once shipped.
+
+So this is not "tune the numbers". There were no numbers.
+
+**Validated on real infrastructure: 82 of 82 crucible checks, 0 failed, 0 skipped, in 2h0m2s**
+— the whole suite, M0 through M6, on a freshly provisioned RKE2 + Rook-Ceph cluster with real
+S3, against the exact image digest this release ships, with `mover.profiles` empty so the
+**built-in defaults** were what got exercised. Zero evicted pods and zero OOM kills across the
+run. [Full report](https://crystalbackup.github.io/CrystalBackup/reports/crucible-m6-1.html).
+
+**No breaking change**, and nothing to do on upgrade: the defaults apply themselves. An
+installation that wants the old behaviour back can set `limits: {memory: "0"}` and
+`cacheSizeLimit: "0"` per operation.
+
+### Fixed
+
+- **Every mover Job ran BestEffort with an unbounded cache.** BestEffort is the bottom of the
+  kubelet's eviction order — under node memory pressure a running backup is killed before
+  almost anything else — and an uncapped `emptyDir` lets one restic cache fill a node's disk.
+  There are now four sizing classes over the thirteen operations (`data`, `repo-heavy`,
+  `repo-light`, `manifests`), overridable per operation through `mover.profiles`, with the
+  defaults living **only** in `internal/mover/profiles.go` and the chart carrying no numbers at
+  all. Requests are modest — a scheduling floor multiplied by `maxConcurrentMovers` — and
+  limits are generous, because they are node protection rather than right-sizing.
+  **No class sets a CPU limit**, deliberately: CPU is compressible, so a hard limit buys
+  nothing but a slower backup.
+  The cache `sizeLimit` is 20Gi, and it is a **ceiling against a runaway, not a fitted
+  estimate** — the load test that would give the real curve is the part of this lot that did
+  not ship. The restic cache is cold on every run (each mover gets a fresh emptyDir), so the
+  cap bounds one operation's download rather than an accumulation, which is what makes a
+  generous ceiling defensible without the benchmark.
+- **An evicted mover was reported as a mover bug.** Exceeding an `emptyDir` `sizeLimit` is not
+  an ENOSPC restic sees: the kubelet removes the pod with no termination message, and the
+  operator read that as `MoverCrashed` — diagnosing its own configuration as a fault in the
+  binary. It now reads the pod's eviction reason and reports **`MoverEvicted`** carrying the
+  kubelet's message verbatim, naming the volume and the number. Introducing memory limits
+  creates the identical blind spot, so **`MoverOOMKilled`** ships with it, and the maintenance
+  path — `prune`, the likeliest victim, whose Job pod was never parsed at all — now appends the
+  reason instead of a pod count.
+- **`GOMEMLIMIT` is derived instead of configured.** It and `limits.memory` are two statements
+  about one budget; a knob that let a caller set them independently only ever produced the
+  disagreement that kills a backup. It is now 80% of the operation's own memory limit, floored
+  to whole MiB, **omitted entirely** when there is no memory limit to derive from (`limits.memory:
+  "0"` means "do not cap this pod", and capping its heap anyway would invert the override's
+  point) or when the result would fall under 256Mi. That floor matters: the failure `GOMEMLIMIT`
+  prevents is an OOM kill, and the failure it *causes* when set too low is a GC death spiral —
+  continuous collection, no progress, a backup that neither finishes nor fails.
+
+### Changed
+
+- `Backup.status` gains **`completionTime`** — additive — stamped once on first arrival at a
+  terminal phase and never moved. It exists because `crystalbackup_backup_last_failure_timestamp_seconds`
+  needed an honest answer to "when did this fail", and neither candidate worked: `backupTime` is
+  the point-in-time of the snapshot set, and the Ready condition's `lastTransitionTime` is the
+  run's START, since a failing run goes `False(InProgress)` → `False(Failed)` and only a STATUS
+  change refreshes it.
+- `docs/MOVER-RESOURCES.md` is generated from the same table the code reads, with a CI verify
+  target, so the numbers an operator reads and the numbers a pod gets cannot drift.
+
+### Fixed (build)
+
+- **`make deploy` rewrote a tracked file, and it reached a binary.** kubebuilder scaffolds
+  `deploy` and `build-installer` as `kustomize edit set image` against
+  `config/manager/kustomization.yaml`; `make e2e` goes through that path, so every e2e run left
+  the repository dirty. `git describe --dirty` is what stamps `crystalbackup_build_info`, so the
+  first 0.6.1 images were built stamped `-dirty` — precisely the "build_info names no build"
+  defect the version-stamping work existed to remove. Nothing published carries it; the images
+  were rebuilt. Both targets now render from a temporary copy, and a test holds the file to its
+  pristine form, because the reintroduction is silent.
+
+### Documented
+
+- The site is now **bilingual EN/FR** — 30 of 33 documentation pages — behind a staleness guard
+  that records the git blob hash of the English source in each translated page and fails CI when
+  they diverge. The three untranslated pages are the generated ones (`reference/metrics.md`,
+  `reference/alerts.md`, `reference/api/index.md`); a hand-written French copy of a generated page
+  drifts the next time the Go changes and has no generator to refresh it, so the checker exempts
+  them from coverage and **errors** on a translation of one. The exemption is derived from the
+  `<!-- GENERATED FILE` marker the generators already write, not from a list of paths.
+  The guard earned itself immediately: bumping the English install pins for this release turned
+  eight French pages red by name, and the French files were untouched — nothing else would ever
+  have shown them in a diff.
+- The English documentation had been telling people to install `0.5.1` for the whole of 0.6.0:
+  every `helm install --version`, the Argo CD and Flux pins, the DR runbook. The 0.6.0 release
+  updated the README and two Astro pages and left thirty documentation pages behind.
+
 ## 0.6.0 — M6 "Observability hardening & production readiness" (2026-07-31)
 
 Milestone M6 began with one measurement. **Five of the nine alert rules this project had been

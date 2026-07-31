@@ -2,7 +2,7 @@
 title: Installer avec Helm
 description: Installation de l'operator Crystal Backup, des CRDs, du RBAC et des policies d'admission.
 sourceFile: src/content/docs/start/install.md
-sourceHash: 41dbedd05e565a29aceca864efa422adae7af39a
+sourceHash: 71bed39ed6e6bab8132eb2eb0393ca7fbfe6b748
 ---
 
 Le chart installe l'operator, les douze CRDs, le RBAC cluster-scoped, les policies
@@ -18,7 +18,7 @@ Le chart est publié comme artefact OCI sur GHCR.
 ```bash
 helm install crystal-backup \
   oci://ghcr.io/crystalbackup/charts/crystal-backup \
-  --version 0.6.0 \
+  --version 0.6.1 \
   --namespace crystal-backup-system \
   --create-namespace
 ```

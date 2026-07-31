@@ -5,7 +5,7 @@ description: What has shipped, what has not, how the project is versioned, and h
 
 ## Where the project is
 
-The current release is **`v0.6.0`**. Milestones M0 through M6 have shipped: the core
+The current release is **`v0.6.1`**. Milestones M0 through M6 have shipped: the core
 backup engine, cluster disaster recovery, restore, manifest and cluster-scoped DR,
 consistency hooks, repository maintenance and verification, the namespace plane, external
 sync, the right to erasure, and the observability layer in front of all of it.

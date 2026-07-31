@@ -69,7 +69,7 @@ external-snapshotter CRDs.
 ```bash
 helm install crystal-backup \
   oci://ghcr.io/crystalbackup/charts/crystal-backup \
-  --version 0.6.0 \
+  --version 0.6.1 \
   --namespace crystal-backup-system --create-namespace
 
 kubectl -n crystal-backup-system rollout status deploy/crystal-backup

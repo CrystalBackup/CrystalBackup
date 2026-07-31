@@ -54,7 +54,6 @@ the implementation is not in this release.
 | **Immutable locations** (S3 Object Lock) | `spec.mode: Immutable` is accepted and a few guards exist around it, but Object Lock support, window rotation and expiry are **not implemented**. Do not use `Immutable` expecting WORM. |
 | **`crystalctl` CLI and the browse UI** | Not written. There is no user-facing command-line tool in this release. |
 | **Repository-scoped mover credentials** | Movers currently receive the location's **root** object-storage credentials. A compromised mover can reach the whole bucket. Scoped, short-lived credentials are planned. |
-| **Metrics catalogue and alert rules** | Metrics are emitted; the documented catalogue and the shipped alert rules are still being finalised. |
 | **Namespace manifests through `ClusterRestore`** | A `ClusterRestore` restores cluster-scoped objects and volume data. Restoring the namespace's own workload manifests through that path is a follow-up. |
 
 ## Costs you are accepting

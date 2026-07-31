@@ -4,7 +4,7 @@ description: La checklist pour se remettre d'une perte totale du cluster, et l'e
 sidebar:
   order: 1
 sourceFile: src/content/docs/operations/dr-runbook.md
-sourceHash: 08030fcc06014aedd96ecf96518fa6ebcb8f1087
+sourceHash: 69196da8409a3f1f0fa929b355c7d7ef46d40eeb
 ---
 
 La version narrative, avec les explications, c'est
@@ -74,7 +74,7 @@ snapshots, et les CRDs de l'external-snapshotter.
 ```bash
 helm install crystal-backup \
   oci://ghcr.io/crystalbackup/charts/crystal-backup \
-  --version 0.6.0 \
+  --version 0.6.1 \
   --namespace crystal-backup-system --create-namespace
 
 kubectl -n crystal-backup-system rollout status deploy/crystal-backup
