@@ -91,6 +91,7 @@ mise exec -- make manifests generate fmt vet build test
 | `make test` | regenerate, provision envtest, run unit tests → coverage in `./cover.out` |
 | `make lint` / `make lint-fix` | run / auto-fix golangci-lint |
 | `make lint-config` | validate the golangci-lint config |
+| `make mover-profiles` | regenerate [`MOVER-RESOURCES.md`](MOVER-RESOURCES.md) from the mover sizing table in `internal/mover/profiles.go` (CI: `make mover-profiles-verify`) |
 | `make run` | run the manager against your current kubeconfig |
 | `make test-e2e` | spin up kind and run the e2e suite |
 

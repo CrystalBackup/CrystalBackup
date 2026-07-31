@@ -16,6 +16,11 @@ spec:
     metadata:
       annotations:
         kubectl.kubernetes.io/default-container: manager
+        # The mover sizing overrides are read ONCE, at startup. Without this checksum a
+        # `helm upgrade` that raises prune's memory limit would update the ConfigMap and change
+        # nothing at all until the next unrelated restart — a knob an admin can read back and that
+        # never reached a pod, which is exactly the defect class this milestone is closing.
+        checksum/mover-profiles: {{ include (print $.Template.BasePath "/mover-profiles.yaml") . | sha256sum }}
         {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -55,6 +60,10 @@ spec:
             # image so rclone stays off the backup/restore path (adr/0013); needed only when an
             # ExternalSync exists, so a cluster that never syncs never pulls it.
             - --sync-image={{ include "crystal-backup.syncImage" . }}
+            # The per-operation mover sizing overrides (`mover.profiles`), rendered into the
+            # ConfigMap mounted below. The operator holds the DEFAULTS itself — this file carries
+            # only what the platform changed — and refuses to start if it cannot make sense of it.
+            - --mover-profiles-file=/etc/crystal-backup/mover/profiles.yaml
             {{- if .Values.rbac.create }}
             # The manifest mover's identity and the ClusterRole the operator binds transiently
             # into a tenant namespace for a capture. Passed rather than derived: these names are
@@ -126,6 +135,9 @@ spec:
             # readOnlyRootFilesystem: true ⇒ give the manager a writable scratch dir.
             - name: tmp
               mountPath: /tmp
+            - name: mover-profiles
+              mountPath: /etc/crystal-backup/mover
+              readOnly: true
             {{- if .Values.admission.webhook.enabled }}
             # The chart-generated webhook serving certificate (webhook.yaml). The path is
             # controller-runtime's default CertDir, so no --webhook-cert-path flag is needed.
@@ -136,6 +148,9 @@ spec:
       volumes:
         - name: tmp
           emptyDir: {}
+        - name: mover-profiles
+          configMap:
+            name: {{ include "crystal-backup.fullname" . }}-mover-profiles
         {{- if .Values.admission.webhook.enabled }}
         - name: webhook-certs
           secret:

@@ -339,6 +339,18 @@ which uid 0 already reads and writes. `DAC_OVERRIDE` here bought nothing.
 
 No `hostPath`, no host namespaces, no privileged containers anywhere in v1.
 
+**Resource isolation (0.6.1).** Every mover carries per-operation requests and limits and a
+**bounded** restic-cache `emptyDir`; the table and its reasoning are
+[`docs/MOVER-RESOURCES.md`](../docs/MOVER-RESOURCES.md), generated from `internal/mover/profiles.go`,
+and the chart overrides it per operation via `mover.profiles`. Two of these belong here rather than
+in an ops guide: a mover with no requests at all is **BestEffort**, i.e. the first pod the kubelet
+evicts under node pressure — a backup should not be the cheapest thing on the node — and an
+unbounded cache `emptyDir` is a tenant-triggerable way to fill a NODE's disk from inside
+`crystal-backup-system`, taking unrelated workloads down with it. Bounding it moves that failure
+onto the mover alone, where it is one retryable backup; the operator reports it as `MoverEvicted`
+with the kubelet's message rather than as a generic crash, and an OOM against the memory limit as
+`MoverOOMKilled`.
+
 ## 7. NetworkPolicies
 
 `crystal-backup-system` is default-deny (ingress and egress). Then:

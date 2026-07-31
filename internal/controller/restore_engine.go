@@ -170,7 +170,10 @@ type restoreEngine struct {
 	Targets           *rexposer.TargetExposer
 	OperatorNamespace string
 	MoverImage        string
-	Queue             *queue.Manager
+	// MoverProfiles is the resolved per-operation sizing table, shared by both restore planes
+	// (the namespaced Restore and the admin ClusterRestore hold the same engine). Nil ⇒ built-in.
+	MoverProfiles mover.Profiles
+	Queue         *queue.Manager
 	// Clock is the only source of "now" for the per-volume progress deadline: clock.RealClock in
 	// production, a fake clock in tests (determinism, CLAUDE.md golden rule 1).
 	Clock clock.PassiveClock
@@ -240,7 +243,7 @@ type resolvedSnapshots struct {
 
 // newRestoreEngine wires an engine from the owning reconciler's primitives.
 func newRestoreEngine(c client.Client, secretsReader *clientsecrets.ByNameReader, targets *rexposer.TargetExposer,
-	operatorNamespace, moverImage string, q *queue.Manager,
+	operatorNamespace, moverImage string, moverProfiles mover.Profiles, q *queue.Manager,
 ) *restoreEngine {
 	return &restoreEngine{
 		Client:            c,
@@ -248,6 +251,7 @@ func newRestoreEngine(c client.Client, secretsReader *clientsecrets.ByNameReader
 		Targets:           targets,
 		OperatorNamespace: operatorNamespace,
 		MoverImage:        moverImage,
+		MoverProfiles:     moverProfiles,
 		Queue:             q,
 		Clock:             clock.RealClock{},
 		resolved:          make(map[types.UID]resolvedSnapshots),
@@ -733,6 +737,7 @@ func (e *restoreEngine) startVolume(ctx context.Context, rc *restoreExecContext,
 		Namespace: e.OperatorNamespace,
 		Image:     e.MoverImage,
 		Operation: mover.OpRestore,
+		Profiles:  e.MoverProfiles,
 		ResticArgs: restic.RestoreArgs(plan.snapshotID, plan.snapshotPath, target,
 			rc.deleteExtras, plan.include, plan.exclude),
 		RepoURL:    rc.repoURL,
@@ -799,6 +804,7 @@ func (e *restoreEngine) maintenanceDeps() repoMaintenanceDeps {
 		Secrets:           e.Secrets,
 		OperatorNamespace: e.OperatorNamespace,
 		MoverImage:        e.MoverImage,
+		MoverProfiles:     e.MoverProfiles,
 	}
 }
 

@@ -37,6 +37,7 @@ import (
 	"github.com/CrystalBackup/CrystalBackup/internal/apiconst"
 	"github.com/CrystalBackup/CrystalBackup/internal/client/secrets"
 	"github.com/CrystalBackup/CrystalBackup/internal/metrics"
+	"github.com/CrystalBackup/CrystalBackup/internal/mover"
 	"github.com/CrystalBackup/CrystalBackup/internal/nsselector"
 	"github.com/CrystalBackup/CrystalBackup/internal/status"
 	"github.com/CrystalBackup/CrystalBackup/internal/tracing"
@@ -76,6 +77,7 @@ type ClusterBackupReconciler struct {
 	// operator.
 	Secrets                          *secrets.ByNameReader
 	MoverImage                       string
+	MoverProfiles                    mover.Profiles
 	ManifestMoverServiceAccount      string
 	ClusterManifestReaderClusterRole string
 	Recorder                         events.EventRecorder
@@ -89,7 +91,9 @@ func NewClusterBackupReconciler(
 	scheme *runtime.Scheme,
 	operatorNamespace string,
 	secretsReader *secrets.ByNameReader,
-	moverImage, manifestMoverSA, clusterManifestReaderRole string,
+	moverImage string,
+	moverProfiles mover.Profiles,
+	manifestMoverSA, clusterManifestReaderRole string,
 	recorder events.EventRecorder,
 ) *ClusterBackupReconciler {
 	return &ClusterBackupReconciler{
@@ -98,6 +102,7 @@ func NewClusterBackupReconciler(
 		OperatorNamespace:                operatorNamespace,
 		Secrets:                          secretsReader,
 		MoverImage:                       moverImage,
+		MoverProfiles:                    moverProfiles,
 		ManifestMoverServiceAccount:      manifestMoverSA,
 		ClusterManifestReaderClusterRole: clusterManifestReaderRole,
 		Recorder:                         recorder,

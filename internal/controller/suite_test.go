@@ -42,6 +42,7 @@ import (
 	cbv1 "github.com/CrystalBackup/CrystalBackup/api/v1alpha1"
 	"github.com/CrystalBackup/CrystalBackup/internal/client/secrets"
 	"github.com/CrystalBackup/CrystalBackup/internal/keys"
+	"github.com/CrystalBackup/CrystalBackup/internal/mover"
 	"github.com/CrystalBackup/CrystalBackup/internal/repo/queue"
 	"github.com/CrystalBackup/CrystalBackup/internal/rexposer"
 )
@@ -115,6 +116,27 @@ const suiteMoverImage = "crystal-mover:test"
 // DIFFERENT from suiteMoverImage so a spec that asserts a sync Job runs the sync image is actually
 // testing something; identical values would make that assertion pass by accident.
 const suiteSyncImage = "crystal-sync:test"
+
+// suiteMoverProfilesYAML is the sizing override the whole suite runs with — the exact shape the
+// chart renders into its ConfigMap. Every value here is DELIBERATELY UNLIKE the built-in table
+// (odd CPU millicores, a cache cap nothing else uses): a spec asserting a mover Job's requests
+// would pass on the built-in defaults if the override were merely plausible, which is how a knob
+// ships documented and inert.
+const suiteMoverProfilesYAML = `
+default:
+  requests:
+    cpu: 33m
+init:
+  requests:
+    cpu: 77m
+    memory: 111Mi
+  limits:
+    memory: 999Mi
+  cacheSizeLimit: 7Gi
+`
+
+// suiteMoverProfiles is the parsed form, resolved once in BeforeSuite.
+var suiteMoverProfiles mover.Profiles
 
 // The manifest mover identity and grant, as the chart would resolve them. envtest has no
 // kubelet so no Job ever runs, but the RoleBinding IS really created against the API server,
@@ -195,6 +217,12 @@ var _ = BeforeSuite(func() {
 		Recorder: mgr.GetEventRecorder("backuplocation"),
 	}).SetupWithManager(mgr)).To(Succeed())
 
+	// The mover sizing table every reconciler below is wired with, parsed from the chart-shaped
+	// override above exactly as main.go parses the mounted ConfigMap.
+	var profilesErr error
+	suiteMoverProfiles, profilesErr = mover.LoadProfiles([]byte(suiteMoverProfilesYAML))
+	Expect(profilesErr).NotTo(HaveOccurred())
+
 	// The per-repository exclusive queue, bound to the suite ctx (cancel() also stops it) and
 	// explicitly Stop()ped in AfterSuite.
 	repoQueue = queue.NewManager(ctx)
@@ -205,6 +233,7 @@ var _ = BeforeSuite(func() {
 		repoQueue,
 		suiteOperatorNamespace,
 		suiteMoverImage,
+		suiteMoverProfiles,
 		mgr.GetEventRecorder("backuprepository"),
 	).SetupWithManager(mgr)).To(Succeed())
 
@@ -220,6 +249,7 @@ var _ = BeforeSuite(func() {
 		repoQueue,
 		suiteOperatorNamespace,
 		suiteMoverImage,
+		suiteMoverProfiles,
 		mgr.GetEventRecorder("maintenance"),
 		maintenanceClock,
 	).SetupWithManager(mgr)).To(Succeed())
@@ -242,6 +272,7 @@ var _ = BeforeSuite(func() {
 		backupExposers,
 		suiteOperatorNamespace,
 		suiteMoverImage,
+		suiteMoverProfiles,
 		suiteManifestMoverSA,
 		suiteManifestReaderRole,
 		mgr.GetEventRecorder("backup"),
@@ -266,6 +297,7 @@ var _ = BeforeSuite(func() {
 		suiteOperatorNamespace,
 		secrets.NewByNameReader(mgr.GetAPIReader()),
 		suiteMoverImage,
+		suiteMoverProfiles,
 		suiteManifestMoverSA,
 		suiteClusterManifestReaderRole,
 		mgr.GetEventRecorder("clusterbackup"),
@@ -319,6 +351,7 @@ var _ = BeforeSuite(func() {
 		restoreLister,
 		suiteOperatorNamespace,
 		suiteMoverImage,
+		suiteMoverProfiles,
 		mgr.GetEventRecorder("clustererasure"),
 	).SetupWithManager(mgr)).To(Succeed())
 
@@ -335,6 +368,7 @@ var _ = BeforeSuite(func() {
 		suiteOperatorNamespace,
 		suiteMoverImage,
 		suiteSyncImage,
+		suiteMoverProfiles,
 		scheduleClock,
 		mgr.GetEventRecorder("clusterbackupexternalsync"),
 	).SetupWithManager(mgr)).To(Succeed())
@@ -348,6 +382,7 @@ var _ = BeforeSuite(func() {
 		suiteOperatorNamespace,
 		suiteMoverImage,
 		suiteSyncImage,
+		suiteMoverProfiles,
 		scheduleClock,
 		mgr.GetEventRecorder("backupexternalsync"),
 	).SetupWithManager(mgr)).To(Succeed())
@@ -361,6 +396,7 @@ var _ = BeforeSuite(func() {
 		restoreLister,
 		suiteOperatorNamespace,
 		suiteMoverImage,
+		suiteMoverProfiles,
 		suiteManifestMoverSA,
 		suiteManifestWriterRole,
 		mgr.GetEventRecorder("restore"),
@@ -374,6 +410,7 @@ var _ = BeforeSuite(func() {
 		restoreLister,
 		suiteOperatorNamespace,
 		suiteMoverImage,
+		suiteMoverProfiles,
 		suiteManifestMoverSA,
 		suiteClusterManifestWriterRole,
 		mgr.GetEventRecorder("clusterrestore"),

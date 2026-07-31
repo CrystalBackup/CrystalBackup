@@ -77,6 +77,18 @@ func waitForInitJobCreated(repoName string) batchv1.Job {
 	return job
 }
 
+// findJobVolume returns a Job pod template's volume by name, failing the spec when it is absent.
+func findJobVolume(job batchv1.Job, name string) corev1.Volume {
+	GinkgoHelper()
+	for _, v := range job.Spec.Template.Spec.Volumes {
+		if v.Name == name {
+			return v
+		}
+	}
+	Fail("no volume " + name + " in the Job pod template")
+	return corev1.Volume{}
+}
+
 // patchInitJobStatus re-reads the init Job and applies mutate to its status, retrying on the
 // resourceVersion conflicts a concurrently-reconciling controller can cause. envtest has no
 // kubelet, so patching status is the ONLY way an init Job ever reaches a terminal state here.
@@ -199,6 +211,20 @@ var _ = Describe("BackupRepositoryReconciler", func() {
 			}
 		}
 		Expect(repoEnv).To(Equal(wantURL))
+
+		// The mover sizing table reached the pod. The suite wires the reconcilers with an
+		// OVERRIDE (suiteMoverProfilesYAML), so these numbers can only be here if the whole path
+		// — parse the chart's ConfigMap shape, hand it to the constructor, resolve THIS operation's
+		// row, stamp the container and the cache volume — is connected. Asserting the built-in
+		// defaults instead would pass with the table wired to nothing, which is the whole failure
+		// mode being guarded against.
+		Expect(c.Resources.Requests.Cpu().String()).To(Equal("77m"))
+		Expect(c.Resources.Requests.Memory().String()).To(Equal("111Mi"))
+		Expect(c.Resources.Limits.Memory().String()).To(Equal("999Mi"))
+		cache := findJobVolume(job, "restic-cache")
+		Expect(cache.EmptyDir).NotTo(BeNil())
+		Expect(cache.EmptyDir.SizeLimit).NotTo(BeNil())
+		Expect(cache.EmptyDir.SizeLimit.String()).To(Equal("7Gi"))
 		// The Job is controller-owned by the BackupRepository (so the Owns(Job) watch maps back).
 		owner := metav1.GetControllerOf(&job)
 		Expect(owner).NotTo(BeNil())

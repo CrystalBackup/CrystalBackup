@@ -84,6 +84,13 @@ jobs:
       - name: Verify the Metrics and Alerts reference pages are regenerated
         run: make observability-docs-verify
 
+      # The mover sizing reference (docs/MOVER-RESOURCES.md) is generated from the one table that
+      # sizes every mover Job. The chart ships no defaults of its own, so this page is where an
+      # administrator reads the numbers before sizing a node pool — and a stale one would have
+      # them plan against limits the operator no longer applies.
+      - name: Verify the mover sizing reference is regenerated
+        run: make mover-profiles-verify
+
       # The preflight script an administrator runs BEFORE installing anything answers, per
       # StorageClass, which exposer would be chosen and which volumes would be skipped. That
       # answer belongs to internal/exposer.Registry.For alone, so the script's routing block is

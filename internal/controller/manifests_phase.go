@@ -210,6 +210,7 @@ func (r *BackupReconciler) startManifestsJob(
 		Namespace: r.OperatorNamespace,
 		Image:     r.MoverImage,
 		Operation: mover.OpManifestsBackup,
+		Profiles:  r.MoverProfiles,
 		// The identity's Path is both what restic records and where the dump writes
 		// (mover.ManifestsRoot + "/" + namespace) — one string, derived once.
 		ResticArgs: resticBackupArgs(id),

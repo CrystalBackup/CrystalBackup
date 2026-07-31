@@ -142,6 +142,10 @@ type BackupReconciler struct {
 	// MoverImage is the image the mover Jobs run. Required for real backups; empty is tolerated
 	// only because envtest simulates the Job outcome and never runs it.
 	MoverImage string
+	// MoverProfiles is the resolved per-operation sizing table (internal/mover.Profiles): the
+	// requests/limits and restic-cache cap every Job this controller builds carries. Nil means
+	// the built-in defaults, which is what envtest runs with.
+	MoverProfiles mover.Profiles
 	// ManifestMoverServiceAccount and ManifestReaderClusterRole name the identity and grant of
 	// the manifest mover. They are CONFIGURED, not derived: the chart release-prefixes every
 	// cluster-scoped object so two installs cannot collide, so the operator must be told the
@@ -178,6 +182,7 @@ func NewBackupReconciler(
 	secretsReader *secrets.ByNameReader,
 	exposers ExposerRegistry,
 	operatorNamespace, moverImage string,
+	moverProfiles mover.Profiles,
 	manifestMoverSA, manifestReaderRole string,
 	recorder events.EventRecorder,
 	q *queue.Manager,
@@ -189,6 +194,7 @@ func NewBackupReconciler(
 		Exposers:                    exposers,
 		OperatorNamespace:           operatorNamespace,
 		MoverImage:                  moverImage,
+		MoverProfiles:               moverProfiles,
 		ManifestMoverServiceAccount: manifestMoverSA,
 		ManifestReaderClusterRole:   manifestReaderRole,
 		Recorder:                    recorder,
@@ -1066,6 +1072,7 @@ func (r *BackupReconciler) advanceSnapshotting(ctx context.Context, backup *cbv1
 		Namespace:    r.OperatorNamespace,
 		Image:        r.MoverImage,
 		Operation:    mover.OpBackup,
+		Profiles:     r.MoverProfiles,
 		ResticArgs:   resticArgs,
 		RepoURL:      rc.repoURL,
 		SecretName:   moverName,
@@ -1617,6 +1624,11 @@ func ensureMoverCredsSecret(ctx context.Context, deps repoMaintenanceDeps, name,
 // and the node the pod ran on. A blank message parses to an error — the load-bearing signal that
 // the mover was killed before it could report (OOMKilled/SIGKILL) — which the caller turns into a
 // volume failure. A package function shared with the restore engine.
+//
+// When the KUBELET did the killing it also left a reason on the pod, and that reason is returned
+// as a moverKilledError instead of the generic parse failure. See podKillReason: with resource
+// limits and a cache sizeLimit on every mover (0.6.1), "the pod vanished" became a thing the
+// platform's own configuration can cause, and it must not read the same as a segfault.
 func readMoverResult(ctx context.Context, c client.Client, operatorNamespace, jobName string) (mover.MoverResult, string, error) {
 	var pods corev1.PodList
 	if err := c.List(ctx, &pods,
@@ -1628,9 +1640,17 @@ func readMoverResult(ctx context.Context, c client.Client, operatorNamespace, jo
 	// and list order is arbitrary — prefer the exit-0 attempt's message so a retried-then-
 	// successful run is never misread as its own earlier failure; fall back to any
 	// terminated pod (all attempts failed, or a hard kill left a blank message).
-	var fallback *corev1.Pod
+	var fallback, killed *corev1.Pod
+	var killedReason string
 	for i := range pods.Items {
 		pod := &pods.Items[i]
+		// Checked BEFORE the terminated-status filter: an evicted pod may carry no container
+		// status at all, and then the loop below would skip it and the whole function would end
+		// at "no terminated mover pod found" — the least informative sentence available about a
+		// failure the operator caused by capping a volume.
+		if reason := podKillReason(pod); reason != "" && killed == nil {
+			killed, killedReason = pod, reason
+		}
 		cs := pod.Status.ContainerStatuses
 		if len(cs) == 0 || cs[0].State.Terminated == nil {
 			continue
@@ -1643,12 +1663,84 @@ func readMoverResult(ctx context.Context, c client.Client, operatorNamespace, jo
 			fallback = pod
 		}
 	}
+	// A kubelet kill outranks the blank termination message it left behind: both mean "the mover
+	// never reported", but only one of them says why, and the why is actionable.
+	if killed != nil {
+		return mover.MoverResult{}, killed.Spec.NodeName, &moverKilledError{reason: killedReason}
+	}
 	if fallback != nil {
 		result, err := mover.ParseMoverResult(fallback.Status.ContainerStatuses[0].State.Terminated.Message)
 		return result, fallback.Spec.NodeName, err
 	}
 	return mover.MoverResult{}, "", fmt.Errorf("no terminated mover pod found for job %s/%s", operatorNamespace, jobName)
 }
+
+// podReasonEvicted is the pod-level status reason the kubelet's eviction manager writes. The
+// message beside it is the only place the CAUSE appears — "Usage of EmptyDir volume
+// "restic-cache" exceeds the limit "20Gi"." — so the message is carried through, not just the
+// reason.
+const podReasonEvicted = "Evicted"
+
+// containerReasonOOMKilled is the terminated-state reason the kubelet writes when the cgroup's
+// memory limit killed the process.
+const containerReasonOOMKilled = "OOMKilled"
+
+// podKillReason classifies the two ways THIS OPERATOR'S OWN SIZING can end a mover, and returns
+// the short reason to record on the CR — or "" when the pod died of something else.
+//
+// Both were possible before 0.6.1 (a node under memory pressure, an admin-set LimitRange) and both
+// arrived at the same place: an empty termination message, reported as "MoverCrashed", a string
+// that sends an operator looking for a bug in the mover. Now that the operator itself sets a
+// memory limit and a cache cap on every Job, that would be its own configuration handing back a
+// misleading diagnosis — which is why the sizeLimit was not shipped without this function.
+//
+//   - EVICTED: the restic cache emptyDir exceeded its sizeLimit (or the node ran out of disk).
+//     The kubelet's own message names the volume and the number, so it is quoted verbatim.
+//   - OOMKILLED: the container exceeded its memory limit.
+func podKillReason(pod *corev1.Pod) string {
+	if pod.Status.Reason == podReasonEvicted {
+		message := strings.TrimSpace(pod.Status.Message)
+		if message == "" {
+			return "MoverEvicted"
+		}
+		return "MoverEvicted: " + message
+	}
+	for i := range pod.Status.ContainerStatuses {
+		if t := pod.Status.ContainerStatuses[i].State.Terminated; t != nil && t.Reason == containerReasonOOMKilled {
+			return "MoverOOMKilled: the mover exceeded its memory limit"
+		}
+	}
+	return ""
+}
+
+// killDetail is podKillReason over a whole Job, formatted for appending to an error message: it
+// returns ": MoverOOMKilled…" / ": MoverEvicted…" or the empty string. Used by the maintenance path,
+// which has no MoverResult to read (its Jobs are watched to completion, not parsed) and would
+// otherwise report a kubelet kill as a pod count.
+//
+// A List error yields "": this is decoration on a failure that is already being reported, and it
+// must never turn into a second, unrelated error about listing pods.
+func killDetail(ctx context.Context, c client.Client, operatorNamespace, jobName string) string {
+	var pods corev1.PodList
+	if err := c.List(ctx, &pods,
+		client.InNamespace(operatorNamespace),
+		client.MatchingLabels{batchv1.JobNameLabel: jobName}); err != nil {
+		return ""
+	}
+	for i := range pods.Items {
+		if reason := podKillReason(&pods.Items[i]); reason != "" {
+			return ": " + reason
+		}
+	}
+	return ""
+}
+
+// moverKilledError is the error readMoverResult returns for a mover the kubelet killed. It carries
+// the reason to record verbatim; every existing behaviour keyed on "the mover did not report"
+// (notably the stale-lock unlock) still fires, because it is still a non-nil error.
+type moverKilledError struct{ reason string }
+
+func (e *moverKilledError) Error() string { return e.reason }
 
 // deleteMoverJobAndSecret best-effort deletes the mover Job and its creds Secret (both named
 // <prefix>-mover in the operator namespace), tolerating NotFound. Errors are logged, not
@@ -1880,7 +1972,13 @@ func setTerminalCondition(backup *cbv1.Backup, phase string) {
 // report — OOMKilled/SIGKILL); an ok=false result carries the mover's own advisory error; a
 // Job-level failure with neither is a generic mover-job failure.
 func moverFailureReason(result mover.MoverResult, parseErr error) string {
+	var killed *moverKilledError
 	switch {
+	// A kubelet kill (eviction on the cache sizeLimit, or an OOM on the memory limit) is reported
+	// as what it is. It is still "the mover did not report", but "MoverCrashed" would point an
+	// operator at the mover instead of at the limit they set.
+	case errors.As(parseErr, &killed):
+		return shortReason(killed.reason)
 	case parseErr != nil:
 		return "MoverCrashed"
 	case result.Error != "":

@@ -145,7 +145,10 @@ type BackupRepositoryReconciler struct {
 	// + restic). Required for real backups; empty is tolerated only because envtest never runs
 	// the Job.
 	MoverImage string
-	Recorder   events.EventRecorder
+	// MoverProfiles is the resolved per-operation sizing table; init takes the light row.
+	// Nil ⇒ built-in defaults.
+	MoverProfiles mover.Profiles
+	Recorder      events.EventRecorder
 
 	// mu guards inflight. inflight tracks the in-flight init Handle per repoKey so the
 	// reconciler is restart-safe (empty map after restart -> re-enqueue -> re-adopt) and never
@@ -166,6 +169,7 @@ func NewBackupRepositoryReconciler(
 	secretsReader *secrets.ByNameReader,
 	q *queue.Manager,
 	operatorNamespace, moverImage string,
+	moverProfiles mover.Profiles,
 	recorder events.EventRecorder,
 ) *BackupRepositoryReconciler {
 	return &BackupRepositoryReconciler{
@@ -175,6 +179,7 @@ func NewBackupRepositoryReconciler(
 		Queue:             q,
 		OperatorNamespace: operatorNamespace,
 		MoverImage:        moverImage,
+		MoverProfiles:     moverProfiles,
 		Recorder:          recorder,
 		inflight:          map[string]*queue.Handle{},
 	}
@@ -546,6 +551,7 @@ func (r *BackupRepositoryReconciler) runInit(opCtx context.Context, owner *cbv1.
 		Namespace:    r.OperatorNamespace,
 		Image:        r.MoverImage,
 		Operation:    mover.OpInit,
+		Profiles:     r.MoverProfiles,
 		ResticArgs:   []string{"init"},
 		RepoURL:      repoURL,
 		SecretName:   name,

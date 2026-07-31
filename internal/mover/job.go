@@ -155,8 +155,16 @@ type JobRequest struct {
 	// A bool rather than a path: the path is fixed by the Secret projection, so a caller that
 	// could choose it could only choose it wrong.
 	FromPasswordFile bool
-	// Resources are the container's requests/limits, passed through as-is.
-	Resources corev1.ResourceRequirements
+	// Profiles is the operator's resolved sizing table (built-in defaults with the platform's
+	// overrides folded in). BuildJob picks THIS request's Operation out of it for the container's
+	// requests/limits and for the restic cache emptyDir's sizeLimit.
+	//
+	// The table rather than one operation's numbers, and nil rather than a required field, both
+	// on purpose: a caller cannot hand a prune Job a backup's limits by picking the wrong row,
+	// and a nil table (every unit test, envtest, a controller not yet wired to the operator's
+	// table) still produces a SIZED pod from the built-in defaults instead of a BestEffort one.
+	// Purity is unaffected — the table is an input like any other field.
+	Profiles Profiles
 	// SpreadOverLabels, when non-empty, adds a SOFT topology-spread constraint (maxSkew 1 over
 	// kubernetes.io/hostname, whenUnsatisfiable=ScheduleAnyway) selecting pods by these labels, so a
 	// wide fan-out's movers prefer distinct nodes instead of piling onto one. Empty ⇒ no constraint.
@@ -190,7 +198,10 @@ type JobRequest struct {
 // mounts the source claim read-only at req.PVC.MountPath. No ServiceAccountName is set, so
 // the Job uses the namespace default SA — and its token is not even mounted (see below).
 func BuildJob(req JobRequest) *batchv1.Job {
-	volumes, mounts := moverVolumes(req)
+	// One lookup, used twice: the container's requests/limits and the cache volume's sizeLimit
+	// come from the same row, so a Job can never be sized as a prune and capped as a backup.
+	profile := req.Profiles.For(req.Operation)
+	volumes, mounts := moverVolumes(req, profile)
 
 	container := corev1.Container{
 		Name:    containerName,
@@ -201,7 +212,7 @@ func BuildJob(req JobRequest) *batchv1.Job {
 		Args:         append([]string{operationFlag, string(req.Operation), "--"}, req.ResticArgs...),
 		Env:          moverEnv(req),
 		VolumeMounts: mounts,
-		Resources:    req.Resources,
+		Resources:    corev1.ResourceRequirements{Requests: profile.Requests, Limits: profile.Limits},
 		// root + a per-operation capability set (see moverCapabilities), while everything
 		// else is stripped: no privilege escalation, a read-only root filesystem (only the
 		// cache and tmp emptyDirs are writable), all other capabilities dropped, default
@@ -376,7 +387,11 @@ func secretEnv(key, secretName string) corev1.EnvVar {
 // filesystem requires. A data job (req.PVC != nil) additionally gets the PVC mounted at
 // req.PVC.MountPath — read-only unless the caller set PVCMount.ReadWrite (restore); a
 // maintenance job gets no data volume at all.
-func moverVolumes(req JobRequest) ([]corev1.Volume, []corev1.VolumeMount) {
+//
+// The restic CACHE emptyDir carries the profile's sizeLimit (nil ⇒ unbounded, the pre-0.6.1
+// behaviour). /tmp and the manifest scratch stay unbounded — see defaultCacheSizeLimit for why
+// bounding the cache is worth an eviction risk and bounding the other two is not.
+func moverVolumes(req JobRequest, profile Profile) ([]corev1.Volume, []corev1.VolumeMount) {
 	volumes := []corev1.Volume{
 		{
 			Name: volumeSecret,
@@ -384,7 +399,9 @@ func moverVolumes(req JobRequest) ([]corev1.Volume, []corev1.VolumeMount) {
 				Secret: &corev1.SecretVolumeSource{SecretName: req.SecretName},
 			},
 		},
-		{Name: volumeCache, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+		{Name: volumeCache, VolumeSource: corev1.VolumeSource{
+			EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: profile.CacheSizeLimit},
+		}},
 		{Name: volumeTmp, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
 	}
 	mounts := []corev1.VolumeMount{

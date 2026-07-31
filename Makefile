@@ -609,6 +609,31 @@ api-docs-verify: api-docs ## Fail if the committed API reference is stale (CI gu
 	fi
 	@echo "$(API_DOCS_OUT) is up to date."
 
+## The mover sizing reference is GENERATED from internal/mover/profiles.go, which is the ONLY place
+## the per-operation requests, limits and cache caps exist. The chart deliberately carries no
+## defaults (its `mover.profiles` is an override map, empty by default), so the two places an
+## operator could read a number — this document and a running Job — come from one table. A hand-
+## maintained copy would be wrong within a release, and it would be wrong in the direction that
+## matters: someone sizing a node pool from it.
+MOVER_PROFILES_OUT ?= docs/MOVER-RESOURCES.md
+
+.PHONY: mover-profiles
+mover-profiles: ## Generate docs/MOVER-RESOURCES.md from internal/mover/profiles.go.
+	go run ./internal/mover/cmd/genmoverdocs --root .
+
+## Regenerates into a scratch directory and diffs, like alert-rules-verify: a file that has never
+## been committed is invisible to `git diff`, and this guard must work on the change that adds it.
+.PHONY: mover-profiles-verify
+mover-profiles-verify: ## Fail if the committed mover sizing reference is stale (CI guard).
+	@tmp="$$(mktemp -d)"; trap 'rm -rf "$$tmp"' EXIT; \
+	go run ./internal/mover/cmd/genmoverdocs --root "$$tmp" >/dev/null; \
+	if ! diff -u "$(MOVER_PROFILES_OUT)" "$$tmp/$(MOVER_PROFILES_OUT)"; then \
+		echo "ERROR: $(MOVER_PROFILES_OUT) is out of date with internal/mover/profiles.go."; \
+		echo "       Run 'make mover-profiles' and commit the result."; \
+		exit 1; \
+	fi; \
+	echo "$(MOVER_PROFILES_OUT) is up to date."
+
 ## The Metrics and Alerts reference pages are GENERATED, for the same reason the API reference is
 ## and at a larger scale of damage. Fifty-three series and eleven rules maintained by hand disagree
 ## with the operator within one release, and a metrics reference that disagrees with a scrape is
