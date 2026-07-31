@@ -72,8 +72,8 @@ const milestones = [
   ['0.3.2', 'Hardening — restore safety (Recreate data loss, finalizer leak)', 'patch', [['Report', `${base}/reports/audit-m3.2.html`]]],
   ['M4', 'Consistency hooks, verification & maintenance', 'done', `${base}/reports/crucible-m4.html`],
   ['M5', 'Namespace plane, external sync & right-to-erasure', 'done', `${base}/reports/crucible-m5.html`],
-  ['M6', 'Observability hardening & production readiness', 'here'],
-  ['M7', 'CLI & browse UI', ''],
+  ['M6', 'Observability hardening & production readiness', 'done', `${base}/reports/crucible-m6.html`],
+  ['M7', 'CLI & browse UI', 'here'],
   ['M8', 'Immutable locations', ''],
   ['M9', 'Coexistence hardening & DR drills', ''],
 ];
@@ -126,7 +126,7 @@ const description =
       <section class="hero">
         <div class="hero-copy">
           <span class="pill">
-            <span class="dot"></span> Building M6 · M5 shipped (v0.5.1)
+            <span class="dot"></span> Building M7 · M6 shipped (v0.6.0)
           </span>
           <h1>
             Every namespace gets <span class="grad">its own backups.</span>
@@ -268,7 +268,7 @@ const description =
         <p class="eyebrow">How it compares</p>
         <h2>Where Crystal Backup stands</h2>
         <p class="section-lead">
-          Our column is <strong>v0.5.1 as shipped</strong> — every “yes” below is code you can
+          Our column is <strong>v0.6.0 as shipped</strong> — every “yes” below is code you can
           install today, exercised by the <a href={links.quality}>published acceptance reports</a>.
           The other columns are those tools’ <strong>current</strong> capabilities, to our
           knowledge — different projects, different goals, not a benchmark.
@@ -326,13 +326,14 @@ const description =
         <p class="eyebrow">Roadmap</p>
         <h2>Releasable, core-first, in the open</h2>
         <p class="section-lead">
-          Each milestone ships something usable. <strong>M0 through M5 have shipped</strong> — CRDs,
+          Each milestone ships something usable. <strong>M0 through M6 have shipped</strong> — CRDs,
           CI, the core engine, cluster disaster recovery, self-service &amp; admin restore,
           manifest &amp; cluster-scoped DR, consistency hooks, repository maintenance, the
-          namespace plane, external sync and the right to erasure are live (v0.5.1); we’re now
-          building <strong>M6 — Observability hardening &amp; production readiness</strong>. Each
-          shipped milestone links its acceptance report below — the checks it had to pass on a
-          real cluster, in full.
+          namespace plane, external sync, the right to erasure and now the observability layer in
+          front of all of it are live (v0.6.0); we’re next on
+          <strong>M7 — CLI &amp; browse UI</strong>. Each shipped milestone links its acceptance
+          report below — the checks it had to pass on a real cluster, in full. M6’s report is the
+          first that is not label-filtered: the whole suite, 82 of 82, nothing skipped.
         </p>
         <ol class="timeline">
           {
@@ -377,7 +378,7 @@ const description =
           <aside class="note">
             <h3>You’re early — and that’s the point</h3>
             <p>
-              M0 through M5 have shipped (v0.5.1) — real, tested code, accepted on a real
+              M0 through M6 have shipped (v0.6.0) — real, tested code, accepted on a real
               RKE2/Ceph cluster with <a href={links.quality}>the reports published</a>. It is
               still early: four milestones are ahead, the CRD API is <code>v1alpha1</code> and
               will still move, and the production-hardening pass is M6. So try it in a sandbox,
@@ -394,7 +395,7 @@ const description =
       <section class="cta">
         <h2>Try it, or read every decision</h2>
         <p>
-          M0–M5 are installable today (v0.5.1); the specifications, the 18 decision records and
+          M0–M6 are installable today (v0.6.0); the specifications, the 18 decision records and
           every acceptance report are public. Observability hardening &amp; production readiness
           (M6) are next.
         </p>
