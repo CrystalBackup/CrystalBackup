@@ -371,3 +371,99 @@ func cacheVolume(t *testing.T, job *batchv1.Job) corev1.Volume {
 	t.Fatalf("no %q volume in the Job", volumeCache)
 	return corev1.Volume{}
 }
+
+// TestGoMemLimitIsBelowEveryOperationsOwnLimit is the invariant the derivation exists for: the Go
+// runtime must start collecting BEFORE the cgroup kills the process, so for every operation the
+// derived GOMEMLIMIT has to be strictly under that operation's own limits.memory.
+//
+// It walks the built-in table rather than a handful of chosen rows, so an operation added later
+// with a memory limit nobody thought about is covered on the day it appears.
+func TestGoMemLimitIsBelowEveryOperationsOwnLimit(t *testing.T) {
+	var checked int
+	for op := range builtinSpecs {
+		profile := Profiles(nil).For(op)
+		limit, hasLimit := profile.Limits[corev1.ResourceMemory]
+		if !hasLimit {
+			t.Errorf("%s has no memory limit; every built-in row is expected to carry one", op)
+			continue
+		}
+		value := profile.GoMemLimit()
+		if value == "" {
+			t.Errorf("%s has a memory limit of %s but derives no GOMEMLIMIT", op, limit.String())
+			continue
+		}
+		checked++
+
+		derived, err := resource.ParseQuantity(strings.TrimSuffix(value, "iB") + "i")
+		if err != nil {
+			t.Fatalf("%s: GOMEMLIMIT %q does not parse back: %v", op, value, err)
+		}
+		if derived.Cmp(limit) >= 0 {
+			t.Errorf("%s: GOMEMLIMIT %s is not below limits.memory %s — the runtime would only "+
+				"start collecting once the kubelet had already killed it", op, value, limit.String())
+		}
+		if derived.Cmp(goMemLimitFloor) < 0 {
+			t.Errorf("%s: GOMEMLIMIT %s is under the %s floor; a built-in row should never be that tight",
+				op, value, goMemLimitFloor.String())
+		}
+	}
+	// Without this, deleting builtinSpecs would make every assertion above vacuous.
+	if checked < 13 {
+		t.Errorf("only %d operation(s) checked; there were 13 when this was written", checked)
+	}
+}
+
+// TestGoMemLimitOmittedWhenThereIsNothingSafeToDerive pins the two cases that must produce no
+// GOMEMLIMIT at all. Both are ways of making things WORSE than not setting it.
+func TestGoMemLimitOmittedWhenThereIsNothingSafeToDerive(t *testing.T) {
+	// No memory limit: `limits.memory: "0"` is how an operator says "do not cap this pod", and
+	// capping its heap anyway would obey the override's letter and invert its purpose.
+	unbounded := Profile{Limits: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")}}
+	if got := unbounded.GoMemLimit(); got != "" {
+		t.Errorf("GoMemLimit() = %q with no memory limit, want empty", got)
+	}
+	if got := (Profile{}).GoMemLimit(); got != "" {
+		t.Errorf("GoMemLimit() = %q on an empty profile, want empty", got)
+	}
+
+	// Under the floor: 80% of 128Mi is 102MiB, tight enough that a GC death spiral is likelier
+	// than the OOM kill this is meant to prevent. Silence beats a cap that stalls a backup.
+	tight := Profile{Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("128Mi")}}
+	if got := tight.GoMemLimit(); got != "" {
+		t.Errorf("GoMemLimit() = %q under the floor, want empty", got)
+	}
+
+	// And the other side of that boundary, so the floor is a threshold rather than a blanket
+	// refusal: 80% of 1Gi is 819MiB, comfortably over, and must be set.
+	ample := Profile{Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("1Gi")}}
+	if got := ample.GoMemLimit(); got != "819MiB" {
+		t.Errorf("GoMemLimit() = %q for a 1Gi limit, want 819MiB", got)
+	}
+}
+
+// TestGoMemLimitFollowsAnOverride is what stops this becoming a second inert knob: an operator who
+// raises prune's memory must get a GOMEMLIMIT that moved with it. The failure this catches is a
+// derivation wired to the BUILT-IN table instead of the resolved one, which no built-in-only test
+// can see.
+func TestGoMemLimitFollowsAnOverride(t *testing.T) {
+	before := Profiles(nil).For(OpPrune).GoMemLimit()
+
+	profiles, err := LoadProfiles([]byte("prune:\n  limits:\n    memory: 16Gi\n"))
+	if err != nil {
+		t.Fatalf("load profiles: %v", err)
+	}
+	after := profiles.For(OpPrune).GoMemLimit()
+
+	if after == before {
+		t.Errorf("GOMEMLIMIT stayed %q after raising prune's memory limit to 16Gi — it is reading "+
+			"the built-in table, not the resolved one", before)
+	}
+	if after != "13107MiB" { // 80% of 16Gi, floored to whole MiB
+		t.Errorf("GOMEMLIMIT = %q after the override, want 13107MiB", after)
+	}
+
+	// The operation next to it must not have moved: overrides are per-operation.
+	if got := profiles.For(OpBackup).GoMemLimit(); got != "3276MiB" {
+		t.Errorf("overriding prune changed backup's GOMEMLIMIT to %q, want 3276MiB", got)
+	}
+}

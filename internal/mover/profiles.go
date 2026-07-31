@@ -176,6 +176,67 @@ type Profile struct {
 	CacheSizeLimit *resource.Quantity
 }
 
+// goMemLimitFraction is how much of the container's memory limit the Go runtime is told it may
+// use. The remaining fifth is not slack: it covers what GOMEMLIMIT does not account for —
+// goroutine stacks past the runtime's own bookkeeping, the mover shim's own small heap living
+// alongside restic in the same cgroup, and anything the allocator has not returned to the OS yet.
+const goMemLimitFraction = 0.8
+
+// goMemLimitFloor is the derived value below which this is not set at all.
+//
+// The failure GOMEMLIMIT prevents is an OOM kill. The failure it CAUSES, when set below what the
+// program actually needs live, is a GC death spiral: the runtime collects continuously, makes no
+// progress, and the backup neither finishes nor fails. Go caps GC at 50% of CPU so it is not a
+// hang, but a prune that takes four times as long and still gets killed is worse than one that is
+// killed immediately with a legible reason.
+//
+// restic holds the repository index in memory, and that index grows with the repository rather
+// than with the volume being backed up — so the floor is about the REPOSITORY, which the operator
+// cannot see from here. 256Mi is chosen as the point below which restic on a non-trivial
+// repository is more likely to thrash than to fit. No built-in profile comes near it (the
+// smallest memory limit is repo-light's 1Gi, deriving 819MiB), so this only ever fires on an
+// aggressive override — which is exactly the case where the operator has taken the decision away
+// from us and a silent cap would be the wrong answer.
+var goMemLimitFloor = resource.MustParse("256Mi")
+
+// GoMemLimit is the value of the GOMEMLIMIT environment variable for this profile, or "" when it
+// must not be set.
+//
+// It is DERIVED, never configured. GOMEMLIMIT and limits.memory are two statements about the same
+// budget, and a knob that let an operator set them independently would let them disagree — the
+// only interesting way for them to disagree being the one that kills a backup. It was a
+// configurable field on JobRequest from M1 to 0.6.1 and no caller ever set it, so the operator
+// shipped a spec-promised heap cap that was never once applied.
+//
+// Two cases yield "":
+//
+//   - No memory limit. `limits.memory: "0"` is how an operator says "do not cap this pod", and
+//     capping its heap anyway would honour the letter of their override and invert its point.
+//     Before 0.6.1 every mover was in this state, which is why nothing needed GOMEMLIMIT then.
+//   - A derived value under goMemLimitFloor — see there.
+//
+// The value is floored to whole MiB and emitted with the unit rather than as raw bytes, because
+// the first person to read it will be reading a pod spec during an incident.
+//
+// It reaches restic as well as the shim, since the child inherits the environment. That is the
+// point: restic is what allocates. The shim execs it and waits on a small JSON result, so the two
+// nominally claiming the same budget is arithmetic that never happens in practice.
+func (p Profile) GoMemLimit() string {
+	limit, ok := p.Limits[corev1.ResourceMemory]
+	if !ok {
+		return ""
+	}
+	mib := int64(float64(limit.Value()) * goMemLimitFraction / (1 << 20))
+	if mib <= 0 {
+		return ""
+	}
+	derived := resource.NewQuantity(mib*(1<<20), resource.BinarySI)
+	if derived.Cmp(goMemLimitFloor) < 0 {
+		return ""
+	}
+	return fmt.Sprintf("%dMiB", mib)
+}
+
 // Profiles is the resolved table the operator hands to every Job builder: built-in defaults with
 // the platform's overrides already folded in, computed ONCE at startup so a malformed override
 // fails the process rather than one backup at 3am.

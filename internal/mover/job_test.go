@@ -121,7 +121,6 @@ func dataRequest() JobRequest {
 		Labels:       map[string]string{"crystalbackup.io/run": "run-1", "app": "mover"},
 		BackoffLimit: 3,
 		TTLSeconds:   600,
-		GoMemLimit:   "900MiB",
 		ExtraEnv:     []corev1.EnvVar{{Name: "AWS_DEFAULT_REGION", Value: "eu-west-1"}},
 	}
 }
@@ -217,7 +216,8 @@ func TestBuildJobDataRequest(t *testing.T) {
 	assertEnvValue(t, env, "RESTIC_PASSWORD_FILE", ResticPasswordFilePath)
 	assertEnvValue(t, env, "RESTIC_CACHE_DIR", CacheDir)
 	assertEnvValue(t, env, "TMPDIR", "/tmp")
-	assertEnvValue(t, env, "GOMEMLIMIT", "900MiB")
+	// Derived: 80% of the data class's 4Gi limit.
+	assertEnvValue(t, env, "GOMEMLIMIT", "3276MiB")
 	assertEnvValue(t, env, "AWS_DEFAULT_REGION", "eu-west-1") // caller ExtraEnv passed through
 
 	// AWS creds arrive by secretKeyRef on the per-Job Secret, never as literal values.
@@ -314,8 +314,8 @@ func TestBuildJobDataRequest(t *testing.T) {
 }
 
 // TestBuildJobMaintenanceRequest asserts a maintenance job (nil PVC, OpInit): no data
-// volume or mount at all, args carry just the operation + restic argv, GOMEMLIMIT is absent
-// when unset, and the shared hardening still applies.
+// volume or mount at all, args carry just the operation + restic argv, GOMEMLIMIT derived from
+// this operation's OWN row rather than the data class's, and the shared hardening still applies.
 func TestBuildJobMaintenanceRequest(t *testing.T) {
 	req := JobRequest{
 		Name:         "init-prod-eu-1",
@@ -329,7 +329,6 @@ func TestBuildJobMaintenanceRequest(t *testing.T) {
 		Labels:       map[string]string{"crystalbackup.io/op": "init"},
 		BackoffLimit: 5,
 		TTLSeconds:   300,
-		GoMemLimit:   "", // must be omitted
 	}
 	job := BuildJob(req)
 	c := job.Spec.Template.Spec.Containers[0]
@@ -348,10 +347,9 @@ func TestBuildJobMaintenanceRequest(t *testing.T) {
 		t.Errorf("args = %v, want %v", c.Args, wantArgs)
 	}
 
-	// GOMEMLIMIT omitted when the request leaves it empty.
-	if hasEnv(c.Env, "GOMEMLIMIT") {
-		t.Error("GOMEMLIMIT present, want omitted when GoMemLimit is empty")
-	}
+	// GOMEMLIMIT comes from OpInit's own sizing row (repo-light, 1Gi), not from the data class.
+	// A single value shared across operations would be the bug this derivation exists to avoid.
+	assertEnvValue(t, c.Env, "GOMEMLIMIT", "819MiB")
 
 	// The repo/password/cache/tmp env and the secret + scratch volumes are still there.
 	assertEnvValue(t, c.Env, "RESTIC_REPOSITORY", req.RepoURL)
@@ -538,5 +536,44 @@ func TestBuildJobTraceEnvIsSortedAndPrecedesExtraEnv(t *testing.T) {
 	// The fixed protocol variables still come first.
 	if env[0].Name != envRepository {
 		t.Errorf("env[0] = %s, want %s", env[0].Name, envRepository)
+	}
+}
+
+// TestGoMemLimitAbsentFromEnvWhenUnbounded closes the loop between the derivation and the pod
+// spec. profiles_test.go proves Profile.GoMemLimit() returns "" when there is no memory limit;
+// this proves BuildJob then omits the variable ENTIRELY rather than emitting GOMEMLIMIT="".
+//
+// The distinction is not cosmetic: an empty GOMEMLIMIT is not "unset", it is a parse error that
+// aborts the Go runtime before restic runs. The old field carried that warning in its doc comment
+// and no caller ever exercised it.
+func TestGoMemLimitAbsentFromEnvWhenUnbounded(t *testing.T) {
+	unbounded, err := LoadProfiles([]byte("prune:\n  limits:\n    memory: \"0\"\n"))
+	if err != nil {
+		t.Fatalf("load profiles: %v", err)
+	}
+	job := BuildJob(JobRequest{
+		Name:       "prune-uncapped",
+		Namespace:  "crystal-backup-system",
+		Operation:  OpPrune,
+		ResticArgs: []string{"prune"},
+		Profiles:   unbounded,
+	})
+	c := job.Spec.Template.Spec.Containers[0]
+
+	if hasEnv(c.Env, "GOMEMLIMIT") {
+		var got string
+		for _, e := range c.Env {
+			if e.Name == "GOMEMLIMIT" {
+				got = e.Value
+			}
+		}
+		t.Errorf("GOMEMLIMIT present with value %q on a pod the operator asked NOT to cap; "+
+			"want the variable omitted entirely", got)
+	}
+	// Not a vacuous pass: the same builder with the default table must still set it.
+	capped := BuildJob(JobRequest{Operation: OpPrune, ResticArgs: []string{"prune"}})
+	if !hasEnv(capped.Spec.Template.Spec.Containers[0].Env, "GOMEMLIMIT") {
+		t.Error("GOMEMLIMIT absent with the default table too — this test would pass on a builder " +
+			"that never sets it at all")
 	}
 }

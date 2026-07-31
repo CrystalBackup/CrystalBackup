@@ -38,23 +38,34 @@ func RenderProfilesDoc() []byte {
 	b.WriteString(profilesDocIntro)
 
 	b.WriteString("## The built-in table\n\n")
-	b.WriteString("| operation | class | cpu request | memory request | cpu limit | memory limit | restic cache cap |\n")
-	b.WriteString("|---|---|---|---|---|---|---|\n")
+	b.WriteString("| operation | class | cpu request | memory request | cpu limit | memory limit | restic cache cap | GOMEMLIMIT |\n")
+	b.WriteString("|---|---|---|---|---|---|---|---|\n")
 	for _, op := range Operations() {
 		spec := builtinSpecs[op]
 		profile := Profiles(nil).For(op)
-		fmt.Fprintf(&b, "| `%s` | %s | %s | %s | %s | %s | %s |\n",
+		fmt.Fprintf(&b, "| `%s` | %s | %s | %s | %s | %s | %s | %s |\n",
 			op, spec.class,
 			docQuantity(profile.Requests, corev1.ResourceCPU),
 			docQuantity(profile.Requests, corev1.ResourceMemory),
 			docQuantity(profile.Limits, corev1.ResourceCPU),
 			docQuantity(profile.Limits, corev1.ResourceMemory),
 			docCache(profile),
+			docGoMemLimit(profile),
 		)
 	}
 
 	b.WriteString(profilesDocBody)
 	return []byte(b.String())
+}
+
+// docGoMemLimit renders the derived heap cap. It is not a column an operator can set — it follows
+// limits.memory — so the "not set" case says WHY rather than showing a dash somebody would try to
+// fill in.
+func docGoMemLimit(p Profile) string {
+	if v := p.GoMemLimit(); v != "" {
+		return "`" + v + "`"
+	}
+	return "not set (no memory limit)"
 }
 
 // docCache renders the cache cap cell, spelling out the unbounded case rather than leaving a dash

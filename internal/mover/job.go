@@ -119,9 +119,6 @@ type JobRequest struct {
 	// owner deletes it (used when the Job itself is the caller's durable state).
 	BackoffLimit int32
 	TTLSeconds   int32
-	// GoMemLimit, when non-empty, sets GOMEMLIMIT to cap the mover's Go heap; skipped when
-	// empty (an empty GOMEMLIMIT is invalid and would abort the runtime).
-	GoMemLimit string
 	// ExtraEnv is appended AFTER the fixed env (e.g. AWS_DEFAULT_REGION, RESTIC_COMPRESSION),
 	// so a caller can add knobs without displacing the protocol variables.
 	ExtraEnv []corev1.EnvVar
@@ -210,7 +207,7 @@ func BuildJob(req JobRequest) *batchv1.Job {
 		// Everything after "--" is restic's own argv, forwarded verbatim by the shim. The
 		// prefix literal has len == cap, so append allocates fresh and never aliases ResticArgs.
 		Args:         append([]string{operationFlag, string(req.Operation), "--"}, req.ResticArgs...),
-		Env:          moverEnv(req),
+		Env:          moverEnv(req, profile),
 		VolumeMounts: mounts,
 		Resources:    corev1.ResourceRequirements{Requests: profile.Requests, Limits: profile.Limits},
 		// root + a per-operation capability set (see moverCapabilities), while everything
@@ -323,7 +320,10 @@ func spreadConstraints(labels map[string]string) []corev1.TopologySpreadConstrai
 // cache/tmp variables, the optional source-repository password, then the backend credentials
 // by secretKeyRef, then the optional GOMEMLIMIT, then the caller's ExtraEnv. Order is stable
 // so the produced Job is byte-reproducible across releases and in tests.
-func moverEnv(req JobRequest) []corev1.EnvVar {
+//
+// It takes the resolved profile rather than reading it back off the request, because GOMEMLIMIT
+// is derived from limits.memory and the two must come from the one lookup BuildJob already did.
+func moverEnv(req JobRequest, profile Profile) []corev1.EnvVar {
 	env := []corev1.EnvVar{
 		{Name: envRepository, Value: req.RepoURL},
 		// restic reads the password from a FILE, never an env var or argv; the file is this
@@ -342,8 +342,10 @@ func moverEnv(req JobRequest) []corev1.EnvVar {
 	for _, key := range credentialKeys(req) {
 		env = append(env, secretEnv(key, req.SecretName))
 	}
-	if req.GoMemLimit != "" {
-		env = append(env, corev1.EnvVar{Name: envGoMemLimit, Value: req.GoMemLimit})
+	// Derived from this operation's memory limit, and empty when there is no limit to derive
+	// from or the result would be too tight to be safe — see Profile.GoMemLimit.
+	if limit := profile.GoMemLimit(); limit != "" {
+		env = append(env, corev1.EnvVar{Name: envGoMemLimit, Value: limit})
 	}
 	// The trace handover, in sorted key order (a Go map's range order is not one). Nil when
 	// tracing is inactive, which is when this whole block adds nothing at all.

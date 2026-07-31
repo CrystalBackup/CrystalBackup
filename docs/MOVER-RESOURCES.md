@@ -15,21 +15,21 @@ statement about what restic needs.
 
 ## The built-in table
 
-| operation | class | cpu request | memory request | cpu limit | memory limit | restic cache cap |
-|---|---|---|---|---|---|---|
-| `backup` | data | `200m` | `256Mi` | — | `4Gi` | `20Gi` |
-| `check` | repo-heavy | `500m` | `1Gi` | — | `8Gi` | `20Gi` |
-| `cluster-manifests-backup` | manifests | `100m` | `256Mi` | — | `2Gi` | `20Gi` |
-| `cluster-manifests-restore` | manifests | `100m` | `256Mi` | — | `2Gi` | `20Gi` |
-| `forget` | repo-light | `50m` | `128Mi` | — | `1Gi` | `20Gi` |
-| `init` | repo-light | `50m` | `128Mi` | — | `1Gi` | `20Gi` |
-| `manifests-backup` | manifests | `100m` | `256Mi` | — | `2Gi` | `20Gi` |
-| `manifests-restore` | manifests | `100m` | `256Mi` | — | `2Gi` | `20Gi` |
-| `prune` | repo-heavy | `500m` | `1Gi` | — | `8Gi` | `20Gi` |
-| `restore` | data | `200m` | `256Mi` | — | `4Gi` | `20Gi` |
-| `snapshots` | repo-light | `50m` | `128Mi` | — | `1Gi` | `20Gi` |
-| `sync` | repo-heavy | `500m` | `1Gi` | — | `8Gi` | `20Gi` |
-| `unlock` | repo-light | `50m` | `128Mi` | — | `1Gi` | `20Gi` |
+| operation | class | cpu request | memory request | cpu limit | memory limit | restic cache cap | GOMEMLIMIT |
+|---|---|---|---|---|---|---|---|
+| `backup` | data | `200m` | `256Mi` | — | `4Gi` | `20Gi` | `3276MiB` |
+| `check` | repo-heavy | `500m` | `1Gi` | — | `8Gi` | `20Gi` | `6553MiB` |
+| `cluster-manifests-backup` | manifests | `100m` | `256Mi` | — | `2Gi` | `20Gi` | `1638MiB` |
+| `cluster-manifests-restore` | manifests | `100m` | `256Mi` | — | `2Gi` | `20Gi` | `1638MiB` |
+| `forget` | repo-light | `50m` | `128Mi` | — | `1Gi` | `20Gi` | `819MiB` |
+| `init` | repo-light | `50m` | `128Mi` | — | `1Gi` | `20Gi` | `819MiB` |
+| `manifests-backup` | manifests | `100m` | `256Mi` | — | `2Gi` | `20Gi` | `1638MiB` |
+| `manifests-restore` | manifests | `100m` | `256Mi` | — | `2Gi` | `20Gi` | `1638MiB` |
+| `prune` | repo-heavy | `500m` | `1Gi` | — | `8Gi` | `20Gi` | `6553MiB` |
+| `restore` | data | `200m` | `256Mi` | — | `4Gi` | `20Gi` | `3276MiB` |
+| `snapshots` | repo-light | `50m` | `128Mi` | — | `1Gi` | `20Gi` | `819MiB` |
+| `sync` | repo-heavy | `500m` | `1Gi` | — | `8Gi` | `20Gi` | `6553MiB` |
+| `unlock` | repo-light | `50m` | `128Mi` | — | `1Gi` | `20Gi` | `819MiB` |
 
 ### Why the classes differ
 
