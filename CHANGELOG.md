@@ -4,6 +4,556 @@ All notable changes to Crystal Backup. Versioning follows
 [adr/0014](spec/adr/0014-versioning-and-release.md): milestone `Mn` → minor `0.n.z` on
 major 0; `1.0.0` is a deliberate post-M9 API-stability decision.
 
+## 0.6.0 — M6 "Observability hardening & production readiness" (2026-07-31)
+
+Milestone M6 began with one measurement. **Five of the nine alert rules this project had been
+shipping as a specification since M1 were inert**: `schedule_active`, `backup_failures_total`,
+`discovery_last_success`, `erasure_blocked` and `pvc_volumesnapshot_count` are series the operator
+**never emitted**. Each rule is valid PromQL. Each evaluates without error. None of them could ever
+fire, and nothing in the build could notice — the rule text and the metric definitions had never
+met. An alert that cannot fire is indistinguishable from an alert that has nothing to report, which
+is the exact failure mode a backup tool cannot afford.
+
+That defect class — **an absence reading as health** — turned out to be everywhere once we started
+looking for it, and finding the rest of it is most of what this release is. `make
+check-alert-rules` opened with `command -v promtool || exit 0`, so it passed on every CI runner by
+virtue of the binary being absent; the crucible's operator-readiness check had self-skipped in
+**every published run since M1** behind an escape hatch whose own documentation gave the wrong
+value; the crucible report called a two-spec filtered run "a green non-regression gate"; a test
+fixture swallowed a failed `setfattr` behind `|| echo WARN` while every assertion that depended on
+those xattrs kept passing; and the fanout campaign script could not report the one outcome you
+hope for, because `grep` finding no failures exited 1 and killed it.
+
+Then the new instrumentation was pointed at the product and found correctness defects that
+**predate this milestone**, including the worst class a backup tool can have: **a run that reported
+`Completed`, `namespacesSucceeded=1`, `pvcsSucceeded=1` for data it never wrote.** M6 did not
+introduce it — it is M1 code — but the restore-fidelity gate found it on its first real run, which
+is the entire argument for building the gate. See **Fixed** below; that one is the reason to
+upgrade.
+
+**What 0.6.0 is: ready to test in real conditions by early adopters.** Backups, restores, the two
+planes, external sync and erasure work and are exercised on real infrastructure; the metrics,
+alerts, dashboards and traces now describe what the operator actually does, and the self-check will
+tell you where your installation stands without a Prometheus. **What it is not: production-ready.**
+The roadmap's own bar for M6 includes a two-week soak alongside Velero on a staging cluster and a
+pilot rollout; neither has happened. Run it on a cluster whose loss you can absorb, alongside — not
+instead of — whatever you back up with today, and read
+[when *not* to choose it](https://crystalbackup.github.io/CrystalBackup/docs/discover/when-not-to-use/)
+first.
+
+**Validated on real infrastructure: 82 of 82 checks, 0 failed, 0 skipped, in 1 h 51 min** — the
+whole suite, M0 through M6, on a freshly provisioned RKE2 + Rook-Ceph cluster with real S3, against
+the exact image digest this release ships. Not a filtered run: the crucible report states its own
+coverage, and a run that selects a subset says so in its verdict line rather than presenting itself
+as a gate. [Full report, check by check](https://crystalbackup.github.io/CrystalBackup/reports/crucible-m6.html).
+
+**No breaking change.** Every API addition is additive (`spec.paused` on the two namespace-plane
+types, `Backup.status.completionTime`, three `BackupRepository.status` fields), so an existing
+installation upgrades in place. Two things to know: **the CRDs must be applied** — Helm does not
+upgrade them ([upgrade guide](https://crystalbackup.github.io/CrystalBackup/docs/guides/upgrading/))
+— and the `scope` metric label changed value vocabulary; see **Changed**.
+
+### Added
+
+- **The metrics catalogue the alert rules were already written against**
+  ([spec/05-observability.md](spec/05-observability.md)). 54 families, and the mechanism matters
+  more than the count: every series name is a **constant** in `internal/metrics/names.go`, the
+  collectors build their `Desc` from it, and the rule table builds its expressions from the same
+  constant — so a rename breaks the compile instead of silently killing an alert. The series-key
+  structs are shared by the gauges and their new counter siblings, so the two physically cannot
+  disagree on label order. New: discovery (§2.5, with `lastDiscoverySuccess` / `projectedBackups` /
+  `orphanSnapshots` as new `BackupRepository` status fields), erasure (§2.6), mover concurrency
+  (§2.7), webhook denials (§2.8), exposure wait and per-PVC `VolumeSnapshot` count (§2.9), plus the
+  event half of the backup/run/restore/sync families — durations, byte counters, terminal-result
+  counters.
+  The counters are **real in-process counters, not state-derived gauges**, deliberately: counting
+  live objects in a terminal phase is not monotone, because the run-history limit deletes them.
+  Every one fires **after** the durable status write and only on first arrival at a terminal phase,
+  guarded by the durable marker, so a conflict retry or a re-list cannot inflate it. The accepted
+  cost — they do not survive a restart — is stated in §1 and is not free; see the `BackupFailed`
+  fix below for what it cost in practice.
+- **Eleven alert rules, generated from one table** and shipped as a `PrometheusRule`
+  (`metrics.rules.enabled`, off by default: the thresholds are platform policy and should be read
+  before they are enabled). `internal/alerts` holds the table — name, severity, `for`, threshold,
+  annotations — and **builds** each expression from the `metrics.Name*` constants; no series name is
+  ever typed as a literal. The chart's YAML is generated from it and a test regenerates into a temp
+  dir and diffs, because a file that has never been committed is invisible to `git diff` and the
+  guard has to work on the commit that *adds* a rule.
+  Three of the eleven exist because writing the other eight exposed a hole:
+  - **`schedule_created_timestamp_seconds`.** §2.1 claimed the last-success gauge was "initialized
+    to the schedule's creation time on first reconcile, so `BackupMissed` fires even if no backup
+    ever succeeded". It is not, and cannot be — the value is derived from `Backup` objects, so a
+    schedule that never produced a single successful backup emitted **no series at all**, and
+    `BackupMissed` was blind to an installation broken since the day it was installed. Fixed with a
+    separate series rather than by seeding a fake success, which would have lied to every "last
+    backup" panel on both dashboards.
+  - **`CrystalbackupSchedulePausedTooLong` and `CrystalbackupExternalSyncPausedTooLong`**, at seven
+    days. A pause guard alone trades a false page for permanent silence: someone suspends a schedule
+    "just for the migration", leaves, and nothing alerts on that namespace again. Neither uses a
+    seven-day `for:` — Prometheus restores pending-alert state only within its outage tolerance, so
+    a week-long hold silently restarts after any outage, in an alert whose whole job is noticing
+    what nobody is watching. `max_over_time` reads history instead. A test walks the table and fails
+    if any `_active` series silences a rule without also feeding one.
+  - `CrystalbackupBackupMissed` gains the per-schedule deadline §8 left open: **1.1 × the period +
+    1 h, derived from the *longest* gap between two firings**, not the next one — `0 2,3 * * *`
+    alternates one hour and twenty-three, and a deadline from the next gap pages every night at
+    03:05. An unreadable cron emits no period and falls back to a fixed 26 h, because a schedule
+    that will never fire is exactly what should page.
+- **promtool unit tests, executed in CI, for all eleven rules.** Each rule has a firing case, a case
+  just under the threshold (or just inside its `for` hold), and the absence case wherever absence
+  carries meaning — a never-checked repository must **not** page, an Immutable location must not
+  look like a stalled prune. Twelve mutations prove the tests can fail, including renaming a series
+  to one nobody emits, which is the original defect class. `make alert-rules-covered` closes the
+  hole one level down: an untested rule passes a promtool run simply by never being mentioned.
+  A crucible lane provokes three of the conditions for real, because a unit test cannot tell you
+  whether the operator emits, whether Prometheus scrapes, or whether the rule the chart packages is
+  the rule that loads — and it asserts every shipped rule loads with `health: ok` and no
+  `lastError`, which catches a many-to-one join failure against real cardinalities that synthetic
+  series never reach.
+- **Two Grafana dashboards** — `crystalbackup-tenant` (29 panels) and `crystalbackup-platform` (36)
+  — as sidecar-provisioned ConfigMaps behind `metrics.dashboards.enabled`, covering all 49
+  catalogue series as they stood when the boards were written. The check is the larger half: a panel
+  querying a series that does not exist renders "No data", and on a backup dashboard "No data" is
+  visually indistinguishable from "nothing to report". `make check-dashboards` parses every
+  expression and cross-checks it against `internal/metrics` — series names, label names per family,
+  and label **values**, resolved from the address of each enumeration rather than copied out of it.
+  Eleven injected faults, eleven exits with status 1; wired into `lint.yml`. It exists because
+  writing the dashboards produced exactly the bug it is meant to catch (see **Changed**, `scope`).
+- **OpenTelemetry tracing across the pipeline, with exemplars.** The nine `go.opentelemetry.io`
+  dependencies were all marked *indirect*: no file imported otel, the `traceID` log key §4 describes
+  could never be populated, and the span tree §5 draws did not exist. M0 recorded the SDK as wired;
+  it was not.
+  An operator has no process continuity — a root span for a `Backup` would have to survive dozens of
+  reconciles, a leader handover and a restart — so **nothing holds one open**. `tracing.Anchor`
+  derives a Backup's trace and root-span IDs as domain-separated hashes of its UID, so any process
+  computes the same answer from the object it already has, and every span is emitted after the fact
+  with explicit timestamps read back from state Kubernetes already keeps (`creationTimestamp`,
+  `backupTime`, the VolumeSnapshot's CSI `creationTime`, the Job's `startTime`/`completionTime`).
+  The in-memory registry of open spans was rejected because it fails in the worst direction: an
+  unended span is never exported, so a restart would **orphan** its children rather than truncate
+  them. Unconfigured, no SDK provider is installed at all — the OTLP exporter defaults to
+  `localhost:4317`, so merely constructing one would have every operator on earth retrying against a
+  collector that is not there. Measured at **3.9 ns per guarded emit site, zero allocations, zero
+  goroutines**, and a mover Job spec byte-identical to before.
+  Three blind spots, named rather than hidden: the movers inherit the operator's own `OTEL_*`,
+  allow-listed (§5 sourced them from a `mover.extraEnv` Helm value that does not exist); the
+  snapshot/expose boundary is **not** observable unless the CSI driver fills the optional
+  `status.creationTime`, so without it one span covers the wait rather than inventing a split in
+  someone's storage latency; and `crystalbackup.snapshots_removed` is left undeclared rather than
+  declared-and-empty, because `restic forget` reports removals as prose and the 4096-byte mover
+  result protocol has no field for a count.
+- **An exportable self-check.** `crystal-backup selfcheck` emits versioned JSON; `crystal-backup
+  report --from` turns it into standalone HTML with **no cluster, no network and no clock**, so a
+  maintainer regenerates the page from a file pasted into an issue. Both are subcommands of the
+  operator binary — no new artefact, no new supply chain, and no CLI invented ahead of M7. Image
+  digests are read from `status.containerStatuses[].imageID`, never from the spec: a report
+  describing the tag someone configured rather than the artefact the kubelet resolved would repeat
+  the 0.5.1 mistake. Every rule's verdict comes from the predicate on its **table entry**, so the
+  self-check and the alert bundle cannot disagree about a threshold.
+  Two limitations stated on the page itself. **Three predicates cannot reproduce their PromQL
+  exactly** and say so next to their verdict rather than in a footnote: `BackupFailed` under-reports,
+  the two paused-too-long rules substitute a condition transition for metric history and so
+  over-report. And a rule that cannot be evaluated reports **"not evaluated" with a diagnostic —
+  never OK**; an unmeasured OK is the exact lie this milestone exists to remove.
+  Redaction is **on by default**, because the intended use is attaching the file to a public issue
+  and the contents are somebody's customer list: HMAC over a 32-byte random salt minted per report
+  and never written into it, so correlation inside the report survives and identity does not.
+  Secrets, repository passwords, S3 credentials and key material are **never read**, in any mode
+  including `--full`, and a test greps the serialised bytes of both modes for fixture credentials —
+  on the serialised output rather than struct fields, so a newly added field that leaks fails the
+  test instead of passing forever.
+- **`spec.paused` on the namespace plane.** A tenant could suspend their backups only by **deleting**
+  their `BackupSchedule`, which throws away `lastSuccessTime` and the history every alert measures
+  against. `BackupSchedule` and `BackupExternalSync` now have `paused`, and pausing **preserves
+  status** — which is the whole difference from deleting. `schedule_active` emits `0` for a paused
+  schedule rather than nothing, so a forgotten pause is representable at all.
+- **`preflight.sh`**, published on the site with a checksum and a keyless cosign bundle. `helm
+  install` answers "does it install"; the question an administrator actually has is *what will be
+  backed up, and what will be silently ignored*. The core is a table: per StorageClass, the exposer
+  that would be resolved, the VolumeSnapshotClass that would actually be picked, and **the number of
+  existing PVCs sitting on it** — the column that turns an abstract verdict into a measured
+  consequence ("local-path … VOLUME SKIPPED … 1 in 1 ns", and it says out loud that those volumes'
+  data will never be backed up, their manifests will, and the `Backup` will still report
+  `Completed`). The CSI-to-exposer table is **generated**, not transcribed: the generator extracts
+  the constants with `go/parser` *and* runs the real `exposer.Registry.For` against nine probe
+  provisioners, refusing to emit a rule that disagrees with what the registry answers. `volumeMode:
+  Block` gets its own check because that limitation is on the **restore** side, so without it the
+  main table would have reported those volumes covered. Three principles: UNKNOWN is never PASS,
+  it is strictly read-only (with the one honest nuance — `kubectl auth can-i` POSTs a
+  `SelfSubjectAccessReview` — behind a flag), and the docs put download → verify → read → run first
+  and the `curl | sh` shortcut second, named as such.
+- **The operator can READ `CustomResourceDefinitions`** — `get`/`list`/`watch`, nothing else — so the
+  self-check can report storage versions and per-CRD controller-gen provenance. Without it that read
+  was `Forbidden` on every real chart install and the report fell back to API discovery, which knows
+  only the *served* versions of the group. It stays read-only on purpose: an operator that could
+  **write** a CRD could rewrite the schema of the objects it is trusted to back up. The discovery
+  fallback stays too, for clusters installed by a chart older than this rule.
+- `Backup.status.completionTime`, mirroring `ClusterBackup`'s — stamped once on first arrival at a
+  terminal phase and never moved, through both doors (`writeStatus` and `failHooks`, the second
+  being where creation and failure are furthest apart). See the `BackupFailed` fix for why it had to
+  exist.
+
+### Fixed
+
+- **A run reported success for data it never wrote.** Found by the restore-fidelity gate on its
+  first real run, and it is the worst class of defect a backup tool can have: not a failure, an
+  **invisible** failure, discovered only when someone tries to restore. Measured on the crucible:
+  the same `ClusterBackup` ran four times against a namespace whose volume was re-seeded with fresh
+  random content between each; **exactly one data snapshot exists — the first**. The three later
+  runs captured nothing at all and each reported `phase=Completed`, `namespacesSucceeded=1`,
+  `pvcsSucceeded=1`. `restic check --read-data` found the repository perfectly intact: nothing
+  corrupted, nothing written. The only honest signal was `addedBytes` staying empty, and nobody
+  alerts on that.
+  `ensureChildBackup` tested for an existing child on `(namespace, name)` alone. Nothing tied the
+  object it found to **this** run, so a discovery projection, a terminal `Backup` from an earlier run
+  of the same name, or the namespace plane's own stamped `Backup` all satisfied it; the controller
+  no-oped and `aggregateAndWrite` counted the found child's status as this run's result — on a
+  projection, a status built from repository snapshots, so the run counted somebody else's bytes as
+  its own.
+  The vector nobody would guess is **not** name reuse. Both planes build the run name with the same
+  function, so a `ClusterBackupSchedule` named `daily` covering a namespace and a `BackupSchedule`
+  named `daily` inside it, on the same cron, produce a **byte-identical name in the same
+  namespace** — and both directions lose data silently. Two administrators naming a schedule `daily`
+  is the whole prerequisite.
+  The fix keys on `cb.UID`, which is exact rather than heuristic: a crash-restarted run keeps its CR
+  and therefore its UID, while a run recreated under the same name gets a new one. Children carry
+  `crystalbackup.io/parent-uid`; a matching UID is the ordinary idempotent second pass, and a
+  different one — or a projection, a terminal phase, or any durable result already at the coordinate
+  — is a **`RunNameCollision`** that fails loudly per namespace and takes the run to `Failed`.
+  Projections are barred from the roll-up outright: even if the ownership test were imperfect, a
+  *view* of the repository must not be able to increment `pvcsSucceeded`. The unstamped, unfinished,
+  resultless case is adopted, which is what lets an existing installation upgrade without declaring
+  its whole history a collision. **This is M1 code — M6 did not introduce it, its gate found it.**
+- **Discovery was erasing an execution record.** `projectGroup` adopted any terminal `Backup` and
+  force-applied a status rebuilt from the repository. Observed live, four seconds apart: a `Skipped`
+  volume and its `CSISnapshotUnsupported` reason vanished along with `addedBytes`, `sizeBytes` and
+  `node`, turning a `PartiallyCompleted` into a `Completed` within thirty seconds. A `Backup` is both
+  a restore-point catalogue and an execution record, and when they disagree the **execution record
+  wins**: a reconstruction from the repository knows, by construction, only what succeeded.
+  Projection now completes and never overwrites — merging per PVC, never raising a recorded phase.
+  Also M1 code.
+- **The ServiceMonitor was overwriting every tenant's namespace label.** A ServiceMonitor attaches
+  its target's labels and, with `honorLabels` false — the default — the **target wins every
+  collision**. So the operator's own namespace overwrote the metric's, and every `crystalbackup_`
+  series in Prometheus arrived carrying `namespace="crystal-backup-system"`, for every tenant on the
+  cluster; the real value survived only as `exported_namespace`, which nothing queries.
+  Nothing looked broken, and that is the point. The alert expressions still joined, because both
+  sides of `on (namespace, …)` carried the same wrong value — so `BackupMissed` fired exactly when it
+  should and then named the operator's namespace in its summary, **routing every tenant's page to the
+  same place**. The tenant dashboard's `$namespace` variable offered one choice.
+  `PVCSnapshotPileup` named the wrong namespace for the PVC it had correctly counted. Every metric
+  this project emits is specified to be tenant-attributable (R19, §1), and at the scrape none of them
+  were. No unit test could have caught it, nor promtool, nor `helm template` — it took a real
+  Prometheus scraping a real operator.
+- **`CrystalbackupBackupFailed` could not page a first failure, restart or not.** Caught by the
+  0.6.0 crucible campaign, silent on a `Backup` that had genuinely failed. Two defects underneath.
+  A `CounterVec` child is created **by** its first `Inc()`, so it appears at 1 rather than stepping
+  0 → 1, and `increase()` measures a rise: a window whose samples all read 1 has none. **The first
+  failure a series ever records could never move the rule**, with the process up the whole time —
+  which is precisely the incident an operator most wants paged, a namespace that was fine yesterday
+  and failed once tonight. The same materialisation rule means an operator restart does not *reset*
+  the counter, it makes the series **disappear**, and `increase()` sees across a reset but not across
+  a disappearance (measured on a live cluster after the operator pod was replaced: zero series, three
+  `increase()` series all equal to 0, one failed `Backup`, nothing firing).
+  The rule now reads a state-derived companion alongside the counter — `or (time() -
+  crystalbackup_backup_last_failure_timestamp_seconds < 3600)` — with both numbers coming from the
+  same window constant, so the two halves of one disjunction cannot describe two different hours.
+  The plain `crystalbackup_backup_failures` gauge was rejected for the second disjunct: it survives a
+  restart too, but has no notion of *when*, so a `Backup` retained for diagnosis after failing three
+  days ago would page every evaluation until someone deleted it — which teaches an operator to
+  silence the rule.
+  **Verified on the crucible, by measurement rather than by a green tick.** Over the whole run
+  `max_over_time(increase(crystalbackup_backup_failures_total[1h])[2h:1m])` was **0** — the counter
+  disjunct never once exceeded zero — and the alert fired anyway, so only the state-derived half can
+  account for it. Without this fix the run would have been red exactly as the campaign before it.
+  **Four things this fix does not do, named rather than hidden.** It cannot recover a failure whose
+  operator restarted *and* whose `Backup` was garbage-collected inside the hour — no source survives
+  that, and the remedy is a history limit above one. In its milder and far more common form, deleting
+  the `Backup` **resolves** this alert even with the operator up, because on a first failure the
+  timestamp is the entire expression: the firing window is the *object's lifetime*, not the hour the
+  rule's name implies. The crucible measured thirty seconds of firing, its own teardown having
+  removed the namespace twelve seconds after the `Backup` went terminal. In production a retained
+  failure outlives the window and the distinction never shows; with a history limit of one and a
+  success right behind the failure, check Alertmanager's `group_wait` before blaming the rule. The
+  Grafana panels inherit the counter's blind
+  spot; the honest addition is a new "time since last failure" stat rather than an or'd timestamp on
+  a rate axis, which is a decision about the dashboards' shape and is **not** in this release. And
+  `crystalbackup_restore_failures_total` behaves identically but no rule reads it, so it is inert; a
+  future rule on it needs the same companion, and `RestoreStatus` has no `completionTime` to derive
+  one from.
+- **`ExternalSyncStale` false-paged on every newly created sync.** `last_success` is deliberately 0
+  for a sync that has never completed (§2.12, so a secondary broken from day one is not silently
+  missed), but `time()` minus zero is 1.77e9, which crosses 26 h on the first scrape — only `for: 1h`
+  stood between creating a sync and a page claiming it had not completed in 26 hours. It now measures
+  from `externalsync_created` when there is no success yet. The metric keeps saying 0, because 0 is
+  the true answer to "when did it last succeed"; it is the rule's job to know what that means.
+- **`ClusterBackupExternalSync.Paused` has existed since M5 with nothing reading it.** Pausing a
+  cluster sync for maintenance would have paged 26 h later, as soon as the rule bundle landed. Guard
+  added — with its paused-too-long companion, above.
+- **Every published image reported `crystalbackup_build_info{version="dev"}`.** The workflow built
+  with `-ldflags="-s -w"` and nothing passed `-X`, so the one series that exists specifically to give
+  a dashboard a build to join against named no build — in a release whose headline is that its
+  metrics can be trusted. Fixed in **all three** build paths: the release workflow (the tag on a tag,
+  `dev-<sha>` elsewhere, never an empty string), `make build`, and the Dockerfile that `make
+  docker-build` and the kind e2e use (`git describe --tags --always --dirty`, where `--dirty` is
+  load-bearing — a binary built from an edited tree is not the tag it is nearest to). The mover and
+  sync images are untouched: they link `./cmd/crystal-mover`, which serves no metrics and has no
+  `Version` symbol to stamp.
+  Guarded, because the linker does **not** report a `-X` flag whose target does not exist — it is
+  silently dropped — so renaming the package would break all three paths at once with no symptom but
+  the "dev" just removed. `TestVersionStampTargetsThisPackage` asks the compiler for the package's
+  real import path and holds every build file to it. The second guard deliberately does *not* assert
+  `Version == "dev"`: the test binary is itself linkable with the flag, and a test forbidding a
+  stamped build would fail for the one person doing the right thing.
+- **The container build could not see two embedded files.** `go:embed report.css` failed inside the
+  Docker build: `.dockerignore` denies everything and re-includes, for source, only `**/*.go` — so a
+  file pulled in by `go:embed` is Go source to the compiler and invisible to the build context. It
+  builds everywhere a developer looks, because the file is on disk, and fails **only in the image**.
+  The file already carried the instruction ("Add every new embed target to this list"), which was
+  right and was not enforced; a test now walks the tree for `go:embed` directives and fails naming
+  any target that is not re-included.
+- **`make e2e` could hang forever on teardown.** It hung for 35 minutes and was cut by the suite
+  timeout: `make undeploy` deletes the operator Deployment, its namespace and the CRDs in one
+  `kubectl delete`, and four `Backup` objects still carrying the `crystalbackup.io/backup` finalizer
+  outlived the operator that was supposed to release them. Three things made it unbounded rather than
+  merely slow — waiting only on the `ClusterBackupLocation` before undeploying, no `--timeout` on the
+  waits, and a deadline that SIGKILLed `make` and not the `kubectl` it spawned while
+  `CombinedOutput`'s `Wait` blocked on the inherited pipe (`exec.Cmd.WaitDelay` is what makes it
+  binding). Teardown now drains the custom resources **first**, while the operator is alive to
+  process its own finalizers, and separates the two cases: leftovers with a serving operator are a
+  product defect and fail the spec; leftovers with no operator are orphans, force-stripped and
+  reported. M3 and M5 no longer force-strip in `AfterAll`, which was masking the very defect the
+  suite should catch. **32 of 32 specs pass in 514 s with no finalizer forced anywhere in the run.**
+  The same trap waits for anyone who uninstalls the operator with live `Backup`s, and no document
+  said so; see **Documented**.
+
+### Changed
+
+- **The `scope` metric label is lowercase.** It carried two vocabularies at once: `repository_*` and
+  `discovery_*` published `BackupRepositoryStatus.Scope` verbatim (`Cluster|Namespaced`, the
+  kubebuilder enum) while `externalsync_*` emitted `cluster|namespace`. One alert expression written
+  across both families matches nothing on one of them, and nothing says so. `metricScope()` now maps
+  the API enum onto the lowercase pair §2 always specified, which is also what `origin` uses and the
+  Prometheus convention for enumerated values. Found because six tenant dashboard panels filtered
+  `scope="namespace"` on the spec's authority and would have read "No data" forever.
+  **No published rule depended on the old values, and this is the last release in which changing them
+  is free** — a custom dashboard or recording rule written against 0.5.x needs updating.
+- **The discovery metric family gains a `namespace` label** — the repository's owner, empty for the
+  shared cluster repo. It does not split a scan. Without it a tenant could see whether their
+  repository was intact (check result, prune recency, stale locks) and nothing about whether the list
+  `kubectl get backups` hands them still corresponds to what is inside it. A failing discovery means
+  their restore points are silently stale, which is actionable by them and was visible only to the
+  platform.
+- **A run recreated at a coordinate it does not own now fails loudly** rather than silently
+  succeeding (see `RunNameCollision`, above). This matters most under GitOps: a `ClusterBackup` is an
+  **execution**, not desired state, so prune-and-recreate brings it back under a name the restic
+  repository has already seen. What belongs in Git is the declarations — schedules and locations.
+  Both new GitOps pages explain why, not just the rule.
+- **`result` carries a fourth value.** `PartiallyCompleted` is a success with a hole in it, and the
+  hole is the signal that a storage class stopped being snapshottable. The platform dashboard's fleet
+  success ratio counted it as a failure and now reads it as the success it is, beside a by-result
+  breakdown that keeps the hole visible.
+- **`repository_stored_bytes` is withdrawn before ever shipping.** It was specified against `restic
+  stats --mode raw-data`; no such operation runs, so the only value available was one
+  `repository_size_bytes` already publishes. Two names for one reading is a lie by implication — and
+  the withdrawn one was the worse of the two for the billing it claimed to serve, since `raw-data`
+  excludes unpruned garbage the bucket still charges for. A test fails if the name comes back,
+  mirroring the guard already standing over the equally unshipped
+  `externalsync_bytes_copied_total`: a withdrawal nobody pins is a name somebody re-adds for
+  completeness two milestones later.
+- **"SLSA L3+" is now "SLSA Build Level 3"**, in all thirteen places it appeared. There is no L3+;
+  the SLSA v1.0 Build Track stops at L3, and `images.yml` had said it correctly all along — the
+  *documentation* was the part overreaching, on the subject where this project has least earned the
+  benefit of the doubt. [adr/0012](spec/adr/0012-container-images-apko-wolfi-slsa.md) carries a dated
+  amendment saying so. Two neighbouring claims retired for the same reason: "re-attested on a
+  scheduled rebuild" (no such workflow exists — only the daily VEX refresh, which re-attests without
+  rebuilding), and an upgrade guide whose copy-pasteable `helm` commands pinned a chart version that
+  had not been published.
+- Terraform state is ignored **at the repository root**, not only in `test/crucible/`. One empty file
+  duly appeared at the root; nothing leaked and no state file has ever been tracked, but a populated
+  one holds the RKE2 token, the Hetzner API token and the S3 credentials, and a single `git add -A`
+  after a real apply is the whole distance between here and a token in a public repository's history.
+
+### Documented
+
+- **A documentation site** — 26 written pages plus a **generated** API reference (12 CRDs, `make
+  api-docs`, with a staleness guard) — and the project stops describing itself as design-stage when
+  six milestones have shipped. Every `crystalbackup.io` example was walked field by field against the
+  OpenAPI schemas in `config/crd/bases`, and the quickstart is **marked UNVERIFIED** until a crucible
+  scenario executes it verbatim: a quickstart nobody has run is the documentation equivalent of an
+  alert rule nobody has fired. Where spec and code disagreed the code is documented and the
+  divergence named — hook annotations are `crystalbackup.io/pre-backup-*`, not the `pre.hook.*` form
+  [01-architecture](spec/01-architecture.md) describes, and R24's `keepWithinDuration` does not exist.
+  The `/quality` page finally links all nine published acceptance reports; the evidence was on disk
+  and reachable from nowhere, on the page most likely to be read by someone deciding whether to
+  believe any of this.
+- **The Metrics and Alerts references are generated** — from the `prometheus.Desc` values the
+  collectors register and from the rule table — with a freshness guard in CI. Fifty-three families
+  written by hand drift within a release, and this milestone was spent proving that. Generation also
+  turns one claim into something machine-checked: the page states that every `_total` family and
+  every histogram is event-driven and everything else is derived at scrape, and **generation fails if
+  that stops being true**. Writing them against the code rather than the spec found a stub promising
+  three sections of series that do not exist (there is no `crystalbackup_hook_*` family at all) and
+  nine planned alert names that were never built.
+- **Installing with Argo CD and with Flux**, and the three sharp edges that only cut there. A prune
+  **deletes your keys**: the chart renders the `crystal-backup-system` Namespace, which holds
+  `cluster-kek` and every wrapped DEK, so an Argo CD prune — or a Flux Kustomization pruning the
+  HelmRelease into a `helm uninstall` — is DECOMMISSION §1.4 executed by accident. The two tools have
+  genuinely **opposite** CRD behaviour, which "Helm never upgrades CRDs" is only half right about.
+  And the webhook certificate churn is the finding worth reading twice: `webhook.yaml` mints a CA on
+  every render, which the chart gets away with because `helm upgrade` renders once — Argo CD renders
+  every refresh, three minutes by default, so with self-heal the Secret and `caBundle` differ every
+  cycle and **the Deployment rolls with them**. An operator restarting every three minutes is a
+  fault, not a cost, and `lookup` cannot fix it because `helm template` has no cluster to look in.
+  Both pages carry the ignore blocks and the honest alternative of turning the webhook off.
+- **The uninstall order nobody had written down.** `DECOMMISSION.md` covered repositories and
+  re-encryption; the site's uninstall section warned only that Helm keeps the CRDs. Both now carry the
+  ordered procedure with a verify gate that must print nothing before the operator is touched, and the
+  recovery for someone already wedged — reinstalling the operator is usually enough, because a
+  `Terminating` CRD still serves patches to its instances and the controller clears its own backlog.
+- **The runbooks pointed at fields that do not exist.** `DECOMMISSION.md` ran three jsonpath
+  expressions against absent fields, so the commands printed nothing and an operator read that as "no
+  data" rather than "wrong query" (`.status.sizeBytes` is `approximateSizeBytes`;
+  `.status.lastCheckSucceeded` is the `lastCheckResult`/`lastCheckTime` pair). The pair matters more
+  than the rename: that command sits in *verify before destroying anything*, and `lastCheckTime` is
+  refreshed on failure as well as success, so a lone `Passed` can be inherited from before the copy
+  existed — the go-ahead now requires `Passed` **and** a `lastCheckTime` after the sync finished. The
+  runbook also patched `spec.paused` on a `BackupSchedule`, which did not exist at the time.
+  `RESTORE.md` was frozen at M2 and told readers manifest restore did not work; it has shipped since
+  0.3.0. The remaining gap is real and now stated: **`ClusterRestore` accepts `spec.resources` and
+  restores nothing from it.**
+- **The metadata-fidelity contract is written down where a user can read it** (`docs/RESTORE.md`); it
+  existed only as a comment in `internal/mover/job.go`. What survives a restore, and the four things
+  that deliberately do not: `trusted.*` xattrs (need `CAP_SYS_ADMIN`), atime (reading a file to check
+  it destroys it), ctime (nothing can set it), and device nodes (a property of your volume's mount
+  options, not of the backup).
+
+### Tests
+
+- **The restore-fidelity gate — the `m6` crucible lane, and M6's exit criterion as a command rather
+  than a paragraph.** A 235-entry corpus engineered to be hard to restore faithfully: a 384 MiB file
+  spanning ~6 restic packs, sparse files, setuid and setgid bits, numeric ownership, binary and
+  512-byte xattrs, a directory's default POSIX ACL, nanosecond mtimes on directories, dangling
+  symlinks, shared inodes, a FIFO, and names carrying newlines, quotes and glob metacharacters —
+  backed up from a Rook-Ceph RBD volume and restored **into a namespace that does not exist yet**,
+  then compared field by field.
+  The empty target is load-bearing: an in-place restore would pass every metadata facet for free,
+  because an xattr, an ACL or a mode the restore failed to re-apply would still be sitting on the
+  pre-existing file and the diff would come back green. The restored PVC is built from the snapshot's
+  own `pvcsize`/`pvcclass` tags onto a fresh filesystem, so everything measured afterwards was put
+  there by the restore. Content is digested per file **and** per 16 MiB window, so a failure names the
+  corrupted byte range rather than reporting that a hash differs. Validated offline in a container: a
+  faithful tar round-trip produces zero deviations across all fourteen fields, and a deliberately
+  damaged copy fires all eight facets and reports the corrupted window exactly. It carries no enable
+  flag and no conditional skip, and **nothing was trimmed from the corpus to keep it green** — a gate
+  made green by removing what fails is the worst of both worlds.
+- **Our labels must survive the scrape.** A general invariant that would have caught the
+  `honorLabels` defect in seconds instead of through a five-minute timeout on an unrelated assertion:
+  no `crystalbackup_` series may carry an `exported_` label, which is exactly what Prometheus renames
+  our label to when a target label wins a collision. It consults `metrics.Catalogue()` for which
+  families own a `namespace` label rather than hardcoding a list, and it **refuses to pass
+  vacuously** — zero `crystalbackup_` series is a failure, not a clean bill. It runs first in the
+  alert container, because a scrape that relabels our series invalidates every measurement after it.
+- **Every crucible run name is now per-campaign, enforced by a test.** The campaign that went 60/5
+  where the previous went 76/1 was not a regression: the restic repository is shared and persistent,
+  and several specs used **constant** run names whose `AfterAll` deleted the Kubernetes objects and
+  never the snapshots — so the second campaign inherited the first one's data, discovery projected
+  yesterday's snapshots back into the re-created namespace as a `Completed` `Backup` before any
+  `ClusterBackup` existed, and the fan-out correctly refused a coordinate it did not own. **The
+  operator was right every time**; `RunNameCollision` said so on the CR, in the events and in its log,
+  and none of that reached the Ginkgo output, which reports only `phase="Failed"`. The sweep found 54
+  run-name sites across 31 files and four independently grown run-ID mechanisms, now one
+  `crucibleRunID`. The lesson had already been written down after M5, and a note that gets re-read is
+  not a control: `TestNoFixedRunNames` fails the build on a fixed name, and is `//go:build !crucible`
+  so it runs in the ordinary suite while inspecting the tagged one. Two cases are deliberately not
+  uniqued — the collision spec *needs* a collision, and the R26 projection specs are testing exactly
+  the case where finding what is already there is the point. **The `m6` lane is 15/15 green on the
+  contaminated cluster**, the one whose repository still holds the snapshots that caused the
+  failures; passing on a fresh bucket would have proven nothing.
+- **Four self-disabling guards removed.**
+  - The `m0` operator-readiness spec had been skipped in **every published crucible run** — M1, M2,
+    M3, M4's seven-lane fanout, M5 — behind a message reading "no released operator image yet
+    (pre-v0.0.1)"; there have been twelve releases since. It self-skipped unless
+    `CRUCIBLE_EXPECT_OPERATOR_READY` equalled exactly `"true"`, and the one place documenting the
+    variable proposed `=1`, which the comparison rejects. The guard is **removed** rather than
+    re-defaulted: whether the operator comes up at all is the single most useful thing a run on real
+    infrastructure can tell us, and it should not be possible to silence it. The published reports are
+    left as they are — they are dated records of what those runs did.
+  - `make check-alert-rules` began with `command -v promtool || exit 0`. It now fetches promtool
+    pinned by version and checksum.
+  - The `c-edge` seed swallowed a failed `apk add attr` and a failed `setfattr` behind `|| echo
+    WARN`, so the fixture the m1 and m2 restore assertions run against could arrive with **no xattrs
+    at all** while every one of those assertions kept passing. It now fails the init container and
+    verifies the xattr it just wrote reads back.
+  - `m1SkipIfNoS3`, on the path of every data-touching spec from m1 to m5, turned one unset variable
+    into a wall of skips. There is no legitimate run without S3, so an empty coordinate means the
+    harness is broken — renamed `m1RequireS3`, and it now fails at all fourteen call sites.
+- **The crucible report no longer calls a filtered run a non-regression gate.** A run of two specs out
+  of eighty-three printed "✅ PASS" and, underneath, "Safe to treat this run as a green non-regression
+  gate." The root cause is a conflation in Ginkgo's own reporting: a spec **deselected by a label
+  filter** and a spec that ran and called `Skip("reason")` arrive in the same `SpecStateSkipped`. The
+  report now answers two questions in that order — did everything that ran pass (the colour), and did
+  everything run (the scope) — with **coverage before result**, and only an unfiltered full run may
+  use the word *gate*. A "Not exercised by this run" section names what did not run, area by area. A
+  run cut short by `--fail-fast`, a timeout or an interrupt produces the same empty-`Failure`
+  signature as a filter and would have been described as "filtered"; it now reports INCOMPLETE and
+  says where it stopped. `CRUCIBLE_VERBOSE` is also actually verbose now — `go test` buffers a
+  package's stdout and **discards it when the package passes**, so verbose mode was verbose only on
+  failure (71 bytes before, 6333 after, on one spec).
+- **`fanout.sh` could not report an all-green campaign.** With `set -euo pipefail`, the `grep '^❌'`
+  that collects per-lane failures exits 1 when no lane has any — so the script died before the
+  residual-object measurement or the verdict, and exited 1: the exact inverse of its own contract. A
+  campaign *with* failures ran to the end and reported correctly; a campaign with none died silently.
+  This is the tool whose header says "green-green-red is timing, red-red-red is a bug" — the one you
+  reach for when you no longer know what to believe — and it could not say green-green-green. The
+  verdict is now coverage-aware, with the exit code answering "did something go wrong" and the words
+  answering "can I ship". Verified end to end under stubs across ten scenarios; the four green-ish
+  ones do not exist at all without the `set -e` fix.
+- **The crucible report's section order was not total, and an entire test package had never been
+  linted.** `areaRank` answers the same value for every area that is neither infra nor `m<N>`, so two
+  such areas compared equal and Go's deliberately randomised map order decided — two runs of the same
+  suite emitted their sections in a different order and could not be diffed by eye, which is most of
+  what a saved report is for. The larger finding is that this was invisible: the suite is behind
+  `//go:build crucible`, `make lint` did not pass the tag, and staticcheck flags it in one line
+  (SA4010) the moment the tag is on. `make lint` now makes a second, **scoped** pass — scoped, not
+  global, because the tag is a two-way switch and turning it on everywhere would hide the
+  `!crucible` guard that keeps the tagged suite honest.
+- `.dockerignore` embed coverage, the version-stamp target, Unix-time gauge naming
+  (`TestUnixTimeGaugesAreNamedTimestampSeconds` — ten of eleven such gauges ended
+  `_timestamp_seconds` and the eleventh was caught by eye; a metric name is compiled into somebody's
+  dashboard, recording rule and alert, none of them in this tree), and the "no `_active` series may
+  silence a rule without also feeding one" table walk. The pattern throughout this release: a lesson
+  written down is not a control.
+
+### Not in this release
+
+Four M6 roadmap items are deliberately not delivered here, and 0.6.0 should not be read as covering
+them ([spec/90-roadmap.md](spec/90-roadmap.md)):
+
+- **Mover resources by operation type** (prune > backup), the cache `emptyDir` `sizeLimit` decision,
+  and the **millions-of-files load test** (with it, the restic-vs-rustic revisit of
+  [adr/0001](spec/adr/0001-repository-engine-restic-format.md)).
+- **VSC ↔ RBD-image reconciliation**, trash monitoring and the active pre-check before
+  `VolumeSnapshot` creation; and **S3 RGW tuning** (`s3.connections`, wave test against
+  `rgw_max_concurrent_requests`).
+- **The two-week soak alongside Velero on a staging cluster**, which runs on a real build cluster
+  after this tag, and the pilot rollout the milestone's exit criteria call for. This is the main
+  reason 0.6.0 is offered for testing rather than for production.
+- A dashboard panel for "time since last failure", which is what would close the Grafana half of the
+  `BackupFailed` blind spot described above.
+- **The PodSecurity review** the same roadmap bullet asks for. The pieces it would review already
+  ship and did not change here — the chart's `NetworkPolicy`, the four PodSecurity namespace labels,
+  and the operator's requests/limits — so this is an unexamined posture rather than a missing one.
+  What the review would have to conclude is now on record, because the crucible surfaced it in
+  passing: the **operator** already satisfies every `restricted` criterion (`runAsNonRoot`,
+  `seccompProfile: RuntimeDefault`, `allowPrivilegeEscalation: false`, `readOnlyRootFilesystem`,
+  `capabilities: drop ALL`), but the **mover cannot**, by design. It runs as uid 0 with a
+  per-operation capability set and everything else stripped, because restic has to read and restore
+  files owned by arbitrary uids inside somebody's volume. Both run in `crystal-backup-system`, so
+  `enforce: baseline` there is a **constraint, not caution** — tightening it to `restricted` would
+  block every mover Job. Under the namespace's `warn: restricted`, the API server says so on every
+  mover creation, which is why the operator log carries a PodSecurity warning on a healthy install.
+
 ## 0.5.1 — Supply-chain: the signed artefact was the wrong one (2026-07-29)
 
 A patch release with no functional change. It exists because verifying 0.5.0's artefacts — rather

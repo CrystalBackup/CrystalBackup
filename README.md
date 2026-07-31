@@ -1,12 +1,12 @@
 # Crystal Backup
 
-> **Early, real code** — **M0 through M5 have shipped (v0.5.1)**: the core backup engine,
+> **Early, real code** — **M0 through M6 have shipped (v0.6.0)**: the core backup engine,
 > cluster disaster recovery, **restore**, **manifest & cluster-scoped DR**, the
 > **namespace plane** (a user's own repository under their own key), **external sync** and the
 > **right to erasure** are implemented, tested and released. Every milestone is accepted on a
 > **real RKE2 + Rook-Ceph cluster** before it ships, and the acceptance reports are
 > [published, check by check](https://crystalbackup.github.io/CrystalBackup/quality/).
-> Four milestones (M6–M9) are still ahead — [what is *not* here yet](#how-it-compares) is
+> Three milestones (M7–M9) are still ahead — [what is *not* here yet](#how-it-compares) is
 > listed explicitly. Built in the open with AI assistance.
 > **[Documentation](https://crystalbackup.github.io/CrystalBackup/docs/)** ·
 > [Project status & disclaimer](#-project-status--disclaimer)
@@ -30,11 +30,19 @@ is restorable, with no pre-existing custom resources and no surviving cluster re
 
 ## ⚠️ Project status & disclaimer
 
-**M0 through M5 have shipped (v0.5.1)** — the core engine, cluster disaster recovery, restore,
+**M0 through M6 have shipped (v0.6.0)** — the core engine, cluster disaster recovery, restore,
 manifest & cluster-scoped DR, the namespace plane, external sync and the right to erasure are
-real, tested code. The CRD API is `v1alpha1` and **will still move** before `1.0.0`, four
-milestones remain ([roadmap](#roadmap)), and the project has not yet had its
-production-hardening pass (that is M6). So: **early, but no longer hypothetical.**
+real, tested code, and M6 has now put instrumentation in front of all of it: a metrics
+catalogue, eleven alert rules with unit tests, traces, an exportable self-check and a
+restore-fidelity gate that compares a restore to its source file by file. The CRD API is
+`v1alpha1` and **will still move** before `1.0.0`, and three milestones remain
+([roadmap](#roadmap)).
+
+**0.6.0 is offered for testing in real conditions, not for production.** The difference is
+specific rather than rhetorical: the milestone's own exit criteria call for a two-week soak
+alongside Velero and a pilot rollout, and neither has happened yet. Run it on a cluster whose
+loss you can absorb, alongside — not instead of — whatever you back up with today. So:
+**early, no longer hypothetical, and honest about which parts are which.**
 
 **How each shipped milestone is verified.** Beyond unit, envtest and kind e2e suites, every
 milestone is accepted on a disposable **real platform** — RKE2, Rook-Ceph (RBD + CephFS),
@@ -51,6 +59,7 @@ The reports are published in full, per check, pass and skip:
 | M3 — manifests & cluster-scoped DR | [crucible-m3](https://crystalbackup.github.io/CrystalBackup/reports/crucible-m3.html) |
 | M4 — hooks, verification & maintenance | [crucible-m4](https://crystalbackup.github.io/CrystalBackup/reports/crucible-m4.html) |
 | M5 — namespace plane, sync & erasure | [crucible-m5](https://crystalbackup.github.io/CrystalBackup/reports/crucible-m5.html) |
+| M6 — observability & production readiness | [crucible-m6](https://crystalbackup.github.io/CrystalBackup/reports/crucible-m6.html) — **the full 82-check suite, M0 through M6** |
 
 The reports include the defects each round found — writing the M5 suite alone turned up three
 features that were documented and completely **inert** on real infrastructure. That is the point
@@ -160,7 +169,7 @@ Full requirements (R1–R28) and rationale: [spec/00-requirements.md](spec/00-re
 
 ## How it compares
 
-The Crystal Backup column is **v0.5.1 as shipped** — every ✅ below is code you can install
+The Crystal Backup column is **v0.6.0 as shipped** — every ✅ below is code you can install
 today, and each one is exercised by the published
 [acceptance reports](#-project-status--disclaimer). The other columns are those tools'
 **current** capabilities to the best of our knowledge. Capabilities evolve, these tools have
@@ -170,7 +179,7 @@ project's own docs.
 Legend: ✅ yes / core goal · 🟡 partial or possible with effort · ❌ no / not a goal ·
 🚧 **not shipped yet** (milestone in the cell).
 
-| Capability | Crystal Backup *(v0.5.1)* | Velero | K8up | VolSync | Kasten K10 |
+| Capability | Crystal Backup *(v0.6.0)* | Velero | K8up | VolSync | Kasten K10 |
 |---|:--:|:--:|:--:|:--:|:--:|
 | Open source | ✅ | ✅ | ✅ | ✅ | ❌ (commercial; limited free tier) |
 | Namespace-user **self-service** (own schedules/restores) | ✅ | ❌ (admin-oriented) | ✅ | 🟡 | 🟡 |
@@ -230,8 +239,8 @@ windows and darwin on amd64 + arm64.
 | **M2** | Restore — self-service, operator-mediated cluster-DR restore, `ClusterRestore`, admission (VAP) | shipped |
 | **M3** | Manifests & cluster-scoped DR — sanitization engine, cluster-scoped capture & selective restore | shipped |
 | **M4** | Consistency hooks, repository verification (`restic check`) & maintenance | shipped |
-| **M5** | Namespace plane, **external sync** & right-to-erasure | shipped — **v0.5.1**, current |
-| **M6** | Observability hardening & production readiness — metrics catalogue, dashboards, alert rules, traces, restore-fidelity gate | in progress |
+| **M5** | Namespace plane, **external sync** & right-to-erasure | shipped |
+| **M6** | Observability hardening & production readiness — metrics catalogue, dashboards, alert rules, traces, restore-fidelity gate | shipped — **v0.6.0**, current |
 | **M7** | `crystalctl` CLI & local browse UI | planned |
 | **M8** | Immutable locations (S3 Object Lock) | planned |
 | **M9** | Coexistence hardening & DR drills | planned |
