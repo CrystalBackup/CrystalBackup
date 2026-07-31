@@ -315,11 +315,49 @@ function inspect({ docsRoot, locales, pathLabel }) {
 	}
 
 	// --- coverage (warning by default; see the header comment) ---------------
+	//
+	// Machine-generated pages are exempt, and the exemption is DERIVED rather than listed.
+	// `reference/metrics.md` and `reference/alerts.md` come out of `internal/metrics` and
+	// `internal/alerts`; `reference/api/index.md` comes out of the Go types via crd-ref-docs.
+	// Hand-translating one of those produces a French copy that goes wrong the next time
+	// somebody edits Go, and only the English side has a generator to regenerate it — the
+	// sourceHash guard would keep flagging it forever with no honest way to clear the flag.
+	//
+	// A hardcoded list of three paths would be a fourth place to forget: add a generated page
+	// next year and coverage silently demands a translation nobody can maintain. So the test
+	// is the marker the generators already write into the file, which means a new generated
+	// page exempts itself on the day it is created.
+	//
+	// This is an exemption from COVERAGE only. A generated page that somebody has translated
+	// anyway is still checked for drift above — and is reported as an error here, because the
+	// right fix is to delete it, not to restamp it.
+	const GENERATED_MARKER = '<!-- GENERATED FILE';
+	const isGenerated = (absolutePath) => {
+		try {
+			return readFileSync(absolutePath, 'utf8').includes(GENERATED_MARKER);
+		} catch {
+			return false;
+		}
+	};
+	const generated = new Set(
+		[...englishByRelative.entries()].filter(([, p]) => isGenerated(p)).map(([rel]) => rel)
+	);
 
 	for (const locale of locales) {
 		for (const relativePath of englishByRelative.keys()) {
 			if (covered[locale].has(relativePath)) continue;
+			if (generated.has(relativePath)) continue;
 			warnings.push(`${locale}: no translation of ${pathLabel(englishByRelative.get(relativePath))}`);
+		}
+		for (const relativePath of generated) {
+			if (!covered[locale].has(relativePath)) continue;
+			errors.push(
+				`${locale}/${relativePath}: this is a translation of a GENERATED page.\n` +
+					`           ${pathLabel(englishByRelative.get(relativePath))} is produced by a generator, so a\n` +
+					`           hand-written translation of it drifts the next time the Go changes and there is no\n` +
+					`           generator to refresh the French side. Delete it; the English page is served under\n` +
+					`           /${locale}/ with the untranslated notice, which is the honest state.`
+			);
 		}
 	}
 

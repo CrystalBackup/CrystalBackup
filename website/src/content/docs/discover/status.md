@@ -5,14 +5,17 @@ description: What has shipped, what has not, how the project is versioned, and h
 
 ## Where the project is
 
-The current release is **`v0.5.1`**. Milestones M0 through M5 have shipped: the core
+The current release is **`v0.6.0`**. Milestones M0 through M6 have shipped: the core
 backup engine, cluster disaster recovery, restore, manifest and cluster-scoped DR,
 consistency hooks, repository maintenance and verification, the namespace plane, external
-sync and the right to erasure.
+sync, the right to erasure, and the observability layer in front of all of it.
 
-Four milestones remain. The CRD API is `v1alpha1` and **will still change** before
-`1.0.0`, and the project has not yet had its production-hardening pass — that is M6, in
-progress. The honest summary is: **early, but no longer hypothetical.** The shipped paths
+Three milestones remain. The CRD API is `v1alpha1` and **will still change** before
+`1.0.0`. M6 was the production-hardening pass and it has shipped, but two of its own exit
+criteria have not been met: a two-week soak alongside an incumbent tool, and a pilot
+rollout. That is why **0.6.0 is offered for testing in real conditions, not for
+production** — a narrower claim than "not hardened", and a more useful one. The honest
+summary is: **early, but no longer hypothetical.** The shipped paths
 are tested against real infrastructure; that is not the same as asking you to trust it
 with data you cannot recreate.
 
@@ -50,7 +53,7 @@ published rather than summarised.
 
 | Milestone | State | What it will add |
 |---|---|---|
-| **M6** | in progress | The full metrics catalogue, Grafana dashboards and alert rules, OTel traces across the pipeline, mover resource tuning, NetworkPolicy and PodSecurity review, and a restore-fidelity gate |
+| **M6** | shipped in `v0.6.0` | The full metrics catalogue, two Grafana dashboards and eleven alert rules watched *firing* against a real Prometheus, OTel traces across the pipeline, an exportable self-check, and a restore-fidelity gate that compares a restore to its source file by file. Mover resource tuning by operation type and the PodSecurity review moved to `0.6.1`; the soak and the pilot rollout have not happened |
 | **M7** | not started | The `crystalctl` CLI and the local browse UI. There is **no user-facing command-line tool** today — everything goes through custom resources, or through upstream `restic` directly |
 | **M8** | not started | Immutable locations. `spec.mode: Immutable` is accepted by the API, but S3 Object Lock, repository rotation and expiry are **not implemented** — it does not give you WORM |
 | **M9** | not started | Coexistence *hardening*. Coexistence itself is structural and works today; M9 adds the validated side-by-side soak against an incumbent tool, coverage-diff guidance and fleet DR drills |
