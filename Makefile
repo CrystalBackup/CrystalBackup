@@ -675,3 +675,49 @@ preflight-table-verify: ## Fail if preflight.sh's exposer table or checksum is s
 		exit 1; \
 	fi; \
 	echo "the preflight script and its checksum are up to date."
+
+## The website is bilingual (English at the root, French under /fr/), and a translated page
+## that has silently fallen behind its English source is worse than no translation at all: a
+## reader trusts a stale page exactly as much as a fresh one, and nothing in a normal review
+## catches it — the French file is untouched, so it never appears in the diff that broke it.
+##
+## So every translated page records the git blob hash of the English bytes it was translated
+## from, and this recomputes it. A blob hash changes if and only if the source changes, which
+## means editing an English page fails the build in the same pull request that edited it — the
+## only moment at which somebody still knows what changed and why.
+##
+## The check refuses to pass by finding nothing: no locale declared, a declared locale with no
+## page, zero English pages, zero translated pages, or no git on PATH are all FAILURES. That is
+## not paranoia, it is this project's own history — `check-alert-rules` opened with
+## `command -v promtool || exit 0` for five milestones and therefore verified nothing, in green,
+## on every runner it ever ran on.
+##
+## Coverage (an English page with no French counterpart) is a WARNING today and an error under
+## --require-full-coverage; the reasoning is written out at the top of the script.
+TRANSLATION_CHECK ?= website/tools/check-translations.mjs
+
+.PHONY: check-translations
+check-translations: ## Fail if a translated website page is stale against its English source (CI guard).
+	@command -v node >/dev/null 2>&1 || { \
+		echo "ERROR: node is not on PATH, so the translation staleness guard cannot run."; \
+		echo "       It fails rather than skipping: a check that quietly declines to run and"; \
+		echo "       reports success is the exact defect this guard exists to prevent."; \
+		exit 1; \
+	}
+	@$(MAKE) --no-print-directory check-translations-selftest
+	@node "$(TRANSLATION_CHECK)"
+
+## Runs before the check itself, every time, because it costs a fifth of a second and it is the
+## difference between "the guard reported green" and "the guard can still go red". It builds
+## fixture trees and runs the real checker against them: drifted source, vanished source, missing
+## sourceHash, a sourceFile redirected at some file that never changes, and an empty locale.
+.PHONY: check-translations-selftest
+check-translations-selftest: ## Prove the translation guard still fails on a drifted page.
+	@node "$(TRANSLATION_CHECK)" --self-test
+
+## The button that says "yes, I have re-translated it". It only stamps the new hash — it
+## translates nothing, and running it without re-reading the English diff certifies a page that
+## is now wrong. It prints every page it touched for that reason.
+.PHONY: translations-refresh
+translations-refresh: ## Restamp sourceHash on stale translated pages AFTER re-translating them.
+	@node "$(TRANSLATION_CHECK)" --refresh

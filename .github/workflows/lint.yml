@@ -129,6 +129,45 @@ jobs:
       - name: Evaluate every rule against synthetic series
         run: make test-alert-rules
 
+  translations:
+    name: Translated pages match their English source
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      # `fetch-depth: 0` is NOT needed — the guard hashes the working-tree bytes with
+      # `git hash-object`, which reads no history and no index. A shallow checkout is enough.
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      # Pin the runtime rather than inherit whatever the image ships. The checker is
+      # stdlib-only and deliberately does not need `npm install`: a guard that only runs
+      # after a successful dependency install stops running the first time the lockfile
+      # breaks, which is the first day anybody would want it.
+      - name: Set up Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: '24'
+
+      # The website is bilingual, and a French page that has silently fallen behind its
+      # English source is worse than no French page: a reader trusts a stale page exactly as
+      # much as a fresh one, and the diff that broke it never touched the French file, so no
+      # review catches it. Every translated page records the git blob hash of the English
+      # bytes it was translated from; this recomputes it and fails when they differ, so the
+      # breakage surfaces in the pull request that edited the English page rather than months
+      # later in a reader's cluster.
+      #
+      # `make check-translations` runs the guard's own self-test first, on fixture trees, and
+      # only then the real check — so this job cannot report green without having just watched
+      # the guard go red on a deliberately drifted page. It also fails on zero translated
+      # pages, on a declared locale with an empty directory and on a missing git, because this
+      # project has shipped a check that opened with `command -v promtool || exit 0` and
+      # therefore verified nothing, in green, on every runner it ever ran on.
+      - name: Verify no translated page is stale
+        run: make check-translations
+
   helm-lint:
     name: helm lint
     runs-on: ubuntu-latest

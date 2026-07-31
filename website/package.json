@@ -7,7 +7,8 @@
   "scripts": {
     "dev": "astro dev",
     "build": "astro build",
-    "preview": "astro preview"
+    "preview": "astro preview",
+    "check:i18n": "node tools/check-translations.mjs --self-test && node tools/check-translations.mjs"
   },
   "dependencies": {
     "@astrojs/starlight": "^0.37.7",
