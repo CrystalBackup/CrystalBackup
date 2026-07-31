@@ -338,8 +338,29 @@ docker-buildx: ## Build and push docker image for the manager for cross-platform
 .PHONY: build-installer
 build-installer: manifests generate kustomize ## Generate a consolidated YAML with CRDs and deployment.
 	mkdir -p dist
-	cd config/manager && "$(KUSTOMIZE)" edit set image controller=${IMG}
-	"$(KUSTOMIZE)" build config/default > dist/install.yaml
+	@$(call kustomize-build-with-image,${IMG}) > dist/install.yaml
+
+# kustomize-build-with-image renders config/default with the manager image overridden, WITHOUT
+# touching the working tree.
+#
+# `kustomize edit set image` — what kubebuilder scaffolds, and what these targets used to run —
+# rewrites the TRACKED config/manager/kustomization.yaml in place. Every `make deploy` and every
+# `make e2e` therefore left the repository dirty with an images: block naming a throwaway
+# example.com tag.
+#
+# That is not cosmetic. `git describe --dirty` is what stamps crystalbackup_build_info, so a
+# release build run after an e2e run stamps `-dirty` into the binary: this exact sequence produced
+# an operator image labelled v0.6.0-7-g6a3bb60-dirty during the 0.6.1 preparation, which is the
+# failure the version-stamping lot existed to remove. It was also nearly committed twice.
+#
+# So the edit happens on a COPY. The whole config/ tree is copied because the overlays reference
+# each other by relative path, and the copy is removed whether the build succeeds or not.
+define kustomize-build-with-image
+set -e; tmp="$$(mktemp -d)"; trap 'rm -rf "$$tmp"' EXIT; \
+cp -R config "$$tmp/config"; \
+(cd "$$tmp/config/manager" && "$(KUSTOMIZE)" edit set image controller=$(1)); \
+"$(KUSTOMIZE)" build "$$tmp/config/default"
+endef
 
 ##@ Deployment
 
@@ -372,8 +393,7 @@ uninstall: manifests kustomize ## Uninstall CRDs from the K8s cluster specified 
 
 .PHONY: deploy
 deploy: manifests kustomize ## Deploy controller to the K8s cluster specified in ~/.kube/config.
-	cd config/manager && "$(KUSTOMIZE)" edit set image controller=${IMG}
-	"$(KUSTOMIZE)" build config/default | "$(KUBECTL)" apply -f -
+	@$(call kustomize-build-with-image,${IMG}) | "$(KUBECTL)" apply -f -
 
 .PHONY: undeploy
 undeploy: kustomize ## Undeploy controller from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion. Delete the custom resources FIRST (docs/DECOMMISSION.md §3) — this target takes the operator and the CRDs down together.

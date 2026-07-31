@@ -43,14 +43,19 @@ charts/crystal-backup/crds/*.yaml
 /stage-*/
 /packages/
 /sbom/
-/apko.lock.json
 /image-refs.txt
-# The `-baseline` variants and root-level SBOMs, from comparing a build against a
-# published one. Same class as the four above, and they were missed because they are
-# named after the comparison rather than after the tool.
-/apko-baseline.lock.json
+# Every apko lockfile at the root, whatever it is named after: the plain one, the
+# `-baseline` comparison, and the per-image `apko-operator/mover/sync.lock.json` a
+# three-image build produces. Named by pattern rather than one by one — the first two
+# were listed individually and the per-image ones still showed up untracked.
+/apko*.lock.json
 /packages-baseline/
 /sbom-*.spdx.json
+
+# The consolidated installer `make build-installer` renders. Regenerated from config/ on
+# demand and never reviewed, so it has no business in a diff. website/dist was already
+# covered; the repo-root one was not.
+/dist/
 
 # Terraform state, ANYWHERE. test/crucible/.gitignore already covers the crucible's own
 # directory and says why — a populated state file holds the RKE2 token, and it would hold
