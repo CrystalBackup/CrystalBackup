@@ -75,10 +75,11 @@ type ClusterBackupExternalSyncReconciler struct {
 func NewClusterBackupExternalSyncReconciler(
 	c client.Client, scheme *runtime.Scheme, secretsReader *secrets.ByNameReader,
 	q *queue.Manager, lister FilteredSnapshotLister, operatorNamespace, moverImage, syncImage string,
-	cl clock.PassiveClock, recorder events.EventRecorder,
+	moverProfiles mover.Profiles, cl clock.PassiveClock, recorder events.EventRecorder,
 ) *ClusterBackupExternalSyncReconciler {
 	deps := repoMaintenanceDeps{
 		Client: c, Secrets: secretsReader, OperatorNamespace: operatorNamespace, MoverImage: moverImage,
+		MoverProfiles: moverProfiles,
 	}
 	return &ClusterBackupExternalSyncReconciler{
 		Client: c, Scheme: scheme, Secrets: secretsReader,

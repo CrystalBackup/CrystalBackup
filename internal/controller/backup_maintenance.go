@@ -205,6 +205,7 @@ func (r *BackupReconciler) maintenanceDeps() repoMaintenanceDeps {
 		Secrets:           r.Secrets,
 		OperatorNamespace: r.OperatorNamespace,
 		MoverImage:        r.MoverImage,
+		MoverProfiles:     r.MoverProfiles,
 	}
 }
 
@@ -305,6 +306,10 @@ type repoMaintenanceDeps struct {
 	Secrets           *secrets.ByNameReader
 	OperatorNamespace string
 	MoverImage        string
+	// MoverProfiles is the operator's resolved sizing table. It travels with the deps rather than
+	// being looked up per op because prune's limits and forget's are DIFFERENT rows of it, and
+	// the op body is one function serving both.
+	MoverProfiles mover.Profiles
 }
 
 // repoMaintenanceRequest fully describes one maintenance op: which repository lane to take
@@ -406,6 +411,7 @@ func runRepoMaintenance(opCtx context.Context, deps repoMaintenanceDeps, name st
 		Namespace:    deps.OperatorNamespace,
 		Image:        deps.MoverImage,
 		Operation:    op,
+		Profiles:     deps.MoverProfiles,
 		ResticArgs:   resticArgs,
 		RepoURL:      repoURL,
 		SecretName:   name,
@@ -512,8 +518,13 @@ func waitForMaintenanceJob(ctx context.Context, c client.Client, operatorNamespa
 			return nil
 		}
 		if jobConditionTrue(&job, batchv1.JobFailed) || job.Status.Failed > maintenanceJobBackoffLimit {
-			return fmt.Errorf("maintenance job %s/%s failed (failed pods=%d, backoffLimit=%d)",
-				operatorNamespace, jobName, job.Status.Failed, maintenanceJobBackoffLimit)
+			// "failed pods=2, backoffLimit=1" is true and useless when the kubelet is the one that
+			// did the killing. prune is the heaviest row of the sizing table and therefore the most
+			// likely operation to meet its own memory limit or fill its cache cap; when it does,
+			// this message is the only thing the operator sees, so it carries the reason.
+			return fmt.Errorf("maintenance job %s/%s failed (failed pods=%d, backoffLimit=%d)%s",
+				operatorNamespace, jobName, job.Status.Failed, maintenanceJobBackoffLimit,
+				killDetail(ctx, c, operatorNamespace, jobName))
 		}
 
 		select {

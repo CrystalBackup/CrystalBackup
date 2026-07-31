@@ -137,7 +137,10 @@ type MaintenanceReconciler struct {
 	Queue             *queue.Manager
 	OperatorNamespace string
 	MoverImage        string
-	Recorder          events.EventRecorder
+	// MoverProfiles is the resolved per-operation sizing table. This controller runs the two
+	// heaviest rows in it — prune and check (internal/mover.classRepoHeavy). Nil ⇒ built-in.
+	MoverProfiles mover.Profiles
+	Recorder      events.EventRecorder
 	// Clock is the only source of "now": clock.RealClock in production, a fake clock in envtest so
 	// a test can step a daily cron without waiting a day.
 	Clock clock.PassiveClock
@@ -156,6 +159,7 @@ func NewMaintenanceReconciler(
 	secretsReader *secrets.ByNameReader,
 	q *queue.Manager,
 	operatorNamespace, moverImage string,
+	moverProfiles mover.Profiles,
 	recorder events.EventRecorder,
 	cl clock.PassiveClock,
 ) *MaintenanceReconciler {
@@ -166,6 +170,7 @@ func NewMaintenanceReconciler(
 		Queue:             q,
 		OperatorNamespace: operatorNamespace,
 		MoverImage:        moverImage,
+		MoverProfiles:     moverProfiles,
 		Recorder:          recorder,
 		Clock:             cl,
 		tracker:           newMaintenanceTracker(),
@@ -518,6 +523,7 @@ func (r *MaintenanceReconciler) submit(ctx context.Context, repo *cbv1.BackupRep
 		Secrets:           r.Secrets,
 		OperatorNamespace: r.OperatorNamespace,
 		MoverImage:        r.MoverImage,
+		MoverProfiles:     r.MoverProfiles,
 	}
 
 	started, err := r.tracker.start(repo, due.op, r.Clock.Now(), func() (*queue.Handle, error) {

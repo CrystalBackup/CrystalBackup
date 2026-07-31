@@ -329,9 +329,18 @@ crucible lanes, all with zero residual snapshot objects
       (namespace-user + platform) under `charts/crystal-backup/dashboards/`, alert rules
       (backup missed/failed/aged, check failed).
 - [x] OTel traces across the pipeline (schedule → snapshot → mover), exemplars.
-- [ ] Mover resources by operation type (prune > backup), cache emptyDir `sizeLimit` decision,
-      load test on millions-of-files volumes (restic vs rustic revisit —
-      [adr/0001](adr/0001-repository-engine-restic-format.md)); delta 7.
+- [ ] Mover resources by operation type (prune > backup) and the cache emptyDir `sizeLimit`
+      decision — **both delivered in 0.6.1**: four sizing classes over the thirteen operations,
+      overridable per operation through `mover.profiles` in the chart, defaults living ONLY in
+      `internal/mover/profiles.go` and documented by generation in
+      [`docs/MOVER-RESOURCES.md`](../docs/MOVER-RESOURCES.md). The `sizeLimit` is a ceiling
+      against a runaway cache filling a node's disk, NOT a fitted estimate — it ships with the
+      eviction made legible (`MoverEvicted` carrying the kubelet's own message, `MoverOOMKilled`
+      for the memory limit), because a pod that silently disappears mid-backup is a worse failure
+      than the unbounded cache it replaced.
+      **Still open**: the load test on millions-of-files volumes and the restic-vs-rustic revisit
+      ([adr/0001](adr/0001-repository-engine-restic-format.md)) — it needs real infrastructure and
+      is what would turn these conservative ceilings into measured numbers; delta 7.
 - [ ] VSC ↔ RBD-image reconciliation + trash monitoring + active pre-check before VS creation
       (VolumeSnapshotClass resolved, secret present, snapshotter sidecar reachable) — delta 9;
       S3 RGW tuning (`s3.connections`, wave test vs `rgw_max_concurrent_requests`) — delta 13.

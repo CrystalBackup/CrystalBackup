@@ -69,6 +69,37 @@ mover:
     # .Chart.AppVersion when left blank.
     tag: ""
 
+  # -- Per-operation mover sizing OVERRIDES. Empty — the default — means every mover Job is sized
+  # from the operator's built-in table, which is documented, with its reasoning and its numbers, in
+  # docs/MOVER-RESOURCES.md (generated from internal/mover/profiles.go — the numbers exist in
+  # exactly one place, and this file is deliberately not a second one).
+  #
+  # Keys are operation names — backup, restore, init, forget, prune, check, snapshots, unlock,
+  # sync, manifests-backup, manifests-restore, cluster-manifests-backup, cluster-manifests-restore
+  # — plus the reserved key `default`, which applies to all of them first. Merging is FIELD BY
+  # FIELD: raising prune's memory limit leaves prune's CPU request, and every other operation,
+  # exactly where the built-in table put them.
+  #
+  # Each entry takes `requests: {cpu, memory}`, `limits: {cpu, memory}` and `cacheSizeLimit`
+  # (the restic cache emptyDir's cap). A value of "0" REMOVES that field — `cacheSizeLimit: "0"`
+  # is an unbounded cache, `limits: {memory: "0"}` is an unlimited container.
+  #
+  # A misconfiguration here STOPS THE OPERATOR at startup (unknown operation, unknown field,
+  # unparseable quantity, a request above its own limit) rather than being ignored. Read
+  # docs/MOVER-RESOURCES.md before raising anything: the two things that go wrong are a memory
+  # limit too low (the pod is OOMKilled — reported as `MoverOOMKilled`) and a cacheSizeLimit too
+  # low (the pod is EVICTED mid-run — reported as `MoverEvicted` with the kubelet's own message).
+  #
+  # Changing this rolls the operator pod: the file is read once at startup, so the deployment
+  # carries a checksum of it.
+  #
+  #   profiles:
+  #     prune:
+  #       limits:
+  #         memory: 16Gi
+  #       cacheSizeLimit: 60Gi
+  profiles: {}
+
 # The sync image carries the same crystal-mover shim and the same pinned restic, PLUS rclone
 # (build/apko/sync.yaml, build/melange/sync.yaml). It is a third image rather than an addition to
 # the mover so that rclone's vulnerability surface stays off the backup and restore path; the
@@ -140,8 +171,9 @@ securityContext:
     drop:
       - ALL
 
-# -- Operator resource requests/limits. Movers get their own (benchmark-derived)
-# resources in later milestones; these are for the controller only.
+# -- Operator resource requests/limits. THE CONTROLLER ONLY: mover Jobs are sized per operation
+# by the operator itself (see `mover.profiles` above and docs/MOVER-RESOURCES.md). Setting this
+# has never affected a mover and still does not.
 resources:
   requests:
     cpu: 10m

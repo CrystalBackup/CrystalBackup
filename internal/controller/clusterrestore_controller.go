@@ -41,6 +41,7 @@ import (
 	"github.com/CrystalBackup/CrystalBackup/internal/apiconst"
 	"github.com/CrystalBackup/CrystalBackup/internal/client/secrets"
 	"github.com/CrystalBackup/CrystalBackup/internal/metrics"
+	"github.com/CrystalBackup/CrystalBackup/internal/mover"
 	"github.com/CrystalBackup/CrystalBackup/internal/repo/queue"
 	"github.com/CrystalBackup/CrystalBackup/internal/restic"
 	"github.com/CrystalBackup/CrystalBackup/internal/rexposer"
@@ -83,14 +84,16 @@ func NewClusterRestoreReconciler(
 	targets *rexposer.TargetExposer,
 	lister FilteredSnapshotLister,
 	operatorNamespace, moverImage string,
+	moverProfiles mover.Profiles,
 	manifestMoverSA, clusterManifestWriterRole string,
 	recorder events.EventRecorder,
 	q *queue.Manager,
 ) *ClusterRestoreReconciler {
 	return &ClusterRestoreReconciler{
-		Client:                           c,
-		Scheme:                           scheme,
-		Engine:                           newRestoreEngine(c, secretsReader, targets, operatorNamespace, moverImage, q),
+		Client: c,
+		Scheme: scheme,
+		Engine: newRestoreEngine(c, secretsReader, targets, operatorNamespace, moverImage,
+			moverProfiles, q),
 		Lister:                           lister,
 		OperatorNamespace:                operatorNamespace,
 		ManifestMoverServiceAccount:      manifestMoverSA,

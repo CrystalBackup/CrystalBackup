@@ -123,9 +123,6 @@ func dataRequest() JobRequest {
 		TTLSeconds:   600,
 		GoMemLimit:   "900MiB",
 		ExtraEnv:     []corev1.EnvVar{{Name: "AWS_DEFAULT_REGION", Value: "eu-west-1"}},
-		Resources: corev1.ResourceRequirements{
-			Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("1Gi")},
-		},
 	}
 }
 
@@ -202,6 +199,17 @@ func TestBuildJobDataRequest(t *testing.T) {
 			t.Errorf("volume %q is not an emptyDir: %+v", name, v.VolumeSource)
 		}
 	}
+	// The restic cache is CAPPED (an unbounded one fills the node's disk and takes other people's
+	// pods down with it), and /tmp is deliberately NOT — a second eviction trigger for a directory
+	// that holds one pack file at a time would be all risk and no gain.
+	cacheLimit := findVolume(t, job.Spec.Template.Spec.Volumes, volumeCache).EmptyDir.SizeLimit
+	wantCacheLimit := resource.MustParse(defaultCacheSizeLimit)
+	if cacheLimit == nil || cacheLimit.Cmp(wantCacheLimit) != 0 {
+		t.Errorf("cache emptyDir sizeLimit = %v, want %s", cacheLimit, wantCacheLimit.String())
+	}
+	if got := findVolume(t, job.Spec.Template.Spec.Volumes, volumeTmp).EmptyDir.SizeLimit; got != nil {
+		t.Errorf("tmp emptyDir sizeLimit = %v, want unset", got)
+	}
 
 	// --- fixed env ----------------------------------------------------------------------
 	env := c.Env
@@ -261,9 +269,15 @@ func TestBuildJobDataRequest(t *testing.T) {
 		t.Errorf("terminationMessagePolicy = %q, want ReadFile", c.TerminationMessagePolicy)
 	}
 
-	// resources pass through untouched.
-	if !reflect.DeepEqual(c.Resources, req.Resources) {
-		t.Errorf("resources = %+v, want %+v", c.Resources, req.Resources)
+	// Sizing comes from the profile table for THIS operation — never from nothing. A backup with
+	// no explicit table is the built-in data class, and a pod with no requests at all is BestEffort:
+	// first in line for eviction under node pressure, which is the state a backup must not be in.
+	wantBackup := Profiles(nil).For(OpBackup)
+	if !reflect.DeepEqual(c.Resources.Requests, wantBackup.Requests) {
+		t.Errorf("resources.requests = %+v, want %+v (the built-in backup profile)", c.Resources.Requests, wantBackup.Requests)
+	}
+	if !reflect.DeepEqual(c.Resources.Limits, wantBackup.Limits) {
+		t.Errorf("resources.limits = %+v, want %+v (the built-in backup profile)", c.Resources.Limits, wantBackup.Limits)
 	}
 
 	// --- pod hardening ------------------------------------------------------------------

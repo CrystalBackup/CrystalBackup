@@ -53,6 +53,7 @@ import (
 	"github.com/CrystalBackup/CrystalBackup/internal/hooks"
 	"github.com/CrystalBackup/CrystalBackup/internal/keys"
 	"github.com/CrystalBackup/CrystalBackup/internal/metrics"
+	"github.com/CrystalBackup/CrystalBackup/internal/mover"
 	"github.com/CrystalBackup/CrystalBackup/internal/repo/queue"
 	"github.com/CrystalBackup/CrystalBackup/internal/repo/s3stat"
 	"github.com/CrystalBackup/CrystalBackup/internal/rexposer"
@@ -118,6 +119,7 @@ func main() {
 	var operatorNamespace string
 	var moverImage string
 	var syncImage string
+	var moverProfilesFile string
 	var manifestMoverSA string
 	var manifestReaderRole string
 	var manifestWriterRole string
@@ -168,6 +170,14 @@ func main() {
 			"with two different sets of object-storage credentials, which restic can only do through "+
 			"rclone remotes (adr/0013) — and rclone has no business on the backup/restore path. Empty "+
 			"disables external sync; nothing else is affected.")
+	flag.StringVar(&moverProfilesFile, "mover-profiles-file", "",
+		"Path to the per-operation mover sizing overrides (requests, limits and the restic cache "+
+			"emptyDir sizeLimit, keyed by operation name plus the reserved \"default\"). The chart renders "+
+			"`mover.profiles` into a ConfigMap and mounts it here. Empty — the normal case — uses the "+
+			"built-in table in internal/mover/profiles.go, which is what docs/MOVER-RESOURCES.md documents. "+
+			"A file that does not parse, names an operation that does not exist, or asks for a request above "+
+			"its own limit STOPS THE OPERATOR: an override an admin can read back in `helm get values` and "+
+			"that never reached a pod is the failure this flag exists to make impossible.")
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
@@ -192,6 +202,21 @@ func main() {
 	flag.Parse()
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+
+	// The mover sizing table, resolved ONCE here. Two properties matter and neither survives
+	// resolving it later: a malformed override kills the process at startup, where an operator is
+	// watching, instead of failing one backup at 3am; and every controller below gets the same
+	// table, so a prune and a backup cannot end up sized by different readings of the same file.
+	moverProfiles, err := mover.LoadProfilesFile(moverProfilesFile)
+	if err != nil {
+		setupLog.Error(err, "Unable to load the mover sizing profiles", "file", moverProfilesFile)
+		os.Exit(1)
+	}
+	// Logged in full, at startup, because "which limits is this install actually running with?" is
+	// otherwise a question only a `kubectl get job -o yaml` during a backup can answer.
+	for _, op := range mover.Operations() {
+		setupLog.Info("Mover sizing profile", "operation", string(op), "profile", moverProfiles.For(op).String())
+	}
 
 	// if the enable-http2 flag is false (the default), http/2 should be disabled
 	// due to its vulnerabilities. More specifically, disabling http/2 will
@@ -390,6 +415,7 @@ func main() {
 		repoQueue,
 		operatorNamespace,
 		moverImage,
+		moverProfiles,
 		mgr.GetEventRecorder("backuprepository"),
 	).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Unable to create controller", "controller", "BackupRepository")
@@ -405,6 +431,7 @@ func main() {
 		repoQueue,
 		operatorNamespace,
 		moverImage,
+		moverProfiles,
 		mgr.GetEventRecorder("maintenance"),
 		clock.RealClock{},
 	)
@@ -439,6 +466,7 @@ func main() {
 		exposer.NewRegistry(mgr.GetClient(), operatorNamespace),
 		operatorNamespace,
 		moverImage,
+		moverProfiles,
 		manifestMoverSA,
 		manifestReaderRole,
 		mgr.GetEventRecorder("backup"),
@@ -462,6 +490,7 @@ func main() {
 		operatorNamespace,
 		secrets.NewByNameReader(mgr.GetAPIReader()),
 		moverImage,
+		moverProfiles,
 		manifestMoverSA,
 		clusterManifestReaderRole,
 		mgr.GetEventRecorder("clusterbackup"),
@@ -509,6 +538,7 @@ func main() {
 		mgr.GetScheme(),
 		operatorNamespace,
 		moverImage,
+		moverProfiles,
 	)
 	if err := controller.NewDiscoveryReconciler(
 		mgr.GetClient(),
@@ -534,6 +564,7 @@ func main() {
 		snapshotLister,
 		operatorNamespace,
 		moverImage,
+		moverProfiles,
 		manifestMoverSA,
 		manifestWriterRole,
 		mgr.GetEventRecorder("restore"),
@@ -550,6 +581,7 @@ func main() {
 		snapshotLister,
 		operatorNamespace,
 		moverImage,
+		moverProfiles,
 		manifestMoverSA,
 		clusterManifestWriterRole,
 		mgr.GetEventRecorder("clusterrestore"),
@@ -568,6 +600,7 @@ func main() {
 		snapshotLister,
 		operatorNamespace,
 		moverImage,
+		moverProfiles,
 		mgr.GetEventRecorder("clustererasure"),
 	).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Unable to create controller", "controller", "ClusterErasure")
@@ -586,6 +619,7 @@ func main() {
 		operatorNamespace,
 		moverImage,
 		syncImage,
+		moverProfiles,
 		clock.RealClock{},
 		mgr.GetEventRecorder("clusterbackupexternalsync"),
 	).SetupWithManager(mgr); err != nil {
@@ -602,6 +636,7 @@ func main() {
 		operatorNamespace,
 		moverImage,
 		syncImage,
+		moverProfiles,
 		clock.RealClock{},
 		mgr.GetEventRecorder("backupexternalsync"),
 	).SetupWithManager(mgr); err != nil {

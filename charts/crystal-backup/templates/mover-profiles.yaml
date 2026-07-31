@@ -1,0 +1,22 @@
+{{/*
+The per-operation mover sizing OVERRIDES, mounted into the operator and read once at startup
+(--mover-profiles-file).
+
+It carries only what the platform overrode. The defaults are NOT rendered here and must never be:
+they live in internal/mover/profiles.go, the operator applies them itself, and a copy in this
+ConfigMap would be a second set of numbers to drift out of agreement with the first. An empty
+`mover.profiles` therefore renders an empty document, which the operator reads as "no overrides".
+
+The ConfigMap is rendered unconditionally so the deployment's volume/mount/flag are unconditional
+too — a conditional mount is one more shape to get wrong, and an empty ConfigMap costs nothing.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "crystal-backup.fullname" . }}-mover-profiles
+  namespace: {{ include "crystal-backup.namespace" . }}
+  labels:
+    {{- include "crystal-backup.labels" . | nindent 4 }}
+data:
+  profiles.yaml: |
+    {{- toYaml (.Values.mover.profiles | default dict) | nindent 4 }}

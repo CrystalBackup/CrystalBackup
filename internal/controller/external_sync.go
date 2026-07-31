@@ -266,6 +266,7 @@ func buildSyncJobRequest(deps repoMaintenanceDeps, syncImage, name string, run *
 		Namespace:  deps.OperatorNamespace,
 		Image:      syncImage,
 		Operation:  mover.OpSync,
+		Profiles:   deps.MoverProfiles,
 		ResticArgs: restic.SyncArgs(run.Namespaces),
 		// The DESTINATION. See RepoURL's comment for why this is not repo.Status.RepositoryURL.
 		RepoURL:          run.Dest.RepoURL(),

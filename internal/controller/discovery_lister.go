@@ -115,16 +115,21 @@ type JobSnapshotLister struct {
 	OperatorNamespace string
 	// MoverImage is the CrystalBackup image the snapshots Job runs (crystal-mover + restic).
 	MoverImage string
+	// MoverProfiles is the resolved per-operation sizing table; the inventory Job takes the light
+	// row. Nil ⇒ built-in defaults.
+	MoverProfiles mover.Profiles
 }
 
 // NewJobSnapshotLister builds the production lister. main.go wires the cached client, a clientset
-// (for pod logs), the uncached Secret reader, the scheme, the operator namespace and the mover image.
+// (for pod logs), the uncached Secret reader, the scheme, the operator namespace, the mover image
+// and the resolved mover sizing table.
 func NewJobSnapshotLister(
 	c client.Client,
 	clientset kubernetes.Interface,
 	secretsReader *secrets.ByNameReader,
 	scheme *runtime.Scheme,
 	operatorNamespace, moverImage string,
+	moverProfiles mover.Profiles,
 ) *JobSnapshotLister {
 	return &JobSnapshotLister{
 		Client:            c,
@@ -133,6 +138,7 @@ func NewJobSnapshotLister(
 		Scheme:            scheme,
 		OperatorNamespace: operatorNamespace,
 		MoverImage:        moverImage,
+		MoverProfiles:     moverProfiles,
 	}
 }
 
@@ -308,6 +314,7 @@ func (l *JobSnapshotLister) ensureSnapshotsJob(ctx context.Context, repo *cbv1.B
 		Namespace:    l.OperatorNamespace,
 		Image:        l.MoverImage,
 		Operation:    mover.OpSnapshots,
+		Profiles:     l.MoverProfiles,
 		ResticArgs:   resticArgs,
 		RepoURL:      repoURL,
 		SecretName:   name,
