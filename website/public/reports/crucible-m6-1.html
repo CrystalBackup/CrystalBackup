@@ -1,0 +1,806 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Crystal Backup &mdash; Crucible 0.6.1 Acceptance Report</title>
+<style>
+  :root {
+    --paper: #f6f8f9;
+    --panel: #ffffff;
+    --ink: #0f1620;
+    --muted: #59636e;
+    --faint: #8b96a1;
+    --line: #e2e7ec;
+    --line-strong: #d0d8de;
+    --steel: #35607a;        /* structural accent: infra / k8s / links */
+    --steel-soft: #eaf1f5;
+    --pass: #0f9d63;         /* the one bold place: success / verdict */
+    --pass-soft: #e6f5ed;
+    --skip: #8a97a3;         /* label-gated, not a failure */
+    --skip-soft: #eef1f4;
+    --amber: #b6791f;
+    --amber-soft: #fbf3e4;
+    --tag-product: #2a5db0;
+    --tag-product-soft: #e9eff9;
+    --tag-test: #5f6b78;
+    --tag-test-soft: #edf0f3;
+    --shadow: 0 1px 2px rgba(15,22,32,.04), 0 8px 24px rgba(15,22,32,.05);
+
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper: #0c1116;
+      --panel: #121a22;
+      --ink: #e8eef3;
+      --muted: #97a3ae;
+      --faint: #6c7883;
+      --line: #212c35;
+      --line-strong: #2c3a45;
+      --steel: #74a7c8;
+      --steel-soft: #16242e;
+      --pass: #37d18b;
+      --pass-soft: #10241b;
+      --skip: #6c7883;
+      --skip-soft: #171f27;
+      --amber: #d6a24e;
+      --amber-soft: #241c0f;
+      --tag-product: #7aa5e8;
+      --tag-product-soft: #16202f;
+      --tag-test: #97a3ae;
+      --tag-test-soft: #1a222a;
+      --shadow: 0 1px 2px rgba(0,0,0,.3), 0 10px 30px rgba(0,0,0,.35);
+    }
+  }
+  :root[data-theme="light"] {
+    --paper: #f6f8f9; --panel: #ffffff; --ink: #0f1620; --muted: #59636e; --faint: #8b96a1;
+    --line: #e2e7ec; --line-strong: #d0d8de; --steel: #35607a; --steel-soft: #eaf1f5;
+    --pass: #0f9d63; --pass-soft: #e6f5ed; --skip: #8a97a3; --skip-soft: #eef1f4;
+    --amber: #b6791f; --amber-soft: #fbf3e4;
+    --tag-product: #2a5db0; --tag-product-soft: #e9eff9; --tag-test: #5f6b78; --tag-test-soft: #edf0f3;
+    --shadow: 0 1px 2px rgba(15,22,32,.04), 0 8px 24px rgba(15,22,32,.05);
+  }
+  :root[data-theme="dark"] {
+    --paper: #0c1116; --panel: #121a22; --ink: #e8eef3; --muted: #97a3ae; --faint: #6c7883;
+    --line: #212c35; --line-strong: #2c3a45; --steel: #74a7c8; --steel-soft: #16242e;
+    --pass: #37d18b; --pass-soft: #10241b; --skip: #6c7883; --skip-soft: #171f27;
+    --amber: #d6a24e; --amber-soft: #241c0f;
+    --tag-product: #7aa5e8; --tag-product-soft: #16202f; --tag-test: #97a3ae; --tag-test-soft: #1a222a;
+    --shadow: 0 1px 2px rgba(0,0,0,.3), 0 10px 30px rgba(0,0,0,.35);
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: var(--sans);
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+  .wrap { max-width: 860px; margin: 0 auto; padding: clamp(28px, 5vw, 64px) clamp(18px, 4vw, 40px) 80px; }
+
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 12px;
+    letter-spacing: .14em;
+    text-transform: uppercase;
+    color: var(--steel);
+    margin: 0;
+  }
+
+  /* ── Masthead ─────────────────────────── */
+  .masthead { border-bottom: 1px solid var(--line); padding-bottom: 26px; }
+  h1 {
+    font-size: clamp(28px, 4.6vw, 40px);
+    line-height: 1.08;
+    letter-spacing: -.02em;
+    text-wrap: balance;
+    margin: 12px 0 8px;
+    font-weight: 680;
+  }
+  .lede { color: var(--muted); font-size: 17px; margin: 0; max-width: 60ch; }
+  .meta {
+    font-family: var(--mono);
+    font-size: 12.5px;
+    color: var(--faint);
+    margin-top: 18px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 18px;
+  }
+  .meta b { color: var(--muted); font-weight: 500; }
+
+  /* ── Verdict ──────────────────────────── */
+  .verdict {
+    margin: 30px 0;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-left: 3px solid var(--pass);
+    border-radius: 12px;
+    box-shadow: var(--shadow);
+    padding: 22px clamp(18px, 3vw, 28px);
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 20px 26px;
+    align-items: center;
+  }
+  @media (max-width: 620px) { .verdict { grid-template-columns: 1fr; } }
+  .verdict-badge {
+    display: inline-flex; align-items: center; gap: 9px;
+    font-family: var(--mono); font-weight: 600; font-size: 15px;
+    color: var(--pass);
+    background: var(--pass-soft);
+    border: 1px solid color-mix(in srgb, var(--pass) 28%, transparent);
+    padding: 8px 14px; border-radius: 999px; white-space: nowrap;
+    justify-self: start;
+  }
+  .verdict-badge .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--pass); box-shadow: 0 0 0 4px color-mix(in srgb, var(--pass) 18%, transparent); }
+  .metrics { display: flex; flex-wrap: wrap; gap: 10px 30px; align-items: baseline; }
+  .metric { display: flex; flex-direction: column; }
+  .metric .n { font-family: var(--mono); font-size: 26px; font-weight: 620; letter-spacing: -.02em; font-variant-numeric: tabular-nums; line-height: 1; }
+  .metric .n.pass { color: var(--pass); }
+  .metric .n.zero { color: var(--ink); }
+  .metric .n.skip { color: var(--skip); }
+  .metric .k { font-family: var(--mono); font-size: 11px; text-transform: uppercase; letter-spacing: .1em; color: var(--faint); margin-top: 5px; }
+
+  /* ── Prose ────────────────────────── */
+  .context { color: var(--muted); font-size: 15.5px; max-width: 66ch; }
+  .context b { color: var(--ink); font-weight: 600; }
+  code { font-family: var(--mono); font-size: .89em; background: var(--steel-soft); color: var(--ink); padding: .1em .38em; border-radius: 5px; }
+
+  h2 {
+    font-size: 13px; font-family: var(--mono); text-transform: uppercase; letter-spacing: .12em;
+    color: var(--steel); font-weight: 600;
+    margin: 0 0 2px;
+  }
+  .group { margin-top: 40px; }
+  .group-head { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; border-bottom: 1px solid var(--line); padding-bottom: 10px; }
+  .group-head .count { font-family: var(--mono); font-size: 12px; color: var(--faint); white-space: nowrap; }
+  .group-head .count code { background: none; padding: 0; color: var(--faint); }
+  .group-question { color: var(--ink); font-size: 14.5px; font-style: italic; margin: 12px 0 2px; max-width: 62ch; }
+  .group-note { color: var(--muted); font-size: 13.5px; margin: 8px 0 4px; max-width: 66ch; }
+
+  /* ── Spec rows ───────────────────────── */
+  ul.specs { list-style: none; margin: 6px 0 0; padding: 0; }
+  ul.specs > li { display: grid; grid-template-columns: 20px 1fr auto; gap: 3px 14px; padding: 14px 0; border-bottom: 1px solid var(--line); }
+  ul.specs > li:last-child { border-bottom: 0; }
+  .check { grid-row: span 2; margin-top: 3px; color: var(--pass); }
+  .check svg { display: block; }
+  .spec-name { font-weight: 560; font-size: 15px; color: var(--ink); }
+  .spec-time { font-family: var(--mono); font-size: 12.5px; color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; grid-row: span 2; align-self: start; margin-top: 2px; }
+  .spec-proves { grid-column: 2 / 3; color: var(--muted); font-size: 13.5px; margin: 0; max-width: 62ch; }
+
+  /* ── Terse rows: the check name is the claim, verbatim from the report ── */
+  ul.specs.terse > li { grid-template-columns: 20px 1fr auto; align-items: baseline; padding: 11px 0; }
+  ul.specs.terse .check, ul.specs.terse .spec-time { grid-row: auto; margin-top: 0; }
+  ul.specs.terse .spec-name { font-weight: 520; font-size: 14.5px; }
+  .skip-mark { color: var(--skip); display: inline-flex; }
+  li.skipped .spec-name { color: var(--muted); }
+  .spec-time.skip { color: var(--skip); }
+
+  /* ── Panels: what the campaign measured / what this is not ──────── */
+  .caught { margin-top: 48px; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: clamp(20px, 3vw, 30px); box-shadow: var(--shadow); }
+  .caught h3.panel-title { color: var(--ink); font-family: var(--sans); font-size: 19px; letter-spacing: -.01em; margin: 8px 0 2px; font-weight: 640; }
+  .limits { border-left: 3px solid var(--amber); }
+  .limits .eyebrow { color: var(--amber); }
+  .limits ul { margin: 14px 0 0; padding-left: 20px; color: var(--muted); font-size: 14.5px; max-width: 66ch; }
+  .limits li { margin-bottom: 9px; }
+  .limits li:last-child { margin-bottom: 0; }
+  .limits b { color: var(--ink); font-weight: 600; }
+  .fixes { display: grid; gap: 12px; margin-top: 12px; }
+  @media (min-width: 620px) { .fixes { grid-template-columns: 1fr 1fr 1fr; } }
+  .fix { border: 1px solid var(--line); border-radius: 10px; padding: 15px 16px; background: var(--paper); }
+  .fix .tag { display: inline-block; font-family: var(--mono); font-size: 10.5px; letter-spacing: .04em; text-transform: uppercase; padding: 2px 8px; border-radius: 999px; margin-bottom: 9px; }
+  .fix.product .tag { color: var(--tag-product); background: var(--tag-product-soft); }
+  .fix.test .tag { color: var(--tag-test); background: var(--tag-test-soft); }
+  .fix h3 { font-size: 14px; margin: 0 0 5px; font-weight: 620; }
+  .fix p { margin: 0; font-size: 13px; color: var(--muted); }
+
+  /* ── Sizing table ─────────────────────── */
+  .table-scroll { overflow-x: auto; margin-top: 18px; -webkit-overflow-scrolling: touch; }
+  table.sizing { border-collapse: collapse; width: 100%; min-width: 580px; font-size: 13.5px; }
+  table.sizing th, table.sizing td { text-align: left; padding: 10px 16px 10px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
+  table.sizing th:last-child, table.sizing td:last-child { padding-right: 0; }
+  table.sizing thead th { font-family: var(--mono); font-size: 10.5px; text-transform: uppercase; letter-spacing: .1em; color: var(--faint); font-weight: 600; border-bottom: 1px solid var(--line-strong); white-space: nowrap; }
+  table.sizing tbody th { font-family: var(--mono); font-size: 13px; color: var(--steel); font-weight: 600; white-space: nowrap; }
+  table.sizing td { color: var(--muted); }
+  table.sizing td.num { font-family: var(--mono); font-variant-numeric: tabular-nums; color: var(--ink); white-space: nowrap; }
+  table.sizing tbody tr:last-child th, table.sizing tbody tr:last-child td { border-bottom: 0; }
+  .table-note { color: var(--muted); font-size: 13.5px; margin: 16px 0 0; max-width: 66ch; }
+  .table-note b { color: var(--ink); font-weight: 600; }
+  .table-note + .table-note { margin-top: 10px; }
+
+  .foot { margin-top: 40px; padding-top: 20px; border-top: 1px solid var(--line); color: var(--faint); font-size: 13px; }
+  .foot code { background: var(--skip-soft); }
+</style>
+
+</head>
+<body>
+<div class="wrap">
+  <header class="masthead">
+    <p class="eyebrow">Crystal Backup &middot; Crucible acceptance</p>
+    <h1>0.6.1 &mdash; The first mover sizing this project ever shipped, put in front of real Ceph</h1>
+    <p class="lede">Since M1, every mover Job this operator created ran <b>BestEffort</b>: no CPU or memory request, no limit, an unbounded restic cache and no <code>GOMEMLIMIT</code>. 0.6.1 gives the thirteen mover operations four sizing classes. This campaign is the first time those numbers have met a real Rook-Ceph cluster and a real restic repository &mdash; the whole suite again, 82 of 82 checks, on a fresh cluster, against the exact image digest v0.6.1 ships.</p>
+    <div class="meta">
+      <span><b>Run</b> full suite &middot; no label filter</span>
+      <span><b>Date</b> 2026-08-01</span>
+      <span><b>Version</b> v0.6.1</span>
+      <span><b>Suite</b> ginkgo &middot; infra + m0&ndash;m6</span>
+      <span><b>Duration</b> 2h0m2s</span>
+    </div>
+  </header>
+
+  <section class="verdict" aria-label="Verdict">
+    <span class="verdict-badge"><span class="dot"></span>PASS &middot; full suite</span>
+    <div class="metrics">
+      <div class="metric"><span class="n pass">82</span><span class="k">Passed</span></div>
+      <div class="metric"><span class="n zero">0</span><span class="k">Failed</span></div>
+      <div class="metric"><span class="n skip">0</span><span class="k">Skipped</span></div>
+      <div class="metric"><span class="n pass">100%</span><span class="k">Coverage</span></div>
+      <div class="metric"><span class="n zero" style="font-size:20px">2h0m2s</span><span class="k">Wall clock</span></div>
+    </div>
+  </section>
+
+  <p class="context">
+    The fields had been there the whole time. <code>JobRequest.Resources</code> existed and <b>no caller ever assigned it</b>; <code>JobRequest.GoMemLimit</code> existed, was consumed by the mover&rsquo;s environment builder, was covered by unit tests, and no caller ever assigned that either &mdash; while the roadmap listed <code>GOMEMLIMIT</code> among what the mover shipped in M1. So 0.6.1 is not a release that tuned the numbers. <b>There were no numbers.</b> BestEffort is the bottom of the kubelet&rsquo;s eviction order &mdash; under node memory pressure a running backup is killed before almost anything else &mdash; and an uncapped <code>emptyDir</code> lets one restic cache fill a node&rsquo;s disk and take the node&rsquo;s other tenants with it.
+  </p>
+
+  <p class="context">
+    What follows is the same 82 checks as the 0.6.0 report, run for a different reason. <b>Every mover pod in this campaign carried requests, a memory limit and a bounded cache volume for the first time.</b> The <code>mover.profiles</code> ConfigMap on the cluster was <b>verified live to be <code>{}</code></b> &mdash; empty &mdash; so what ran is the built-in table, not an override fitted until a run went green. Across the two hours: <b>zero evicted pods and zero OOM kills</b>. That is the number to read here, and it is not a coincidence that it is reportable at all: this lot ships the <code>MoverEvicted</code> and <code>MoverOOMKilled</code> conditions precisely so a sizing mistake would be legible rather than appearing as a pod that vanished mid-backup. Neither fired. Ceph held <code>HEALTH_OK</code> with 3 of 3 OSDs for the duration.
+  </p>
+
+  <p class="context">
+    One procedural note, because this project publishes those too: an earlier attempt at this same campaign was <b>interrupted mid-run by an orchestration mistake on our side and reported FAIL</b>. It had passed 47 of the 47 checks it managed to execute. Nothing from it is carried over or cited below &mdash; the run on this page is a clean re-run from the first check, on a cleaned cluster.
+  </p>
+
+  <section class="caught">
+    <p class="eyebrow">What this run was actually testing</p>
+    <h3 class="panel-title">Four sizing classes over thirteen operations</h3>
+    <p class="context" style="margin-top:6px;">The defaults live in exactly one file and nowhere else: the chart carries no quantities at all, <code>docs/MOVER-RESOURCES.md</code> is generated from the same table the code reads with a CI target that fails when the two drift, and the operator logs its effective table at startup. A quantity written twice is a quantity that will eventually disagree with itself.</p>
+    <div class="table-scroll">
+      <table class="sizing">
+        <thead>
+          <tr>
+            <th scope="col">Class</th>
+            <th scope="col">Operations</th>
+            <th scope="col">Requests (cpu / mem)</th>
+            <th scope="col">Memory limit</th>
+            <th scope="col">GOMEMLIMIT</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <th scope="row">data</th>
+            <td>backup, restore</td>
+            <td class="num">200m / 256Mi</td>
+            <td class="num">4Gi</td>
+            <td class="num">3276MiB</td>
+          </tr>
+          <tr>
+            <th scope="row">repo-heavy</th>
+            <td>prune, check, sync</td>
+            <td class="num">500m / 1Gi</td>
+            <td class="num">8Gi</td>
+            <td class="num">6553MiB</td>
+          </tr>
+          <tr>
+            <th scope="row">repo-light</th>
+            <td>init, forget, snapshots, unlock</td>
+            <td class="num">50m / 128Mi</td>
+            <td class="num">1Gi</td>
+            <td class="num">819MiB</td>
+          </tr>
+          <tr>
+            <th scope="row">manifests</th>
+            <td>the four manifest operations</td>
+            <td class="num">100m / 256Mi</td>
+            <td class="num">2Gi</td>
+            <td class="num">1638MiB</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="table-note"><b>No class sets a CPU limit</b>, and that is a decision rather than an omission. CPU is compressible: a mover that wants more than its share gets throttled by the scheduler, whereas a hard CPU limit on a backup buys nothing but a slower backup and a window that closes before the run finishes.</p>
+    <p class="table-note"><b>The restic cache <code>sizeLimit</code> is 20Gi</b>, the same for all four classes. It is a <b>ceiling against a runaway</b>, not a fitted estimate: the cache is cold on every run &mdash; each mover gets a fresh <code>emptyDir</code> &mdash; so the cap bounds what one operation downloads rather than an accumulation, which is what makes a generous number defensible without the benchmark that is missing.</p>
+    <p class="table-note"><b><code>GOMEMLIMIT</code> is derived, never configured</b>: 80% of the operation&rsquo;s own memory limit, floored to whole MiB, omitted entirely when there is no memory limit to derive from, or when the result would fall below 256Mi. The remaining fifth is not slack &mdash; it covers what the Go runtime&rsquo;s accounting does not.</p>
+    <p class="table-note">Requests are a scheduling floor multiplied by <code>maxConcurrentMovers</code>, not a reservation; limits exist to stop one runaway mover from taking a node down, not to right-size restic. <b>Raise them if your repositories are large. Do not read them as measurements</b> &mdash; see the panel at the bottom of this page.</p>
+  </section>
+
+  <section class="group">
+    <div class="group-head"><h2>Platform &middot; the cluster under the suite</h2><span class="count">8 / 8 &middot; <code>infra</code></span></div>
+    <p class="group-question">&ldquo;is the live cluster itself healthy enough to trust the rest?&rdquo;</p>
+    <p class="group-note">Eight preflight checks on the machine everything else is measured on: node roles, the four storage classes and their snapshot classes, Ceph&rsquo;s own health verdict, S3 reachability, and a real provision-and-snapshot on each driver &mdash; including the one <b>without</b> snapshot support. Ceph answered <code>HEALTH_OK</code> with 3&nbsp;of&nbsp;3 OSDs up, and held it for the two hours that follow &mdash; which matters more than usual in this campaign, because a memory ceiling set too low and a storage layer in trouble fail a backup in ways that look alike from the outside.</p>
+    <ul class="specs terse">
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">has all nodes Ready with the expected roles</span>
+        <span class="spec-time">300ms</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">exposes the four storage classes (ceph-block default)</span>
+        <span class="spec-time">400ms</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">exposes the snapshot classes for the snapshot-capable drivers</span>
+        <span class="spec-time">300ms</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">reports Ceph HEALTH_OK (via the rook toolbox)</span>
+        <span class="spec-time">1.5s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">reaches the Hetzner Object Storage backup bucket</span>
+        <span class="spec-time">1.1s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">provisions and snapshots a ceph-block volume</span>
+        <span class="spec-time">16.4s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">provisions and snapshots a longhorn volume</span>
+        <span class="spec-time">20.9s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">provisions a local-path volume (the class WITHOUT snapshot support)</span>
+        <span class="spec-time">10.6s</span>
+      </li>
+    </ul>
+  </section>
+
+  <section class="group">
+    <div class="group-head"><h2>Milestone M0 &middot; scaffolding, installed for real</h2><span class="count">4 / 4 &middot; <code>m0</code></span></div>
+    <p class="group-question">&ldquo;are the CRDs and the Helm chart correctly installed on a real cluster?&rdquo;</p>
+    <p class="group-note">The chart and the twelve CRDs on a live API server, and a create/read-back/delete round trip on every kind. The chart itself carries no sizing numbers at all &mdash; its <code>mover.profiles</code> map is a pure override and rendered empty here &mdash; so what got installed is the override mechanism, and what ran in every section below is the built-in table.</p>
+    <ul class="specs terse">
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">has all 12 CRDs Established</span>
+        <span class="spec-time">6.1s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">has the chart artifacts (namespace, deployment, RBAC, service account)</span>
+        <span class="spec-time">700ms</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">runs the operator</span>
+        <span class="spec-time">200ms</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">creates, reads back and deletes a minimal CR of each of the 12 kinds</span>
+        <span class="spec-time">5.2s</span>
+      </li>
+    </ul>
+  </section>
+
+  <section class="group">
+    <div class="group-head"><h2>Milestone M1 &middot; core engine &amp; cluster DR</h2><span class="count">15 / 15 &middot; <code>m1</code></span></div>
+    <p class="group-question">&ldquo;does the M1 acceptance suite pass on real infrastructure?&rdquo;</p>
+    <p class="group-note">The engine, discovery and the reliability criteria, re-run in full. Every data mover in this section is a <code>data</code>-class pod &mdash; 200m/256Mi requested, a 4Gi ceiling, <code>GOMEMLIMIT</code> 3276MiB &mdash; and the repository assertions still go through an <b>independent restic oracle</b> (a throwaway Job running the plain <code>restic</code> CLI), so a controller that both writes and reports the same wrong thing cannot make a check pass. The OOM check below reproduces the <i>signal</i> rather than the cause: it SIGKILLs the mover pod so the kubelet leaves an empty termination message. That is why it does not contradict the zero OOM kills counted across the run.</p>
+    <ul class="specs terse">
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">Discovery projects a Backup per (namespace, run) into existing namespaces</span>
+        <span class="spec-time">2m36.5s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">A projected Backup is a view, not the source of truth</span>
+        <span class="spec-time">1m3.9s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">kubectl get backups lists exactly the restorable set</span>
+        <span class="spec-time">1m0.9s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">Leak-check — a run leaves zero residual snapshot objects</span>
+        <span class="spec-time">5m34s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">The operator killed mid-run converges via Job re-adoption</span>
+        <span class="spec-time">5m31.9s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">An OOMKilled mover is reported as a failure, not a silent success</span>
+        <span class="spec-time">55.6s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">backs up same-named PVCs in different namespaces to DISTINCT snapshots (no object-name collision)</span>
+        <span class="spec-time">39.6s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">A ClusterBackupLocation provisions one initialized shared repository</span>
+        <span class="spec-time">17.6s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">The shared repository is initialized exactly once, even under concurrent reconciles</span>
+        <span class="spec-time">36s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">Only one ClusterBackupLocation may be the default</span>
+        <span class="spec-time">300ms</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">A ClusterBackupSchedule fans out a Backup into every matched namespace</span>
+        <span class="spec-time">6m18.1s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">Every snapshottable PVC lands in the shared repository with the correct restic identity</span>
+        <span class="spec-time">22.7s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">A volume on storage without snapshot support is Skipped, not Failed</span>
+        <span class="spec-time">200ms</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">A namespace with no PVC completes cleanly</span>
+        <span class="spec-time">1.3s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">restores a data snapshot straight from S3 with the restic CLI and byte-verifies it against the seed</span>
+        <span class="spec-time">1m36s</span>
+      </li>
+    </ul>
+  </section>
+
+  <section class="group">
+    <div class="group-head"><h2>Milestone M2 &middot; self-service restore</h2><span class="count">5 / 5 &middot; <code>m2</code></span></div>
+    <p class="group-question">&ldquo;does the M2 acceptance suite pass on real infrastructure?&rdquo;</p>
+    <p class="group-note">Overwrite and Recreate semantics, partial restore, the R23 confirmation gate and the fail-closed storage negative. Restore is the other half of the <code>data</code> class and runs under exactly the ceiling a backup does &mdash; deliberately, since a restore is the operation you least want throttled by a number nobody measured.</p>
+    <ul class="specs terse">
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">restores the repo coordinate into a freshly-created namespace, PVC sized from the snapshot tags, data byte-identical</span>
+        <span class="spec-time">2m3.7s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">parks without a confirmation, then Overwrite-restores while KEEPING local extras (R23 + Overwrite semantics)</span>
+        <span class="spec-time">1m18.4s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">partial-restores ONLY the selected file (R7)</span>
+        <span class="spec-time">44s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">Recreate-restores to an EXACT match (extras removed)</span>
+        <span class="spec-time">30.2s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">fails CLOSED when a tampered projection points at another namespace&#x27;s run (R14 storage negative)</span>
+        <span class="spec-time">28.6s</span>
+      </li>
+    </ul>
+  </section>
+
+  <section class="group">
+    <div class="group-head"><h2>Milestone M3 &middot; manifests &amp; cluster-scoped DR</h2><span class="count">11 / 11 &middot; <code>m3</code></span></div>
+    <p class="group-question">&ldquo;does the M3 acceptance suite pass on real infrastructure?&rdquo;</p>
+    <p class="group-note">Namespace and cluster-scoped manifest capture and restore, opt-in cluster resources, the RBAC and confirmation gates, and a bootstrap DR into a namespace that did not exist. The four manifest operations are their own sizing class: their floor is the client-go object cache for one namespace &mdash; or, cluster-scoped, one cluster&rsquo;s CRDs and RBAC &mdash; which is why they sit above the light repository verbs instead of in with them.</p>
+    <ul class="specs terse">
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">captures the namespace manifests: run Completes, child Backup + clusterResourcesCaptured set, kind=manifests snapshot present</span>
+        <span class="spec-time">1m14.5s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">Overwrite-restores the drifted ConfigMap via SSA, keeping target-only extras (R23 parks without a confirmation)</span>
+        <span class="spec-time">15.9s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">Recreate-restores the ConfigMap to an EXACT match (target-only extra removed)</span>
+        <span class="spec-time">15.7s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">restores the workload manifests: Deployment reaches Ready, nodePort preserved, clusterIP freshly allocated</span>
+        <span class="spec-time">15.8s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">rejects a WRONG confirmation at admission (R23 gate)</span>
+        <span class="spec-time">21.3s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">captures a kind=cluster-manifests snapshot; clusterResourcesCaptured is set</span>
+        <span class="spec-time">56.2s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">selectively restores ONLY the included CRD + StorageClass, leaving the un-included ClusterRole absent</span>
+        <span class="spec-time">21.8s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">restores NOTHING cluster-scoped when clusterResources is omitted (opt-in default)</span>
+        <span class="spec-time">10.5s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">denies a destructive cluster-scoped restore with a WRONG confirmation (R23 gate)</span>
+        <span class="spec-time">100ms</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">denies a cluster-scoped restore to a NON-admin identity (RBAC)</span>
+        <span class="spec-time">1.2s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">bootstraps DR into a created namespace, remaps the storage class, and a workload runs on the restored volume</span>
+        <span class="spec-time">2m23.1s</span>
+      </li>
+    </ul>
+  </section>
+
+  <section class="group">
+    <div class="group-head"><h2>Milestone M4 &middot; verification &amp; maintenance</h2><span class="count">4 / 4 &middot; <code>m4</code></span></div>
+    <p class="group-question">&ldquo;does the M4 acceptance suite pass on real infrastructure?&rdquo;</p>
+    <p class="group-note">Crash-only teardown at the terminal transition, the per-repository exclusive maintenance queue, and bit-rot caught by <code>check --read-data-subset</code> &mdash; again the longest single check in the suite, at 17m25.7s. This is the <code>repo-heavy</code> class&rsquo;s home section: prune rewrites pack files while holding the whole index, check re-reads the structure, and both cost what the <i>repository</i> costs rather than what the volume in front of them costs. That asymmetry &mdash; the roadmap wrote it as &ldquo;prune &gt; backup&rdquo; &mdash; is the reason there are four classes and not one.</p>
+    <ul class="specs terse">
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">The operator SIGKILLed at the terminal transition still converges to zero residual snapshot objects</span>
+        <span class="spec-time">1m29.8s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">holds the prune until the backup&#x27;s movers have drained, then runs it exclusively</span>
+        <span class="spec-time">6m52.7s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">is absorbed by the Job retry: a terminal outcome is recorded and the repository is not wedged</span>
+        <span class="spec-time">8m11.2s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">is caught by check --read-data-subset and surfaced on the repository</span>
+        <span class="spec-time">17m25.7s</span>
+      </li>
+    </ul>
+  </section>
+
+  <section class="group">
+    <div class="group-head"><h2>Milestone M5 &middot; namespace plane, external sync &amp; right to erasure</h2><span class="count">14 / 14 &middot; <code>m5</code></span></div>
+    <p class="group-question">&ldquo;does the M5 acceptance suite pass on real infrastructure?&rdquo;</p>
+    <p class="group-note">The user&rsquo;s own repository under the user&rsquo;s own key, snapshot-level replication re-encrypted to a second key, and erasure verified by re-scanning the repository. Sync is the third <code>repo-heavy</code> operation and the most demanding of the three: <code>restic copy</code> opens <b>two</b> repositories at once and holds both indexes, plus rclone&rsquo;s own buffers. It is the specific case the 8Gi ceiling was chosen for.</p>
+    <ul class="specs terse">
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">Parks an unconfirmed erasure and names what it would remove (R23)</span>
+        <span class="spec-time">1m48.2s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">Refuses a confirmation that does not name the target, at admission</span>
+        <span class="spec-time">100ms</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">Physically removes exactly the confirmed namespace, leaving its neighbour and the repository sound</span>
+        <span class="spec-time">50.4s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">Is Blocked, not Completed, on an Immutable location</span>
+        <span class="spec-time">1s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">A narrowed sync copies only the selected namespace, and the copies are re-encrypted to the destination&#x27;s own key</span>
+        <span class="spec-time">2m56.3s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">The destination does NOT open with the source&#x27;s key, nor the source with the destination&#x27;s (case 18: the keys differ per repository)</span>
+        <span class="spec-time">29.1s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">Mirror propagates a source forget to the destination, and removes nothing else</span>
+        <span class="spec-time">1m3.9s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">A sync onto its own location is refused at admission (rule 9)</span>
+        <span class="spec-time">100ms</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">A sync between two DIFFERENTLY-NAMED locations that address one repository is refused by the controller</span>
+        <span class="spec-time">21s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">The operator was deployed with a real sync image, not the chart&#x27;s placeholder digest</span>
+        <span class="spec-time">100ms</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">Backs a tenant volume up to the tenant&#x27;s own repository, readable with the tenant&#x27;s own password</span>
+        <span class="spec-time">1m19.3s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">Holds exactly one key slot, and the platform holds no wrapped key for it (adr/0004 amendment)</span>
+        <span class="spec-time">7.3s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">Loses platform access the moment the user deletes their password Secret — while the data stays readable to them</span>
+        <span class="spec-time">22.3s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">Left no residual snapshot objects behind</span>
+        <span class="spec-time">51.4s</span>
+      </li>
+    </ul>
+  </section>
+
+  <section class="group">
+    <div class="group-head"><h2>Milestone M6 &middot; observability hardening &amp; restore fidelity</h2><span class="count">21 / 21 &middot; <code>m6</code></span></div>
+    <p class="group-question">&ldquo;does the M6 acceptance suite pass on real infrastructure?&rdquo;</p>
+    <p class="group-note">Two halves. The first asks whether the observability works end to end &mdash; whether the operator <b>emits</b>, whether Prometheus <b>scrapes</b> under the tenant&rsquo;s own labels, whether the rules the chart ships <b>load and evaluate</b>, and whether an alert <b>fires</b> on a real failure and on a real damaged repository. The second is the <b>restore-fidelity gate</b>: one backup, one restore into a namespace that did not exist yet, and two manifest captures of the same volume with the same generator &mdash; the facet assertions that read <code>0s</code> below are separate verdicts on that single measurement, one per restorable attribute. Its 384&nbsp;MiB multi-pack file is the largest single object this sizing has yet been asked to move, which is worth stating plainly rather than leaving to be inferred.</p>
+    <ul class="specs terse">
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">emits every series under the tenant&#x27;s own labels, not the scraper&#x27;s</span>
+        <span class="spec-time">400ms</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">loads every rule the chart ships, and evaluates all of them without error</span>
+        <span class="spec-time">200ms</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">counts another tool&#x27;s VolumeSnapshots piling up on one PVC</span>
+        <span class="spec-time">39.1s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">increments the failure counter and pages, with no hold to wait out</span>
+        <span class="spec-time">16m23.3s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">pages critical after the 5m hold, and only for the damaged repository</span>
+        <span class="spec-time">11m33.6s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">pages on the snapshot pile-up once its 30m hold has elapsed</span>
+        <span class="spec-time">2m41.5s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">compares source and restore by per-file manifest, not by file count</span>
+        <span class="spec-time">3m25.3s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">gives every path back, and invents none</span>
+        <span class="spec-time">0s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">gives every byte back — per-file digests, including a 384 MiB file spanning several restic packs (restic#5543)</span>
+        <span class="spec-time">0s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">keeps modes, setuid/setgid/sticky bits and numeric ownership</span>
+        <span class="spec-time">0s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">keeps extended attributes on files and on directories</span>
+        <span class="spec-time">0s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">keeps POSIX ACLs, including the default ACL on a directory</span>
+        <span class="spec-time">0s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">keeps modification times to the nanosecond, on files, symlinks and directories</span>
+        <span class="spec-time">0s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">keeps symbolic links as links, with their exact targets — including the dangling one</span>
+        <span class="spec-time">0s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">keeps hard links hard — the same inode, not three independent copies</span>
+        <span class="spec-time">0s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">keeps sparse files sparse — a densified restore silently fills the volume</span>
+        <span class="spec-time">0s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">restores a multi-pack 384 MiB file and a 0-byte file, both exactly</span>
+        <span class="spec-time">0s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">restores non-ASCII, whitespace, quote and glob-metacharacter file names</span>
+        <span class="spec-time">0s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">restores a 16-level deep tree and a 240-character file name</span>
+        <span class="spec-time">0s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">restores a FIFO as a FIFO and an empty directory as a directory</span>
+        <span class="spec-time">26.8s</span>
+      </li>
+      <li>
+        <span class="check" aria-hidden="true"><svg width="18" height="18" viewBox="0 0 18 18" fill="none"><path d="M4 9.3l3.2 3.2L14 5.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="spec-name">fails the re-created run instead of adopting the earlier run&#x27;s result</span>
+        <span class="spec-time">1m42.8s</span>
+      </li>
+    </ul>
+  </section>
+  <section class="caught limits">
+    <p class="eyebrow">What this report does not say</p>
+    <h3 class="panel-title">82 green checks do not make these the right numbers</h3>
+    <p class="context" style="margin-top:6px;"><b>v0.6.1 is offered for testing in real conditions by early adopters, not for production.</b> The suite above is evidence that the code does what the checks describe, on one cluster, for the duration of one run, under this sizing. It is not evidence of the following &mdash; and the following are, plainly, not true yet:</p>
+    <ul>
+      <li><b>The green does not prove the numbers are optimal.</b> It proves they did not break anything this suite exercises. Not one of the 82 checks measures a mover&rsquo;s peak memory or its cache high-water mark; they assert outcomes. A ceiling that is never approached and a ceiling that is correct look identical from a passing run.</li>
+      <li><b>The load test did not ship, and it is the one that matters here.</b> The millions-of-files load test &mdash; the M6 item that would turn these conservative ceilings into measured values, and with it the restic-vs-rustic revisit &mdash; is still open. It needs infrastructure this campaign did not have. Until it runs, the table above is a set of defensible guesses with an override mechanism attached.</li>
+      <li><b>The two-week soak alongside an incumbent tool has not happened</b>, and neither has <b>the pilot rollout</b>. Both are M6&rsquo;s own exit criteria; both are still unmet. That is the honest reason 0.6.1 is a testing release rather than a production one, and it did not change with this campaign.</li>
+      <li><b>Other M6 roadmap items remain deliberately undelivered</b> and should not be read as covered by a full-suite green: VSC&nbsp;&harr;&nbsp;RBD-image reconciliation with trash monitoring and the active pre-check, S3 RGW tuning, and the PodSecurity review.</li>
+      <li><b>A green run is a sample, not a proof.</b> Timing-dependent defects in this project have historically appeared roughly one run in three &mdash; which is why M4 was accepted on seven independent lanes rather than one. This is a single session, and the sizing it exercised has been in existence for one of them.</li>
+    </ul>
+    <p class="context" style="margin-top:16px;">Run it on a cluster whose loss you can absorb, alongside &mdash; not instead of &mdash; whatever you back up with today. If a mover in your installation is evicted or OOM-killed, the failure now arrives as a condition with the kubelet&rsquo;s own message in it, and <code>mover.profiles</code> is the per-operation override that answers it.</p>
+  </section>
+
+  <p class="foot">
+    <b>Full-suite gate &mdash;</b> all 82 criteria (platform preflight, M0&ndash;M5 non-regression and the M6 label) with no filter, on a freshly provisioned RKE2 + Rook-Ceph cluster and real Hetzner Object Storage, against the exact image digest v0.6.1 ships, with <code>mover.profiles</code> empty so the built-in sizing table is what every mover pod ran under. Check names and durations are reproduced verbatim from the run, in the order the suite reported them. &middot; Report generated from <code>test/crucible/artifacts/crucible-report.md</code>.
+  </p>
+
+</div>
+</body>
+</html>

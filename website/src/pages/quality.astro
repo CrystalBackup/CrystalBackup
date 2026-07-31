@@ -68,6 +68,11 @@ const reports = [
     covered: 'Observability hardening — the metrics catalogue, eleven alert rules watched <em>firing</em> against a real Prometheus, traces, the self-check, and a restore-fidelity gate that compares a restore to its source file by file. The first report here that is <strong>not label-filtered</strong>: the whole suite, <strong>82 of 82 checks, nothing failed and nothing skipped</strong>',
     links: [['Crucible M6', 'crucible-m6.html']],
   },
+  {
+    milestone: '0.6.1',
+    covered: 'The first mover sizing this project ever shipped, put in front of real Ceph. Every mover Job had run BestEffort since M1 — no requests, no limits, an unbounded restic cache, no heap cap. The same full suite again on a fresh cluster: <strong>82 of 82, nothing failed and nothing skipped</strong>, on the built-in defaults, with zero evicted pods and zero OOM kills',
+    links: [['Crucible 0.6.1', 'crucible-m6-1.html']],
+  },
 ];
 
 const gates = [
