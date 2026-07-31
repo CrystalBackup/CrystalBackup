@@ -325,17 +325,17 @@ crucible lanes, all with zero residual snapshot objects
 
 ## M6 — Observability hardening & production readiness
 
-- [ ] Full metrics catalogue ([05-observability.md](05-observability.md)), Grafana dashboards
+- [x] Full metrics catalogue ([05-observability.md](05-observability.md)), Grafana dashboards
       (namespace-user + platform) under `charts/crystal-backup/dashboards/`, alert rules
       (backup missed/failed/aged, check failed).
-- [ ] OTel traces across the pipeline (schedule → snapshot → mover), exemplars.
+- [x] OTel traces across the pipeline (schedule → snapshot → mover), exemplars.
 - [ ] Mover resources by operation type (prune > backup), cache emptyDir `sizeLimit` decision,
       load test on millions-of-files volumes (restic vs rustic revisit —
       [adr/0001](adr/0001-repository-engine-restic-format.md)); delta 7.
 - [ ] VSC ↔ RBD-image reconciliation + trash monitoring + active pre-check before VS creation
       (VolumeSnapshotClass resolved, secret present, snapshotter sidecar reachable) — delta 9;
       S3 RGW tuning (`s3.connections`, wave test vs `rgw_max_concurrent_requests`) — delta 13.
-- [ ] **Restore-fidelity gate** (the beta bar for `0.6`, not a 1.0/GA claim): e2e restore +
+- [x] **Restore-fidelity gate** (the beta bar for `0.6`, not a 1.0/GA claim): e2e restore +
       checksum comparison to a Rook-Ceph PVC while restic#5543 stays open (delta 14).
       **Executable as the `m6` crucible label** (`mise run test m6`) — the exit criterion is a
       command, not a paragraph. It restores into a namespace that does not exist yet, so a mode,
@@ -344,9 +344,27 @@ crucible lanes, all with zero residual snapshot objects
       disable itself reads as a pass.
 - [ ] NetworkPolicies, PodSecurity review, resource limits/requests; docs (user guide, ops
       guide, DR runbooks); deploy alongside Velero on a staging cluster, soak 2+ weeks.
+      **Partially delivered in 0.6.0, and the split matters.** The docs shipped in full (the
+      site, the GitOps install pages, the preflight script). The NetworkPolicy, the four
+      PodSecurity namespace labels and the operator's requests/limits were already in the chart
+      from earlier milestones and did not change here — so what is missing is the *review*, not
+      the mechanism. That review now has a known answer to start from: the operator satisfies
+      every `restricted` criterion, but the mover runs as uid 0 with a per-operation capability
+      set because restic has to read and restore files owned by arbitrary uids, and both live in
+      `crystal-backup-system` — so `enforce: baseline` there is a constraint, not caution.
+      The soak alongside Velero has **not** happened; it runs on a real build cluster after the
+      0.6.0 tag, which is why 0.6.0 is offered for testing rather than for production.
 
 **Exit criteria**: production rollout on a pilot cluster for pilot namespaces; dashboards +
 alerts live; leak-check and restore-checksum gate green.
+
+**Status as of 0.6.0 (2026-07-31).** Three of the six bullets shipped, and the crucible ran the
+whole suite unfiltered — 82 of 82 checks, nothing failed, nothing skipped, the project's first
+green campaign that is not label-scoped. Dashboards and alerts are live and the restore-fidelity
+gate is green, so two of the three exit criteria are met. The third — a pilot rollout — is not,
+and neither is the soak, which is the honest reason 0.6.0 is a testing release. The two
+remaining bullets move to 0.6.1: mover resources by operation type with the cache `sizeLimit`
+decision and the millions-of-files load test, and the VSC ↔ RBD reconciliation with RGW tuning.
 
 ## M7 — CLI & UI v1 (R8, R9 — lower priority, agreed)
 
