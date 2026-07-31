@@ -79,6 +79,16 @@ groups:
       # counter series is gone and no object is left to derive a timestamp from. That failure is
       # unrecoverable from either source and this rule will not fire for it. The remedy is a history
       # limit greater than one, not a third disjunct.
+      # AND ITS MILDER FORM, measured on the crucible rather than reasoned about: deleting the
+      # Backup object RESOLVES this alert, even with the operator up, because on a first failure the
+      # counter contributes nothing and the timestamp is all there is. In the 0.6.0 run the lane's
+      # own teardown removed the namespace twelve seconds after the Backup went terminal, and the
+      # alert fired for exactly thirty seconds before resolving. That is correct — no wreckage, no
+      # page — but it means this rule's firing window is the OBJECT'S lifetime, not the hour its
+      # name implies. In production a retained failure outlives the window and the distinction never
+      # shows; with a history limit of one and a success right behind the failure, the page can be
+      # shorter than an operator's notification pipeline. Alertmanager's group_wait is the thing to
+      # check before blaming the rule.
       - alert: CrystalbackupBackupFailed
         expr: |
           increase(crystalbackup_backup_failures_total[3600s]) > 0
