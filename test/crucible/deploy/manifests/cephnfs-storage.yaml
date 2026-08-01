@@ -1,0 +1,53 @@
+# Wave 4 — Ceph NFS StorageClass + VolumeSnapshotClass.
+#
+# WITH a VolumeSnapshotClass: rook-ceph.nfs.csi.ceph.com supports snapshots, and upstream ships
+# the class verbatim.
+#   https://github.com/rook/rook/blob/master/deploy/examples/csi/nfs/snapshotclass.yaml
+#   https://github.com/rook/rook/blob/master/deploy/examples/csi/nfs/storageclass.yaml
+#
+# ------------------------------------------------------------------------------------------
+# A TRAP FOR THE RECAP TABLE, and the reason this driver is interesting at all:
+# the provisioner is `rook-ceph.nfs.csi.ceph.com`. It contains ".nfs.csi." — NOT ".cephfs.csi." —
+# so internal/exposer/registry.go routes it to the csi-generic exposer, exactly like Longhorn or
+# TopoLVM, and NOT to cephfs-shallow. It is a Ceph driver that must not take the Ceph path.
+# One character of substring matching separates the two, which is precisely the kind of thing a
+# qualification lane exists to prove empirically instead of by reading the constant.
+# ------------------------------------------------------------------------------------------
+#
+# Note the secrets: the NFS provisioner reuses the CEPHFS credentials (rook-csi-cephfs-*), not
+# the RBD ones, because the exports are carved out of the CephFilesystem.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: ceph-nfs
+provisioner: rook-ceph.nfs.csi.ceph.com
+parameters:
+  # Name of the CephNFS CR (cephnfs-cluster.yaml).
+  nfsCluster: crucible-nfs
+  # The Service Rook creates for that CephNFS: rook-ceph-nfs-<name>-<letter>.
+  server: rook-ceph-nfs-crucible-nfs-a
+  # Namespace of the CephCluster, matching ceph-storage.yaml.
+  clusterID: rook-ceph
+  # The CephFilesystem and data pool created by ceph-cluster.yaml.
+  fsName: cephfs
+  pool: cephfs-data0
+  csi.storage.k8s.io/provisioner-secret-name: rook-csi-cephfs-provisioner
+  csi.storage.k8s.io/provisioner-secret-namespace: rook-ceph
+  csi.storage.k8s.io/controller-expand-secret-name: rook-csi-cephfs-provisioner
+  csi.storage.k8s.io/controller-expand-secret-namespace: rook-ceph
+  csi.storage.k8s.io/node-stage-secret-name: rook-csi-cephfs-node
+  csi.storage.k8s.io/node-stage-secret-namespace: rook-ceph
+reclaimPolicy: Delete
+allowVolumeExpansion: true
+volumeBindingMode: Immediate
+---
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshotClass
+metadata:
+  name: ceph-nfs
+driver: rook-ceph.nfs.csi.ceph.com
+deletionPolicy: Delete
+parameters:
+  clusterID: rook-ceph
+  csi.storage.k8s.io/snapshotter-secret-name: rook-csi-cephfs-provisioner
+  csi.storage.k8s.io/snapshotter-secret-namespace: rook-ceph

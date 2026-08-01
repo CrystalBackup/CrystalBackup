@@ -160,6 +160,11 @@ export default defineConfig({
               translations: { fr: 'Règles d’admission' },
               slug: 'docs/reference/admission',
             },
+            {
+              label: 'Storage compatibility',
+              translations: { fr: 'Compatibilité du stockage' },
+              slug: 'docs/reference/storage-compatibility',
+            },
             { label: 'Metrics', translations: { fr: 'Métriques' }, slug: 'docs/reference/metrics' },
             { label: 'Alerts', translations: { fr: 'Alertes' }, slug: 'docs/reference/alerts' },
           ],

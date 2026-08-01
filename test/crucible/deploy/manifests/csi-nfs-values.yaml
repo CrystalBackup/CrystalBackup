@@ -1,0 +1,36 @@
+# Wave 1 — csi-driver-nfs chart values.
+#
+# The two snapshot keys in this chart are independent and easy to confuse; getting them backwards
+# is the classic way to break a cluster's snapshot stack:
+#
+#   controller.enableSnapshotter   (default true)  -> the csi-snapshotter SIDECAR in the driver
+#                                                     Deployment. We WANT this. It is already on.
+#   externalSnapshotter.enabled    (default false) -> a bundled snapshot-controller Deployment
+#                                                     AND the VolumeSnapshot CRDs. We do NOT want
+#                                                     this: RKE2 already ships
+#                                                     rke2-snapshot-controller and the CRDs, and
+#                                                     deploy.sh keys its whole snapshot setup off
+#                                                     their presence. Installing a second
+#                                                     controller would have two reconcilers
+#                                                     fighting over every VolumeSnapshotContent.
+#
+# The upstream snapshot example README says "Make sure you have externalSnapshotter.enabled=true
+# if you are using the Helm chart". That instruction is written for a bare cluster with no
+# snapshot support at all. Following it here is exactly the wrong move. Both keys are therefore
+# left at their chart defaults and spelled out below only so nobody has to re-derive this.
+controller:
+  enableSnapshotter: true
+  # The controller is a plain Deployment with no node affinity of its own; the crucible masters
+  # are not tainted, so leave placement to the scheduler rather than inventing a constraint.
+  replicas: 1
+
+externalSnapshotter:
+  enabled: false
+  customResourceDefinitions:
+    enabled: false
+
+# The chart can create its own VolumeSnapshotClass (csi-nfs-snapclass). We create ours in
+# csi-nfs-storage.yaml instead, so the name matches the StorageClass and the whole SC/VSC pair
+# is reviewable in one file next to every other driver's.
+volumeSnapshotClass:
+  create: false

@@ -65,6 +65,12 @@ variable "ceph_volume_size" {
   default     = 40
 }
 
+variable "extra_volume_size" {
+  description = "Size (GB) of the SECOND unformatted volume attached to each worker — the disk dedicated to the node-local CSI drivers under test (LVM, thin-LVM, ZFS). Carved into three by the `storage_prep` ansible role; never seen by Ceph."
+  type        = number
+  default     = 30
+}
+
 variable "ssh_key_name" {
   description = "Name of an SSH key ALREADY registered in the Hetzner Cloud project (Security > SSH keys)."
   type        = string

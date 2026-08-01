@@ -1,6 +1,14 @@
 ---
 # Base packages + kernel bits every node needs (Longhorn wants open-iscsi
 # and NFS client bits; curl fetches the RKE2 installer).
+#
+# lvm2 / thin-provisioning-tools / cifs-utils are here — on EVERY node, not just
+# the workers that carry the extra CSI disk — because the kubelet is what mounts
+# a volume, and it can be asked to do so from any node the pod lands on: an
+# LVM-backed or SMB-backed PV mounted on a node missing the userland tooling
+# fails at NodePublish, with an error that names the volume rather than the
+# missing package. The VG/thin-pool CREATION side lives in `storage_prep`
+# (workers only); this is just the tooling.
 
 - name: Install required packages
   ansible.builtin.apt:
@@ -8,6 +16,9 @@
       - curl
       - open-iscsi
       - nfs-common
+      - lvm2
+      - thin-provisioning-tools
+      - cifs-utils
     state: present
     update_cache: true
     cache_valid_time: 3600
@@ -28,6 +39,23 @@
   ansible.builtin.copy:
     dest: /etc/modules-load.d/crucible-iscsi.conf
     content: "iscsi_tcp\n"
+    mode: "0644"
+
+# The in-cluster NFS server (csi-driver-nfs's backing store, deploy-csi.sh wave 1)
+# runs nfsd in a container, and nfsd lives in the HOST kernel: the container's
+# own modprobe cannot load it (its /lib/modules belongs to the image, so it fails
+# with "invalid module format"). nfs-common above is only the client side.
+- name: Load the nfsd/nfs kernel modules now (in-cluster NFS server)
+  ansible.builtin.command: "modprobe {{ item }}"
+  loop:
+    - nfsd
+    - nfs
+  changed_when: false
+
+- name: Persist the nfsd/nfs modules across reboots
+  ansible.builtin.copy:
+    dest: /etc/modules-load.d/crucible-nfsd.conf
+    content: "nfsd\nnfs\n"
     mode: "0644"
 
 - name: Create RKE2 config directory

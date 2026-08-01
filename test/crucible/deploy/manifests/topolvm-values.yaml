@@ -1,0 +1,87 @@
+# Wave 3 — TopoLVM on the thin pool `thinpool` inside VG `crucible-vg2`.
+#
+# ---------------------------------------------------------------------------------------------
+# THE POD MUTATING WEBHOOK — read this before changing anything below.
+# ---------------------------------------------------------------------------------------------
+# TopoLVM ships a MutatingWebhookConfiguration on Pod CREATE. What it does is benign: for a pod
+# with unbound TopoLVM PVCs it annotates capacity.topolvm.io/<device-class> and adds a
+# topolvm.io/capacity resource request to the first container, so the scheduler can place the pod
+# on a node with room in the volume group.
+#   https://github.com/topolvm/topolvm/blob/main/docs/topolvm-controller.md
+#
+# What it costs is not benign. The chart hardcodes `failurePolicy: Fail` with
+# rules: apiGroups [""], resources [pods], operations [CREATE]. If the topolvm-controller
+# Deployment is down, or its serving cert expires, or the Service has no endpoints, then EVERY
+# POD CREATE IN THE CLUSTER IS REJECTED — not just TopoLVM's. On the crucible that means rook's
+# OSDs, longhorn, prometheus, the crystal-backup operator and every mover Job stop being
+# creatable at once, and the cluster cannot self-heal because healing requires creating pods.
+# It is a cluster-wide single point of failure installed by a driver we are merely qualifying.
+#
+# It is DISABLED here. That is also the chart's own default in 17.x
+# (webhook.podMutatingWebhook.enabled: false), stated explicitly rather than inherited so that a
+# future chart bump flipping the default cannot turn it on silently. The cost of disabling it:
+# the scheduler no longer sees per-node LVM capacity, so a PVC may be scheduled onto a node whose
+# volume group is too full and stay Pending. For a qualification lane that is a far better
+# failure mode than "no pod can be created anywhere".
+#
+# If it ever DOES need to be enabled, the chart generates the namespaceSelector from
+# `ignoreNamespaces` and always emits an escape hatch alongside it:
+#     matchExpressions:
+#       - {key: topolvm.io/webhook,            operator: NotIn, values: ["ignore"]}
+#       - {key: kubernetes.io/metadata.name,   operator: NotIn, values: [<ignoreNamespaces>]}
+# so the restriction is done by listing namespaces in ignoreNamespaces (pre-populated below with
+# every namespace the crucible cannot afford to lose) and/or by labelling a namespace
+# `topolvm.io/webhook=ignore`. The list below is inert while enabled=false; it is written out so
+# that turning the webhook on is a one-line change that is already safe.
+#
+# Side effect of enabled:false worth knowing: the controller then runs with
+# --enable-webhooks=false and the chart creates no cert-manager Certificate/Issuer at all. With
+# the webhook ON, `webhook.certManager: true` (the default) requires a cert-manager ALREADY
+# INSTALLED in the cluster — the crucible has none, and the chart does not install one
+# (cert-manager.enabled: false). Enabling the webhook without first installing cert-manager
+# produces a controller stuck waiting for a TLS secret that never appears, which — because
+# failurePolicy is Fail — is the cluster-wide outage described above.
+webhook:
+  podMutatingWebhook:
+    enabled: false
+    ignoreNamespaces:
+      - kube-system
+      - topolvm-system
+      - rook-ceph
+      - longhorn-system
+      - local-path-storage
+      - monitoring
+      - default
+      - crystal-backup-system
+
+lvmd:
+  managed: true
+  deviceClasses:
+    - name: thin
+      volume-group: crucible-vg2
+      default: true
+      # Reserve for the VG, in GiB. 1 rather than the chart's 10: /dev/sdc is small on the
+      # crucible workers and vg2 is split with the thin pool already.
+      spare-gb: 1
+      type: thin
+      thin-pool:
+        # Created by ansible. TopoLVM does NOT create thin pools — "You need to create a thin
+        # pool of LVM beforehand, because TopoLVM doesn't create one."
+        # https://github.com/topolvm/topolvm/blob/main/docs/snapshot-and-restore.md
+        name: thinpool
+        overprovision-ratio: 5.0
+  nodeSelector:
+    crystalbackup.io/node-role: worker
+
+node:
+  nodeSelector:
+    crystalbackup.io/node-role: worker
+
+controller:
+  nodeSelector:
+    crystalbackup.io/node-role: worker
+
+# The chart would otherwise create a `topolvm-provisioner` StorageClass (xfs, device-class ssd).
+# Ours lives in topolvm-storage.yaml so that the SC/VSC pair for every driver is reviewable in
+# one place and the device-class wiring is explicit.
+storageClasses: []

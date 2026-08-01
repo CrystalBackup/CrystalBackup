@@ -1,0 +1,28 @@
+# Wave 4 — Hetzner Cloud CSI driver.
+#
+# The Secret it reads (`hcloud`, key `token`) is created by deploy-csi.sh from the HCLOUD_TOKEN
+# environment variable. It is NEVER written to a file in this repository and never appears in a
+# helm value — which is exactly why there is no token key anywhere below, and why this chart is
+# fed `--values` plus a pre-existing Secret rather than `--set hcloudToken=...` (a --set value
+# lands in the helm release Secret in cleartext, in `helm get values` output, and in the shell
+# history of whoever ran it).
+
+hcloudToken:
+  existingSecret:
+    name: hcloud
+    key: token
+
+storageClasses:
+  # The chart creates a `hcloud-volumes` StorageClass by default AND marks it the cluster
+  # default. Marking it default would silently re-point every PVC in the crucible that omits
+  # storageClassName away from ceph-block — including the seed matrix. Emphatically not.
+  - name: hcloud-volumes
+    defaultStorageClass: false
+    reclaimPolicy: Delete
+
+node:
+  # The node plugin attaches Hetzner block devices, which only exist on the Hetzner servers
+  # themselves. All crucible nodes are Hetzner servers, but keeping it to workers matches every
+  # other driver here and keeps the masters free of CSI mount machinery.
+  nodeSelector:
+    crystalbackup.io/node-role: worker

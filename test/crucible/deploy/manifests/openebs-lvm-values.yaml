@@ -1,0 +1,36 @@
+# Wave 3 — OpenEBS LocalPV LVM, installed as its OWN release from the lvm-localpv chart rather
+# than by flipping engines.local.lvm.enabled on the wave-1 umbrella release.
+#
+# That is a deliberate structural choice. Turning the flag on in the umbrella would mean wave 3
+# `helm upgrade`s the release wave 1 owns, so replaying wave 1 alone would then TEAR DOWN wave 3's
+# driver. Separate releases in separate namespaces keep the "each wave is replayable alone"
+# contract literally true: the umbrella has lvm disabled, so it renders no local.csi.openebs.io
+# CSIDriver, and there is nothing for the two releases to fight over.
+#
+# Backing store: VG `crucible-vg1` (thick), created on /dev/sdc by ansible. Thick, not thin —
+# see openebs-lvm-storage.yaml for what that costs at snapshot time.
+
+crds:
+  lvmLocalPv:
+    # lvmnodes / lvmvolumes / lvmsnapshots — this release's own CRDs, nobody else's.
+    enabled: true
+  csi:
+    volumeSnapshots:
+      # RKE2 owns the VolumeSnapshot CRDs. Same reasoning as the umbrella chart: a helm-managed
+      # copy would clash on install and could take the cluster's snapshot stack down on uninstall.
+      enabled: false
+
+# The node plugin is what actually runs lvcreate, so it belongs only where crucible-vg1 exists.
+# Scheduling it onto a master would give a node plugin with no volume group and a stream of
+# "volume group not found" events that look like a driver fault.
+lvmNode:
+  nodeSelector:
+    crystalbackup.io/node-role: worker
+
+lvmController:
+  nodeSelector:
+    crystalbackup.io/node-role: worker
+
+analytics:
+  # No phone-home from a test cluster.
+  enabled: false

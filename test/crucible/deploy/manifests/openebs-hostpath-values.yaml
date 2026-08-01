@@ -1,0 +1,55 @@
+# Wave 1 — OpenEBS umbrella chart reduced to the LocalPV hostpath provisioner alone.
+#
+# The umbrella chart's defaults are a whole platform: Mayastor (replicated, wants hugepages and
+# dedicated disks), LocalPV LVM and ZFS (wave 3's business, and installing them here would make
+# wave 1 and wave 3 fight over the same CSIDriver objects), plus Loki + Alloy + MinIO for its own
+# observability. On a 3x40GB Ceph cluster that is not a reasonable default. Everything below is
+# switched off; what remains renders to exactly one Deployment, one ServiceAccount, one
+# ClusterRole/Binding and one StorageClass.
+#
+# LocalPV hostpath gets NO VolumeSnapshotClass, and there is no manifest for one — see the
+# comment in deploy-csi.sh. openebs.io/local is not even a CSI driver (it is an out-of-tree
+# dynamic provisioner writing into a host directory); there is no CreateSnapshot to call. The
+# expected probe verdict is SKIPPED, which is a RESULT: CrystalBackup marks such volumes
+# Skipped/CSISnapshotUnsupported and still completes the Backup (ADR 0003).
+
+engines:
+  local:
+    hostpath:
+      enabled: true
+    # Wave 3 installs these as their own releases, against the VGs/zpool ansible prepared.
+    # Enabling them here would create local.csi.openebs.io / zfs.csi.openebs.io from wave 1 and
+    # break the "each wave is replayable alone" contract.
+    lvm:
+      enabled: false
+    zfs:
+      enabled: false
+    rawfile:
+      enabled: false
+  replicated:
+    mayastor:
+      enabled: false
+
+# OpenEBS's own log/metrics stack. Two StatefulSets, seven Services and a MinIO — none of it
+# tells us anything about the exposure path, all of it competes for the crucible's Ceph capacity.
+loki:
+  enabled: false
+alloy:
+  enabled: false
+
+openebs-crds:
+  csi:
+    volumeSnapshots:
+      # CRITICAL. Default is true, and true would re-apply the VolumeSnapshot CRDs that RKE2
+      # already owns — the exact clash deploy.sh goes out of its way to avoid by only installing
+      # external-snapshotter when no VolumeSnapshot CRD exists yet. A helm-owned copy of those
+      # CRDs would also mean `helm uninstall` could take the cluster's entire snapshot stack with
+      # it, silently breaking rook and longhorn.
+      enabled: false
+
+localpv-provisioner:
+  localpv:
+    # hostpath volumes only make sense where the workloads run; the crucible's masters carry no
+    # workload storage.
+    nodeSelector:
+      crystalbackup.io/node-role: worker

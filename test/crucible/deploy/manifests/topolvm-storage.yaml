@@ -1,0 +1,34 @@
+# Wave 3 — TopoLVM StorageClass + VolumeSnapshotClass.
+#
+# WITH a VolumeSnapshotClass, and this is the one driver in wave 3 where snapshot support is
+# conditional on the STORAGE LAYOUT rather than on the driver: TopoLVM snapshots exist only for
+# THIN volumes. A device-class of type thick would provision fine and then fail every
+# CreateSnapshot. That is why the device class in topolvm-values.yaml is `type: thin` over the
+# pre-created `thinpool`, and why this class names it explicitly.
+#   https://github.com/topolvm/topolvm/blob/main/docs/snapshot-and-restore.md
+#
+# No parameters on the VolumeSnapshotClass — upstream's example has none.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: topolvm-thin
+provisioner: topolvm.io
+parameters:
+  # Selects the lvmd device class defined in topolvm-values.yaml. Omitting it would fall through
+  # to the default device class, which happens to be the same one here — but naming it means a
+  # future second device class cannot silently re-point this StorageClass.
+  topolvm.io/device-class: thin
+  csi.storage.k8s.io/fstype: ext4
+reclaimPolicy: Delete
+allowVolumeExpansion: true
+# Node-local storage: same reasoning as openebs-lvm. TopoLVM's own docs recommend it outright
+# ("TopoLVM cannot schedule pods wisely if volumeBindingMode is Immediate"), and with the pod
+# mutating webhook deliberately disabled the scheduler has even less to go on.
+volumeBindingMode: WaitForFirstConsumer
+---
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshotClass
+metadata:
+  name: topolvm-thin
+driver: topolvm.io
+deletionPolicy: Delete

@@ -1,0 +1,47 @@
+# Wave 2 — csi-driver-smb StorageClass. There is DELIBERATELY no VolumeSnapshotClass in this
+# file, and its absence is the expected result, not an oversight.
+#
+# smb.csi.k8s.io does not implement CreateSnapshot. Verified in upstream source, twice over:
+#
+#   pkg/smb/controllerserver.go — CreateSnapshot, DeleteSnapshot and ListSnapshots each return
+#     status.Error(codes.Unimplemented, "") outright.
+#     https://github.com/kubernetes-csi/csi-driver-smb/blob/master/pkg/smb/controllerserver.go
+#   pkg/smb/smb.go — the controller advertises only CREATE_DELETE_VOLUME,
+#     SINGLE_NODE_MULTI_WRITER, CLONE_VOLUME and EXPAND_VOLUME. CREATE_DELETE_SNAPSHOT is absent.
+#     https://github.com/kubernetes-csi/csi-driver-smb/blob/master/pkg/smb/smb.go
+#   The restore direction is blocked too: CreateVolume rejects a snapshot content source with
+#     "copy volume from volumeSnapshot is not supported".
+#
+# The chart's values.yaml contains no snapshot keys at all and the README has no snapshot section.
+#
+# So: no VolumeSnapshotClass exists whose .driver equals smb.csi.k8s.io, Registry.For returns
+# ErrUnsupported, and csi-probe.sh must report SKIPPED (exit 0). A SKIPPED here proves the skip
+# path works end to end; a COMPATIBLE here would mean the probe is lying.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: csi-smb
+provisioner: smb.csi.k8s.io
+parameters:
+  source: //smb-server.csi-smb-server.svc.cluster.local/share
+  # The same Secret backs provisioning and node staging. Keys: username, password.
+  csi.storage.k8s.io/provisioner-secret-name: smb-creds
+  csi.storage.k8s.io/provisioner-secret-namespace: csi-smb-server
+  csi.storage.k8s.io/node-stage-secret-name: smb-creds
+  csi.storage.k8s.io/node-stage-secret-namespace: csi-smb-server
+reclaimPolicy: Delete
+allowVolumeExpansion: false
+volumeBindingMode: Immediate
+mountOptions:
+  # CIFS has no real POSIX ownership unless the server negotiates unix extensions, which samba
+  # does not do for SMB3. Without these the mount is owned by root and every non-root workload
+  # in the seed matrix fails to write, which reads exactly like a driver bug and is not one.
+  - dir_mode=0777
+  - file_mode=0777
+  - uid=1000
+  - gid=1000
+  - noperm
+  - mfsymlinks
+  - cache=strict
+  - noserverino
+# NO VolumeSnapshotClass — see the header. Expected probe verdict: SKIPPED.

@@ -1,0 +1,59 @@
+# Wave 1 — csi-driver-nfs StorageClass + VolumeSnapshotClass.
+#
+# THIS ONE GETS A VolumeSnapshotClass, and that is the hypothesis wave 1 exists to test.
+# csi-driver-nfs really does implement CreateSnapshot/DeleteSnapshot, as a tar (optionally
+# gzipped) archive of the PVC's subdirectory:
+#   pkg/nfs/nfs.go — advertises csi.ControllerServiceCapability_RPC_CREATE_DELETE_SNAPSHOT
+#   pkg/nfs/controllerserver.go — CreateSnapshot mounts the source subdir and TarPack()s it
+#   https://github.com/kubernetes-csi/csi-driver-nfs/blob/master/deploy/example/snapshot/README.md
+#     ("This creates a snapshot of a volume using `tar`", supported since v4.3.0)
+#
+# The snapshot is therefore a FULL COPY, not a COW clone. Expect csi-probe.sh --copy-probe to
+# return COMPATIBLE_COPIE_COMPLETE here, and expect the temp-PVC provisioning time to scale with
+# the dataset. That is the correct answer for this driver, not a defect.
+#
+# The static re-bind step (csi-probe.sh step 4, internal/exposer) is the interesting part, and
+# it will "work" for a subtle reason worth knowing before anyone trusts it: csi-driver-nfs does
+# NOT advertise RPC_LIST_SNAPSHOTS, and external-snapshotter short-circuits to readyToUse=true
+# whenever the driver cannot list snapshots ("If the driver does not support ListSnapshots,
+# assume the snapshot ID is valid" — pkg/snapshotter/snapshotter.go). So a pre-provisioned
+# VolumeSnapshotContent goes Ready WITHOUT anything verifying the tar exists. The archive is
+# only really validated later, at restore, when CreateVolume untars it.
+#
+# snapshotHandle format, if a handle ever has to be built or read by hand — exactly 5 fields
+# joined by '#' (pkg/nfs/utils.go: separator = "#"); 4 or 6 is a parse error:
+#   {server}#{baseDir}#{snapUUID}#{snapUUID}#{sourceSubDir}
+#
+# No parameters and no snapshotter secret are required on the VolumeSnapshotClass
+# (docs/driver-parameters.md lists server/share/mountOptions, all "Mandatory: No").
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: csi-nfs
+provisioner: nfs.csi.k8s.io
+parameters:
+  server: nfs-server.csi-nfs-server.svc.cluster.local
+  # "/" because the server exports /nfsshare with fsid=0, i.e. as the NFSv4 pseudo-root.
+  share: /
+reclaimPolicy: Delete
+allowVolumeExpansion: true
+# Immediate on purpose, matching ceph-block: the crucible seed matrix includes UNMOUNTED PVCs
+# that must still reach Bound.
+volumeBindingMode: Immediate
+mountOptions:
+  - nfsvers=4.1
+  - hard
+  - timeo=600
+  - retrans=3
+  - noresvport
+---
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshotClass
+metadata:
+  name: csi-nfs
+driver: nfs.csi.k8s.io
+# Delete, matching every other class the crucible ships. Note this is honoured on
+# PRE-PROVISIONED content too: DeleteSnapshot will remove the tar from the share. The probe
+# flips the origin content to Retain for the handover and puts it back — but a human doing this
+# by hand on a handle they do not own should use Retain.
+deletionPolicy: Delete
