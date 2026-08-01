@@ -107,6 +107,63 @@ func TestNewAgeWrapperTrimsWhitespace(t *testing.T) {
 	}
 }
 
+// TestNewAgeWrapperAcceptsAgeKeygenFile proves the constructor takes the full
+// `age-keygen -o` file — comments, blank line and all — not only the bare
+// AGE-SECRET-KEY-1 line. This is the file an admin following the docs naturally stores
+// under the Secret's identity key; before ParseIdentities it failed with a bech32
+// "mixed case" error (the comment lines), observed on a real cluster. The cross-check
+// wraps with the file-parsed KEK and unwraps with the bare-parsed one, proving both
+// inputs yield the SAME identity rather than merely both parsing.
+func TestNewAgeWrapperAcceptsAgeKeygenFile(t *testing.T) {
+	id, err := age.GenerateX25519Identity()
+	if err != nil {
+		t.Fatalf("generate age identity: %v", err)
+	}
+	file := "# created: 2026-08-01T17:40:12+02:00\n" +
+		"# public key: " + id.Recipient().String() + "\n" +
+		"\n" +
+		id.String() + "\n"
+
+	fromFile, err := keys.NewAgeWrapper(file)
+	if err != nil {
+		t.Fatalf("NewAgeWrapper should accept the age-keygen file format, got: %v", err)
+	}
+	fromLine, err := keys.NewAgeWrapper(id.String())
+	if err != nil {
+		t.Fatalf("NewAgeWrapper on the bare line: %v", err)
+	}
+
+	dek := []byte("the-same-identity-either-way")
+	ct, err := fromFile.Wrap(dek)
+	if err != nil {
+		t.Fatalf("Wrap with file-parsed KEK: %v", err)
+	}
+	pt, err := fromLine.Unwrap(ct)
+	if err != nil {
+		t.Fatalf("Unwrap with bare-parsed KEK: %v", err)
+	}
+	if !bytes.Equal(pt, dek) {
+		t.Fatalf("round-trip across the two parse forms mismatch: got %q, want %q", pt, dek)
+	}
+}
+
+// TestNewAgeWrapperRejectsMultipleIdentities pins the "one key, not a keyring" rule: a
+// Secret holding two identities is ambiguous — refusing beats silently picking one and
+// leaving the other looking load-bearing.
+func TestNewAgeWrapperRejectsMultipleIdentities(t *testing.T) {
+	a, err := age.GenerateX25519Identity()
+	if err != nil {
+		t.Fatalf("generate first identity: %v", err)
+	}
+	b, err := age.GenerateX25519Identity()
+	if err != nil {
+		t.Fatalf("generate second identity: %v", err)
+	}
+	if _, err := keys.NewAgeWrapper(a.String() + "\n" + b.String() + "\n"); err == nil {
+		t.Fatal("NewAgeWrapper accepted two identities; want an error")
+	}
+}
+
 // TestNewAgeWrapperRejectsBadInput asserts empty, whitespace-only and malformed identities
 // are refused rather than deferred to a later, more confusing failure.
 func TestNewAgeWrapperRejectsBadInput(t *testing.T) {
