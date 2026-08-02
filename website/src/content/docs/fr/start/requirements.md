@@ -116,12 +116,13 @@ Par location, il vous faut :
   non-AWS ont aussi besoin de `forcePathStyle: true` ;
 - si l'endpoint utilise une CA privée, son bundle PEM pour `spec.s3.caBundle`.
 
-:::caution[Les movers détiennent aujourd'hui les credentials root du bucket]
-Des credentials de mover à durée de vie courte et limités au repository ne sont pas
-implémentés dans cette release. Chaque Job de mover reçoit les credentials de la location
-tels quels, si bien qu'un mover compromis peut atteindre tout ce que ces credentials peuvent
-atteindre. Limitez la portée des credentials au bucket — ou au prefix — côté stockage objet,
-et donnez à chaque location les siens.
+:::caution[Les movers détiennent les credentials du bucket de la location]
+Chaque Job de mover reçoit les credentials de la location tels quels, si bien qu'un mover
+compromis peut atteindre tout ce que ces credentials peuvent atteindre. Des credentials
+restreints au repository et forgés par l'opérateur ne sont **pas prévus** : un repository
+partagé est dédupliqué entre namespaces, donc aucune policy de stockage ne peut y découper les
+données d'un namespace. Le scoping est donc **votre** étape — limitez les credentials au
+bucket, ou au prefix, côté stockage objet, et donnez à chaque location les siens.
 :::
 
 ## Réseau

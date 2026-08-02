@@ -2,11 +2,13 @@
 ################################################################################
 # Network posture for crystal-backup-system (spec/03-security-and-tenancy.md §7).
 #
-# Why this matters more here than in a typical operator: until I4 lands (repo-scoped,
-# short-lived mover credentials — deferred to M6), every mover receives the location's ROOT S3
-# credentials. Invariant I4 names three compensating controls for that window — no token,
-# NetworkPolicy egress, and TTL — and before this file existed only the first was real. A
-# compromised mover could reach any cluster-internal service.
+# Why this matters more here than in a typical operator: every mover receives the location's S3
+# credentials verbatim, and operator-minted repo-scoped credentials are NOT coming (adr/0019 —
+# a shared repository is dedup-shared, so no storage policy can carve out a namespace). That
+# makes this file permanent load-bearing security rather than a stopgap: invariant I4 names
+# three compensating controls — no token, NetworkPolicy egress, Job lifetime — and before this
+# file existed only the first was real. A compromised mover could reach any cluster-internal
+# service.
 #
 # The shape is default-deny plus narrow allowances, so a pod shape added later starts with no
 # connectivity and has to be granted it deliberately, rather than inheriting everything.

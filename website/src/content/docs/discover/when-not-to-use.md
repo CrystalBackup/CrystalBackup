@@ -53,7 +53,6 @@ the implementation is not in this release.
 |---|---|
 | **Immutable locations** (S3 Object Lock) | `spec.mode: Immutable` is accepted and a few guards exist around it, but Object Lock support, window rotation and expiry are **not implemented**. Do not use `Immutable` expecting WORM. |
 | **`crystalctl` CLI and the browse UI** | Not written. There is no user-facing command-line tool in this release. |
-| **Repository-scoped mover credentials** | Movers currently receive the location's **root** object-storage credentials. A compromised mover can reach the whole bucket. Scoped, short-lived credentials are planned. |
 | **Namespace manifests through `ClusterRestore`** | A `ClusterRestore` restores cluster-scoped objects and volume data. Restoring the namespace's own workload manifests through that path is a follow-up. |
 
 ## Costs you are accepting
@@ -66,6 +65,17 @@ with total cluster data, not per namespace. Schedule it off-peak and bound it wi
 **No fair-share between tenants.** Mover concurrency is capped cluster-wide by
 `maxConcurrentMovers`. A namespace with a great deal of churn can **delay** other
 namespaces' backups. It cannot read them, but it can make them late.
+
+**Movers hold the repository's credentials, and nothing narrows them.** A mover Job runs in
+the operator's namespace, never in a tenant's, so a namespace user cannot read its Secret,
+exec into its pod or edit the Job. What it does hold is the location's object-storage
+credential, with full access to the repository — and that is structural, not an omission: a
+restic repository is content-addressed and deduplicated across namespaces, so no object in
+the bucket belongs to any one namespace and no storage policy can carve one out. Per-tenant
+scoped credentials are therefore **not planned**; they are not expressible against a shared
+repository. The blast radius of a compromised mover is the repository, bounded by the
+operator namespace's egress NetworkPolicy. Give the operator a credential already scoped to
+its bucket or prefix — nothing downstream will narrow it for you.
 
 **Erasure is physical, not cryptographic.** `ClusterErasure` runs `restic forget` by tag
 followed by `prune`. There is no per-tenant crypto-shredding and there will not be: one

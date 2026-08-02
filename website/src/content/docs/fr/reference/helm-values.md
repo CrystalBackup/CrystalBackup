@@ -98,7 +98,7 @@ forme de pod ajoutée plus tard démarre sans connectivité plutôt qu'en hérit
 
 | Value | Défaut | Notes |
 |---|---|---|
-| `networkPolicy.create` | `true` | Activé par défaut. Tant que les credentials de mover limités au repository n'ont pas atterri, ce confinement d'egress est l'un des deux seuls vrais contrôles sur un mover compromis détenant des credentials root de stockage objet. |
+| `networkPolicy.create` | `true` | Activé par défaut. Un mover détient nécessairement des credentials donnant un accès complet à son repository — un repository partagé ne peut pas être découpé par une policy de stockage — donc ce confinement d'egress est l'un des deux seuls vrais contrôles sur un mover compromis. Des credentials restreints par tenant ne viendront pas : traitez cette valeur comme portante. |
 | `networkPolicy.dnsNamespace` | `kube-system` | Sélectionné par `kubernetes.io/metadata.name`. |
 | `networkPolicy.clusterInternalCIDRs` | RFC1918 + link-local + loopback | Les plages que les movers ne doivent **pas** atteindre sur le 443. C'est ce qui empêche un mover compromis de pivoter vers les services internes au cluster. |
 | `networkPolicy.extraMoverEgress` | `[]` | **Un endpoint S3 on-premises sur une adresse privée a besoin d'une entrée ici.** Le défaut est fermé et l'exception est visible. |

@@ -155,9 +155,12 @@ la clé venait à être compromise.
 
 ## Ce qui n'est pas couvert
 
-**Les movers détiennent les credentials racine du bucket.** Des credentials restreints au
-repository et à durée de vie courte ne sont pas implémentés dans cette version. Un mover
-compromis peut atteindre tout ce que les credentials de la location peuvent atteindre — y
+**Les movers détiennent les credentials du bucket de la location.** Des credentials restreints
+au repository et forgés par l'opérateur ne sont **pas prévus** : un repository partagé est
+dédupliqué entre namespaces, donc aucune policy de stockage ne peut y découper les données d'un
+namespace, et le scoping n'aurait produit aucune isolation entre tenants, quel qu'en soit
+l'effort. Un mover compromis peut atteindre tout ce que les credentials de la location
+peuvent atteindre — y
 compris l'objet de clé wrappée séquestré, dont la protection est la KEK et non le chemin dans
 le stockage objet. Restreignez les credentials côté stockage objet, et donnez à chaque
 location les siens.

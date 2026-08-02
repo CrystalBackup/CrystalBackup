@@ -717,8 +717,10 @@ Rationale in [adr/0009](adr/0009-shared-cluster-repo-tag-tenancy.md).
 the operator mirrors the wrapped platform DEK (the age ciphertext of Secret
 `crystal-dek-<location>`; useless without the KEK) to the object
 `<prefix>/<clusterID>.crystal-meta/wrapped-dek.age` — a **sibling** of the repository prefix,
-so it is invisible to restic, excluded from the movers' repo-scoped credentials (I4), and
-survives total cluster loss. It is (re)written whenever the DEK Secret is ensured or
+so it is invisible to restic and survives total cluster loss. It is **not** out of a mover's
+reach: movers hold the location's credentials and operator-minted scoping was withdrawn (I4,
+[adr/0019](adr/0019-no-scoped-mover-credentials.md)), so this object's protection is the KEK —
+it is ciphertext useless without it — and not the S3 path. It is (re)written whenever the DEK Secret is ensured or
 re-wrapped; on location add, a missing in-cluster DEK Secret is **recovered from this object**
 (bare-cluster DR bootstrap = escrowed KEK + this object + a `ClusterBackupLocation`).
 

@@ -144,8 +144,10 @@ compromised.
 
 ## What is not covered
 
-**Movers hold root bucket credentials.** Repository-scoped, short-lived credentials are not
-implemented in this release. A compromised mover can reach everything the location's
+**Movers hold the location's bucket credentials.** Operator-minted, repository-scoped
+credentials are **not planned** — a shared repository is deduplicated across namespaces, so no
+storage policy can carve out one namespace's data, and scoping would not have produced tenant
+isolation at any effort. A compromised mover can reach everything the location's
 credentials can reach — including the escrowed wrapped key object, whose protection is the
 KEK and not the object-storage path. Scope credentials at the object-storage side, and give
 each location its own.

@@ -25,14 +25,18 @@ limitations under the License.
 //
 // The object lives at a SIBLING of the repository prefix —
 // "<prefix>/<clusterID>.crystal-meta/wrapped-dek.age" — deliberately OUTSIDE the restic
-// repository root (restic never sees it; a repo copy/check never drags it along). The path is
-// ALSO chosen to sit outside the movers' intended repo-scoped credential prefix
-// "<prefix>/<clusterID>/*" so that once per-repo mover credential scoping (invariant I4) lands, a
-// compromised mover cannot read or overwrite it. NOTE (M0–M2): I4 is NOT yet implemented — movers
-// currently receive the location's ROOT S3 credentials (the STS/per-repo-key minting is deferred to
-// M6, 03-security §13 Q1) — so today a mover credential reaches this object like any other. The
-// effective protection is therefore NOT the path but the encryption: the escrowed bytes are
-// ciphertext under the admin-held KEK.
+// repository root (restic never sees it; a repo copy/check never drags it along).
+//
+// The path was ALSO chosen to sit outside the repo-scoped credential prefix
+// "<prefix>/<clusterID>/*" that invariant I4 once planned to mint, so that a compromised mover
+// could not reach it. That scoping was WITHDRAWN (adr/0019): a shared repository is
+// content-addressed and dedup-shared, so no storage policy can carve a namespace out of it, and
+// building the S3-specific minting path would have foreclosed non-S3 backends. Movers therefore
+// hold the location's credentials and DO reach this object, permanently and by design.
+//
+// The protection is consequently NOT the path but the encryption: the escrowed bytes are
+// ciphertext under the admin-held KEK. The sibling placement survives on its own merits — it
+// keeps restic from listing the object and a repo copy/check from dragging it along.
 //
 // Security note: the escrowed bytes are ciphertext under the admin-held KEK. Writing them
 // to the bucket grants the bucket nothing it did not already have — an attacker with

@@ -315,9 +315,10 @@ manifestMover:
 # nothing (kind's default kindnet among them), so their presence is not by itself
 # evidence the confinement holds — verify on your CNI.
 networkPolicy:
-  # -- Install the NetworkPolicies. Until I4 lands (repo-scoped mover credentials,
-  # M6) this egress confinement is one of only two real controls on a compromised
-  # mover holding root S3 credentials, so it defaults ON.
+  # -- Install the NetworkPolicies. A mover necessarily holds credentials with full
+  # access to its repository and operator-minted scoping is not coming (adr/0019), so
+  # this egress confinement is one of only two real controls on a compromised mover.
+  # It defaults ON and should stay on.
   create: true
   # -- Namespace running cluster DNS, selected by kubernetes.io/metadata.name.
   dnsNamespace: kube-system

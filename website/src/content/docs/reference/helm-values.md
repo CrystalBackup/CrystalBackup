@@ -95,7 +95,7 @@ later starts with no connectivity rather than inheriting everything.
 
 | Value | Default | Notes |
 |---|---|---|
-| `networkPolicy.create` | `true` | On by default. Until repository-scoped mover credentials land, this egress confinement is one of only two real controls on a compromised mover holding root object-storage credentials. |
+| `networkPolicy.create` | `true` | On by default. A mover necessarily holds credentials with full access to its repository — a shared repository cannot be carved up by storage policy — so this egress confinement is one of only two real controls on a compromised mover. Scoped per-tenant credentials are not coming; treat this value as load-bearing. |
 | `networkPolicy.dnsNamespace` | `kube-system` | Selected by `kubernetes.io/metadata.name`. |
 | `networkPolicy.clusterInternalCIDRs` | RFC1918 + link-local + loopback | Ranges movers must **not** reach on 443. This is what stops a compromised mover pivoting to in-cluster services. |
 | `networkPolicy.extraMoverEgress` | `[]` | **An on-premises S3 endpoint on a private address needs an entry here.** The default is closed and the exception is visible. |

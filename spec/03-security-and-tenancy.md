@@ -32,7 +32,7 @@ Key management: [adr/0004](adr/0004-encryption-key-management.md). Immutability:
 |---|---|---|---|
 | Malicious namespace user | Crafted CRs: point a `Restore`/`Backup` at cluster DR or another namespace, hostile hook commands, schedule spam | Invariants I1–I2, I7 (§3): the `namespace=` filter cannot be forged, cluster-origin `Backup`s are read-only, a user CR cannot reference a `ClusterBackupLocation`; hooks exec only in the CR's own namespace (§5); admission rules (§8); global/per-node mover concurrency caps | No per-user fair-share of mover slots in v1 (R24: no quotas) — a noisy user can delay others' backups, not read them; the shared-repo prune window contends with backups (serialized, never corrupts) |
 | Compromised namespace user K8s credentials | Attacker creates `Restore`/`BackupSchedule` in the victim namespace | Blast radius = that namespace's own data (I1); a cluster-origin `Backup` is served only through the mediated `namespace=<that namespace>` filter, so it restores the namespace's **own** history back into itself; R23 confirmation gates accidents, not attackers; exfiltration via a user `BackupLocation` adds nothing the namespace's pod egress didn't already allow | Attacker can destroy in-namespace data via a `Recreate` restore — same power as their existing PVC access; off-platform copies (user location) survive |
-| Compromised mover | Container escape attempt, credential/DEK theft from the Job | Unprivileged pod, `seccompProfile: RuntimeDefault`, caps dropped (§6); **no ServiceAccount token** (`crystal-mover`, `automountServiceAccountToken: false`, zero RBAC); short-lived repo-scoped S3 credentials (I4); NetworkPolicy egress = S3 only (§7); snapshot mounted `readOnly` — source data cannot be tampered | A leaked **cluster-repo** mover credential or DEK reads/writes the **whole shared repo** (all namespaces) — the shared-repo cost ([adr/0009](adr/0009-shared-cluster-repo-tag-tenancy.md)); bounded by TTL, confinement and Immutable mode; a leaked DEK → repo-copy reencrypt ([adr/0004](adr/0004-encryption-key-management.md)). On a **user** location the mover holds only that user's key; a **sync mover** transiently holds the **source + destination** keys and egresses to two S3 endpoints, under the same TTL/confinement (R28, I9) |
+| Compromised mover | Container escape attempt, credential/DEK theft from the Job | Unprivileged pod, `seccompProfile: RuntimeDefault`, caps dropped (§6); **no ServiceAccount token** (`crystal-mover`, `automountServiceAccountToken: false`, zero RBAC); per-Job credential Secret deleted with the Job (I4 — the credential itself is **not** operator-scoped, [adr/0019](adr/0019-no-scoped-mover-credentials.md)); NetworkPolicy egress = S3 only (§7); snapshot mounted `readOnly` — source data cannot be tampered | A leaked **cluster-repo** mover credential or DEK reads/writes the **whole shared repo** (all namespaces) **and the whole bucket the credential covers** — the shared-repo cost ([adr/0009](adr/0009-shared-cluster-repo-tag-tenancy.md)) plus the withdrawn-scoping cost; bounded by egress confinement, Job lifetime, Immutable mode and by how narrowly the **deployer** scoped the account; a leaked DEK → repo-copy reencrypt ([adr/0004](adr/0004-encryption-key-management.md)). On a **user** location the mover holds only that user's key; a **sync mover** transiently holds the **source + destination** keys and egresses to two S3 endpoints, under the same TTL/confinement (R28, I9) |
 | Ransomware / deletion on S3 | Stolen S3 credentials encrypt or delete backup objects | Cluster-repo root creds exist only in `crystal-backup-system` (I3); `Immutable` location mode = S3 Object Lock / append-only (R18) — note: object-locked buckets break `restic prune` **and** lock-file deletion, hence the no-prune + rotation design in [adr/0005](adr/0005-immutability-mode.md) | In `Standard` mode a mover credential can delete objects of the **shared** cluster repo (restic needs delete for lock files and prune) — blast radius is the whole DR repo, not one namespace; `Immutable` mode (R18, M8) removes even that. Until M8, the platform Velero safety net and off-platform user locations are the fallback |
 | Insider (platform administrator) | Admin reads every namespace via the platform key, or erases data via `ClusterErasure` | Cluster KEK access restricted to the operator SA + break-glass group; `ClusterRestore`/`ClusterErasure` are cluster-scoped, audited objects (§12) with typed `confirmation` (R23); two-person review on key/erasure code (roadmap DoD) | The platform can read the shared cluster DR repo **by design** (one key, same trust level as existing etcd/node access); users opt out with their own location + key — no operator slot exists on it, and an admin reaching for their password Secret is visible in the audit log and revocable by the user |
 
@@ -61,24 +61,29 @@ logic checks against this list (cf. roadmap DoD).
   wrapped platform DEK (`crystal-dek-<location>`) exist only in `crystal-backup-system`.
   User namespaces never contain platform credentials; user CRs reference only
   same-namespace Secrets (typed name-only refs, 02-api rule 5).
-- **I4 — Movers get short-lived, repo-scoped credentials.** *Cluster plane*: the operator
-  mints S3 credentials via RGW STS `AssumeRole` with a session policy scoped to the shared
-  repo prefix `<bucket>/<prefix>/<clusterID>/*` — **not** per namespace, because the shared
-  repo is content-addressed and dedup-shared, so a namespace's data cannot be isolated to
-  an S3 subtree (a direct consequence of I2). TTL = Job `activeDeadlineSeconds` + margin,
-  projected as a Job-owned Secret (`ownerReference` → GC with the Job). Fallback when STS
-  is unavailable: per-repo static keys via the RGW admin ops API. *Namespace plane*: the
-  mover receives the user's own Secret — already scoped to the user's bucket by
-  construction.
-  **Implementation status (M0–M2): NOT yet implemented.** Every mover (backup, restore,
-  discovery listing) currently receives the location's **root** S3 credentials (`dr-s3`)
-  verbatim — neither STS `AssumeRole` nor the static per-repo-key fallback is wired yet (deferred
-  to M6, §13 Q1). So a compromised mover today can read/write/delete the **whole bucket** — the
-  shared repository of every namespace **and** the wrapped-DEK escrow object — not just a repo
-  prefix. This is a compromised-**mover** blast radius (a leaked Job credential), not a
-  namespace-user vector: I1/I5/I6 still confine what a namespace user can reach. Until I4 lands,
-  the mover's confinement rests on no-token + NetworkPolicy egress + TTL (§6/§7) and the escrow's
-  protection rests on the KEK (ciphertext at rest), not on the S3 path being unreachable.
+- **I4 — Movers hold the location's credentials; confinement is not credential-scoped.**
+  A mover receives the location's object-storage credentials verbatim, through a per-Job
+  Secret co-located with the Job in `crystal-backup-system` and deleted with it. *Cluster
+  plane*: the `ClusterBackupLocation` credentials (`dr-s3`). *Namespace plane*: the user's own
+  Secret — already scoped to the user's bucket by construction, by the tenant rather than by
+  the operator.
+  **The operator mints nothing, and this is now a decision rather than a gap**
+  ([adr/0019](adr/0019-no-scoped-mover-credentials.md)). Credential scoping was previously
+  specified here as RGW STS `AssumeRole` with a session policy bounded to the repository
+  prefix `<bucket>/<prefix>/<clusterID>/*` — **not** per namespace, because the shared repo is
+  content-addressed and dedup-shared, so a namespace's data cannot be isolated to an S3 subtree
+  (a direct consequence of I2). That remains true and is exactly why the mechanism was
+  withdrawn: it could never have delivered tenant isolation, and building it would have put
+  STS-shaped, S3-specific concepts into the one layer that must stay backend-neutral for
+  `sftp:` / `rest:` / `rclone:` repositories to remain reachable later.
+  **Standing consequence.** A compromised mover can read/write/delete the **whole bucket** —
+  the shared repository of every namespace **and** the wrapped-DEK escrow object. This is a
+  compromised-**mover** blast radius (a leaked Job credential), not a namespace-user vector:
+  I1/I5/I6 still confine what a namespace user can reach. The mover's confinement rests on
+  no-token + NetworkPolicy egress + Job lifetime (§6/§7), the escrow's protection rests on the
+  KEK (ciphertext at rest) rather than on the S3 path being unreachable, and bounding the
+  credential itself is a **deployment responsibility**: supply an account already scoped to the
+  bucket or prefix, because nothing downstream will narrow it.
 - **I5 — No backup pods, keys, or platform Secrets in user namespaces.** Movers and temp
   PVCs live in `crystal-backup-system`. The only objects the operator creates in a user
   namespace are `VolumeSnapshot`s (transient, during a run), transient manifest-mover
@@ -134,7 +139,7 @@ What lives where:
 |---|---|---|---|
 | Cluster KEK | Secret `cluster-kek` | `crystal-backup-system` | operator SA (get by name), break-glass admins |
 | Wrapped platform DEK (one per cluster repo) | Secret `crystal-dek-<location>`, label `crystalbackup.io/location` | `crystal-backup-system` | operator; useless without the KEK |
-| Cluster DR S3 root creds | Secret `dr-s3` | `crystal-backup-system` | operator (STS minting, maintenance Jobs) |
+| Cluster DR S3 creds | Secret `dr-s3` | `crystal-backup-system` | operator (copied verbatim into per-Job mover Secrets; no minting — [adr/0019](adr/0019-no-scoped-mover-credentials.md)) |
 | Per-mover S3 creds + unwrapped DEK | Job-owned Secret, TTL-bounded | `crystal-backup-system` | the one mover Job (volume projection) |
 | User location creds / user repo password | user-named Secrets (`offsite-s3`, `offsite-key`) | user namespace | user; operator by name (to run the user's movers) |
 
@@ -162,10 +167,11 @@ Rules:
   strand it even with the KEK safe in escrow — the KEK alone cannot open the repository without
   the wrapped DEK to unwrap. The operator therefore **escrows the wrapped DEK in the bucket**
   (useless without the KEK) at `<prefix>/<clusterID>.crystal-meta/wrapped-dek.age` — a sibling
-  of the repository prefix, invisible to restic and outside the movers' *intended* repo-scoped
-  credential prefix (I4 — but see I4's status note: until per-repo mover credential scoping lands
-  in M6, movers hold the root bucket credentials and CAN reach this object, so its protection is
-  the KEK, not the S3 path) — rewritten on every DEK ensure/re-wrap. Bare-cluster DR = escrowed KEK + this
+  of the repository prefix and invisible to restic. Movers hold the location's credentials and
+  **can** reach this object; since credential scoping was withdrawn (I4,
+  [adr/0019](adr/0019-no-scoped-mover-credentials.md)) that is the designed situation, not a
+  temporary one, and the object's protection is the KEK — it is ciphertext useless without it —
+  not the S3 path. Rewritten on every DEK ensure/re-wrap. Bare-cluster DR = escrowed KEK + this
   object: creating a `ClusterBackupLocation` whose DEK Secret is missing recovers it from the
   escrow object, then discovery inventories the repo
   ([02-api.md § Repository layout](02-api.md#repository-layout--snapshot-identity)).
@@ -286,8 +292,8 @@ normative as what it grants. The contract:
 oversight.** The mover Job lives in `crystal-backup-system` (I5) while the RoleBinding
 must live in the tenant namespace; Kubernetes does not permit cross-namespace
 ownerReferences, and the GC controller treats such a dependent as orphaned and deletes
-it. The creds-Secret precedent in I4 works only because that Secret is co-located with
-its owner. So the backstop above is not belt-and-braces — it is the *only* automatic
+it. The per-Job creds-Secret precedent in I4 works only because that Secret is co-located
+with its owner. So the backstop above is not belt-and-braces — it is the *only* automatic
 cleanup, and its sweep parameters are a security control, not a housekeeping tunable.
 
 In particular the reaper's general 30-minute minimum age is calibrated for a temp clone
@@ -497,9 +503,10 @@ full namespace recovery (R15). Implications, stated plainly:
 
 ## 13. Open questions
 
-1. STS availability on the platform RGW (I4): confirm `AssumeRole` + session-policy support
-   on the RGW version before M1; otherwise start with the static per-repo-keys fallback and
-   track STS as M6 hardening.
+1. ~~STS availability on the platform RGW (I4)~~ — **closed 2026-08-02** by
+   [adr/0019](adr/0019-no-scoped-mover-credentials.md): operator-minted scoped credentials are
+   not being built, so RGW STS support is no longer a dependency. Bounding a mover credential
+   is a deployment responsibility (supply a bucket- or prefix-scoped account).
 2. Per-user fair-share queueing of mover slots (DoS residual, §2) — revisit when quota work
    (post-v1, R24 note) is scheduled.
 3. `manifestOptions.excludeSecretData` (§10) to be added to 02-api.md and

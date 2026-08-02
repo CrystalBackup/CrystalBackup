@@ -57,7 +57,6 @@ documents de conception, et l'implémentation n'est pas dans cette version.
 |---|---|
 | **Locations immuables** (S3 Object Lock) | `spec.mode: Immutable` est accepté et quelques garde-fous existent autour, mais le support d'Object Lock, la rotation de fenêtre et l'expiration **ne sont pas implémentés**. N'utilisez pas `Immutable` en attendant du WORM. |
 | **La CLI `crystalctl` et l'UI de navigation** | Pas écrites. Il n'y a aucun outil en ligne de commande destiné aux utilisateurs dans cette version. |
-| **Credentials de mover limités au repository** | Les movers reçoivent aujourd'hui les credentials **racine** de stockage objet de la location. Un mover compromis peut atteindre tout le bucket. Des credentials restreints et à durée de vie courte sont prévus. |
 | **Manifests de namespace via `ClusterRestore`** | Un `ClusterRestore` restaure les objets cluster-scoped et les données de volume. Restaurer par ce chemin les manifests de workload propres au namespace viendra plus tard. |
 
 ## Les coûts que vous acceptez
@@ -71,6 +70,18 @@ Planifiez-la hors des heures de pointe et bornez-la avec `pruneMaxRepackSize`.
 l'échelle du cluster par `maxConcurrentMovers`. Un namespace très mouvant peut **retarder**
 les backups des autres namespaces. Il ne peut pas les lire, mais il peut les mettre en
 retard.
+
+**Les movers détiennent les credentials du repository, et rien ne les restreint.** Un Job de
+mover s'exécute dans le namespace de l'opérateur, jamais dans celui d'un tenant : un
+utilisateur de namespace ne peut ni lire son Secret, ni exec dans son pod, ni modifier le Job.
+Ce qu'il détient, en revanche, ce sont les credentials de stockage objet de la location, avec
+un accès complet au repository — et c'est structurel, pas un oubli : un repository restic est
+adressé par contenu et dédupliqué entre namespaces, donc aucun objet du bucket n'appartient à
+un namespace donné et aucune policy de stockage ne peut en découper un. Des credentials
+restreints par tenant ne sont donc **pas prévus** : ils ne sont pas exprimables face à un
+repository partagé. Le rayon de souffle d'un mover compromis est le repository, borné par la
+NetworkPolicy d'egress du namespace opérateur. Donnez à l'opérateur des credentials déjà
+limités à son bucket ou à son préfixe — rien en aval ne les restreindra pour vous.
 
 **L'effacement est physique, pas cryptographique.** `ClusterErasure` exécute
 `restic forget` par tag, suivi d'un `prune`. Il n'y a pas de crypto-shredding par tenant, et

@@ -107,11 +107,13 @@ Per location you need:
   `forcePathStyle: true`;
 - if the endpoint uses a private CA, its PEM bundle for `spec.s3.caBundle`.
 
-:::caution[Movers currently hold root bucket credentials]
-Repository-scoped, short-lived mover credentials are not implemented in this release.
+:::caution[Movers hold the location's bucket credentials]
 Every mover Job receives the location's credentials verbatim, so a compromised mover can
-reach everything those credentials can reach. Scope the credentials to the bucket — or to
-the prefix — at the object-storage side, and give each location its own.
+reach everything those credentials can reach. Operator-minted, repository-scoped credentials
+are **not planned**: a shared repository is deduplicated across namespaces, so no storage
+policy can carve out one namespace's data. Scoping is therefore **your** step — bound the
+credentials to the bucket, or to the prefix, at the object-storage side, and give each
+location its own.
 :::
 
 ## Network

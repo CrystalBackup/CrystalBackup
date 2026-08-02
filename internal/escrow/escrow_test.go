@@ -22,8 +22,8 @@ import (
 )
 
 // TestObjectKey pins the escrow object key — part of the DR contract (02-api.md): a
-// SIBLING of the repository prefix (never inside "<prefix>/<clusterID>/", so restic and
-// the movers' repo-scoped credentials never see it), byte-stable across releases.
+// SIBLING of the repository prefix (never inside "<prefix>/<clusterID>/", so restic never
+// lists it), byte-stable across releases.
 func TestObjectKey(t *testing.T) {
 	cases := []struct {
 		prefix, clusterID, want string
@@ -40,8 +40,9 @@ func TestObjectKey(t *testing.T) {
 }
 
 // TestObjectKeyOutsideRepoPrefix proves the sibling property structurally: the escrow key
-// never falls under the repository's own "<prefix>/<clusterID>/" subtree, so the movers'
-// repo-scoped credential prefix (I4) can never reach it and restic never lists it.
+// never falls under the repository's own "<prefix>/<clusterID>/" subtree, so restic never
+// lists it and a repo copy/check never drags it along. It says nothing about mover reach —
+// credential scoping was withdrawn (adr/0019) and the object's protection is the KEK.
 func TestObjectKeyOutsideRepoPrefix(t *testing.T) {
 	for _, tc := range []struct{ prefix, clusterID string }{
 		{"prod", "prod-eu-1"},
