@@ -56,7 +56,7 @@ doit aussi repasser ici. Les points de version à contrôler :
 
 | Fichier | Quoi vérifier |
 |---|---|
-| `slides/slides.md` | Pill de couverture (`v0.6.1 · M0–M6 livrés`), disclaimer `whoami`, note du tableau comparatif (« v0.6.1 livrée »), slide « Ce que vous n'avez PAS vu » (M7/M8/M9 → recaler quand un milestone sort), `--version 0.6.1` du `helm install` (CTA), le compte « 82 checks » et « 18 ADRs » |
+| `slides/slides.md` | Pill de couverture (`v0.6.1 · M0–M6 livrés`), disclaimer `whoami`, note du tableau comparatif (« v0.6.1 livrée »), slide « Ce que vous n'avez PAS vu » (M7/M8/M9 → recaler quand un milestone sort **ou quand la roadmap est re-arbitrée**, cf. 2026-08-02), `--version 0.6.1` du `helm install` (CTA), le compte « 82 checks » et « 20 ADRs » |
 | `conferencehall.md` | Mentions `v0.6.1`, « M0–M6 », « 82 checks » dans l'abstract et la description |
 | `demo/00-prep.sh` | Le commentaire « releases ≤ 0.6.1 » sur l'extraction de la KEK (le fix `age.ParseIdentities` est à HEAD : dès la release qui l'embarque, le `grep` devient optionnel) ; `CHART_VERSION` si on veut épingler |
 | `demo/README.md` + runbook | Re-dérouler `mise run prep && mise run demo` sur la nouvelle release (c'est aussi le quickstart en conditions réelles) et ré-enregistrer `plan-b.cast` |

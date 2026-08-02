@@ -54,9 +54,21 @@ published rather than summarised.
 | Milestone | State | What it will add |
 |---|---|---|
 | **M6** | shipped in `v0.6.0` | The full metrics catalogue, two Grafana dashboards and eleven alert rules watched *firing* against a real Prometheus, OTel traces across the pipeline, an exportable self-check, and a restore-fidelity gate that compares a restore to its source file by file. Mover resource tuning by operation type and the PodSecurity review moved to `0.6.1`; the soak and the pilot rollout have not happened |
-| **M7** | not started | The `crystalctl` CLI and the local browse UI. There is **no user-facing command-line tool** today — everything goes through custom resources, or through upstream `restic` directly |
-| **M8** | not started | Immutable locations. `spec.mode: Immutable` is accepted by the API, but S3 Object Lock, repository rotation and expiry are **not implemented** — it does not give you WORM |
-| **M9** | not started | Coexistence *hardening*. Coexistence itself is structural and works today; M9 adds the validated side-by-side soak against an incumbent tool, coverage-diff guidance and fleet DR drills |
+| **M7** | not started | **Reach.** Backing up storage that cannot snapshot — today a PVC on `local-path`, hostPath or plain NFS is *skipped*, which leaves most small k3s/RKE2 installations with nothing — plus restoring a single file into a running application's volume, and notifications over a generic webhook for teams without a Prometheus stack |
+| **M8** | not started | **Proof.** A `RestoreDrill` that restores your latest backup into a scratch namespace on a schedule, compares it file by file and reports — the machinery already exists as the project's own fidelity gate, but it is a CI test today, not something that runs at your site. Plus restore alerting: none of the eleven shipped rules watches a restore failing |
+| **M9** | not started | Immutable locations. `spec.mode: Immutable` is accepted by the API, but S3 Object Lock, repository rotation and expiry are **not implemented** — it does not give you WORM |
+
+**Two things left this list rather than moving down it.** The `crystalctl` CLI and the browse
+UI are no longer milestones here: they become separate projects, the CLI as a `kubectl` plugin
+and the UI as its own repository. Nothing is lost — the repository is plain restic format, so
+everything remains reachable with upstream `restic`, and no capability will ever be reachable
+*only* through them. But it does mean there is **no user-facing command-line tool today**, and
+none is coming from this repository. And coexistence *hardening* has been retired as a
+milestone because coexistence is structural and already works: distinct API group and
+namespaces, no mutation of anyone else's snapshot classes, and an alert that deliberately
+counts *every* tool's VolumeSnapshots, because during coexistence it is the incumbent's that
+fill the shared per-volume headroom. What remained of that milestone was the soak already owed
+by M6, counted a second time.
 
 The practical consequences of those gaps — and the costs the shipped design imposes on you
 whether or not the gaps close — are on

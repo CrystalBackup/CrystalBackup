@@ -59,9 +59,21 @@ sont publiés plutôt que résumés.
 | Jalon | État | Ce qu'il ajoutera |
 |---|---|---|
 | **M6** | livré en `v0.6.0` | Le catalogue complet des métriques, deux dashboards Grafana et onze règles d'alerte observées *en firing* contre un vrai Prometheus, les traces OTel à travers le pipeline, un self-check exportable, et un gate de fidélité du restore qui compare fichier par fichier un restore à sa source. Le réglage des ressources des movers par type d'opération et la revue PodSecurity passent en `0.6.1` ; le soak et le déploiement pilote n'ont pas eu lieu |
-| **M7** | pas commencé | La CLI `crystalctl` et l'UI de navigation locale. Il n'y a **aucun outil en ligne de commande destiné aux utilisateurs** aujourd'hui — tout passe par les custom resources, ou par `restic` upstream directement |
-| **M8** | pas commencé | Les locations immuables. `spec.mode: Immutable` est accepté par l'API, mais S3 Object Lock, la rotation de repository et l'expiration **ne sont pas implémentés** — cela ne vous donne pas de WORM |
-| **M9** | pas commencé | Le *durcissement* de la coexistence. La coexistence elle-même est structurelle et fonctionne aujourd'hui ; M9 ajoute le soak validé côte à côte avec un outil en place, des recommandations de diff de couverture et des exercices de DR de flotte |
+| **M7** | pas commencé | **La portée.** Sauvegarder le stockage incapable de faire des snapshots — aujourd'hui une PVC sur `local-path`, hostPath ou NFS simple est *sautée*, ce qui laisse sans rien la plupart des petites installations k3s/RKE2 — plus la restauration d'un fichier unique dans le volume d'une application qui tourne, et des notifications par webhook générique pour les équipes sans stack Prometheus |
+| **M8** | pas commencé | **La preuve.** Un `RestoreDrill` qui restaure périodiquement votre dernier backup dans un namespace jetable, le compare fichier par fichier et rapporte — la machinerie existe déjà, c'est le propre gate de fidélité du projet, mais c'est un test de CI aujourd'hui, pas quelque chose qui tourne chez vous. Plus les alertes de restauration : aucune des onze règles livrées ne surveille l'échec d'un restore |
+| **M9** | pas commencé | Les locations immuables. `spec.mode: Immutable` est accepté par l'API, mais S3 Object Lock, la rotation de repository et l'expiration **ne sont pas implémentés** — cela ne vous donne pas de WORM |
+
+**Deux choses ont quitté cette liste au lieu d'y descendre.** La CLI `crystalctl` et l'UI de
+navigation ne sont plus des jalons ici : elles deviennent des projets séparés, la CLI sous forme
+de plugin `kubectl` et l'UI dans son propre dépôt. Rien n'est perdu — le repository est au format
+restic standard, donc tout reste atteignable avec `restic` upstream, et aucune capacité ne sera
+jamais accessible *uniquement* par elles. Mais cela veut dire qu'il n'y a **aucun outil en ligne
+de commande destiné aux utilisateurs aujourd'hui**, et qu'il n'en viendra pas de ce dépôt. Et le
+*durcissement* de la coexistence a été retiré des jalons parce que la coexistence est structurelle
+et fonctionne déjà : groupe d'API et namespaces distincts, aucune mutation des classes de snapshot
+d'autrui, et une alerte qui compte délibérément les VolumeSnapshots de *tous* les outils, parce
+qu'en coexistence ce sont ceux de l'outil en place qui remplissent la réserve partagée par volume.
+Ce qu'il restait de ce jalon, c'était le soak déjà dû par M6, compté une seconde fois.
 
 Les conséquences pratiques de ces manques — et les coûts que la conception livrée vous
 impose, que ces manques soient comblés ou non — sont sur

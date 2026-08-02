@@ -69,7 +69,8 @@ Pauses naturelles pour les questions : après l'étape 4 (le checksum) et à la 
   `website/…/guides/namespace-plane.md`.
 - Les snapshots **Ceph** least-data-movement — le laptop utilise csi-hostpath ; le chemin
   Ceph est exercé par le crucible (rapports publiés).
-- `mode: Immutable` (M8), `crystalctl` (M7) — pas livrés, c'est dans les slides.
+- `mode: Immutable` (M9) — pas livré, c'est dans les slides. `crystalctl` non plus, et il
+  ne sortira pas de ce dépôt (plugin krew à part).
 
 ## Plan B (le démon de la démo existe)
 

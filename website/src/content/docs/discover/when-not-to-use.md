@@ -52,7 +52,7 @@ the implementation is not in this release.
 | Feature | State |
 |---|---|
 | **Immutable locations** (S3 Object Lock) | `spec.mode: Immutable` is accepted and a few guards exist around it, but Object Lock support, window rotation and expiry are **not implemented**. Do not use `Immutable` expecting WORM. |
-| **`crystalctl` CLI and the browse UI** | Not written. There is no user-facing command-line tool in this release. |
+| **`crystalctl` CLI and the browse UI** | Not written, and they will not ship from this repository — the CLI becomes a `kubectl` krew plugin and the UI its own project. There is no user-facing command-line tool today. Neither will ever be required: no capability is reachable only through them. |
 | **Namespace manifests through `ClusterRestore`** | A `ClusterRestore` restores cluster-scoped objects and volume data. Restoring the namespace's own workload manifests through that path is a follow-up. |
 
 ## Costs you are accepting

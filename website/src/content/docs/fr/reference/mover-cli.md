@@ -9,8 +9,13 @@ sourceHash: 28beff6f2b9908a7d7a8867090f5971c4e29a7b0
 
 `crystalctl` — le binaire autonome qui listera, parcourra, extraira et exportera depuis un
 repository sans aucune dépendance à Kubernetes, plus des helpers façon kubectl — est spécifié
-et **non implémenté**. Il sort avec M7. Il n'y a pas de `cmd/crystalctl` dans l'arbre, et
-rien à télécharger.
+et **non implémenté**. Il n'y a pas de `cmd/crystalctl` dans l'arbre, et rien à télécharger.
+
+Il ne sortira pas non plus de ce dépôt : la CLI devient un plugin `kubectl` dans son propre
+dépôt, distribué via krew, et l'UI de navigation devient un projet à part. C'est une décision
+d'empaquetage, pas un recul — la spécification est inchangée, et la contrainte qui l'accompagne
+est qu'**aucune capacité ne sera jamais accessible uniquement par la CLI**. Tout reste
+exprimable en custom resource, et tout reste lisible avec `restic` upstream.
 
 Cette page est là pour que ce soit sans ambiguïté, et pour que vous sachiez quoi utiliser à
 la place.

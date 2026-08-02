@@ -592,8 +592,9 @@ Le jour où ce projet vous déçoit,<br/><span class="grad">vous partez avec vos
 <!--
 [17:30 → 18:30]
 L'argument anti-lock-in le plus fort : la garantie de sortie n'est pas une feature,
-c'est le FORMAT. C'est aussi pour ça que le CLI (M7) n'est pas pressé : restic upstream
-EST déjà le CLI de secours. On le démontre en live dans la démo.
+c'est le FORMAT. C'est aussi pour ça que le CLI n'est pas pressé — et pour ça qu'il peut
+sortir du dépôt : restic upstream EST déjà le CLI de secours. On le démontre en live dans
+la démo.
 -->
 
 ---
@@ -759,8 +760,11 @@ class: text-center
 <!--
 [23:00 → 23:30]
 Point d'adoption crucial : personne ne remplace son outil de backup sur un coup de tête,
-et le projet ne le demande PAS. Le soak side-by-side validé est d'ailleurs un milestone
-à part entière (M9) — pas encore fait, et dit comme tel.
+et le projet ne le demande PAS. La coexistence n'est plus un milestone parce qu'elle est
+structurelle et déjà livrée — groupe d'API distinct, aucune mutation des classes de
+snapshot d'autrui, et une alerte qui compte les snapshots de TOUS les outils, parce qu'en
+coexistence ce sont ceux de l'autre qui remplissent la réserve partagée par image RBD. Ce
+qui reste dû, c'est le soak de M6 — pas encore fait, et dit comme tel.
 -->
 
 ---
@@ -1017,7 +1021,7 @@ désactiver — pas de flag, pas de Skip() conditionnel, pas de tolérance régl
 
 <v-click>
 
-<div class="qbig text-center mt-8">18 ADRs publics. 82 checks publiés.<br/><span class="grad">Vous pouvez relire chaque décision.</span></div>
+<div class="qbig text-center mt-8">20 ADRs publics. 82 checks publiés.<br/><span class="grad">Vous pouvez relire chaque décision.</span></div>
 
 </v-click>
 
@@ -1071,25 +1075,25 @@ Plan B : replay enregistré (voir demo/README.md § Plan B).
 <div class="panel problem">
 <span class="pill mb-2">M7</span>
 
-**`crystalctl` & UI de browse**
+**Le stockage sans snapshot**
 
-Aujourd'hui : CRs + `kubectl`, ou restic upstream directement.
+Une PVC sur `local-path` ou NFS simple est **sautée** — tout un parc k3s/RKE2 sans rien.
 </div>
 
 <div class="panel problem">
 <span class="pill mb-2">M8</span>
 
-**Immutabilité (S3 Object Lock)**
+**Les drills de restauration**
 
-Le champ `mode: Immutable` est accepté — **il ne donne pas de WORM aujourd'hui.**
+Comparer un restore à sa source, on sait faire — mais **en CI, pas chez vous**.
 </div>
 
 <div class="panel problem">
 <span class="pill mb-2">M9</span>
 
-**Durcissement coexistence**
+**Immutabilité (S3 Object Lock)**
 
-Le soak validé côte-à-côte avec Velero et les drills DR de flotte : **pas encore faits**.
+Le champ `mode: Immutable` est accepté — **il ne donne pas de WORM aujourd'hui.**
 </div>
 
 </div>
@@ -1105,8 +1109,13 @@ Le soak validé côte-à-côte avec Velero et les drills DR de flotte : **pas en
 <!--
 [43:00 → 44:00]
 La slide qui rend tout le reste crédible. La doc a même une page « When NOT to use it ».
-Roadmap : M7 CLI/UI, M8 Object Lock, M9 coexistence hardening → 1.0.0 comme décision
-délibérée de stabilité d'API, pas comme accident de compteur.
+Roadmap : M7 la portée (stockage sans snapshot, restore fichier, webhooks), M8 la preuve
+(drills + alertes restore), M9 Object Lock → 1.0.0 comme décision délibérée de stabilité
+d'API, pas comme accident de compteur.
+Si on demande la CLI et l'UI : elles sortent du dépôt — plugin krew et projet séparé. Rien
+n'est perdu, le repo est du restic standard, et aucune capacité ne passera jamais
+uniquement par elles. La coexistence, elle, n'est plus un jalon : elle est structurelle et
+déjà livrée, ce qu'il en restait c'était le soak déjà dû par M6.
 -->
 
 ---

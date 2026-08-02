@@ -7,8 +7,13 @@ description: The state of crystalctl, the crystal-mover container entrypoint, an
 
 `crystalctl` — the standalone binary that will list, browse, dump and export from a
 repository with no Kubernetes dependency, plus kubectl-style helpers — is specified and
-**not implemented**. It ships with M7. There is no `cmd/crystalctl` in the tree, and
-nothing to download.
+**not implemented**. There is no `cmd/crystalctl` in the tree, and nothing to download.
+
+It will not ship from this repository either: the CLI becomes a `kubectl` plugin in its own
+repository, distributed through krew, and the browse UI becomes its own project. That is a
+packaging decision, not a downgrade — the specification is unchanged, and the constraint that
+comes with it is that **no capability will ever be reachable only through the CLI**. Everything
+stays expressible as a custom resource, and everything stays readable with upstream `restic`.
 
 This page is here so that is unambiguous, and so you know what to use instead.
 
