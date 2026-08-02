@@ -213,6 +213,70 @@ func TestHighWaterKeepsThePeakAndTheSampleCount(t *testing.T) {
 	}
 }
 
+// TestPodsRanButWereNeverSampledSaysSo is the sentence a four-hour soak on a real crucible
+// cluster actually printed, beside `"pods": 57`:
+//
+//	"no repo-light mover pod ran while the collector was up"
+//
+// The status was right and the reason was false — and self-contradicting, since the same object
+// carried the count of the pods it said had not run. A reader diagnosing that soak would conclude
+// their workload was idle when what failed was the instrument.
+//
+// The two cases are distinguished here from the one fact that separates them: whether any pod of
+// that class was ever SEEN. Nothing about the sampling changes; only what the report claims.
+func TestPodsRanButWereNeverSampledSaysSo(t *testing.T) {
+	store := newTestStore(t, 1<<20)
+	start := day0.Add(time.Hour)
+	// metrics-server is healthy — it answers, with an empty list, exactly as it does for a pod
+	// that lived less than one of its scrape intervals. This is the 63-mover case: no error to
+	// record, no NotFound, simply nothing about any mover ever.
+	f := &fakeLister{
+		jobs: []batchv1.Job{moverJob("job-forget", mover.OpForget, start, time.Time{})},
+		pods: []corev1.Pod{
+			moverPod("job-forget-a", "job-forget", "worker-1", start),
+			moverPod("job-forget-b", "job-forget", "worker-2", start),
+		},
+		metrics: []podMetric{},
+	}
+	h := NewHighWater(store, f, testNS, 15*time.Second, false)
+	h.Sample(t.Context(), start.Add(15*time.Second))
+
+	marks := h.Marks(start.Add(time.Minute))
+	light := marks.Classes["repo-light"]
+	if light.Pods != 2 {
+		t.Fatalf("pods = %d, want 2 (the pods were listed; only the sampling failed)", light.Pods)
+	}
+	if light.Memory.Status != statusNotMeasured {
+		t.Fatalf("memory status = %q, want NOT_MEASURED", light.Memory.Status)
+	}
+	if strings.Contains(light.Memory.Reason, "no repo-light mover pod ran") {
+		t.Errorf("the reason contradicts the object it lives in: pods=%d yet the reason says none "+
+			"ran.\nreason: %q", light.Pods, light.Memory.Reason)
+	}
+	// It must say the pods ran, that none was sampled, WHY (metrics-server's cadence), that the
+	// obvious fix is not one — and it must stay honest that this is not a measurement of zero.
+	for _, want := range []string{
+		"2 repo-light mover pod(s) ran",
+		"was ever sampled",
+		"metrics-server",
+		"Sampling faster does not help",
+		"not a measurement of zero",
+	} {
+		if !strings.Contains(light.Memory.Reason, want) {
+			t.Errorf("the reason is missing %q:\n%q", want, light.Memory.Reason)
+		}
+	}
+
+	// The other side of the same coin: a class that genuinely saw nothing still says so.
+	heavy := marks.Classes["repo-heavy"]
+	if heavy.Pods != 0 {
+		t.Fatalf("repo-heavy pods = %d, want 0", heavy.Pods)
+	}
+	if !strings.Contains(heavy.Memory.Reason, "no repo-heavy mover pod ran") {
+		t.Errorf("a class with no pods at all must say so plainly: %q", heavy.Memory.Reason)
+	}
+}
+
 // TestNoMetricsServerIsNotMeasuredNotZero. This project has been bitten five times by an absence
 // reading as health.
 func TestNoMetricsServerIsNotMeasuredNotZero(t *testing.T) {

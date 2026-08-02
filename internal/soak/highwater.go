@@ -614,19 +614,46 @@ func (h *HighWater) Marks(now time.Time) Marks {
 		m.Classes[class] = cm
 	}
 	// A class with pods sampled but a metrics-server that never answered keeps NOT_MEASURED; a
-	// class with no pods at all says EMPTY rather than reporting a peak of zero.
+	// class with no peak of its own says why, in the words that are true of THAT class.
 	for class, cm := range m.Classes {
-		if cm.Memory.Status == statusOK && cm.MemoryPods == 0 {
-			cm.Memory = MeasuredValue{Status: statusNotMeasured, Reason: fmt.Sprintf(
-				"no %s mover pod ran while the collector was up, so there is no peak to report. "+
-					"This is not a measurement of zero", class)}
-			m.Classes[class] = cm
+		if cm.Memory.Status != statusOK || cm.MemoryPods > 0 {
+			continue
 		}
+		cm.Memory = MeasuredValue{Status: statusNotMeasured, Reason: noPeakReason(class, cm.Pods)}
+		m.Classes[class] = cm
 	}
 
 	slices.SortFunc(m.Pods, func(a, b PodMark) int { return a.FirstSeen.Compare(b.FirstSeen) })
 	slices.SortFunc(m.Jobs, func(a, b JobMark) int { return strings.Compare(a.Job, b.Job) })
 	return m
+}
+
+// noPeakReason spells the TWO ways a class ends up with no peak, because they are two different
+// findings and only one of them is about the workload.
+//
+// The first is an idle class: nothing of that shape ran. The second is a MEASUREMENT failure: pods
+// ran and not one of them was ever sampled. Reporting the first sentence over the second is a false
+// statement in the very object that carries the pod count — a soak reporting `"pods": 57` beside
+// "no repo-light mover pod ran" invites the reader to conclude their workload was idle when what
+// actually happened is that the instrument missed every one of them.
+//
+// The second case names its cause, which is structural rather than a bug in the sampling loop:
+// metrics-server exposes a pod only after its own scrape has covered it, on its own cadence, so a
+// container that lives a couple of seconds never exists for metrics.k8s.io at all. Measured on a
+// real cluster: 63 mover pods, lifetimes 0.9s to 17s, metrics-server healthy throughout and
+// answering for long-lived pods, ZERO samples on every single mover. A shorter
+// --mover-sample-interval cannot fix it — the data is not there to be sampled — which is why the
+// mover reports its own peak (mover.MoverResult) and why this stream prefers that number.
+func noPeakReason(class string, pods int) string {
+	if pods == 0 {
+		return fmt.Sprintf("no %s mover pod ran while the collector was up, so there is no peak to "+
+			"report. This is not a measurement of zero", class)
+	}
+	return fmt.Sprintf("%d %s mover pod(s) ran and NOT ONE of them was ever sampled: metrics-server "+
+		"only exposes a pod after it has scraped it, on its own cadence (~15s), so a mover that "+
+		"lives seconds never exists for metrics.k8s.io. Sampling faster does not help — the data is "+
+		"not there to be sampled. This is not a measurement of zero, and it is not a measurement of "+
+		"an idle class either", pods, class)
 }
 
 // percentile is the nearest-rank p95 over the per-pod peaks. Nearest-rank rather than an
