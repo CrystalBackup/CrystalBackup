@@ -141,6 +141,23 @@ escrow it **outside** the cluster, and provision it as a Secret yourself.
 age-keygen -o cluster-kek.txt
 ```
 
+Then provision it as a Secret in the operator namespace, under the data key `identity`:
+
+```bash
+kubectl -n crystal-backup-system create secret generic cluster-kek \
+  --from-file=identity=cluster-kek.txt
+```
+
+The whole `age-keygen` file is accepted as is — its `# created:` / `# public key:`
+comment lines included. Releases **up to 0.6.1** parse only the bare key line, and fail
+with `KEKInvalid` (`malformed secret key: mixed case`) when given the full file; on those
+versions, strip it down first:
+
+```bash
+kubectl -n crystal-backup-system create secret generic cluster-kek \
+  --from-literal=identity="$(grep '^AGE-SECRET-KEY-' cluster-kek.txt)"
+```
+
 Escrow `cluster-kek.txt` wherever you keep root secrets — a password manager, an HSM, a
 sealed envelope. **It is the input to disaster recovery.** Without it, a bucket full of
 backups is a bucket full of ciphertext.

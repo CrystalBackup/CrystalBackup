@@ -2,7 +2,7 @@
 title: Prérequis
 description: Ce que votre cluster, votre stockage et votre stockage objet doivent fournir avant d'installer Crystal Backup.
 sourceFile: src/content/docs/start/requirements.md
-sourceHash: 29a56bf478978c2cdc27a3a3f7cb2d48124a3a5b
+sourceHash: a1b1a48903f6e68c5ce69699da56ba8301b5517f
 ---
 
 ## Vérifiez votre cluster avant d'installer
@@ -151,6 +151,24 @@ Secret.
 
 ```bash
 age-keygen -o cluster-kek.txt
+```
+
+Provisionnez-la ensuite comme Secret dans le namespace de l'operator, sous la clé de
+données `identity` :
+
+```bash
+kubectl -n crystal-backup-system create secret generic cluster-kek \
+  --from-file=identity=cluster-kek.txt
+```
+
+Le fichier `age-keygen` complet est accepté tel quel — lignes de commentaires
+`# created:` / `# public key:` comprises. Les releases **jusqu'à 0.6.1** ne parsent que
+la ligne de clé nue et échouent en `KEKInvalid` (`malformed secret key: mixed case`) face
+au fichier complet ; sur ces versions, extrayez-la d'abord :
+
+```bash
+kubectl -n crystal-backup-system create secret generic cluster-kek \
+  --from-literal=identity="$(grep '^AGE-SECRET-KEY-' cluster-kek.txt)"
 ```
 
 Mettez `cluster-kek.txt` sous séquestre là où vous gardez vos secrets racines — un

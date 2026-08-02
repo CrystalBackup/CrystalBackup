@@ -1,0 +1,25 @@
+# Wave 4 — Hetzner Cloud CSI. NO VolumeSnapshotClass in this file, and unlike csi-driver-smb
+# this one CONTRADICTS the wave-4 brief, which asked for one. It cannot be written:
+#
+#   csi.hetzner.cloud does not implement CreateSnapshot at all. The chart's values.yaml contains
+#   no snapshot keys, there is no snapshotter sidecar, and the feature has been an open upstream
+#   request since 2019 and is still open.
+#     https://github.com/hetznercloud/csi-driver/issues/88
+#     https://github.com/hetznercloud/csi-driver/issues/849
+#
+# Writing a VolumeSnapshotClass with driver: csi.hetzner.cloud would make
+# Registry.findVolumeSnapshotClass match it and route the volume to csiGenericExposer, which
+# would then fail at CreateSnapshot with codes.Unimplemented — turning a clean, correct SKIPPED
+# into a hard Backup error. The absence below is what makes the operator behave correctly.
+#
+# Expected probe verdict: SKIPPED.
+#
+# ------------------------------------------------------------------------------------------
+# The StorageClass itself is created BY THE CHART (see hcloud-csi-values.yaml: storageClasses[]),
+# not here, because the chart wires the provisioner parameters and the CSIDriver together. This
+# file exists to document the deliberate omission and to keep the
+# <composant>-storage.yaml convention honest — every other driver has one, and a missing file
+# would read as "somebody forgot", which is the exact ambiguity this whole exercise is about.
+# ------------------------------------------------------------------------------------------
+#
+# Nothing to apply. Intentionally empty of objects.

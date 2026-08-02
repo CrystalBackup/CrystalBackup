@@ -1,0 +1,18 @@
+# LA TRICHE N°1 — un utilisateur crée un Backup qui référence directement la
+# ClusterBackupLocation (le dépôt DR partagé). Refusé à l'admission par la
+# ValidatingAdmissionPolicy `crystalbackup-backup-user-isolation` (R2) :
+#
+#   "a user-created Backup must reference a namespaced BackupLocation, never a
+#    ClusterBackupLocation (R2 user isolation)"
+#
+# (Le ServiceAccount de l'opérateur est exempté : ses fan-outs cluster-origin portent
+# légitimement la location cluster.)
+apiVersion: crystalbackup.io/v1alpha1
+kind: Backup
+metadata:
+  name: sneaky
+  namespace: demo
+spec:
+  locationRef:
+    kind: ClusterBackupLocation
+    name: dr-primary

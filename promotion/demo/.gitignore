@@ -1,0 +1,4 @@
+# La KEK de démo — jetable, mais on ne committe pas une clé, même de démo.
+.kek/
+# Enregistrements du plan B
+*.cast

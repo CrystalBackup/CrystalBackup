@@ -1,0 +1,28 @@
+# Wave 3 — OpenEBS LocalPV ZFS on the zpool `crucible-zpool` (created on /dev/sdc by ansible).
+#
+# Own release, own namespace, for the same reason as lvm-localpv: the wave-1 umbrella has
+# engines.local.zfs disabled, so nothing here collides with it and either wave can be replayed
+# alone.
+#
+# Node prerequisite this shares with nothing else in wave 3: the ZFS kernel module and the
+# zfsutils userspace must be present on every worker. lvm2 and thin-provisioning-tools are
+# usually already there on an Ubuntu cloud image; ZFS generally is not.
+
+crds:
+  zfsLocalPv:
+    enabled: true
+  csi:
+    volumeSnapshots:
+      # RKE2 owns the VolumeSnapshot CRDs — see openebs-hostpath-values.yaml.
+      enabled: false
+
+zfsNode:
+  nodeSelector:
+    crystalbackup.io/node-role: worker
+
+zfsController:
+  nodeSelector:
+    crystalbackup.io/node-role: worker
+
+analytics:
+  enabled: false

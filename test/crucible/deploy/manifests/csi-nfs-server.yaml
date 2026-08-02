@@ -1,0 +1,186 @@
+# Wave 1 — an in-cluster NFS server for csi-driver-nfs to export subdirectories of.
+#
+# The driver itself provisions a SUBDIRECTORY per PVC on an existing NFS share; it does not
+# bring a server. So the share has to come from somewhere, and on a cluster with no external
+# filer that means a pod. Its backing store is a ceph-block PVC — deliberately NOT hostPath:
+# the export must survive a reschedule, or every csi-nfs PVC in the cluster loses its data the
+# first time the node drains.
+#
+# Image choice: ghcr.io/obeone/nfs-server:2.2.2 (a maintained multi-arch rebuild of
+# ehough/docker-nfs-server). The image everyone copy-pastes,
+# itsthenetwork/nfs-server-alpine:12, was last pushed in 2019, is amd64-only, and its own README
+# says Kubernetes needs `privileged: true` because the author could not make capability-only mode
+# work. registry.k8s.io/volume-nfs:0.8 is worse than stale: its manifest is Docker schema 1,
+# which containerd 2.x refuses outright — it would ErrImagePull on RKE2, not run slowly.
+#   https://github.com/ehough/docker-nfs-server
+#
+# WHY 2.2.2 AND NOT 2.2.1 — this is a real bug in 2.2.1, not a version-hygiene bump, and the
+# symptom points at the wrong layer, so the evidence is recorded here.
+#
+# 2.2.1 CrashLoopBackOffs on any modern host with:
+#     ----> starting rpc.nfsd on port 2049 with 8 server thread(s)
+#     2: Unsupported version
+#     ----> ERROR: /usr/sbin/rpc.nfsd failed
+# That reads like "the kernel dropped NFSv2, so ask for v4" — and it is NOT. Setting
+# NFS_VERSION=4.2 does not help, because the entrypoint of 2.2.1 emits the offending flag
+# unconditionally (/usr/local/bin/entrypoint.sh, boot_helper_get_version_flags):
+#     local flags=('--nfs-version' "$requested_version" '--no-nfs-version' 2)
+# There is no environment variable that removes it. NFS_DISABLE_VERSION_3 only ADDS
+# `--no-nfs-version 3`; nothing guards the `2`.
+#
+# And the failure is in USERSPACE, not the kernel. Proof, run inside the 2.2.1 image with no
+# privileges at all — argument parsing happens before rpc.nfsd ever touches /proc/fs/nfsd:
+#     # rpc.nfsd --no-nfs-version 2 1   ->  "2: Unsupported version"          (dies at parse)
+#     # rpc.nfsd --no-nfs-version 3 1   ->  "Unable to access /proc/fs/nfsd"  (parsed fine)
+#     # rpc.nfsd --no-nfs-version 4 1   ->  "Unable to access /proc/fs/nfsd"  (parsed fine)
+# i.e. the image's own nfs-utils (2.6.2, Alpine, built without NFSv2) rejects `-N 2` as an
+# unknown version. Kernel 6.8 never gets a say. Loading nfsd/nfs on the workers and granting
+# privileged were both necessary for earlier failures, but neither could have fixed this one.
+#
+# 2.2.2 fixes exactly this line — the flag is simply gone:
+#     local flags=('--nfs-version' "$requested_version")
+# (verified in the 2.2.2 image; it also ships nfs-utils 2.6.3, whose rpc.nfsd still rejects
+# `-N 2`, so the fix had to be the removal and not a newer nfs-utils.)
+#
+# NFS-Ganesha was the other candidate and was rejected on evidence, not taste. A userspace
+# server would be strictly better here — no privileged flag, no /lib/modules, no host modprobe,
+# and the namespace could drop to `baseline` like csi-smb-server does. But there is no
+# maintained, pinnable Ganesha image that serves a plain static export: the only one on a
+# trusted registry is registry.k8s.io/sig-storage/nfs-provisioner:v4.0.8, whose entrypoint is a
+# dynamic PVC provisioner, whose base is Fedora 36 (EOL), and which was last built in 2022 —
+# using it would mean overriding its command to run ganesha.nfsd against a hand-written
+# ganesha.conf, i.e. running a four-year-old image in a way its maintainers never test. Trading
+# a currently-rebuilt, cosign-signed image used as designed for a stale one used off-label is
+# the wrong trade for a fixture whose privilege is already fenced into its own namespace.
+# If a maintained standalone Ganesha image appears, this is the first thing to revisit.
+#
+# Privileges: nfsd is a KERNEL service, so this pod cannot be unprivileged. Upstream's README
+# requires CAP_SYS_ADMIN ("the server needs to mount several filesystems inside the container");
+# CAP_SYS_MODULE + /lib/modules are kept so it can at least try to modprobe nfsd itself. That
+# combination forces allowPrivilegeEscalation, so the namespace is PSA-privileged.
+#
+# NOTE — wave 1 IS a node prerequisite, whatever this file used to claim. The in-container
+# modprobe does NOT work: /lib/modules is bind-mounted from the host, but the container's
+# modprobe still resolves against its own kernel release and fails with "invalid module format".
+# nfsd and nfs must already be loaded on the worker; the ansible `common` role does it and
+# persists it through /etc/modules-load.d/crucible-nfsd.conf. The privilege here buys the mounts
+# (rpc_pipefs, nfsd), not the modules.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: csi-nfs-server
+  labels:
+    # nfsd needs CAP_SYS_ADMIN; baseline/restricted would reject this pod outright.
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/audit: privileged
+    pod-security.kubernetes.io/warn: privileged
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nfs-server-data
+  namespace: csi-nfs-server
+spec:
+  accessModes: [ReadWriteOnce]
+  # ceph-block is the cluster default class from deploy.sh. Named explicitly rather than
+  # inherited: if someone ever flips the default annotation, this must not silently land on
+  # local-path — an NFS export on a node-local disk is a data-loss trap on reschedule.
+  storageClassName: ceph-block
+  resources:
+    requests:
+      storage: 20Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nfs-server
+  namespace: csi-nfs-server
+spec:
+  replicas: 1
+  # Recreate, not RollingUpdate: the data PVC is ReadWriteOnce, so a second pod could never
+  # attach it anyway — a rolling update would just deadlock on Pending.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: nfs-server
+  template:
+    metadata:
+      labels:
+        app: nfs-server
+    spec:
+      nodeSelector:
+        crystalbackup.io/node-role: worker
+      containers:
+        - name: nfs-server
+          image: ghcr.io/obeone/nfs-server:2.2.2
+          env:
+            # fsid=0 makes /nfsshare the NFSv4 pseudo-root, so clients (and the CSI driver's
+            # `share` parameter) mount "/" — see csi-nfs-storage.yaml.
+            - name: NFS_EXPORT_0
+              value: "/nfsshare *(rw,fsid=0,sync,no_subtree_check,no_auth_nlm,insecure,no_root_squash)"
+            - name: NFS_VERSION
+              value: "4.2"
+            # NFS_VERSION alone does NOT make the server v4-only: without this the startup banner
+            # reads "list of enabled NFS protocol versions: 4.2, 4.1, 4, 3" and rpc.mountd /
+            # rpc.statd / rpcbind stay reachable. The Service only publishes 2049, so a v3 client
+            # could never complete a mount anyway — it would hang on the MOUNT protocol instead of
+            # failing fast. Every csi-nfs mount is nfsvers=4.1 (csi-nfs-storage.yaml); make the
+            # server say so too.
+            - name: NFS_DISABLE_VERSION_3
+              value: "1"
+            - name: NFS_LOG_LEVEL
+              value: "INFO"
+          ports:
+            - name: nfs
+              containerPort: 2049
+              protocol: TCP
+          securityContext:
+            # Fully privileged, not just SYS_ADMIN+SYS_MODULE: nfsd needs to mount
+            # rpc_pipefs and nfsd inside its own mount namespace, and the container
+            # runtime's default AppArmor profile denies those mounts to a merely
+            # capability-elevated container ("mounting rpc_pipefs failed:
+            # Permission denied"). This pod is a TEST FIXTURE living in its own
+            # PSA-privileged namespace; nothing CrystalBackup ships needs this.
+            privileged: true
+            capabilities:
+              add: ["SYS_ADMIN", "SYS_MODULE"]
+          volumeMounts:
+            - name: data
+              mountPath: /nfsshare
+            - name: modules
+              mountPath: /lib/modules
+              readOnly: true
+          readinessProbe:
+            tcpSocket:
+              port: 2049
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: 2049
+            initialDelaySeconds: 30
+            periodSeconds: 20
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: nfs-server-data
+        - name: modules
+          hostPath:
+            path: /lib/modules
+            type: Directory
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nfs-server
+  namespace: csi-nfs-server
+spec:
+  type: ClusterIP
+  selector:
+    app: nfs-server
+  ports:
+    - name: nfs
+      port: 2049
+      targetPort: 2049
+      protocol: TCP

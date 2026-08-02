@@ -57,7 +57,13 @@ spec:
     useAllNodes: true
     useAllDevices: false
     # The hcloud volume shows up as /dev/sdb on the workers (masters have none).
-    deviceFilter: "^sd[bc]$"
+    # DELIBERATELY narrow — sdb and nothing else. Workers also carry a SECOND raw
+    # volume at /dev/sdc, carved up by the `storage_prep` ansible role for the
+    # node-local CSI drivers under test (LVM / thin-LVM / ZFS). A wider filter
+    # (`^sd[bc]$`, what this used to be) hands sdc to an OSD before the driver
+    # ever sees it, and the compatibility campaign then measures nothing.
+    # Do not widen it: add explicit device names instead.
+    deviceFilter: "^sdb$"
 ---
 apiVersion: ceph.rook.io/v1
 kind: CephBlockPool

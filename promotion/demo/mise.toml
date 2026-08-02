@@ -1,0 +1,34 @@
+# Démo meetup — outils + task runner (même pattern que test/crucible/mise.toml).
+#
+# mise active cette config en entrant dans promotion/demo (il lit les configs en
+# remontant depuis $PWD, donc le mise.toml racine du dépôt est mergé aussi).
+# `mise install` une fois ici, puis tout se pilote avec `mise run` :
+#
+#   mise run prep      # la veille, avec réseau : cluster kind + opérateur + seed
+#   mise run demo      # le jour J, offline : le déroulé interactif
+#   mise run reset     # remise à zéro entre deux répétitions
+#
+# Restent SYSTÈME (non gérés par mise) : docker (Desktop/colima), make et git —
+# utilisés par les targets e2e du dépôt que 00-prep.sh réutilise.
+[tools]
+kind = "latest"
+kubectl = "1.34"   # même pin que test/crucible
+helm = "3"
+age = "latest"     # fournit age et age-keygen
+restic = "latest"
+# "aqua:asciinema/asciinema" = "latest"   # optionnel — enregistrement du plan B
+
+[tasks.prep]
+description = "Pré-bake complet (la veille, avec réseau) : kind + infra + opérateur + seed"
+dir = "{{config_root}}"
+run = "./00-prep.sh"
+
+[tasks.demo]
+description = "Dérouler la démo (jour J, offline) — Entrée entre chaque commande"
+dir = "{{config_root}}"
+run = "./10-demo.sh"
+
+[tasks.reset]
+description = "Remise à zéro entre deux répétitions (garde cluster, opérateur, location)"
+dir = "{{config_root}}"
+run = "./99-reset.sh"

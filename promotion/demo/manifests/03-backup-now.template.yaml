@@ -1,0 +1,16 @@
+# « Un run, maintenant » — le placeholder __RUN__ est remplacé par 10-demo.sh avec un
+# nom horodaté (demo-YYYYMMDD-HHMMSS). Un nom de run réutilisé sur un dépôt qui a déjà
+# vu ce nom = RunNameCollision, échec bruyant et VOULU (cf. war story n°2 du talk) —
+# le timestamp permet de rejouer la démo à volonté sur le même dépôt.
+apiVersion: crystalbackup.io/v1alpha1
+kind: ClusterBackup
+metadata:
+  name: __RUN__
+spec:
+  locationRef:
+    name: dr-primary
+  namespaces:
+    matchNames: ["demo"]
+  includeManifests: true
+  clusterResources:
+    enabled: false

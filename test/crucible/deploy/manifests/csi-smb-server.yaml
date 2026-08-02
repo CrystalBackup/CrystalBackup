@@ -1,0 +1,144 @@
+# Wave 2 — an in-cluster Samba server for csi-driver-smb to carve subdirectories out of.
+#
+# Same shape as the NFS server (wave 1) and the same reasoning for the ceph-block PVC, with one
+# sharp difference worth noticing: smbd is entirely userspace, so this pod needs NO capabilities,
+# NO privileged flag and NO hostPath. Where the NFS server had to be PSA-privileged to run nfsd,
+# this namespace can stay `baseline`. If a lane can be satisfied by SMB instead of NFS, it is a
+# far cheaper pod to justify.
+#
+# Image: ghcr.io/servercontainers/samba, `smbd-only` variant (no avahi, no wsdd2, no netbios —
+# in-cluster discovery protocols are noise at best). Pinned BY DIGEST rather than by version tag
+# because upstream stopped publishing versioned smbd-only tags at s4.18.2 (2023) while
+# smbd-only-latest keeps being rebuilt: a version tag here would mean running a three-year-old
+# samba, and a floating tag would mean an unpinned image. The digest is both current and exact.
+#   https://github.com/ServerContainers/samba
+#
+# The `crucible` account's password is NOT in this file and never lands in the repo. deploy-csi.sh
+# generates it once, stores it in the Secret `smb-creds`, and reuses whatever is already there on
+# a replay — regenerating it would invalidate every mounted csi-smb volume in the cluster.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: csi-smb-server
+  labels:
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: smb-server-data
+  namespace: csi-smb-server
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: ceph-block
+  resources:
+    requests:
+      storage: 20Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: smb-server
+  namespace: csi-smb-server
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: smb-server
+  template:
+    metadata:
+      labels:
+        app: smb-server
+    spec:
+      nodeSelector:
+        crystalbackup.io/node-role: worker
+      # WITHOUT THIS BLOCK csi-driver-smb CANNOT PROVISION A SINGLE VOLUME, and the error names
+      # the wrong side of the connection:
+      #   ProvisioningFailed ... failed to make subdirectory:
+      #   mkdir /tmp/pvc-<uid>/pvc-<uid>: permission denied
+      # That path is inside the DRIVER's container, so it reads as a driver or node problem. It is
+      # neither. The controller's CIFS mount succeeds (the driver logs "mount ... succeeded" right
+      # before the failure); what fails is the mkdir, and the EACCES comes back over the wire from
+      # smbd. A ceph-block PVC arrives formatted and mounted root:root 0755, while smbd serves this
+      # share as the `crucible` account (UID_crucible=1000). uid 1000 cannot create anything in a
+      # root-owned 0755 directory. Verified directly on the server pod:
+      #   $ ls -ldn /share                      -> drwxr-xr-x 3 0 0 ... /share
+      #   $ su crucible -c 'mkdir /share/probe'  -> Permission denied
+      #
+      # Note that the StorageClass's dir_mode=0777/file_mode=0777/noperm do NOT help and are not
+      # meant to: those are CIFS *client* options describing how the mount is presented locally.
+      # They cannot grant the server permissions it does not have.
+      #
+      # fsGroup is the fix rather than an initContainer running chown: the kubelet applies it at
+      # mount time, it needs no extra image and no extra privilege, and it is idempotent by
+      # construction on a replay. OnRootMismatch keeps it O(1) — a full recursive chown of a
+      # 20Gi share on every pod start would make the rollout time grow with the number of
+      # provisioned volumes. smbd itself still runs as root (it binds 445, a privileged port);
+      # fsGroup only adds the supplementary group and re-owns the volume.
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      containers:
+        - name: samba
+          image: ghcr.io/servercontainers/samba@sha256:a789aa42c2e5db804fab5fb5dd5f2d4343a9a8a7789e4a191aab45e993c15d4f
+          env:
+            # ACCOUNT_<user> creates the account; the value is the password. Sourced from the
+            # Secret so it is never in a manifest, a helm value, or a log line.
+            - name: ACCOUNT_crucible
+              valueFrom:
+                secretKeyRef:
+                  name: smb-creds
+                  key: password
+            - name: UID_crucible
+              value: "1000"
+            # SAMBA_VOLUME_CONFIG_<anyname> is one smb.conf stanza; ';' becomes a newline.
+            - name: SAMBA_VOLUME_CONFIG_share
+              value: "[share]; path=/share; valid users = crucible; guest ok = no; read only = no; browseable = yes"
+            - name: WSDD2_DISABLE
+              value: "1"
+            - name: AVAHI_DISABLE
+              value: "1"
+            - name: NETBIOS_DISABLE
+              value: "1"
+            - name: SAMBA_CONF_LOG_LEVEL
+              value: "1"
+          ports:
+            - name: smb
+              containerPort: 445
+              protocol: TCP
+          volumeMounts:
+            - name: data
+              mountPath: /share
+          readinessProbe:
+            tcpSocket:
+              port: 445
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: 445
+            initialDelaySeconds: 45
+            periodSeconds: 20
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: smb-server-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: smb-server
+  namespace: csi-smb-server
+spec:
+  type: ClusterIP
+  selector:
+    app: smb-server
+  ports:
+    - name: smb
+      port: 445
+      targetPort: 445
+      protocol: TCP

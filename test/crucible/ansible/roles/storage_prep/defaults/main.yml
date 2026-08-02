@@ -1,0 +1,17 @@
+---
+# The SECOND raw hcloud volume attached to every worker (terraform:
+# hcloud_volume.csi). /dev/sdb is the Ceph OSD disk and is NEVER touched by this
+# role — the first assertion in tasks/main.yml is what enforces that, so this
+# default is not a knob: changing it fails the play on purpose.
+crucible_extra_device: /dev/sdc
+
+# Partition sizes, in sfdisk syntax. The third partition takes whatever is left.
+crucible_lvm_thick_size: 10G
+crucible_lvm_thin_size: 10G
+
+# The three backends the CSI drivers under test will be pointed at. Their names
+# are part of the campaign's contract: the driver StorageClasses reference them.
+crucible_lvm_thick_vg: crucible-vg1 # OpenEBS LocalPV LVM
+crucible_lvm_thin_vg: crucible-vg2 # TopoLVM, LINSTOR
+crucible_thinpool_lv: thinpool
+crucible_zpool: crucible-zpool # OpenEBS LocalPV ZFS

@@ -1,0 +1,72 @@
+# Wave 3 — OpenEBS LocalPV LVM StorageClass + VolumeSnapshotClass.
+#
+# WITH a VolumeSnapshotClass: local.csi.openebs.io implements CreateSnapshot via `lvcreate -s`.
+#   https://github.com/openebs/lvm-localpv/blob/develop/deploy/sample/lvmsnapclass.yaml
+#
+# THE THICK-VG CAVEAT — measured, and harsher than the capacity worry it was written for.
+#
+# The concern here used to be free extents: a snapshot of a THICK logical volume is a
+# copy-on-write snapshot carved out of the SAME volume group, so `lvcreate -s` can fail with
+# "Insufficient free space" on a full VG. That is real, but it is not what stops CrystalBackup.
+#
+# What actually happens, reproduced three times by scripts/csi-probe.sh on a VG with 10G free:
+# the snapshot is created and goes readyToUse — and then creating a volume FROM it is refused
+# outright:
+#
+#     rpc error: code = InvalidArgument
+#     desc = snapshot snapshot-<uid> is not of thin type
+#
+# lvm-localpv can only restore a snapshot into a new volume when the origin is THIN-provisioned.
+# On a thick VG the snapshot is a dead end: CrystalBackup gets as far as the temp PVC and the
+# volume never binds. So the two classes below are not a stylistic pair — the first is
+# INCOMPATIBLE with the exposure path and the second is COMPATIBLE, on the same disk, the same
+# driver and the same volume group, differing only by `thinProvision: "yes"`.
+#
+# (topolvm-thin, same wave, same disk, reaches thin provisioning by a different route and is
+# likewise compatible — which is what isolates provisioning mode as the variable that matters.)
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: openebs-lvm
+provisioner: local.csi.openebs.io
+parameters:
+  storage: lvm
+  volgroup: crucible-vg1
+  fsType: ext4
+reclaimPolicy: Delete
+allowVolumeExpansion: true
+# WaitForFirstConsumer is mandatory, not stylistic: the volume is a logical volume on ONE node's
+# /dev/sdc. Binding before the pod is scheduled would pick a node at random and then the pod
+# could not be placed anywhere else. (This does mean unmounted PVCs on this class stay Pending
+# by design — the crucible's unmounted-PVC seed cases belong on ceph-block, not here.)
+volumeBindingMode: WaitForFirstConsumer
+---
+# The same driver and the same volume group, thin-provisioned. lvm-localpv creates its own thin
+# pool inside crucible-vg1 on first use, so this needs no extra ansible preparation beyond the VG
+# — but it DOES need the dm_snapshot device-mapper target in the kernel (roles/storage_prep loads
+# it): `lvcreate --snapshot` is used even for thin origins, and without that target the
+# LVMSnapshot CR sits in Pending while NOTHING surfaces to the Kubernetes API — no status, no
+# event. The only trace is "Required device-mapper target(s) not detected in your kernel" in the
+# node agent's log.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: openebs-lvm-thin
+provisioner: local.csi.openebs.io
+parameters:
+  storage: lvm
+  volgroup: crucible-vg1
+  thinProvision: "yes"
+  fsType: ext4
+reclaimPolicy: Delete
+allowVolumeExpansion: true
+volumeBindingMode: WaitForFirstConsumer
+---
+# One VolumeSnapshotClass serves both StorageClasses: resolution is by DRIVER, not by class
+# (internal/exposer/registry.go, Registry.findVolumeSnapshotClass), so both resolve to this one.
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshotClass
+metadata:
+  name: openebs-lvm
+driver: local.csi.openebs.io
+deletionPolicy: Delete

@@ -1,0 +1,28 @@
+# Wave 4 — Piraeus / LINSTOR StorageClass + VolumeSnapshotClass.
+#
+# WITH a VolumeSnapshotClass — conditional on the thin pool, see piraeus-cluster.yaml.
+#   https://piraeus.io/docs/stable/tutorial/snapshots/
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: piraeus-thin
+provisioner: linstor.csi.linbit.com
+parameters:
+  # Must match .spec.storagePools[].name in piraeus-cluster.yaml, not the volume group name.
+  linstor.csi.linbit.com/storagePool: vg2-thin
+  # One replica. The crucible has three workers, so 2 would be defensible — but replication is
+  # DRBD's job and DRBD replication is not what this lane is qualifying: the question is whether
+  # the EXPOSURE path (snapshot -> static re-bind -> temp PVC -> read-only mount) works. One
+  # replica keeps a failure attributable to the CSI path rather than to DRBD sync state.
+  linstor.csi.linbit.com/placementCount: "1"
+  csi.storage.k8s.io/fstype: ext4
+reclaimPolicy: Delete
+allowVolumeExpansion: true
+volumeBindingMode: WaitForFirstConsumer
+---
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshotClass
+metadata:
+  name: piraeus-thin
+driver: linstor.csi.linbit.com
+deletionPolicy: Delete

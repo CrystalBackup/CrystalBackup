@@ -95,21 +95,34 @@ type AgeWrapper struct {
 // caught at build time rather than where a controller wires the two together.
 var _ Wrapper = (*AgeWrapper)(nil)
 
-// NewAgeWrapper parses a cluster KEK age identity ("AGE-SECRET-KEY-1...") into an
-// AgeWrapper. Surrounding whitespace and newlines are trimmed first because the KEK is
-// almost always read from a Kubernetes Secret or a file, both of which routinely carry a
-// trailing newline that age.ParseX25519Identity would otherwise reject. An empty (or
-// whitespace-only) input is rejected with a clear error rather than deferred to age, so a
-// missing/unmounted KEK Secret surfaces as an obvious configuration fault.
+// NewAgeWrapper parses a cluster KEK age identity into an AgeWrapper. It accepts both the
+// bare "AGE-SECRET-KEY-1..." line and the full `age-keygen -o` FILE — comment lines
+// ("# created: ...", "# public key: age1...") and blank lines included — because that file
+// is what an operator following the docs naturally puts in the Secret, and rejecting it
+// used to surface as a bech32 error ("malformed secret key: mixed case") that pointed
+// nowhere near the real cause. Parsing goes through age.ParseIdentities, the upstream
+// parser for exactly this format, so the Secret accepts whatever `age -d -i` would.
+//
+// Exactly ONE identity is required: the KEK is one key, not a keyring, and silently
+// picking one of several would leave the others looking load-bearing when they are not.
+// An empty (or whitespace-only) input is rejected with a clear error rather than deferred
+// to age, so a missing/unmounted KEK Secret surfaces as an obvious configuration fault.
 func NewAgeWrapper(kekIdentity string) (*AgeWrapper, error) {
 	trimmed := strings.TrimSpace(kekIdentity)
 	if trimmed == "" {
 		return nil, errors.New("keys: empty cluster KEK identity")
 	}
-	identity, err := age.ParseX25519Identity(trimmed)
+	identities, err := age.ParseIdentities(strings.NewReader(trimmed))
 	if err != nil {
 		// age's message never echoes the secret material, so it is safe to wrap.
 		return nil, fmt.Errorf("keys: parse cluster KEK identity: %w", err)
+	}
+	if len(identities) != 1 {
+		return nil, fmt.Errorf("keys: cluster KEK must hold exactly one age identity, found %d", len(identities))
+	}
+	identity, ok := identities[0].(*age.X25519Identity)
+	if !ok {
+		return nil, errors.New("keys: cluster KEK is not an age X25519 identity (AGE-SECRET-KEY-1...)")
 	}
 	return &AgeWrapper{identity: identity}, nil
 }

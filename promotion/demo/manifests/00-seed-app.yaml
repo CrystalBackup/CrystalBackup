@@ -1,0 +1,69 @@
+# L'appli témoin : un PVC snapshotable (csi-hostpath-sc) + un writer qui pose un canari.
+# Un second PVC sur la StorageClass `standard` (local-path, sans snapshots CSI) est monté
+# exprès : son phase `Skipped / CSISnapshotUnsupported` dans le status du Backup est un
+# talking point de la démo (« jamais un drop silencieux »).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: demo
+  labels:
+    crystalbackup.io/protect: "true"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: data
+  namespace: demo
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: csi-hostpath-sc
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: legacy
+  namespace: demo
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: standard
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: writer
+  namespace: demo
+spec:
+  containers:
+    - name: sh
+      image: busybox:1.36
+      command:
+        - sh
+        - -c
+        - |
+          # Idempotent EXPRÈS : après un ClusterRestore, ce pod est ré-appliqué par-dessus
+          # le PVC restauré — il ne doit JAMAIS écraser un canari existant, sinon la
+          # preuve byte-for-byte de la démo compare un fichier fraîchement réécrit.
+          if [ ! -f /data/canary.txt ]; then
+            echo "les-donnees-de-prod-du-tenant $(date -u +%Y%m%dT%H%M%SZ)" > /data/canary.txt
+            sha256sum /data/canary.txt > /data/MANIFEST.sha256
+          fi
+          [ -f /legacy/old.txt ] || echo "vieux-fichiers" > /legacy/old.txt
+          sleep infinity
+      volumeMounts:
+        - name: data
+          mountPath: /data
+        - name: legacy
+          mountPath: /legacy
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: data
+    - name: legacy
+      persistentVolumeClaim:
+        claimName: legacy

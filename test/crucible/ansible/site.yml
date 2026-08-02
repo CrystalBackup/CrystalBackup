@@ -58,6 +58,15 @@
   roles:
     - common
 
+# Before RKE2, not after: this partitions the workers' second raw disk and builds
+# the LVM/thin/ZFS backends the node-local CSI drivers under test consume. Those
+# devices must be settled before the kubelet starts, or a CSI node plugin can come
+# up looking at a volume group that does not exist yet and cache the absence.
+- name: Prepare the extra raw disk on the workers (LVM / thin LVM / ZFS)
+  hosts: workers
+  roles:
+    - storage_prep
+
 - name: Install RKE2 servers (first bootstraps, others join)
   hosts: masters
   serial: 1

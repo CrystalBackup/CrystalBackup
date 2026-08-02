@@ -1,0 +1,58 @@
+# Wave 4 — Rook CephNFS.
+#
+# ############################################################################################
+# #  DISPOSABLE LANE ONLY. This is the one manifest in this whole directory that modifies an  #
+# #  ALREADY-DEPLOYED component of the crucible instead of adding an isolated one.            #
+# ############################################################################################
+#
+# Two facts make it dangerous on the standard crucible:
+#
+#  1. Creating a CephNFS makes Ceph create the built-in `.nfs` RADOS pool, where all Ganesha
+#     daemons keep their shared export configuration. Rook creates it with Ceph defaults —
+#     replicated (it MUST be replicated, never erasure-coded), so it multiplies its footprint by
+#     the replica count. The crucible's Ceph cluster is 3x40 GB. That is not a lot of headroom
+#     for an unplanned pool, and Ceph's response to running low is to raise nearfull/backfillfull
+#     flags, which is HEALTH_WARN.
+#     https://rook.io/docs/rook/latest/Storage-Configuration/NFS/nfs-advanced/
+#
+#  2. `HEALTH_OK` is a HARD GATE in deploy.sh: it polls the CephCluster and exits non-zero if the
+#     cluster has not reached HEALTH_OK within CEPH_HEALTH_TIMEOUT. So degrading Ceph here does
+#     not merely add a warning — it makes the NEXT full crucible deploy on this cluster FAIL,
+#     with an error that points at rook and says nothing about NFS. That is why wave 4 refuses to
+#     run without CRUCIBLE_WAVE4_CONFIRM=yes and why the lane must be torn down, not reused.
+#
+# Prerequisite already satisfied by deploy.sh: a CephFilesystem named `cephfs` exists
+# (ceph-cluster.yaml) and backs the exports.
+#
+# The other in-place modification wave 4 makes lives in deploy-csi.sh rather than here, because
+# it is a patch and not an object: ROOK_CSI_ENABLE_NFS must be flipped to "true" in the
+# rook-ceph-operator-config ConfigMap. It defaults to "false", and without it Rook deploys no NFS
+# provisioner at all, so the StorageClass below would sit there provisioning nothing.
+# (CSI_ENABLE_NFS_SNAPSHOTTER is a different key and already defaults to "true" — it only decides
+# whether the snapshotter sidecar joins the NFS provisioner pod.)
+apiVersion: ceph.rook.io/v1
+kind: CephNFS
+metadata:
+  name: crucible-nfs
+  namespace: rook-ceph
+spec:
+  server:
+    # One Ganesha daemon. Rook supports several but documents that it "cannot guarantee high
+    # availability" across them, and a second daemon is a second consumer of a cluster that is
+    # already tight on capacity.
+    active: 1
+    logLevel: NIV_INFO
+    placement:
+      nodeAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms:
+            - matchExpressions:
+                - key: crystalbackup.io/node-role
+                  operator: In
+                  values: ["worker"]
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "256Mi"
+      limits:
+        memory: "1Gi"

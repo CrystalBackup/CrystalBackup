@@ -1,0 +1,24 @@
+# Values de démo : le S3 est IN-CLUSTER (SeaweedFS, ns crystalbackup-e2e, port 8333),
+# donc dans les CIDRs privés que les NetworkPolicies du chart ferment par défaut.
+# On garde les policies ACTIVES (elles font partie du modèle de confinement des movers)
+# et on déclare l'exception explicitement — « the default is closed and the exception
+# is visible here » (values.yaml du chart). Les kind récents appliquent réellement les
+# NetworkPolicies (kindnet embarque kube-network-policies) : sans ces règles, l'opérateur
+# ne peut même pas sonder l'endpoint (Reachable=False).
+networkPolicy:
+  extraOperatorEgress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: crystalbackup-e2e
+      ports:
+        - protocol: TCP
+          port: 8333
+  extraMoverEgress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: crystalbackup-e2e
+      ports:
+        - protocol: TCP
+          port: 8333

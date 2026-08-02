@@ -1,0 +1,7 @@
+# Dépendances et artefacts de build Slidev — `npm install` / `npm run build|export`
+# les régénèrent ; rien de tout ça n'est une source.
+node_modules/
+dist/
+slides-export.pdf
+slides-export.pptx
+.slidev/

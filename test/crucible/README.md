@@ -18,14 +18,22 @@ Anyone with a Hetzner Cloud project can run it — see
 ```
                         Hetzner Cloud (fsn1, private net 10.10.0.0/16)
    ┌──────────────────────────────────────────────────────────────────┐
-   │  crucible-master-1..3 (cpx32)       crucible-worker-1..3 (cpx42)  │
+   │  crucible-master-1..3 (cpx32)       crucible-worker-1..3 (cpx42) │
    │  ─ RKE2 servers (HA etcd)           ─ RKE2 agents                │
-   │  ─ ceph MON + MGR                   ─ ceph OSD (raw 40G volume)  │
+   │  ─ ceph MON + MGR                   ─ ceph OSD  (sdb, raw 40G)   │
    │                                     ─ ceph MDS + toolbox         │
    │                                     ─ longhorn disks             │
+   │                                     ─ CSI disks (sdc, raw 30G)   │
    └──────────────────────────────────────────────────────────────────┘
         + S3 bucket on Hetzner Object Storage (backup target)
 ```
+
+Each worker carries **two** raw hcloud volumes. `/dev/sdb` is Ceph's — rook's
+`deviceFilter` is pinned to `^sdb$` for exactly that reason. `/dev/sdc` belongs to
+the node-local CSI drivers under test: the `storage_prep` ansible role splits it
+into `crucible-vg1` (thick LVM), `crucible-vg2/thinpool` (thin LVM) and the
+`crucible-zpool` ZFS pool, so a driver can be installed against a real backend
+without borrowing Ceph's disk. Size it with `TF_VAR_extra_volume_size`.
 
 Storage classes exercised by the seed and the tests:
 
@@ -47,8 +55,12 @@ Storage classes exercised by the seed and the tests:
 
 ## 💶 Cost & lifetime
 
-Defaults (3× cpx32 + 3× cpx42 + 3× 40 GB volumes + 6 IPv4) run **≈ €0.52/hour ≈
-€12.5/day** (≈ €370/month if forgotten!) — a ~2 h validation session is about €1.
+Defaults (3× cpx32 + 3× cpx42 + 3× 40 GB + 3× 30 GB volumes + 6 IPv4) run
+**≈ €0.53/hour ≈ €12.6/day** (≈ €375/month if forgotten!) — a ~2 h validation
+session is about €1. The second volume per worker is **negligible**: 3 × 30 GB at
+€0.044/GB/month is €3.96/month, i.e. €0.0055/hour — under 1 % of the bill, and
+about 1 cent on a full-day session. Volumes are the cheap part; the servers and
+the clock are not.
 The cheaper Intel `cx` line and the ARM `cax` line aren't creatable in fsn1 today
 (`hcloud datacenter describe fsn1-dc14` → `server_types.available`); override
 `TF_VAR_master_type` / `TF_VAR_worker_type` if your location offers something
@@ -274,7 +286,9 @@ and `m2` restore specs verify integrity against it, byte for byte.
 ## Troubleshooting
 
 - **Ceph stuck short of `HEALTH_OK`** — `mise run ssh crucible-worker-1`,
-  check `/dev/sdb` exists and is raw; then
+  check `/dev/sdb` exists and is raw (`/dev/sdc` is the CSI campaign's disk and is
+  *meant* to be partitioned — if an OSD landed on it, someone widened
+  `deviceFilter`); then
   `kubectl -n rook-ceph logs -l app=rook-ceph-operator --tail=100` and
   `kubectl -n rook-ceph exec deploy/rook-ceph-tools -- ceph -s`.
 - **A phase failed mid-way** — every phase is idempotent; fix and re-run it.

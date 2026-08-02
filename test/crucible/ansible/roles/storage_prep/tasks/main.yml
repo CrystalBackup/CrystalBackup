@@ -1,0 +1,286 @@
+---
+# Carve the workers' second raw disk into the three backends the node-local CSI
+# drivers under test need. They cannot share one: LVM wants a VG, TopoLVM wants
+# a thin pool, ZFS wants the whole block device.
+#
+#   /dev/sdc1   10G    VG crucible-vg1, thick        -> OpenEBS LocalPV LVM
+#   /dev/sdc2   10G    VG crucible-vg2 + thinpool    -> TopoLVM (LINSTOR on lane 4)
+#   /dev/sdc3   rest   zpool crucible-zpool          -> OpenEBS LocalPV ZFS
+#
+# Runs BEFORE rke2 in site.yml: the devices must exist before the kubelet — and
+# any CSI node plugin it later starts — first looks at them.
+#
+# Plain command:/shell: throughout, like `common` does for modprobe: this repo
+# runs bare ansible-core with NO collections, so community.general's lvg / lvol /
+# parted / zpool modules (which would do this in four tasks) are not available.
+#
+# Replayability is a hard requirement — `mise run cluster` is re-run after every
+# fix — so sfdisk is gated on `creates:` and every create step is gated on a
+# `failed_when: false` probe of the object it would create. A second run must
+# report zero changed.
+
+# ---------------------------------------------------------------------------
+# Guard 1 — we are aimed at the right disk at all.
+# ---------------------------------------------------------------------------
+- name: Refuse to prepare any disk but the dedicated CSI one
+  ansible.builtin.assert:
+    that:
+      - crucible_extra_device == "/dev/sdc"
+    fail_msg: >-
+      storage_prep is aimed at {{ crucible_extra_device }}, not /dev/sdc.
+      /dev/sdb on these workers carries the Ceph OSDs; partitioning it destroys
+      the cluster's whole data plane, and this role partitions what it is given.
+      Refusing to run. If the disk genuinely moved, confirm with
+      `lsblk -o NAME,SIZE,FSTYPE,SERIAL` on the node and fix the terraform
+      attachment order (servers.tf) rather than this default.
+
+- name: Look for the extra CSI disk
+  ansible.builtin.stat:
+    path: "{{ crucible_extra_device }}"
+  register: crucible_extra_disk
+
+# Not a failure: the role must stay playable on a cluster provisioned before the
+# second volume existed. `mise run infra` then `mise run cluster` picks it up.
+- name: Note that this node has no extra CSI disk, so there is nothing to prepare
+  ansible.builtin.debug:
+    msg: >-
+      {{ crucible_extra_device }} is absent on {{ inventory_hostname }} — this
+      cluster predates the second hcloud volume (terraform: hcloud_volume.csi).
+      Skipping storage_prep entirely; run `mise run infra` and then
+      `mise run cluster` again to get the LVM/thin/ZFS backends.
+  when: not crucible_extra_disk.stat.exists
+
+- name: Prepare the extra CSI disk
+  when: crucible_extra_disk.stat.exists
+  block:
+    # Recorded rather than asserted on: it costs nothing and it puts the size and
+    # serial of the disk we are about to partition in the run log, which is the
+    # first thing anyone will want if a device name ever moved.
+    - name: Record which disk is about to be prepared
+      ansible.builtin.command:
+        cmd: "lsblk --nodeps --noheadings --output NAME,SIZE,SERIAL {{ crucible_extra_device }}"
+      register: crucible_extra_disk_id
+      changed_when: false
+
+    - name: Report the disk about to be prepared
+      ansible.builtin.debug:
+        msg: "storage_prep target -> {{ crucible_extra_disk_id.stdout | trim }}"
+
+    # -----------------------------------------------------------------------
+    # Guard 2 — the disk is blank, or carries ONLY what a previous run of this
+    # role put there.
+    #
+    # Nothing outside the guest names these disks: Hetzner attaches them and the
+    # kernel enumerates them in attach order, so sdb and sdc *can* trade places.
+    # If that ever happens after Ceph is up, /dev/sdc is a live OSD — it will
+    # show a ceph_bluestore signature or sit in a `ceph-<uuid>` VG, and both are
+    # rejected below. Four cheap probes, one loud assert.
+    # -----------------------------------------------------------------------
+    - name: Collect the filesystem signatures present on the extra disk
+      ansible.builtin.shell:
+        cmd: "lsblk --noheadings --output FSTYPE {{ crucible_extra_device }} | sort -u"
+      register: crucible_extra_fstypes
+      changed_when: false
+
+    - name: Collect anything mounted from the extra disk
+      ansible.builtin.shell:
+        cmd: "lsblk --noheadings --output MOUNTPOINT {{ crucible_extra_device }} | sort -u"
+      register: crucible_extra_mounts
+      changed_when: false
+
+    - name: Collect the LVM volume groups already claiming a slice of the extra disk
+      ansible.builtin.shell:
+        cmd: "pvs --noheadings --options pv_name,vg_name 2>/dev/null | awk -v d={{ crucible_extra_device }} '$1 ~ \"^\" d {print $2}' | sort -u"
+      register: crucible_extra_vgs
+      changed_when: false
+
+    - name: Collect the ZFS pool labels already on the extra disk
+      ansible.builtin.shell:
+        cmd: "lsblk --noheadings --output FSTYPE,LABEL {{ crucible_extra_device }} | awk '$1 == \"zfs_member\" {print $2}' | sort -u"
+      register: crucible_extra_zlabels
+      changed_when: false
+
+    - name: Refuse to partition a disk that is not blank and not ours
+      ansible.builtin.assert:
+        that:
+          - crucible_extra_fstypes.stdout_lines | map('trim') | select() | list | difference(['LVM2_member', 'zfs_member']) | length == 0
+          - crucible_extra_mounts.stdout_lines | map('trim') | select() | list | length == 0
+          - crucible_extra_vgs.stdout_lines | map('trim') | select() | list | difference([crucible_lvm_thick_vg, crucible_lvm_thin_vg]) | length == 0
+          - crucible_extra_zlabels.stdout_lines | map('trim') | select() | list | difference([crucible_zpool]) | length == 0
+        fail_msg: >-
+          {{ crucible_extra_device }} on {{ inventory_hostname }} already carries
+          something this role did not put there — signatures=
+          {{ crucible_extra_fstypes.stdout_lines | map('trim') | select() | list }},
+          mounts={{ crucible_extra_mounts.stdout_lines | map('trim') | select() | list }},
+          volume groups={{ crucible_extra_vgs.stdout_lines | map('trim') | select() | list }},
+          zpools={{ crucible_extra_zlabels.stdout_lines | map('trim') | select() | list }}.
+          STOPPING before the partitioning step. The likeliest cause is that sdb
+          and sdc traded places (the guest names disks in attach order, Hetzner
+          does not), which would make this the Ceph OSD disk. Check
+          `lsblk -o NAME,SIZE,FSTYPE,SERIAL` on the node; if the OSD disk is now
+          sdc, do NOT re-run this role — fix the attachment first.
+
+    # -----------------------------------------------------------------------
+    # Partition table: one sfdisk call writes all three.
+    # `creates:` on the LAST partition makes the whole step a no-op on replay.
+    # --wipe flags keep sfdisk from ever stopping at an interactive prompt (its
+    # stdin is this script — a prompt would eat a partition line); guard 2 above
+    # is what makes that safe, since nothing foreign gets this far.
+    # GPT names are cosmetic, but they make `lsblk -o NAME,PARTLABEL` on the node
+    # explain itself without this file.
+    # -----------------------------------------------------------------------
+    - name: Partition the extra disk (thick LVM / thin LVM / ZFS)
+      ansible.builtin.shell:
+        cmd: |
+          set -e
+          sfdisk --wipe always --wipe-partitions always {{ crucible_extra_device }} <<'PARTITIONS'
+          label: gpt
+          size={{ crucible_lvm_thick_size }}, name=crucible-lvm-thick
+          size={{ crucible_lvm_thin_size }}, name=crucible-lvm-thin
+          name=crucible-zfs
+          PARTITIONS
+          udevadm settle
+        creates: "{{ crucible_extra_device }}3"
+
+    # -----------------------------------------------------------------------
+    # Backend 1 — thick LVM volume group (OpenEBS LocalPV LVM).
+    # -----------------------------------------------------------------------
+    - name: Check whether the thick volume group already exists
+      ansible.builtin.command:
+        cmd: "vgs --noheadings {{ crucible_lvm_thick_vg }}"
+      register: crucible_vg_thick
+      changed_when: false
+      failed_when: false
+
+    # vgcreate initialises the PV itself. No `--yes`, deliberately: if LVM finds
+    # a signature it did not expect it must abort on the (unanswerable, no tty)
+    # prompt rather than wipe it.
+    - name: Create the thick volume group on the first partition
+      ansible.builtin.command:
+        cmd: "vgcreate {{ crucible_lvm_thick_vg }} {{ crucible_extra_device }}1"
+      when: crucible_vg_thick.rc != 0
+      changed_when: true
+
+    # -----------------------------------------------------------------------
+    # Backend 2 — thin-provisioned LVM (TopoLVM, and LINSTOR on lane 4).
+    # -----------------------------------------------------------------------
+    - name: Check whether the thin volume group already exists
+      ansible.builtin.command:
+        cmd: "vgs --noheadings {{ crucible_lvm_thin_vg }}"
+      register: crucible_vg_thin
+      changed_when: false
+      failed_when: false
+
+    - name: Create the thin volume group on the second partition
+      ansible.builtin.command:
+        cmd: "vgcreate {{ crucible_lvm_thin_vg }} {{ crucible_extra_device }}2"
+      when: crucible_vg_thin.rc != 0
+      changed_when: true
+
+    # dm_thin_pool has to be in the kernel before lvcreate can build the pool —
+    # and again on every boot before a node plugin can activate a thin LV. Same
+    # plain-command + modules-load.d pattern `common` uses for iscsi_tcp.
+    # dm_thin_pool for the pool itself; dm_snapshot because OpenEBS LocalPV LVM takes
+    # snapshots with `lvcreate --snapshot`, which needs the device-mapper SNAPSHOT target
+    # even when the origin LV is thin. Without it the LVMSnapshot CR sits in Pending
+    # forever and the CSI layer reports NOTHING — the only trace is
+    # "Required device-mapper target(s) not detected in your kernel" in the node agent's
+    # log, which is why both are loaded here rather than left to the first driver that
+    # happens to need them.
+    - name: Load the device-mapper kernel modules now
+      ansible.builtin.command: "modprobe {{ item }}"
+      loop:
+        - dm_thin_pool
+        - dm_snapshot
+      changed_when: false
+
+    - name: Persist the device-mapper modules across reboots
+      ansible.builtin.copy:
+        dest: /etc/modules-load.d/crucible-thinpool.conf
+        content: "dm_thin_pool\ndm_snapshot\n"
+        mode: "0644"
+
+    - name: Check whether the thin pool already exists
+      ansible.builtin.command:
+        cmd: "lvs --noheadings {{ crucible_lvm_thin_vg }}/{{ crucible_thinpool_lv }}"
+      register: crucible_thinpool
+      changed_when: false
+      failed_when: false
+
+    # 95%VG, not 100%: the remaining extents are where LVM puts the thin pool's
+    # metadata LV (and its spare). Ask for the whole VG and lvcreate fails with a
+    # message about extents that reads like a sizing bug rather than a recipe one.
+    - name: Create the thin pool across 95% of the thin volume group
+      ansible.builtin.command:
+        cmd: "lvcreate --type thin-pool --extents 95%VG --name {{ crucible_thinpool_lv }} {{ crucible_lvm_thin_vg }}"
+      when: crucible_thinpool.rc != 0
+      changed_when: true
+
+    # -----------------------------------------------------------------------
+    # Backend 3 — ZFS. LAST on purpose.
+    #
+    # zfsutils-linux pulls the kernel module in, which is by far the heaviest and
+    # most fragile thing this role does (and why it is installed here, on workers
+    # only, rather than in `common`). Everything above is already built and usable
+    # by the time we get here, so a node whose kernel has no zfs.ko loses the ZFS
+    # backend and nothing else.
+    # -----------------------------------------------------------------------
+    - name: Install the ZFS userland and kernel module (workers only — it is heavy)
+      ansible.builtin.apt:
+        name: zfsutils-linux
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Load the zfs kernel module now
+      ansible.builtin.command: modprobe zfs
+      register: crucible_zfs_modprobe
+      changed_when: false
+      failed_when: false
+
+    # Loud, but NOT fatal. An assert here would drop the host from every later
+    # play, so a worker that cannot load zfs.ko would never get rke2_agent: we
+    # would lose a whole node over an optional test backend. The three ZFS tasks
+    # below are gated instead, and the campaign records the ZFS lane as
+    # unavailable rather than the cluster as one node short.
+    - name: Report that the ZFS backend will be unavailable on this node
+      ansible.builtin.debug:
+        msg: >-
+          `modprobe zfs` failed on {{ inventory_hostname }}
+          (rc={{ crucible_zfs_modprobe.rc }}):
+          {{ crucible_zfs_modprobe.stderr | default('') | trim }}.
+          The ZFS backend — zpool {{ crucible_zpool }}, consumed by OpenEBS
+          LocalPV ZFS — will be UNAVAILABLE on this node. The two LVM backends
+          ({{ crucible_lvm_thick_vg }}, {{ crucible_lvm_thin_vg }}/{{ crucible_thinpool_lv }})
+          were prepared before this step and are unaffected. Usual cause on
+          Ubuntu 24.04: no zfs.ko built for the running kernel — check
+          `dkms status`, `uname -r`, and whether the node is running an older
+          kernel than the one the zfs module was built against (a reboot after a
+          kernel upgrade fixes that case).
+      when: crucible_zfs_modprobe.rc != 0
+
+    - name: Persist the zfs module across reboots
+      ansible.builtin.copy:
+        dest: /etc/modules-load.d/crucible-zfs.conf
+        content: "zfs\n"
+        mode: "0644"
+      when: crucible_zfs_modprobe.rc == 0
+
+    - name: Check whether the ZFS pool already exists
+      ansible.builtin.command:
+        cmd: "zpool list {{ crucible_zpool }}"
+      register: crucible_zpool_state
+      changed_when: false
+      failed_when: false
+      when: crucible_zfs_modprobe.rc == 0
+
+    # No -f: if the partition carries a label zpool does not expect, it must
+    # refuse rather than overwrite it. ashift=12 pins 4K sectors — hcloud volumes
+    # report 512, and a pool created at ashift=9 cannot be changed afterwards.
+    - name: Create the ZFS pool on the third partition
+      ansible.builtin.command:
+        cmd: "zpool create -o ashift=12 {{ crucible_zpool }} {{ crucible_extra_device }}3"
+      when:
+        - crucible_zfs_modprobe.rc == 0
+        - crucible_zpool_state.rc | default(1) != 0
+      changed_when: true

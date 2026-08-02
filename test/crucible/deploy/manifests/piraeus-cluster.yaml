@@ -1,0 +1,40 @@
+# Wave 4 — Piraeus / LINSTOR cluster + satellite configuration.
+#
+# Backing store: the SAME VG as TopoLVM, `crucible-vg2`, and the same pre-created thin pool
+# `thinpool`. Wave 3 and wave 4 must therefore never be up at once on the same nodes — two
+# drivers carving logical volumes out of one thin pool will overprovision it and the first one to
+# hit the ceiling gets I/O errors, not a clean failure. deploy-csi.sh refuses `all` past wave 3
+# for this reason among others.
+#
+# Thin is not an aesthetic choice here — it is what makes snapshots possible at all:
+#   "LINSTOR supports snapshots for LVM_THIN, FILE_THIN, ZFS and ZFS_THIN pools."
+#   https://piraeus.io/docs/stable/tutorial/snapshots/
+# Plain thick LVM is absent from that list, so crucible-vg1 could not have backed this lane.
+#
+# Omitting `source:` from the storage pool is deliberate and is the documented way to say "the
+# backing pool already exists, do not create it":
+#   "If it exists, the storage pool is registered as-is. If it does not exist and no source is
+#    configured, the storage pool is not registered. Instead, the Configured condition of the
+#    LinstorSatellite reports that it is waiting for the backing pool to appear."
+#   https://piraeus.io/docs/stable/reference/linstorsatelliteconfiguration/#specstoragepools
+# So a typo in the VG name shows up as a stuck `Configured` condition on the LinstorSatellite —
+# a readable symptom rather than LINSTOR helpfully wiping and recreating a volume group.
+---
+apiVersion: piraeus.io/v1
+kind: LinstorCluster
+metadata:
+  name: linstorcluster
+spec: {}
+---
+apiVersion: piraeus.io/v1
+kind: LinstorSatelliteConfiguration
+metadata:
+  name: crucible-thin
+spec:
+  nodeSelector:
+    crystalbackup.io/node-role: worker
+  storagePools:
+    - name: vg2-thin
+      lvmThinPool:
+        volumeGroup: crucible-vg2
+        thinPool: thinpool
