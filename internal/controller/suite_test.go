@@ -72,6 +72,16 @@ var (
 	testEnv   *envtest.Environment
 	ctx       context.Context
 	cancel    context.CancelFunc
+	// cachedReader is the manager's client — the SHARED INFORMER CACHE every reconciler below
+	// Gets and Lists through, as opposed to k8sClient, which talks straight to the apiserver.
+	//
+	// A spec that seeds a fixture with k8sClient and then immediately provokes a reconcile has
+	// created an object the reconciler cannot see yet: the two paths are different connections,
+	// and nothing orders the fixture's watch event ahead of the poke's. Asserting on what the
+	// controller did with that fixture is then a coin toss — measured at ~10% wrong on this
+	// suite (see the Forbid spec in backupschedule_controller_test.go). Waiting on this reader
+	// is how a spec states "the controller can now see it" instead of assuming it.
+	cachedReader client.Reader
 	// repoQueue is the process-wide per-repository exclusive work queue the BackupRepository
 	// reconciler drives init through. It is created in BeforeSuite (bound to the suite ctx) and
 	// Stop()ped in AfterSuite so its worker goroutines are joined — a leaked worker would keep
@@ -192,6 +202,7 @@ var _ = BeforeSuite(func() {
 		HealthProbeBindAddress: "0",
 	})
 	Expect(err).NotTo(HaveOccurred())
+	cachedReader = mgr.GetClient()
 
 	Expect((&ClusterBackupLocationReconciler{
 		Client: mgr.GetClient(),
