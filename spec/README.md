@@ -56,6 +56,7 @@ Architecture Decision Records live in [adr/](adr/). Key ones:
 - [0016 — Restore execution: operator-namespace movers, PV-level target exposure, server-side snapshot resolution](adr/0016-restore-execution-and-target-exposure.md)
 - [0017 — Cascade materialization: `Backup` carries identity, pulls its run configuration](adr/0017-cascade-materialization-backup-carries-identity.md)
 - [0019 — No scoped object-storage credentials for movers; credential handling stays backend-neutral](adr/0019-no-scoped-mover-credentials.md)
+- [0020 — CLI and UI ship as separate repositories; the API types become an importable module](adr/0020-cli-and-ui-as-separate-repositories.md)
 
 ## Research
 

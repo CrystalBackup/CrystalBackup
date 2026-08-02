@@ -1,6 +1,12 @@
 # ADR 0008 — UI strategy: local thick client first, hosted multi-tenant console later
 
 Status: **Accepted** (2026-07-11; realigned to the two-plane cascade model 2026-07-12)
+Amended by [adr/0020](0020-cli-and-ui-as-separate-repositories.md) (2026-08-02): the **packaging**
+decisions below are superseded — the UI ships as its own repository rather than from this one, and
+`crystalctl ui` is dropped since the CLI also leaves and the UI is not a subcommand of it. The
+**architecture** decided here is unchanged and still binding on the external implementation:
+repositories are opened server-side, keys and credentials never reach the browser, and a
+cluster-origin backup is served under a non-forgeable `namespace=` tag filter.
 
 ## Context
 

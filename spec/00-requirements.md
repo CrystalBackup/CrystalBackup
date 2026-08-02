@@ -147,8 +147,13 @@ backlog (§6) and its number is not reused.
    manifests, hooks, verification, metrics, cluster DR + repository discovery.
 2. Namespace-plane locations (user's own storage + own key), then **external sync** to a
    secondary location (R28) — a bonus resilience layer, scheduled after restore.
-3. **CLI + UI: lower priority** (agreed). The reversibility promise (R8) is already met by the
-   repository being standard restic (readable with upstream `restic`), so `crystalctl` is a
-   convenience — the CLI and the local browse UI land **together in M7**; long-term UI =
-   Rancher extension or Headlamp plugin. See [06-cli.md](06-cli.md), [07-ui.md](07-ui.md).
-4. Immutable-mode implementation: later milestones.
+3. **CLI + UI: out of this repository** (decided 2026-08-02,
+   [adr/0020](adr/0020-cli-and-ui-as-separate-repositories.md)). The reversibility promise (R8) is
+   already met by the repository being standard restic (readable with upstream `restic`), so
+   neither is a guarantee this repository owes. The UI becomes its own project; the CLI becomes a
+   `kubectl` krew plugin in its own repository. Both are **optional** access paths: no capability
+   may be reachable only through them. R9 is therefore satisfied by the product, not by this
+   repository. See [06-cli.md](06-cli.md), [07-ui.md](07-ui.md).
+4. **Reach then proof**: storage without CSI snapshots, file-level restore and notifications (M7),
+   then automated restore drills and restore alerting (M8).
+5. Immutable-mode implementation: M9.

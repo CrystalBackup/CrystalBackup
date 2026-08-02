@@ -1,8 +1,14 @@
 # CLI — `crystalctl`
 
-Status: draft v2 (two-plane cascade + de-brand); the whole `crystalctl` binary ships in **M7**
-(reprioritized with the UI — the repo being standard restic already guarantees R8 reversibility,
-so the CLI is a convenience: [90-roadmap.md](90-roadmap.md)). Naming contract: [02-api.md](02-api.md).
+Status: draft v2 (two-plane cascade + de-brand). **The CLI ships from a separate repository**, as a
+`kubectl` krew plugin, and no longer from this one (decided 2026-08-02,
+[adr/0020](adr/0020-cli-and-ui-as-separate-repositories.md)) — the repo being standard restic
+already guarantees R8 reversibility, so the CLI is a convenience rather than a guarantee this
+repository owes. This document remains the **contract** the external implementation follows; what
+changed is where the code lives, not what it does. Two constraints travel with it: no capability
+may be reachable *only* through the CLI, and it consumes the object definitions through the
+`github.com/CrystalBackup/CrystalBackup/api` module (split out in M7). Naming contract:
+[02-api.md](02-api.md).
 Engine choice: [adr/0001](adr/0001-repository-engine-restic-format.md). Model rationale:
 [adr/0009](adr/0009-shared-cluster-repo-tag-tenancy.md).
 

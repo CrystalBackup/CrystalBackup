@@ -4,11 +4,17 @@ Status: agreed direction (two-plane cascade rework, 2026-07-12); estimates refin
 milestone kickoff. Naming contract: [02-api.md](02-api.md); model rationale:
 [adr/0009](adr/0009-shared-cluster-repo-tag-tenancy.md).
 Priorities per [00-requirements.md §7](00-requirements.md): core two-plane path (incl.
-**cluster DR** + discovery) → namespace-plane locations/keys + **external sync** → **CLI + UI
-together** (lower priority; R8 reversibility is already met by the repo being standard restic) →
-immutable mode. Cluster DR is now **core** (M1), no longer deferred; coexistence with other
-backup tools is a standing guarantee, **not** a replacement project
+**cluster DR** + discovery) → namespace-plane locations/keys + **external sync** → observability
+→ **reach** (storage without snapshots, file-level restore, notifications) → **proof** (restore
+drills and alerting) → immutable mode. Cluster DR is now **core** (M1), no longer deferred;
+coexistence with other backup tools is a standing guarantee, **not** a replacement project
 ([adr/0006](adr/0006-coexistence-with-backup-tools.md)).
+
+**Re-prioritised 2026-08-02** (M7–M9). The CLI and the UI leave this repository entirely
+([adr/0020](adr/0020-cli-and-ui-as-separate-repositories.md)) — R8 reversibility is already met by
+the repo being plain restic, so neither is a guarantee this repository owes. M7 becomes reach, M8
+becomes proof, M9 becomes immutability, and coexistence hardening is retired as a deliverable
+because it is already structural.
 
 Each milestone ends **releasable**: tagged image + Helm chart, e2e suite green, docs
 updated. Definition of Done at the bottom applies to every task. Lessons folded in from
@@ -375,21 +381,117 @@ and neither is the soak, which is the honest reason 0.6.0 is a testing release. 
 remaining bullets move to 0.6.1: mover resources by operation type with the cache `sizeLimit`
 decision and the millions-of-files load test, and the VSC ↔ RBD reconciliation with RGW tuning.
 
-## M7 — CLI & UI v1 (R8, R9 — lower priority, agreed)
+**Status as of 0.6.1, and the plan to close it (2026-08-02).** Mover resources by operation type
+shipped. What is still open splits three ways, and conflating them is what let it drift:
 
-- [ ] `crystalctl` CLI (R8): `repo snapshots|ls|dump|export --tar|restore|stats` against S3 +
-      key without Kubernetes (wraps restic; documented upstream-command equivalence for
-      reversibility — [06-cli.md](06-cli.md)); the `backup`/`restore`/`admin` kubeconfig subtrees
-      (incl. the `admin erase|decommission` wrappers over the M5 CRs); e2e byte-compares the
-      `repo export --tar` output against source.
-- [ ] `crystalctl ui`: local Go binary serving the browse SPA on localhost (list backups,
-      browse trees, download file/dir as stream/zip) via `internal/browse` — packages designed
-      for reuse by a future Rancher extension / Headlamp plugin ([07-ui.md](07-ui.md),
-      [adr/0008](adr/0008-ui-strategy.md)).
-- [ ] Later (post-v1, separate decision): hosted multi-tenant backend + Rancher extension or
-      Headlamp plugin with OIDC.
+- **Code — scheduled as `0.6.2`, before M7 opens.** The VSC ↔ RBD reconciliation, trash monitoring
+  and the active pre-check before VolumeSnapshot creation (delta 9), and the S3 RGW tuning
+  (delta 13). Carrying code from milestone to milestone is the mechanism that produced the
+  announced-but-inert features of the M5 lot E; it gets its own patch instead.
+- **Measurements — needs real infrastructure.** The millions-of-files load test and the
+  restic-vs-rustic revisit ([adr/0001](adr/0001-repository-engine-restic-format.md)) that depends
+  on it. This is what would turn the conservative mover ceilings into measured numbers.
+- **Activities — run in parallel, they block nothing.** The PodSecurity review (whose answer is
+  already known: the operator satisfies `restricted`, the mover cannot, so `enforce: baseline` in
+  `crystal-backup-system` is a constraint rather than caution), the two-week soak alongside an
+  incumbent, and the pilot rollout. These are the two unmet exit criteria, and they are calendar
+  work, not engineering work.
 
-## M8 — Immutable locations (R18 — design done in the M0 API, implementation here)
+## M7 — Reach: storage without snapshots, file-level restore, notifications (0.7)
+
+**Re-scoped 2026-08-02.** M7 previously stacked the CLI and the UI under one number; both now
+ship as separate repositories ([adr/0020](adr/0020-cli-and-ui-as-separate-repositories.md)) and
+M7 becomes the milestone that **widens the addressable estate**. The ordering rationale: a CSI
+that cannot snapshot leaves a cluster with nothing at all today, which is a larger gap than any
+convenience layer, and the mover placement this milestone builds is the prerequisite for
+file-level restore.
+
+- [ ] **Degraded mode for storage without snapshots** — a `filesystem-direct` exposer registered
+      in the existing cascade (`cephfs-shallow` / `csi-generic` / `rook-rbd-direct` are unchanged),
+      backing up the **live** filesystem with restic instead of a snapshot. Delivered in **two
+      stages, and the seam is what de-risks the milestone**:
+      - **unmounted volumes first** — no writer, so the copy is genuinely consistent rather than
+        merely crash-consistent, and there is no placement constraint at all. `rexposer.attachedNode`
+        already returns the empty node name when a PV has no attachment, which is exactly the free-
+        scheduling behaviour this needs;
+      - **mounted volumes second** — this half carries the whole cost: the mover must land on the
+        node holding the RWO attachment, the copy is **not** crash-consistent, and the perception
+        guardrails live here. Explicit opt-in per PVC or per schedule (**never** a silent fallback
+        from the snapshot path), a consistency field on `status.volumes[]` (not a doc note), a
+        distinct metric and alert so an operator can see how many backups are degraded, and
+        quiescence hooks documented as the only way to recover some consistency.
+      A PVC in `Pending` under `WaitForFirstConsumer` has no PV and therefore nothing to back up:
+      **skipped cleanly**, never waited on.
+- [ ] **Mover placement** (promoted from the backlog): pin the mover to the node where the volume
+      is attached, reusing the `VolumeAttachment` resolution already written for restore
+      (`internal/rexposer`), including its refusals — no single attached node, or a not-ready node,
+      means free scheduling rather than a guaranteed `Pending` wedge.
+- [ ] **File-level restore**: restore a single file or directory into a PVC **already mounted** by
+      a running application. Cheap once placement exists, but it inherits the *mounted* half's
+      constraints, not the unmounted half's.
+- [ ] **Notifications outside Prometheus**: a generic webhook, deliberately **not** a connector per
+      destination (Slack/Discord/mail are a bottomless scope) and **no message templating** — a
+      stable, versioned JSON envelope the receiver formats. Delivery is handled by a **separate
+      notifier component** so the egress opens for it alone and the operator's own NetworkPolicy
+      stays narrow: a tenant-supplied webhook URL otherwise lets a tenant direct operator egress,
+      which points straight at the `clusterInternalCIDRs` confinement
+      ([03-security-and-tenancy.md §7](03-security-and-tenancy.md)). Chart values constrain the
+      notifier's own policy (default egress open, tightenable).
+- [ ] **`api/` split into its own Go module** (`github.com/CrystalBackup/CrystalBackup/api`) so the
+      external CLI and UI repositories can import the object definitions without inheriting the
+      operator's dependency graph or Go floor — **before either repository exists**, because the
+      import path becomes a breaking change for both once they do
+      ([adr/0020](adr/0020-cli-and-ui-as-separate-repositories.md)). Ships with the test that keeps
+      `api/` free of `internal/` imports and of dependencies beyond `k8s.io/apimachinery`.
+
+**Decisions to take at milestone start, not now**: whether notifier delivery is durable (which
+decides whether it is a stateless Deployment or needs state) and the exact webhook payload —
+specifically what must never leave, since a namespace name is a customer name; and who wins when
+an application starts while the mover holds an unmounted RWO volume.
+
+## M8 — Proof: restore drills, restore alerting, cluster-scoped DR hardening (0.8)
+
+**Why after M7 and not before**: drills *consume* the restore path, and M7 modifies it (placement,
+file-level restore). Building the verification on a path that has just changed is worse than
+building it once the path has settled. This milestone also reverses an M4 decision — M4 recorded
+that restore-testing stays the administrator's job with no automated canary — and that reversal is
+deliberate: an untested backup is not a backup, and "we tested it" is a different claim from
+"it tests itself at your site".
+
+- [ ] **`RestoreDrill`** — restore the latest backup of a namespace into a scratch namespace on a
+      schedule, compare fingerprints, tear down, report. Most of the machinery exists: the m6
+      fidelity gate (`test/crucible/tests/m6_fidelity_test.go`) already compares content, modes,
+      setuid/setgid/sticky bits, numeric ownership, xattrs, POSIX ACLs, nanosecond mtimes, sym- and
+      hard links, sparse files and non-ASCII names, and it restores into a namespace that **does
+      not exist** so nothing pre-existing can mask a failure. The work is lifting it out of the test
+      harness and giving it a CR, a status, metrics and an alert.
+      **Same-cluster only.** No inter-cluster communication: making the operator orchestrate a
+      second cluster would mean credentials to another cluster's API for what is a verification
+      feature. The cross-cluster rebuild path stays a **harness activity** (the crucible), which is
+      where it already lives. Restoring under a *different* StorageClass was considered as a way to
+      weaken the "it worked because the identifiers were still right" effect and **rejected**: it
+      changes volumeMode, filesystem and topology, so a failure would no longer distinguish the
+      backup from the StorageClass — and for a verification mechanism a false failure is worse than
+      a false pass, because a gate that cries wolf gets disabled.
+- [ ] **Restore alerting** (the corollary, and it must ship with the drills): none of the eleven
+      shipped rules covers restore, and `crystalbackup_restore_failures_total` is read by no rule
+      at all. Prerequisite: `RestoreStatus` has no `completionTime` (unlike `BackupStatus`), so
+      the same start-vs-end drift already fixed for `Backup` would otherwise apply; the counter
+      also needs the state-derived companion that
+      `crystalbackup_backup_last_failure_timestamp_seconds` has, against the materialise-at-1 flaw.
+- [ ] **Cluster-scoped DR hardening** (R22, moved here from M9 — it is restore reliability, so it
+      belongs with the drills): default-allowlist review, guidance on excluding GitOps-managed
+      resources (ArgoCD/Flux) at restore time, coverage audit
+      ([adr/0011](adr/0011-cluster-scoped-dr.md)).
+
+**Decisions to take at milestone start**: drills by **frequency** or by **sampling** — frequency
+has a constant cost and a coverage that decays as the estate grows, sampling follows the estate but
+needs a rotation policy or the same volumes are always the ones proven; where the drill restores
+and who pays for the scratch storage; cleanup guaranteed even if the operator dies mid-drill;
+cluster-plane, namespace-plane or both; and whether a failed drill only alerts or also marks the
+backup.
+
+## M9 — Immutable locations (R18 — design done in the M0 API, implementation here)
 
 - [ ] Immutable mode: S3 Object Lock bucket support, repo rotation (`rotationPeriod`),
       forget-only bookkeeping, expired-repo deletion, lock-file strategy (`--no-lock` reads;
@@ -401,22 +503,30 @@ decision and the millions-of-files load test, and the VSC ↔ RBD reconciliation
 - [ ] e2e with **Ceph RGW Object Lock**: erasure blocked then completing; rotation retiring an
       expired repo.
 
-## M9 — Coexistence hardening & DR drills (R22)
+## Coexistence — no longer a milestone
 
-Cluster DR — including cluster-scoped capture & selective restore
-([adr/0011](adr/0011-cluster-scoped-dr.md)) — already ships in M1/M3; this milestone hardens the
-side-by-side coexistence guarantees and the fleet DR drills. **Replacing another backup tool is an
-operator decision, not a project deliverable** ([adr/0006](adr/0006-coexistence-with-backup-tools.md)).
+The former M9 coexistence-hardening bullet is **retired as a deliverable**, because coexistence is
+structural and already shipped. [adr/0006](adr/0006-coexistence-with-backup-tools.md) states that
+the interesting surface is *shared infrastructure, not CRDs*, and the mechanisms are in place: a
+distinct API group with a denied-namespaces deny-list, distinct namespaces/identities/repositories,
+no mutation of any `VolumeSnapshotClass` or of the cluster default, a `crystal-` prefix on every
+VS/VSC the operator creates with manipulation restricted to its own objects, schedule-offset
+guidance, and the `CrystalbackupPVCSnapshotPileup` alert — whose predicate counts **everyone's**
+VolumeSnapshots on purpose, because during coexistence it is the incumbent's snapshots that stack
+up against the shared ceph-csi headroom (`--minsnapshotsonimage` 250 → background flatten,
+`--maxsnapshotsonimage` 450 → `ResourceExhausted`).
 
-- [ ] Cluster-scoped DR **hardening**: default-allowlist review, guidance on excluding
-      GitOps-managed resources (ArgoCD/flux) at restore time, coverage audit
-      ([adr/0011](adr/0011-cluster-scoped-dr.md)).
-- [ ] DR restore drills: full-namespace fleet `ClusterRestore` onto a rebuilt cluster
-      (repo-only bootstrap, namespaces recreated), RTO measurement, runbook.
-- [ ] Coexistence validation: run side-by-side with an incumbent tool (e.g. Velero) with no
-      interference (distinct snapshots/repos/namespaces; snapshot-count headroom). **Operator
-      guidance** (coverage-diff, DR-drill harness) for teams who *choose* to consolidate onto
-      Crystal Backup — no forced decommission, no tool-specific parity gate.
+What remains is not a deliverable: **running side by side with an incumbent and observing** is the
+M6 soak, which is already owed and should not be counted twice; and **coverage-diff guidance** for
+teams choosing to consolidate is a documentation page. The one thing no design can fix — snapshot
+headroom per RBD image is finite and shared — is instrumented and documented, not boundable.
+
+## DR drills at fleet scale — backlog
+
+Full-namespace fleet `ClusterRestore` onto a rebuilt cluster (repo-only bootstrap, namespaces
+recreated), RTO measurement and runbook. Distinct from M8's `RestoreDrill`, which proves the
+repository holds restorable bytes; this proves the **rebuild** path, needs a second cluster, and is
+therefore a harness/ops activity rather than a product feature.
 
 ## Backlog / future (not scheduled)
 
@@ -430,11 +540,37 @@ Recorded in [00-requirements.md §6](00-requirements.md); no milestone yet.
   unmounted).
 - **Mover placement on `[Cluster]BackupLocation`** (`nodeAffinity`/`tolerations` near the S3
   endpoint — bandwidth / IO cost / network segmentation); admin-unrestricted, tenant
-  governance-gated ([02-api.md](02-api.md)).
+  governance-gated ([02-api.md](02-api.md)). **Not** the placement M7 builds: this one steers
+  movers toward the *storage endpoint* as a policy on the location, while M7 pins a mover to the
+  node holding a volume's attachment because an RWO cannot be mounted twice. Same word, unrelated
+  mechanisms — if both ever exist, the M7 constraint wins, since it is a correctness requirement
+  and this one is an optimisation.
 - **Preferred backup window** (was R27; removed from v1 2026-07-15). If re-introduced, model it
   as **`start` + `duration`** (unambiguous across midnight), not `start`/`end`, with a skip
   Event/metric and a `WindowUnsatisfiable` controller condition
   ([00-requirements.md §6](00-requirements.md)).
+- **Volume quotas per tenant** (arbitrated to the backlog 2026-08-02). Per-tenant metrics exist
+  (`crystalbackup_backup_protected_bytes`); nothing bounds. The blocker is not technical but
+  political and unanswered: on overrun, refuse the backup (and lose the data), accept it and
+  alert, or degrade retention? Adopting it also amends [00-requirements.md §6](00-requirements.md),
+  where storage quotas are explicitly out of scope for v1.
+- **Opt-in telemetry and crash reporting** (arbitrated to the backlog 2026-08-02). The Ceph model:
+  separately-enabled channels (`ident`, `basic`, `crash`), a command that shows the exact payload
+  before it is sent, re-consent on schema change, immediate revocation, announced retention. It
+  would be an **admin** decision through a Helm value and an operator flag, never a namespaced CR —
+  the same asymmetry as the refusal of an operator key slot on a user repository
+  ([adr/0004](adr/0004-encryption-key-management.md)). The redaction primitive already exists and
+  is tested (self-check HMAC over a per-report random salt never written into the report). Two hard
+  parts: **no namespace name may ever leave** — a namespace name is a customer name, so
+  cluster-level aggregates only — and stack traces carry object names, paths and sometimes
+  repository URLs, so a `crash` channel needs dedicated scrubbing rather than a `recover()` that
+  posts. **The real cost is the receiving infrastructure**, not the client: endpoint, storage,
+  retention, a published privacy policy and someone who actually reads the data. Do not start the
+  client before deciding who runs the server.
+- **Application hook presets** (PostgreSQL, MySQL, MongoDB). Small, high perceived value — the
+  generic exec hooks are already good, but everyone rewrites the same `pg_start_backup`. The trap
+  to avoid: a preset that suggests a *database-aware* backup, which the project explicitly does not
+  do. The label stays "quiescence", never "Postgres backup".
 
 ## Global Definition of Done (every task)
 
