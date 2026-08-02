@@ -203,7 +203,8 @@ What to produce, per **operation class** (`data`, `repo-heavy`, `repo-light`, `m
 
 | mark | source | note |
 |---|---|---|
-| peak memory per mover pod | `metrics.k8s.io` PodMetrics, sampled every `--mover-sample-interval` | keep the max per pod, then the max and the p95 per class |
+| peak memory per mover pod | the mover's own `MoverResult`, read off the terminated pod's termination message | **the source that works** — exact, and available for pods no sampler can see. See "Why polling cannot answer this" below |
+| peak memory per mover pod (fallback) | `metrics.k8s.io` PodMetrics, sampled every `--mover-sample-interval` | keep the max per pod, then the max and the p95 per class. This is the highest SAMPLE, not the peak |
 | OOM kills | pod `containerStatuses[].lastState.terminated.reason == OOMKilled` | definitive, always available, and the one number that says a limit is too low |
 | evictions | pod phase `Failed`, reason `Evicted`, plus the kubelet message | the emptyDir-over-limit kill lands here, naming the volume and the number |
 | restic cache high-water | kubelet `stats/summary`, per-pod volume stats | `--kubelet-stats` only; otherwise NOT MEASURED |
@@ -222,7 +223,40 @@ a different claim from a peak from four hundred.
 
 If `metrics.k8s.io` is absent (no metrics-server), record the memory marks as **NOT MEASURED**
 with the reason. Not zero, not omitted. This project has been bitten five times by an absence
-reading as health.
+reading as health. And distinguish the two ways a class ends up with no peak: **no pod of that
+class ran** (an idle class) versus **pods ran and none was ever sampled** (a measurement
+failure). Saying the first over the second is a false statement in the same object that carries
+the pod count.
+
+### Why polling cannot answer this, and what does
+
+Measured on a real crucible cluster over four hours: **63 mover pods, every one of them 0
+samples**, lifetimes from 0.9s to 17s, with metrics-server installed, healthy, and returning data
+for long-lived pods throughout. The cause is structural, not a bug in the sampling loop —
+metrics-server scrapes on its own ~15s cadence and exposes a pod only after it has scraped it, so
+a container that lives one second never exists for it. **Sampling faster changes nothing: the
+data is not there to be sampled.**
+
+The mover therefore measures itself and reports through the channel that already exists. Its
+`MoverResult` gains, and this stream prefers:
+
+| field | what it is | what it means |
+|---|---|---|
+| `peakRSSBytes` | restic's peak resident set (`ru_maxrss`, RUSAGE_CHILDREN) | **the sizing number.** Anonymous + mapped, no page cache — what a memory limit must cover |
+| `shimPeakRSSBytes` | the same for the crystal-mover process | resident at the same time, so a limit covers the SUM |
+| `cgroupPeakBytes` | cgroup v2 `memory.peak` | **an upper bound, not a sizing target.** It is the peak of `memory.current`, which counts reclaimable PAGE CACHE; a backup streams a volume through it, so this can sit an order of magnitude above the RSS peak, and the kernel reclaims that cache long before it OOM-kills anything |
+| `memoryLimitHits` | `memory.events` `max` | 0 ⇒ the limit was never pressed, so a large cgroup peak is cache the container was merely allowed to keep |
+| `memoryOOMKills` | `memory.events` `oom_kill` | not redundant with the kubelet's `OOMKilled`: when restic is killed and the shim survives to report, Kubernetes records no OOM anywhere |
+
+Constraints this has to respect, and does: the termination message is capped at **4096 bytes**
+(`mover.Fit` is applied last, after the figures are stamped), **cgroup v1 is deliberately not
+reported** (its `memory.max_usage_in_bytes` exists, but in the host cgroup namespace v1 uses,
+nothing inside the container distinguishes its own directory from the NODE's), and an unreadable
+cgroup leaves the figure absent rather than zero. The RSS peaks need no cgroup at all, so a v1
+node still gets the number that sizes a limit.
+
+Every figure in `marks.json` names its provenance in `classes[].memory.source`:
+`mover-reported` or `sampled`. Never inferred from which field happens to be populated.
 
 ## 6. Redaction — at export, not at collection
 

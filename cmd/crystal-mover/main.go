@@ -216,6 +216,18 @@ func report(path string, result mover.MoverResult) {
 	// collector that hangs must never be the reason the kubelet sees no result and the controller
 	// concludes the mover was hard-killed.
 	flushTracing()
+
+	// What this mover cost, measured HERE because this is the last moment that exists: the cgroup
+	// peak has to cover restic AND a manifest apply that runs after it, and the whole point of
+	// reporting it from inside is that nothing outside can see a container that lived nine
+	// seconds. Every reader that does not answer leaves its field absent, so this can add a
+	// number but can never turn a result into a failure. The meaning goes to the pod log, where a
+	// human is; the numbers go on the wire, where the soak is.
+	figures := collectMemoryFigures(cgroupRoot, procSelfCgroup)
+	fmt.Fprintln(os.Stderr, describeMemory(figures))
+	// Stamp the figures and re-fit, in that order and last of all: see finalize.
+	result = finalize(result, figures)
+
 	if err := writeResult(path, result); err != nil {
 		// If we cannot write the termination log the controller will read a blank message and
 		// (correctly, per ParseMoverResult) treat the run as failed; log loudly so the pod log

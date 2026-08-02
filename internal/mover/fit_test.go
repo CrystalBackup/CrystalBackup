@@ -123,6 +123,109 @@ func TestFitClampsAVerboseReason(t *testing.T) {
 	}
 }
 
+// TestMemoryFiguresCannotPushAResultOverTheCap. The memory figures were added to a message that
+// already had a size discipline, and the failure mode of getting this wrong is silent: past 4096
+// bytes the kubelet truncates, the JSON stops parsing, and a successful restore is recorded as a
+// mover that never reported.
+//
+// Every figure is set to the largest int64 there is — a value no cgroup will ever hold — so the
+// assertion is about the BUDGET rather than about plausible numbers.
+func TestMemoryFiguresCannotPushAResultOverTheCap(t *testing.T) {
+	const huge = int64(9223372036854775807)
+	for _, n := range []int{0, 1, 100, 1000} {
+		t.Run(fmt.Sprintf("%d entries", n), func(t *testing.T) {
+			got := MoverResult{
+				OK: true, Operation: string(OpManifestsRestore),
+				RestoredResources: int32(n), FailedResources: 7,
+				ResourceEntries:  entries(n, "Configured"),
+				PeakRSSBytes:     huge,
+				ShimPeakRSSBytes: huge,
+				CgroupPeakBytes:  huge,
+				MemoryLimitHits:  huge,
+				MemoryOOMKills:   huge,
+				MemorySource:     MemorySourceBoth,
+			}.Fit()
+
+			encoded, err := got.Encode()
+			if err != nil {
+				t.Fatalf("Encode() = %v", err)
+			}
+			if len(encoded) > TerminationMessageLimit {
+				t.Errorf("encoded length %d exceeds the %d-byte kubelet cap", len(encoded),
+					TerminationMessageLimit)
+			}
+			if _, err := ParseMoverResult(encoded); err != nil {
+				t.Errorf("ParseMoverResult() = %v, want a clean round trip", err)
+			}
+			// The figures themselves are never what gets trimmed: they are a fixed handful of
+			// bytes and they are the payload this whole channel was extended for.
+			if got.PeakRSSBytes != huge || got.CgroupPeakBytes != huge || got.MemorySource == "" {
+				t.Errorf("Fit dropped a memory figure: %+v", got)
+			}
+		})
+	}
+}
+
+// TestMemoryFiguresFitTheSizeMargin bounds what the figures cost.
+//
+// Fit already counts them — encodedLen encodes the whole result — so this is not what keeps the
+// message under the cap; the test above is. What this one rules out is the case Fit cannot trim
+// its way out of: a result with NO entries to drop, where the only thing between the payload and
+// the kubelet's cap is the margin. The figures must stay inside it.
+func TestMemoryFiguresFitTheSizeMargin(t *testing.T) {
+	const huge = int64(9223372036854775807)
+	bare := MoverResult{OK: true, Operation: string(OpBackup)}
+	withMemory := bare
+	withMemory.PeakRSSBytes = huge
+	withMemory.ShimPeakRSSBytes = huge
+	withMemory.CgroupPeakBytes = huge
+	withMemory.MemoryLimitHits = huge
+	withMemory.MemoryOOMKills = huge
+	withMemory.MemorySource = MemorySourceBoth
+
+	cost := withMemory.encodedLen() - bare.encodedLen()
+	if cost > resultSizeMargin {
+		t.Errorf("the memory block costs %d bytes at its largest, over the %d-byte margin Fit "+
+			"leaves under the cap", cost, resultSizeMargin)
+	}
+	t.Logf("worst-case memory block: %d bytes of the %d-byte margin", cost, resultSizeMargin)
+}
+
+// TestMemoryFiguresRoundTrip: the fields must survive the wire, and must be OMITTED when absent —
+// a zero peak on the wire would read as "this mover used no memory" at the far end, which is the
+// absence-reads-as-a-measurement failure the whole change exists to avoid.
+func TestMemoryFiguresRoundTrip(t *testing.T) {
+	in := MoverResult{
+		OK: true, Operation: string(OpBackup), SnapshotID: "abc123",
+		PeakRSSBytes: 412 << 20, ShimPeakRSSBytes: 9 << 20, CgroupPeakBytes: 3 << 30,
+		MemoryLimitHits: 4, MemoryOOMKills: 1, MemorySource: MemorySourceBoth,
+	}
+	encoded, err := in.Encode()
+	if err != nil {
+		t.Fatalf("Encode() = %v", err)
+	}
+	out, err := ParseMoverResult(encoded)
+	if err != nil {
+		t.Fatalf("ParseMoverResult() = %v", err)
+	}
+	if out.PeakRSSBytes != in.PeakRSSBytes || out.ShimPeakRSSBytes != in.ShimPeakRSSBytes ||
+		out.CgroupPeakBytes != in.CgroupPeakBytes || out.MemoryLimitHits != in.MemoryLimitHits ||
+		out.MemoryOOMKills != in.MemoryOOMKills || out.MemorySource != in.MemorySource {
+		t.Errorf("round trip lost a figure:\n got %+v\nwant %+v", out, in)
+	}
+
+	plain, err := MoverResult{OK: true, Operation: string(OpForget)}.Encode()
+	if err != nil {
+		t.Fatalf("Encode() = %v", err)
+	}
+	for _, field := range []string{"peakRSSBytes", "cgroupPeakBytes", "memorySource",
+		"memoryLimitHits", "memoryOOMKills", "shimPeakRSSBytes"} {
+		if strings.Contains(plain, field) {
+			t.Errorf("an unmeasured result carries %q: %s", field, plain)
+		}
+	}
+}
+
 func TestFitLeavesASmallReportAlone(t *testing.T) {
 	// The common case: a handful of interesting outcomes, well under budget, reported whole.
 	in := MoverResult{

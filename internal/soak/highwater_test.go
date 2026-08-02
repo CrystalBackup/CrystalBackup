@@ -213,6 +213,170 @@ func TestHighWaterKeepsThePeakAndTheSampleCount(t *testing.T) {
 	}
 }
 
+// terminatedWith stamps a mover's own MoverResult onto a pod the way the kubelet does: the bytes
+// the container wrote to /dev/termination-log, hung on the terminated container status.
+func terminatedWith(pod corev1.Pod, r mover.MoverResult) corev1.Pod {
+	encoded, err := r.Encode()
+	if err != nil {
+		panic(err)
+	}
+	pod.Status.ContainerStatuses = []corev1.ContainerStatus{{
+		Name: "mover",
+		State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+			Reason: "Completed", ExitCode: 0, Message: encoded,
+		}},
+	}}
+	return pod
+}
+
+// TestTheMoversOwnPeakIsPreferredOverTheSampledOne is the whole point of the mover measuring
+// itself: it produces a peak on a cluster where the sampler produced none, which is every real
+// cluster.
+//
+// metrics-server here is healthy and answers with an empty list, exactly as it does for a pod
+// that lived less than one scrape interval — the 63-of-63 case. The peak still lands, exactly,
+// because it came from the process that ran.
+func TestTheMoversOwnPeakIsPreferredOverTheSampledOne(t *testing.T) {
+	store := newTestStore(t, 1<<20)
+	start := day0.Add(time.Hour)
+	pod := terminatedWith(moverPod("job-backup-1", "job-backup", "worker-1", start), mover.MoverResult{
+		OK: true, Operation: string(mover.OpBackup), SnapshotID: "abc",
+		PeakRSSBytes: 412 << 20, ShimPeakRSSBytes: 11 << 20, CgroupPeakBytes: 3900 << 20,
+		MemoryLimitHits: 0, MemoryOOMKills: 0, MemorySource: mover.MemorySourceBoth,
+	})
+	f := &fakeLister{
+		jobs:    []batchv1.Job{moverJob("job-backup", mover.OpBackup, start, time.Time{})},
+		pods:    []corev1.Pod{pod},
+		metrics: []podMetric{},
+	}
+	h := NewHighWater(store, f, testNS, 15*time.Second, false)
+	h.Sample(t.Context(), start.Add(15*time.Second))
+
+	marks := h.Marks(start.Add(time.Minute))
+	data := marks.Classes["data"]
+	if data.Memory.Status != statusOK {
+		t.Fatalf("memory status = %q (%s); the mover reported its own peak", data.Memory.Status,
+			data.Memory.Reason)
+	}
+	if data.Memory.Source != sourceMover {
+		t.Errorf("memory source = %q, want %q: a reader must never have to wonder whether they "+
+			"are looking at a sample or a measurement", data.Memory.Source, sourceMover)
+	}
+	if data.ReportedPeakRSSBytes != 412<<20 {
+		t.Errorf("reported peak RSS = %d, want %d", data.ReportedPeakRSSBytes, int64(412)<<20)
+	}
+	if data.ReportedCgroupPeakBytes != 3900<<20 {
+		t.Errorf("reported cgroup peak = %d, want %d", data.ReportedCgroupPeakBytes, int64(3900)<<20)
+	}
+	if data.ReportedShimPeakRSSBytes != 11<<20 {
+		t.Errorf("the shim's own contribution was dropped: %d", data.ReportedShimPeakRSSBytes)
+	}
+	if data.ReportedPods != 1 || data.ReportedPeakPod != "job-backup-1" {
+		t.Errorf("reportedPods/%q = %d/%q", "reportedPeakPod", data.ReportedPods, data.ReportedPeakPod)
+	}
+	// The sampled fields stay empty and stay SEPARATE — the two are not the same quantity and
+	// must never be folded into one number.
+	if data.PeakMemoryBytes != 0 || data.MemoryPods != 0 {
+		t.Errorf("a sampled peak appeared from nowhere: %d over %d pods", data.PeakMemoryBytes,
+			data.MemoryPods)
+	}
+	// And the reason must state the meaning, or the cgroup peak gets read as a sizing target and
+	// somebody raises a limit that was never the constraint.
+	for _, want := range []string{
+		"RESIDENT SET", "page cache", "NOT a sizing target", "limit was never reached",
+	} {
+		if !strings.Contains(data.Memory.Reason, want) {
+			t.Errorf("the reason is missing %q:\n%s", want, data.Memory.Reason)
+		}
+	}
+}
+
+// TestAMoverReportedPeakSurvivesNoMetricsServerAtAll. This is the configuration the measurement
+// was built for: no metrics-server, nothing to poll, and the answer arrives anyway because the
+// process that ran wrote it down.
+func TestAMoverReportedPeakSurvivesNoMetricsServerAtAll(t *testing.T) {
+	store := newTestStore(t, 1<<20)
+	start := day0.Add(time.Hour)
+	pod := terminatedWith(moverPod("job-prune-1", "job-prune", "worker-1", start), mover.MoverResult{
+		OK: true, Operation: string(mover.OpPrune),
+		PeakRSSBytes: 2 << 30, MemoryLimitHits: 3, MemoryOOMKills: 1,
+		MemorySource: mover.MemorySourceBoth, CgroupPeakBytes: 8 << 30,
+	})
+	f := &fakeLister{
+		jobs: []batchv1.Job{moverJob("job-prune", mover.OpPrune, start, time.Time{})},
+		pods: []corev1.Pod{pod},
+		metricsErr: apierrors.NewNotFound(
+			schema.GroupResource{Group: "metrics.k8s.io", Resource: "pods"}, "pods"),
+	}
+	h := NewHighWater(store, f, testNS, 15*time.Second, false)
+	h.Sample(t.Context(), start.Add(15*time.Second))
+
+	heavy := h.Marks(start.Add(time.Minute)).Classes["repo-heavy"]
+	if heavy.Memory.Status != statusOK || heavy.Memory.Source != sourceMover {
+		t.Fatalf("memory = %+v; the mover reported without needing metrics-server", heavy.Memory)
+	}
+	if heavy.ReportedPeakRSSBytes != 2<<30 {
+		t.Errorf("reported peak = %d, want %d", heavy.ReportedPeakRSSBytes, int64(2)<<30)
+	}
+	if heavy.ReportedLimitHits != 3 {
+		t.Errorf("limit hits = %d, want 3: this is what tells a high cgroup peak from a tight limit",
+			heavy.ReportedLimitHits)
+	}
+	if heavy.ReportedOOMKills != 1 {
+		t.Errorf("cgroup OOM kills = %d, want 1", heavy.ReportedOOMKills)
+	}
+	// A limit that WAS reached must not be described as one that was not.
+	if strings.Contains(heavy.Memory.Reason, "limit was never reached") {
+		t.Errorf("the reason claims the limit was never reached, with %d hits:\n%s",
+			heavy.ReportedLimitHits, heavy.Memory.Reason)
+	}
+	if !strings.Contains(heavy.Memory.Reason, "running at its ceiling") {
+		t.Errorf("the reason does not say the limit was reached:\n%s", heavy.Memory.Reason)
+	}
+	// The cgroup OOM kill is the one the kubelet never sees, because the shim survived to report.
+	if !strings.Contains(heavy.Memory.Reason, "kubelet does NOT record") {
+		t.Errorf("the reason does not explain why this OOM kill is not in the pod status:\n%s",
+			heavy.Memory.Reason)
+	}
+}
+
+// TestAnUnwritableTerminationMessageIsNotAZeroPeak: a hard kill leaves the message EMPTY, which
+// is precisely how a mover that was OOM-killed presents. It must count as not measured, never as
+// a mover that used no memory.
+func TestAnUnwritableTerminationMessageIsNotAZeroPeak(t *testing.T) {
+	store := newTestStore(t, 1<<20)
+	start := day0.Add(time.Hour)
+	killed := moverPod("job-backup-oom", "job-backup", "worker-1", start)
+	killed.Status.ContainerStatuses = []corev1.ContainerStatus{{
+		State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+			Reason: "OOMKilled", ExitCode: 137, Message: "",
+		}},
+	}}
+	f := &fakeLister{
+		jobs:    []batchv1.Job{moverJob("job-backup", mover.OpBackup, start, time.Time{})},
+		pods:    []corev1.Pod{killed},
+		metrics: []podMetric{},
+	}
+	h := NewHighWater(store, f, testNS, 15*time.Second, false)
+	h.Sample(t.Context(), start.Add(15*time.Second))
+
+	marks := h.Marks(start.Add(time.Minute))
+	data := marks.Classes["data"]
+	if data.ReportedPods != 0 || data.ReportedPeakRSSBytes != 0 {
+		t.Errorf("an empty termination message produced a reported peak: %+v", data)
+	}
+	if data.Memory.Status != statusNotMeasured {
+		t.Errorf("memory status = %q, want NOT_MEASURED", data.Memory.Status)
+	}
+	// The definitive half still works: the kubelet's OOMKilled needs nothing from anybody.
+	if data.OOMKills != 1 {
+		t.Errorf("oomKills = %d, want 1", data.OOMKills)
+	}
+	if len(marks.Pods) != 1 || marks.Pods[0].ReportedSource != "" {
+		t.Errorf("the pod claims a reporting source it never had: %+v", marks.Pods)
+	}
+}
+
 // TestPodsRanButWereNeverSampledSaysSo is the sentence a four-hour soak on a real crucible
 // cluster actually printed, beside `"pods": 57`:
 //
@@ -468,7 +632,7 @@ func TestPercentileIsNearestRank(t *testing.T) {
 		{"unsorted input", []int64{9, 1, 5}, 9},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := percentile(tc.values, 0.95); got != tc.want {
+			if got := percentile(tc.values); got != tc.want {
 				t.Errorf("percentile = %d, want %d", got, tc.want)
 			}
 		})
@@ -476,7 +640,7 @@ func TestPercentileIsNearestRank(t *testing.T) {
 	// Nearest-rank, so the answer is always a value some pod actually reached. Interpolating
 	// would produce a number no mover ever used, which is precisely what a sizing decision must
 	// not be based on.
-	got := percentile([]int64{100, 200}, 0.95)
+	got := percentile([]int64{100, 200})
 	if got != 100 && got != 200 {
 		t.Errorf("percentile returned %d, which is neither observation", got)
 	}

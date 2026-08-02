@@ -585,6 +585,7 @@ func (e *exporter) writeHighwater() {
 	}
 	for class, cm := range marks.Classes {
 		cm.PeakMemoryPod = e.red.Pod(cm.PeakMemoryPod)
+		cm.ReportedPeakPod = e.red.Pod(cm.ReportedPeakPod)
 		cm.LongestJob = e.red.Object(cm.LongestJob)
 		marks.Classes[class] = cm
 	}
@@ -598,22 +599,47 @@ func (e *exporter) writeHighwater() {
 	e.note("highwater: %d mover pod(s), %d Job(s)", len(marks.Pods), len(marks.Jobs))
 
 	report := newStreamReport(StreamHighwater, len(marks.Pods),
-		"peak memory per mover operation class, with the SAMPLE COUNT and the pod's lifetime beside "+
-			"each peak: a pod that lives eleven minutes is sampled ~44 times at 15s and the true peak "+
-			"is above the highest sample, so a peak from three samples is a different claim from a "+
-			"peak from four hundred. OOM kills and evictions are definitive and need no "+
-			"metrics-server.").
+		"peak memory per mover operation class. Every figure names its SOURCE (classes[].memory."+
+			"source) and the two sources are not the same quantity: `mover-reported` is the mover's "+
+			"own exact measurement of the process that ran, read back off its termination message; "+
+			"`sampled` is metrics.k8s.io polled every interval, which is the highest SAMPLE rather "+
+			"than the peak and is structurally blind to a pod that lives seconds. OOM kills and "+
+			"evictions are definitive and need no metrics-server.").
 		withSamples(marks.UpdatedAt, marks.UpdatedAt).
 		withCoverage(e.requestedDays(), e.uptime.ObservedSeconds/86400)
+	// The stream's verdict follows the CLASSES, not metrics-server. A soak where metrics-server
+	// never saw a single mover but every mover reported its own peak has the number, and saying
+	// NOT MEASURED over it would throw away the whole point of the mover reporting it.
+	measured, reported := measuredClasses(marks)
 	switch {
-	case marks.MetricsServer.Status != statusOK:
+	case measured == 0:
 		report.Status = statusNotMeasured
 		report.Note = "peak memory NOT MEASURED — " + marks.MetricsServer.Reason + " " + report.Note
+	case marks.MetricsServer.Status != statusOK:
+		report = report.degrade(fmt.Sprintf("metrics.k8s.io was not usable (%s), so the sampled "+
+			"figures are absent; %d class(es) carry a mover-reported peak instead, which is the "+
+			"exact number.", marks.MetricsServer.Reason, reported))
 	case marks.KubeletStats.Status != statusOK:
 		report = report.degrade("The restic cache high-water is " +
 			strings.ToLower(marks.KubeletStats.Status) + ": " + marks.KubeletStats.Reason + ".")
 	}
 	e.streams = append(e.streams, report)
+}
+
+// measuredClasses counts the classes that carry a memory figure at all, and how many of those got
+// it from the mover itself. Used for the stream verdict, so a NOT MEASURED there means no class
+// has a peak from ANY source rather than "metrics-server was down".
+func measuredClasses(marks Marks) (measured, reported int) {
+	for _, cm := range marks.Classes {
+		if cm.Memory.Status != statusOK {
+			continue
+		}
+		measured++
+		if cm.Memory.Source == sourceMover {
+			reported++
+		}
+	}
+	return measured, reported
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1100,11 +1126,29 @@ func statusLines(dir string, info CollectorInfo) []string {
 			if cm.Pods == 0 {
 				continue
 			}
-			out = append(out, fmt.Sprintf("  %-18s %d pod(s), peak %s over %d sample(s), %d OOM, %d evicted",
-				class, cm.Pods, humanBytes(cm.PeakMemoryBytes), cm.PeakSamples, cm.OOMKills, cm.Evictions))
+			out = append(out, fmt.Sprintf("  %-18s %d pod(s), peak %s, %d OOM, %d evicted",
+				class, cm.Pods, classPeakWord(cm), cm.OOMKills, cm.Evictions))
 		}
 	}
 	return out
+}
+
+// classPeakWord renders one class's peak for the --status screen WITH ITS SOURCE attached.
+//
+// The two sources are different quantities — an exact process peak measured by the mover, and the
+// highest sample metrics.k8s.io happened to catch — so a bare number on a one-line summary is the
+// one place a reader would silently take one for the other. This is the screen the admin runs on
+// day 1 and day 2; it is where the distinction is cheapest to make and most likely to be missed.
+func classPeakWord(cm ClassMarks) string {
+	switch cm.Memory.Source {
+	case sourceMover:
+		return fmt.Sprintf("%s RSS (mover-reported, exact)", humanBytes(cm.ReportedPeakRSSBytes))
+	case sourceSampled:
+		return fmt.Sprintf("%s (sampled, %d sample(s) — the highest sample, not the peak)",
+			humanBytes(cm.PeakMemoryBytes), cm.PeakSamples)
+	default:
+		return "NOT MEASURED"
+	}
 }
 
 func sortedClasses(m Marks) []string {

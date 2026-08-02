@@ -44,10 +44,27 @@ import (
 // because "the load test that would give us the real curve has not been run". This stream is that
 // curve, measured on real data instead of paid infrastructure.
 //
-// It is the one number the maintainer cannot obtain any other way. A mover pod lives for minutes
-// and then its PodMetrics vanish with it; nothing retrospective can recover a peak that was never
-// sampled, which is why this needs a resident process and why --mover-sample-interval defaults to
-// something as aggressive as 15s.
+// TWO SOURCES, AND THE SECOND ONE IS THE ONE THAT WORKS.
+//
+// This stream was built to poll metrics.k8s.io every --mover-sample-interval, on the assumption
+// that a mover pod lives for minutes. It does not. Measured over four hours on a real crucible
+// cluster: 63 mover pods, lifetimes from 0.9s to 17s, and ZERO samples on every single one, with
+// metrics-server installed, healthy and answering for long-lived pods throughout. metrics-server
+// exposes a pod only after its own ~15s scrape has covered it, so a container that lives one
+// second never exists for it at all — and sampling faster cannot fix that, because the data is
+// not there to be sampled.
+//
+// So the mover measures itself. The shim already writes a structured mover.MoverResult to its
+// termination message; it now carries its own peak RSS (exact, from the kernel's per-process
+// accounting), its cgroup peak, and the two memory.events counters. The collector reads them off
+// the terminated pod — an object it was listing anyway, which survives the pod for the Job's
+// ttlSecondsAfterFinished (600s to 3600s), two to three orders of magnitude more forgiving than
+// one scrape interval.
+//
+// The sampled path stays, for pods long-lived enough to be caught and as a cross-check, but the
+// mover-reported figure is PREFERRED and every figure names its source. The two are not the same
+// quantity: one is an exact process peak, the other is the highest sample anyone happened to
+// catch.
 // ---------------------------------------------------------------------------------------------
 
 // classUnknown is where a mover whose operation could not be recovered is filed. NEVER a guess:
@@ -111,6 +128,43 @@ type PodMark struct {
 
 	CachePeakBytes int64 `json:"cachePeakBytes,omitempty"`
 	CacheSamples   int   `json:"cacheSamples,omitempty"`
+
+	// ------------------------------------------------------------------------------------
+	// What the MOVER said about itself, read off its termination message
+	// (mover.MoverResult). Everything above this line is sampled from outside; everything
+	// below it was measured by the process that ran, and the two must never be confused,
+	// which is why they are separate fields with separate names rather than one number whose
+	// provenance a reader has to guess.
+	//
+	// This is the half that works. A mover lives seconds and metrics-server exposes a pod only
+	// after its own ~15s scrape has covered it, so the sampled fields above are empty for most
+	// real movers — 63 of 63 on a four-hour crucible run. The termination message survives the
+	// pod for as long as the Job's ttlSecondsAfterFinished (600s to 3600s across the
+	// controllers), which is two to three orders of magnitude more forgiving than one scrape
+	// interval.
+	// ------------------------------------------------------------------------------------
+
+	// ReportedPeakRSSBytes is the restic process's peak resident set size, exact. This is the
+	// figure a memory limit has to cover.
+	ReportedPeakRSSBytes int64 `json:"reportedPeakRSSBytes,omitempty"`
+	// ReportedShimPeakRSSBytes is the crystal-mover shim's own peak, resident AT THE SAME TIME
+	// (the shim waits while restic runs), so a limit has to cover the sum of the two.
+	ReportedShimPeakRSSBytes int64 `json:"reportedShimPeakRSSBytes,omitempty"`
+	// ReportedCgroupPeakBytes is the peak of the container cgroup's memory.current: anonymous
+	// memory PLUS reclaimable page cache. An upper bound, NOT a sizing target — a backup
+	// streams a volume through the page cache and every one of those pages is charged here.
+	ReportedCgroupPeakBytes int64 `json:"reportedCgroupPeakBytes,omitempty"`
+	// ReportedLimitHits is memory.events `max`: times the cgroup reached its limit and the
+	// kernel reclaimed. Zero means the limit was never pressed, so a large cgroup peak is cache
+	// the container was merely allowed to keep.
+	ReportedLimitHits int64 `json:"reportedLimitHits,omitempty"`
+	// ReportedOOMKills is memory.events `oom_kill`. Not redundant with OOMKilled above: when
+	// restic is killed and the shim survives to report, the container exits 1 and Kubernetes
+	// records no OOM anywhere.
+	ReportedOOMKills int64 `json:"reportedOOMKills,omitempty"`
+	// ReportedSource is the mover's own MemorySource, naming which of its readers succeeded.
+	// Empty means this pod reported no memory figures at all.
+	ReportedSource string `json:"reportedSource,omitempty"`
 }
 
 // JobMark is one mover Job's wall clock, which is what actually blocks a backup window.
@@ -137,7 +191,22 @@ type JobMark struct {
 type MeasuredValue struct {
 	Status string `json:"status"` // OK | NOT_MEASURED | DISABLED
 	Reason string `json:"reason,omitempty"`
+	// Source names WHERE an OK figure came from, because two sources with different meanings
+	// now feed the same field and a reader must never have to wonder which one they are
+	// looking at: sourceMover is the mover's own exact measurement of the process that ran,
+	// sourceSampled is metrics.k8s.io polled from outside. Empty when nothing was measured.
+	Source string `json:"source,omitempty"`
 }
+
+// The provenances a MeasuredValue can carry.
+const (
+	// sourceMover — the mover measured itself and reported through its termination message.
+	// Exact, and the only source that works for a pod that lives seconds.
+	sourceMover = "mover-reported"
+	// sourceSampled — polled from metrics.k8s.io at --mover-sample-interval. Structurally
+	// blind to short-lived pods; a peak from it is the highest SAMPLE, not the peak.
+	sourceSampled = "sampled"
+)
 
 // ClassMarks is the answer, per operation class.
 type ClassMarks struct {
@@ -151,6 +220,20 @@ type ClassMarks struct {
 	P95MemoryBytes  int64         `json:"p95MemoryBytes,omitempty"`
 	MemorySamples   int           `json:"memorySamples,omitempty"`
 	MemoryPods      int           `json:"memoryPods,omitempty"`
+
+	// The mover's own figures, aggregated. PREFERRED over the sampled ones above: they are
+	// exact, they exist for pods no sampler could ever catch, and Memory.Source says which of
+	// the two the class's verdict rests on. Peaks are the MAX across the class's pods; the two
+	// counters are SUMS, because "how many times did any mover of this shape hit its limit" is
+	// the question they answer.
+	ReportedPods             int    `json:"reportedPods,omitempty"`
+	ReportedPeakRSSBytes     int64  `json:"reportedPeakRSSBytes,omitempty"`
+	ReportedPeakPod          string `json:"reportedPeakPod,omitempty"`
+	ReportedP95RSSBytes      int64  `json:"reportedP95RSSBytes,omitempty"`
+	ReportedShimPeakRSSBytes int64  `json:"reportedShimPeakRSSBytes,omitempty"`
+	ReportedCgroupPeakBytes  int64  `json:"reportedCgroupPeakBytes,omitempty"`
+	ReportedLimitHits        int64  `json:"reportedLimitHits,omitempty"`
+	ReportedOOMKills         int64  `json:"reportedOOMKills,omitempty"`
 
 	OOMKills  int `json:"oomKills"`
 	Evictions int `json:"evictions"`
@@ -401,6 +484,49 @@ func (h *HighWater) observePods(pods *corev1.PodList, now time.Time) {
 			mark.LifetimeSeconds = mark.LastSeen.Sub(mark.FirstSeen).Seconds()
 		}
 		markTerminations(mark, pod)
+		markReportedMemory(mark, pod)
+	}
+}
+
+// markReportedMemory reads what the mover said about its own memory off the pod's termination
+// message.
+//
+// This is the stream's answer to the thing sampling structurally cannot do. The shim writes a
+// mover.MoverResult to /dev/termination-log on the way out and the kubelet hangs those bytes on
+// the terminated container status, where they stay for as long as the pod object does — the
+// mover Jobs' ttlSecondsAfterFinished runs from 600s to 3600s, against a 15s sample interval, so
+// a pod that lived 0.9s is still readable minutes later. Nothing here perturbs the mover: the
+// figures are already in an object the collector was listing anyway.
+//
+// A message that does not parse is IGNORED, never counted as zero. That is the normal shape of a
+// hard kill (the kubelet leaves the message empty when the container never got to write) and of
+// a mover image older than these fields; both mean "not measured", and both must stay
+// distinguishable from a mover that measured itself and found a small number.
+func markReportedMemory(mark *PodMark, pod *corev1.Pod) {
+	statuses := make([]corev1.ContainerStatus, 0,
+		len(pod.Status.ContainerStatuses)+len(pod.Status.InitContainerStatuses))
+	statuses = append(statuses, pod.Status.ContainerStatuses...)
+	statuses = append(statuses, pod.Status.InitContainerStatuses...)
+	for _, cs := range statuses {
+		for _, state := range []*corev1.ContainerStateTerminated{
+			cs.State.Terminated, cs.LastTerminationState.Terminated,
+		} {
+			if state == nil {
+				continue
+			}
+			result, err := mover.ParseMoverResult(state.Message)
+			if err != nil || result.MemorySource == "" {
+				continue
+			}
+			// Sticky maxima. A container that terminated twice (a retry in place) reports twice,
+			// and the interesting attempt is the expensive one.
+			mark.ReportedPeakRSSBytes = max(mark.ReportedPeakRSSBytes, result.PeakRSSBytes)
+			mark.ReportedShimPeakRSSBytes = max(mark.ReportedShimPeakRSSBytes, result.ShimPeakRSSBytes)
+			mark.ReportedCgroupPeakBytes = max(mark.ReportedCgroupPeakBytes, result.CgroupPeakBytes)
+			mark.ReportedLimitHits = max(mark.ReportedLimitHits, result.MemoryLimitHits)
+			mark.ReportedOOMKills = max(mark.ReportedOOMKills, result.MemoryOOMKills)
+			mark.ReportedSource = result.MemorySource
+		}
 	}
 }
 
@@ -558,6 +684,7 @@ func (h *HighWater) Marks(now time.Time) Marks {
 	}
 
 	peaks := map[string][]int64{}
+	reported := map[string][]int64{}
 	for _, p := range h.pods {
 		cm := m.Classes[p.Class]
 		if cm.Class == "" {
@@ -579,6 +706,18 @@ func (h *HighWater) Marks(now time.Time) Marks {
 				cm.PeakMemoryPod = p.Pod
 				cm.PeakSamples = p.Samples
 			}
+		}
+		if p.ReportedSource != "" {
+			cm.ReportedPods++
+			reported[p.Class] = append(reported[p.Class], p.ReportedPeakRSSBytes)
+			if p.ReportedPeakRSSBytes > cm.ReportedPeakRSSBytes {
+				cm.ReportedPeakRSSBytes = p.ReportedPeakRSSBytes
+				cm.ReportedPeakPod = p.Pod
+			}
+			cm.ReportedShimPeakRSSBytes = max(cm.ReportedShimPeakRSSBytes, p.ReportedShimPeakRSSBytes)
+			cm.ReportedCgroupPeakBytes = max(cm.ReportedCgroupPeakBytes, p.ReportedCgroupPeakBytes)
+			cm.ReportedLimitHits += p.ReportedLimitHits
+			cm.ReportedOOMKills += p.ReportedOOMKills
 		}
 		if p.CacheSamples > 0 {
 			cm.CacheSamples += p.CacheSamples
@@ -610,22 +749,84 @@ func (h *HighWater) Marks(now time.Time) Marks {
 
 	for class, values := range peaks {
 		cm := m.Classes[class]
-		cm.P95MemoryBytes = percentile(values, 0.95)
+		cm.P95MemoryBytes = percentile(values)
 		m.Classes[class] = cm
 	}
-	// A class with pods sampled but a metrics-server that never answered keeps NOT_MEASURED; a
-	// class with no peak of its own says why, in the words that are true of THAT class.
+	for class, values := range reported {
+		cm := m.Classes[class]
+		cm.ReportedP95RSSBytes = percentile(values)
+		m.Classes[class] = cm
+	}
+	// The verdict, in preference order, and it is stated POSITIVELY in every branch — a reader
+	// must never have to infer which of two sources with different meanings they are looking at.
 	for class, cm := range m.Classes {
-		if cm.Memory.Status != statusOK || cm.MemoryPods > 0 {
-			continue
+		switch {
+		case cm.ReportedPods > 0:
+			// The mover measured itself. This wins over the sampled figure even when
+			// metrics-server answered, because the two are not the same quantity and only one of
+			// them is exact.
+			cm.Memory = MeasuredValue{
+				Status: statusOK, Source: sourceMover,
+				Reason: moverReportedReason(cm),
+			}
+		case cm.MemoryPods > 0:
+			cm.Memory = MeasuredValue{
+				Status: statusOK, Source: sourceSampled,
+				Reason: "polled from metrics.k8s.io every " + h.Interval.String() + ". This is the " +
+					"highest SAMPLE, not the peak: the true peak sits above it by however much the " +
+					"pod grew between two scrapes. No mover of this class reported a peak of its own",
+			}
+		case cm.Memory.Status == statusOK:
+			// metrics-server answered and nothing of this class ever landed in it.
+			cm.Memory = MeasuredValue{Status: statusNotMeasured, Reason: noPeakReason(class, cm.Pods)}
+		case cm.Pods > 0:
+			// metrics-server was unavailable AND no mover reported. Both halves, so the reader
+			// knows the fallback was tried rather than absent.
+			cm.Memory = MeasuredValue{Status: statusNotMeasured, Reason: cm.Memory.Reason +
+				fmt.Sprintf(". Nor did any of the %d %s mover pod(s) report a peak of its own: a "+
+					"mover image older than the reporting itself, or one killed before it could "+
+					"write its result", cm.Pods, class)}
 		}
-		cm.Memory = MeasuredValue{Status: statusNotMeasured, Reason: noPeakReason(class, cm.Pods)}
 		m.Classes[class] = cm
 	}
 
 	slices.SortFunc(m.Pods, func(a, b PodMark) int { return a.FirstSeen.Compare(b.FirstSeen) })
 	slices.SortFunc(m.Jobs, func(a, b JobMark) int { return strings.Compare(a.Job, b.Job) })
 	return m
+}
+
+// moverReportedReason states what the mover-reported figures MEAN, beside the figures, because a
+// number whose meaning lives in another document is a number that will be read wrong.
+//
+// The one sentence that has to survive being skimmed: the cgroup peak is not a sizing target. It
+// counts reclaimable page cache, a backup streams a volume through the page cache, and the kernel
+// reclaims that cache before it OOM-kills anything — so raising a memory limit to cover it raises
+// a ceiling that was never the constraint. The RSS pair is what a limit has to cover, and the two
+// counters say whether the limit was ever pressed at all.
+func moverReportedReason(cm ClassMarks) string {
+	b := fmt.Sprintf("measured by the %d mover pod(s) themselves and read back off their "+
+		"termination messages — exact, not sampled, and available for pods far too short-lived for "+
+		"metrics.k8s.io to have ever seen. reportedPeakRSSBytes is restic's peak RESIDENT SET "+
+		"(anonymous + mapped, no page cache): this is what a memory limit has to cover, together "+
+		"with reportedShimPeakRSSBytes, which is resident at the same time",
+		cm.ReportedPods)
+	if cm.ReportedCgroupPeakBytes > 0 {
+		b += ". reportedCgroupPeakBytes is the cgroup's peak memory.current and INCLUDES " +
+			"reclaimable page cache, so for a streaming backup it can sit an order of magnitude " +
+			"above the RSS peak: it is an upper bound, NOT a sizing target"
+		if cm.ReportedLimitHits == 0 {
+			b += ". reportedLimitHits is 0, so the limit was never reached: whatever the cgroup " +
+				"peak is, it is memory the container was merely ALLOWED to keep"
+		} else {
+			b += fmt.Sprintf(". reportedLimitHits is %d, so the limit WAS reached and the kernel "+
+				"reclaimed to stay under it — this class is running at its ceiling", cm.ReportedLimitHits)
+		}
+	}
+	if cm.ReportedOOMKills > 0 {
+		b += fmt.Sprintf(". reportedOOMKills is %d: the cgroup OOM killer killed a process, which "+
+			"the kubelet does NOT record when the shim survives to report", cm.ReportedOOMKills)
+	}
+	return b
 }
 
 // noPeakReason spells the TWO ways a class ends up with no peak, because they are two different
@@ -656,18 +857,22 @@ func noPeakReason(class string, pods int) string {
 		"an idle class either", pods, class)
 }
 
+// p95 is the only percentile this stream reports, named rather than passed: every call site wants
+// the same one, and a parameter would invite a second answer to a question that has one.
+const p95 = 0.95
+
 // percentile is the nearest-rank p95 over the per-pod peaks. Nearest-rank rather than an
 // interpolating estimator because these are a handful of real observations, not a distribution:
 // interpolating between two measured pods would produce a number no pod ever reached, which is
 // precisely what a sizing decision must not be based on.
-func percentile(values []int64, p float64) int64 {
+func percentile(values []int64) int64 {
 	if len(values) == 0 {
 		return 0
 	}
 	sorted := make([]int64, len(values))
 	copy(sorted, values)
 	slices.Sort(sorted)
-	rank := min(max(int(math.Ceil(p*float64(len(sorted)))), 1), len(sorted))
+	rank := min(max(int(math.Ceil(p95*float64(len(sorted)))), 1), len(sorted))
 	return sorted[rank-1]
 }
 
