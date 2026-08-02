@@ -1,9 +1,9 @@
 # `soak-collect` / `soak-export` — what the Go side has to do
 
-This is the specification for the two subcommands `hack/soak/manifests/collector.yaml` and
-`hack/soak/collect.sh` are written against. **Neither exists yet.** Everything else in
-`hack/soak/` is complete and usable the moment they do; the fallback CronJob is what runs until
-then.
+This is the specification for the two subcommands the chart's `soak.enabled`
+(`charts/crystal-backup/templates/soak.yaml`) and `hack/soak/collect.sh` are written against.
+Both subcommands now exist, and so does the chart template; the fallback CronJob remains for one
+case only, an operator image whose build predates `soak-collect`.
 
 It is written as a lot brief: what to build, where it goes, and — for each decision that has a
 tempting wrong answer — which one to take and why.
@@ -62,14 +62,26 @@ REFUSALS. None of them falls back to another method: a collector that quietly ch
 would produce an archive claiming one guarantee and holding another, and nothing about the
 running pod would show it.
 
-**These are flags, not chart values.** The collector is `hack/soak/manifests/collector.yaml`,
-applied with `kubectl`; nothing in `charts/crystal-backup/` renders it today. Moving it into the
-chart is its own lot — Deployment, PVC, ServiceAccount, ClusterRole and bindings, the two
-NetworkPolicies, all release-prefixed, and the image digest, which is the whole reason to do it
-(the standalone manifest makes an administrator hand-copy four things the chart already knows,
-and soaking a different build from the one under test for a fortnight has nothing to signal it).
-That lot maps these flags onto values; a value added before anything renders it would be an inert
-knob.
+**These are flags, and the chart's `soak.*` values are what set them.** The standalone
+`manifests/collector.yaml` this spec was written against is GONE, and deliberately: it made an
+administrator hand-copy four things the chart already knows — the operator image, the metrics
+Service name, the namespace, and the metrics-reader ClusterRole name — three of which are
+release-scoped, and the fourth of which is the image. Soaking a build other than the one under
+test describes a cluster that does not exist and has nothing to signal it. `soak.enabled` renders
+the same objects (Deployment, PVC, ServiceAccount, ClusterRoles and bindings, both
+NetworkPolicies) with all four resolved from the chart's own helpers, and the collector's image is
+`crystal-backup.image` — the same reference the operator Deployment takes.
+
+Two implementations of one collector is the drift this project distrusts most, so there is exactly
+one. A cluster that installs by kustomize rather than Helm never had a working copy of that
+manifest anyway: `config/default` lands in `bs-k8s-backup-system` with a
+`bs-k8s-backup-controller-manager-metrics-service`, and the standalone file named
+`crystal-backup-metrics.crystal-backup-system.svc`. It only ever worked against a Helm install —
+the very installs that can now set one value.
+
+`test/chart/soak_test.go` renders the chart with every `soak.*` value moved off its default and
+finds each one in the rendered pod spec. A value that reads back nicely and reaches nothing is the
+defect class this repository has shipped more than once; that file is the guard.
 
 ## 2. Metrics — scrape, auth, TLS
 
@@ -81,8 +93,9 @@ TokenReview plus a SubjectAccessReview on the non-resource URL `/metrics`.
   `/var/run/secrets/kubernetes.io/serviceaccount/token`, sent as `Authorization: Bearer`. Read
   it per scrape, not once at startup — the projected token is rotated, and a collector that
   cached it starts failing on day 3 with a 401.
-- **Authorization**: the chart's `crystal-backup-metrics-reader` ClusterRole, bound to the
-  collector's SA by `manifests/collector.yaml`.
+- **Authorization**: the chart's `<fullname>-metrics-reader` ClusterRole, which `rbac.yaml`
+  renders and binds to nobody ("Scrapers bind this to read /metrics"); `soak.yaml` binds it to
+  the collector's SA and to nothing else.
 - **TLS**: the metrics server presents a self-signed certificate; the chart's own ServiceMonitor
   sets `insecureSkipVerify` for exactly this reason. `--metrics-insecure-skip-verify` is
   therefore expected to be on, and the flag exists rather than being implicit so that a cluster
@@ -464,9 +477,16 @@ Rules, and each of them is the feature rather than a detail:
 ## 10. What this deliberately does not do
 
 - **No writes to the cluster.** Not a Lease, not an Event, not a ConfigMap. The RBAC in
-  `manifests/collector.yaml` has no write verb in it, and it should stay that way: a soak kit
-  that mutates the cluster it is measuring has to be argued about on every review, and the
-  argument is not worth what a Lease would buy.
+  `templates/soak.yaml` has no write verb in it, and `TestSoakRBACIsReadOnly` asserts the shape
+  rather than the list, so a rule added later still has to be a read. It should stay that way: a
+  soak kit that mutates the cluster it is measuring has to be argued about on every review, and
+  the argument is not worth what a Lease would buy.
+- **No `watch`, and three grants the standalone manifest carried that nothing reads.** The verbs
+  were checked against the code rather than carried over: nothing in `internal/soak` watches (the
+  event stream lists on a resync interval and §5 says why; the API reader is `client.New`, which
+  opens no informers), `storage.k8s.io` storageclasses/volumeattachments are read by the operator
+  and never by the collector, and the `nodes` resource is not read at all — the node a mover
+  landed on comes off `pod.Spec.NodeName`.
 - **No exec into mover pods** to measure the cache from inside, though the operator's own
   ClusterRole would allow it. Running commands inside a pod during a backup is perturbation, and
   the kubelet stats endpoint answers the same question from outside.

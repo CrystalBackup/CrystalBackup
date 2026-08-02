@@ -352,3 +352,72 @@ networkPolicy:
   # -- Namespace allowed to scrape metrics. Empty allows any source on the metrics
   # port.
   monitoringNamespace: ""
+
+# -- The resident soak collector (hack/soak/SPEC.md). One pod, one small PVC, cluster-wide
+# READ-ONLY RBAC, running `crystal-backup soak-collect` — a subcommand of the OPERATOR binary,
+# not a second image — for the two weeks of a soak. It keeps five streams (the operator's own
+# /metrics scraped and downsampled locally, Warning events, mover high-water marks, a daily
+# self-check, hourly CR snapshots) and hands back ONE archive at the end. No Prometheus needed.
+#
+# Off by default: this is a fortnight-long measurement exercise, not a component of an install.
+#
+# The collector runs the SAME IMAGE the operator does — `image.digest`, resolved once — which is
+# the reason this lives in the chart at all. Soaking a build other than the one under test
+# describes a cluster that does not exist and has nothing to signal it.
+soak:
+  # -- Render the collector. Everything below is inert while this is false, and with it false the
+  # chart renders nothing soak-related at all.
+  enabled: false
+  # -- Where the redaction salt comes from — the thing that makes the same namespace the same
+  # token on day 2 and on day 13, which is the entire product of a soak. A NAMED choice, never
+  # inferred: `auto` derives SHA256("crystalbackup-soak-salt-v1" || the operator namespace's UID)
+  # and GENERATES NOTHING, so there is nothing to lose and nothing to regenerate. `fromSecret`
+  # reads a Secret you created (soak.saltSecret) and buys one thing over auto: anyone who can
+  # `get` your operator namespace can recompute the derived salt and reverse every token, and with
+  # a Secret only you can.
+  #
+  # The chart never generates this Secret, and never will — see templates/soak.yaml. Accepts
+  # `fromSecret` or the flag's own `from-secret`; anything else is refused at template time.
+  saltMethod: auto
+  # -- Name of the Secret holding at least 32 raw bytes under the key `salt`. REQUIRED by
+  # saltMethod: fromSecret, refused with saltMethod: auto (which would never read it).
+  #
+  #   openssl rand -out soak-salt.bin 32
+  #   kubectl -n crystal-backup-system create secret generic crystal-backup-soak-salt \
+  #     --from-file=salt=soak-salt.bin
+  #
+  # KEEP soak-salt.bin on your own machine and do NOT put it in the archive you send: with it,
+  # every token is reversible in seconds by dictionary.
+  saltSecret: ""
+  # -- Size of the collector's PVC. The cap below is what the collector actually honours; this
+  # leaves the filesystem room to breathe above it. No storageClassName: the cluster default is
+  # the right choice, and naming one would be wrong on every cluster but ours.
+  storage: 1Gi
+  # -- Hard cap on the on-disk footprint (`--max-bytes`). On reaching it the collector drops the
+  # OLDEST raw samples — keeping the aggregates and the high-water marks, which are the part that
+  # cannot be reconstructed — and records the drop in its own manifest. What it never does is fill
+  # the volume, which on a node-backed StorageClass would be a DiskPressure eviction of the
+  # workload it was deployed to measure.
+  maxBytes: 512Mi
+  # -- Read the restic cache high-water mark from the kubelet (`--kubelet-stats`). OFF, and it
+  # should stay off unless you have decided otherwise: it needs nodes/proxy, which is access to
+  # the kubelet API, and on most clusters that transitively includes running commands in
+  # containers. Without it the cache figure is reported as NOT MEASURED and nothing else changes.
+  # Turning it on renders both the flag and the ClusterRoleBinding, so the grant and the flag
+  # cannot get out of step.
+  kubeletStats: false
+  # -- Scrape cadence for the operator's /metrics (`--metrics-interval`).
+  metricsInterval: 60s
+  # -- Downsample window (`--metrics-resolution`). Raw scrapes are NOT kept: each series is
+  # reduced to one point per window plus the min and max seen inside it, which is what keeps a
+  # fortnight of a thousand series inside maxBytes while still showing a four-minute spike.
+  metricsResolution: 5m
+  # -- Mover high-water sampling cadence (`--mover-sample-interval`). Mover pods are short-lived
+  # and their peak is what a soak came for; 15s catches the peak of an eleven-minute backup at a
+  # negligible cost to metrics-server.
+  moverSampleInterval: 15s
+  # -- Self-check cadence (`--selfcheck-interval`), through the same code path as
+  # `crystal-backup selfcheck`.
+  selfcheckInterval: 24h
+  # -- CR state snapshot cadence (`--state-interval`).
+  stateInterval: 1h

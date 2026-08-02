@@ -166,9 +166,10 @@ func TestStatusNeedsNoSalt(t *testing.T) {
 }
 
 // TestUsageNamesEveryFlagTheManifestPasses is the cheap guard on the one coupling nobody would
-// notice breaking: hack/soak/manifests/collector.yaml passes these by name, and a renamed flag
-// makes the Deployment CrashLoop with "flag provided but not defined" — on the customer's
-// cluster, on day one, after they have already installed everything.
+// notice breaking: charts/crystal-backup/templates/soak.yaml passes these by name, and a renamed
+// flag makes the Deployment CrashLoop with "flag provided but not defined" — on the customer's
+// cluster, on day one, after they have already installed everything. test/chart asserts the other
+// half, that each flag carries the value its chart value was set to.
 func TestUsageNamesEveryFlagTheManifestPasses(t *testing.T) {
 	for _, flag := range []string{
 		"--data-dir", "--max-bytes", "--metrics-url", "--metrics-insecure-skip-verify",

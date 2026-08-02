@@ -22,12 +22,18 @@ rely on, and CrystalBackup is what is being measured against it. If at any momen
 answer to "could I restore this today?" depends on CrystalBackup, the scope is too large — see
 below.
 
-Three things go in:
+Two things go in, and they are one install:
 
 | | what | footprint |
 |---|---|---|
-| CrystalBackup 0.6.1 | the operator itself, per the install docs | one pod |
-| `manifests/collector.yaml` | the soak collector: one pod, one 1Gi PVC, read-only cluster RBAC | one pod, 1Gi |
+| CrystalBackup | the operator itself, per the install docs | one pod |
+| `soak.enabled=true` | the soak collector, from the same chart: one pod, one 1Gi PVC, read-only cluster RBAC | one pod, 1Gi |
+
+The collector is **part of the chart**, turned on with one value. It is not a separate manifest to
+apply, and deliberately so: it runs `crystal-backup soak-collect`, a subcommand of the operator
+binary, and the chart gives it *the image the operator is actually running*. A collector built
+from a different commit than the operator under test describes a cluster that does not exist, for
+a fortnight, with nothing to signal it.
 
 The redaction salt — what makes the same namespace the same token on day 2 and on day 13 — is
 **derived from your operator namespace's UID** and needs no Secret. `--salt-method=from-secret`
@@ -69,12 +75,15 @@ Do these in order. The first two take a minute and save the fortnight.
 
 # 2. does this build have the collector?
 kubectl -n crystal-backup-system exec deploy/crystal-backup -- /manager soak-collect --help
-#    prints usage  -> apply manifests/collector.yaml
-#    "unknown"     -> apply manifests/fallback-selfcheck-cronjob.yaml instead, and read the
-#                     header of that file: you get the daily self-checks and nothing else.
+#    prints usage  -> turn on soak.enabled, below
+#    "unknown"     -> your chart predates the collector: apply
+#                     manifests/fallback-selfcheck-cronjob.yaml instead, and read the header of
+#                     that file: you get the daily self-checks and nothing else.
 
-# 3. install the collector (edit the image to the digest your operator runs, first)
-kubectl apply -f manifests/collector.yaml
+# 3. install the collector. Nothing to edit, nothing to look up: the chart already knows the
+#    image, the namespace, the metrics Service and the metrics-reader ClusterRole.
+helm upgrade --install crystal-backup crystal-backup/crystal-backup \
+  --namespace crystal-backup-system --reuse-values --set soak.enabled=true
 
 # 4. the baseline self-check, kept as day zero. It has to be salted the SAME way as the soak or
 #    day zero shares no tokens with day one, so hand it the file you just derived.
@@ -116,19 +125,29 @@ archive is going anywhere wider than the maintainer, take it with no fixed salt 
 lost with a recreated namespace, or redone "to be safe" — and when that happens mid-soak the
 correlation breaks with nothing to signal it: seven days of tokens on one side, seven on the
 other, and no way to join them. Nothing generates a namespace UID, so nothing can regenerate it.
-To hold the salt yourself instead, create the Secret and switch the collector to
-`--salt-method=from-secret` (both blocks are in `manifests/collector.yaml`, commented, ready to
-uncomment):
+To hold the salt yourself instead, create the Secret and point the chart at it:
 
 ```sh
 openssl rand -out soak-salt.bin 32
 kubectl -n crystal-backup-system create secret generic crystal-backup-soak-salt \
   --from-file=salt=soak-salt.bin
+
+helm upgrade --install crystal-backup crystal-backup/crystal-backup \
+  --namespace crystal-backup-system --reuse-values \
+  --set soak.enabled=true \
+  --set soak.saltMethod=fromSecret \
+  --set soak.saltSecret=crystal-backup-soak-salt
 ```
 
-Passing `--redaction-salt-file` without `--salt-method=from-secret` is refused at startup rather
-than silently ignored: the two produce archives with different guarantees, and a running
-collector looks identical either way.
+**The chart never generates that Secret**, and never will. A generated salt would be re-generated
+on every Argo CD refresh — three minutes by default — and unlike a regenerated certificate, which
+rolls the Deployment and gets noticed, a regenerated salt changes nothing visible at all: the
+collector keeps running, the reports keep being written, and only the correlation dies.
+
+Setting `saltSecret` without `saltMethod: fromSecret` — or the reverse — is refused when the chart
+renders, and `--redaction-salt-file` without `--salt-method=from-secret` is refused again by the
+collector at startup rather than silently ignored: the two methods produce archives with different
+guarantees, and a running collector looks identical either way.
 
 ## During the soak — how to check it in ten seconds
 
@@ -273,7 +292,7 @@ exists for.
 | | |
 |---|---|
 | `README.md` | this — the protocol |
-| `manifests/collector.yaml` | the resident collector: Deployment, PVC, read-only RBAC, NetworkPolicies |
+| the chart's `soak.enabled` | the resident collector: Deployment, PVC, read-only RBAC, NetworkPolicies. `charts/crystal-backup/templates/soak.yaml`, and there is no second copy of it |
 | `manifests/fallback-selfcheck-cronjob.yaml` | the degraded mode, for a build with no `soak-collect` |
 | `collect.sh` | export, verify, leak-check, and tell you what to read |
 | `restore-drill.md` | the end-of-soak restore drill |

@@ -336,8 +336,8 @@ func NewHighWater(store *Store, lister podLister, namespace string, interval tim
 const kubeletDisabledReason = "--kubelet-stats was not set, so the restic cache high-water was " +
 	"never read. It cannot be obtained from the API: the cache is an emptyDir inside a mover pod " +
 	"and the only in-cluster source for its size is the kubelet's own stats/summary endpoint, " +
-	"which needs nodes/proxy — a grant hack/soak/manifests/collector.yaml deliberately leaves " +
-	"unbound"
+	"which needs nodes/proxy — a grant the chart renders but deliberately leaves unbound until " +
+	"soak.kubeletStats is set"
 
 // Sample takes one round: every mover pod, its class, its memory, its kills and — when enabled —
 // its cache.

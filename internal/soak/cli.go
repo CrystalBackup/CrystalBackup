@@ -83,8 +83,8 @@ crystal-backup ` + CommandExport + ` [flags]
         --status                         no archive: one screen on stderr saying what is there
 `
 
-// Defaults, named so the usage text, the flag registration and hack/soak/manifests/collector.yaml
-// can be checked against each other.
+// Defaults, named so the usage text, the flag registration and the chart values that render into
+// these flags (charts/crystal-backup/values.yaml, `soak:`) can be checked against each other.
 const (
 	defaultDataDir             = "/var/lib/crystal-backup-soak"
 	defaultMaxBytes            = "512Mi"
@@ -313,7 +313,8 @@ func proveScrape(ctx context.Context, s *Scraper, stderr io.Writer) error {
 		"could not scrape %s after %d attempts: %w\n\n"+
 			"  A 401 means the projected ServiceAccount token was rejected.\n"+
 			"  A 403 means this ServiceAccount is not bound to crystal-backup-metrics-reader —\n"+
-			"    that is the second ClusterRoleBinding in hack/soak/manifests/collector.yaml.\n"+
+			"    that is the <release>-soak-metrics-reader ClusterRoleBinding the chart renders\n"+
+			"    under soak.enabled.\n"+
 			"  A TLS error means you want --metrics-insecure-skip-verify (the metrics server's\n"+
 			"    certificate is self-signed unless you wired cert-manager).\n"+
 			"  A timeout means a NetworkPolicy: the chart's default-deny covers pods that did not\n"+

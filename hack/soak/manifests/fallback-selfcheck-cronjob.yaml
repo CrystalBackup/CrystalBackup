@@ -2,14 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # ---------------------------------------------------------------------------------------------
-# READ THIS FIRST: collector.yaml IS THE SOAK KIT. THIS IS THE DEGRADED MODE.
+# READ THIS FIRST: THE CHART'S soak.enabled IS THE SOAK KIT. THIS IS THE DEGRADED MODE.
 #
-#   The soak is collected by a resident Deployment (collector.yaml), which does everything this
-#   CronJob does and four things it cannot: it watches Events (they expire after about an hour,
-#   so a daily job sees almost none), it holds high-water marks for mover memory and the restic
-#   cache (a peak inside an eleven-minute pod is invisible to daily sampling), it scrapes the
-#   operator's /metrics itself so the kit needs no Prometheus, and it keeps the operator's error
-#   lines past the kubelet's log rotation.
+#   The soak is collected by a resident Deployment — `--set soak.enabled=true` on the operator's
+#   own chart — which does everything this CronJob does and four things it cannot: it collects
+#   Warning Events on a cadence of minutes (they expire after about an hour, so a daily job sees
+#   almost none), it holds high-water marks for mover memory and the restic cache (a peak inside
+#   an eleven-minute pod is invisible to daily sampling), it scrapes the operator's /metrics
+#   itself so the kit needs no Prometheus, and it keeps the operator's error lines past the
+#   kubelet's log rotation.
 #
 #   This file is kept for exactly one situation, and it is a real one: `soak-collect` is a
 #   subcommand that does not exist in every build. If the operator image you are soaking has
@@ -22,7 +23,7 @@
 #
 #   Check first:
 #     kubectl -n crystal-backup-system exec deploy/crystal-backup -- /manager soak-collect --help
-#   If that prints usage, use collector.yaml and delete this file.
+#   If that prints usage, use `--set soak.enabled=true` and delete this CronJob.
 #
 # WHAT IT IS
 #

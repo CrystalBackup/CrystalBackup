@@ -6,7 +6,7 @@
 # ---------------------------------------------------------------------------------------------
 # WHAT THIS DOES
 #
-#   The collecting happens in the cluster: a resident Deployment (manifests/collector.yaml) has
+#   The collecting happens in the cluster: a resident Deployment (the chart's `soak.enabled`) has
 #   been keeping metrics, events, high-water marks, daily self-checks and the operator's error
 #   lines for the length of the soak. This script does the four things that have to happen from
 #   OUTSIDE it:
@@ -97,7 +97,10 @@ MANIFEST=''
 
 KUBECTL=${KUBECTL:-kubectl}
 
-DEPLOY='crystal-backup-soak'
+# The chart's default name for the collector Deployment: "<fullname>-soak", and fullname is the
+# chart name unless the release set fullnameOverride. Override it here if yours did:
+#   SOAK_DEPLOY=<release>-soak ./collect.sh …
+DEPLOY=${SOAK_DEPLOY:-crystal-backup-soak}
 CONTAINER='collector'
 
 # The minimum length of an identifier the leak check will look for. Below it a name is more
