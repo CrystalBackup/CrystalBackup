@@ -99,8 +99,8 @@ func m1ResticRun(repoURL, password string, args ...string) (string, bool) {
 				// the operator namespace reaches S3 ONLY if it matches the mover-egress policy,
 				// which selects app.kubernetes.io/managed-by=crystal-backup (chart
 				// networkPolicy.moverManagedByValue). Without this label the Job is default-denied
-				// and restic times out dialing the S3 endpoint. This is NOT a crystalbackup.io/*
-				// label, so m1HasCrystalLabel still excludes the oracle from the mover-Job predicates.
+				// and restic times out dialing the S3 endpoint. It carries no crystalbackup.io/pvc
+				// label, so m1IsExposureResidue still excludes the oracle from the leak predicates.
 				ObjectMeta: metav1.ObjectMeta{
 					Labels: map[string]string{"app.kubernetes.io/managed-by": "crystal-backup"},
 				},

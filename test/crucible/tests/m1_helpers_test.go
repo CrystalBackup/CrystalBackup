@@ -39,7 +39,6 @@ import (
 	"filippo.io/age"
 
 	cbv1 "github.com/CrystalBackup/CrystalBackup/api/v1alpha1"
-	"github.com/CrystalBackup/CrystalBackup/internal/apiconst"
 	"github.com/CrystalBackup/CrystalBackup/internal/keys"
 )
 
@@ -67,7 +66,6 @@ const (
 	// m1S3Prefix is the bucket prefix under which the one shared repo lives (<prefix>/<clusterID>).
 	m1S3Prefix = "crystal"
 	// m1SeedLabel / m1SeedValue tag the crucible's seeded tenant namespaces (and their PVCs).
-	m1SeedLabel = "crystalbackup.io/seed"
 	m1SeedValue = "crucible"
 )
 
@@ -289,16 +287,6 @@ func m1ListBackups(namespace string) []cbv1.Backup {
 	return list.Items
 }
 
-// m1HasCrystalLabel reports whether labels carry any crystalbackup.io/* key.
-func m1HasCrystalLabel(labels map[string]string) bool {
-	for k := range labels {
-		if strings.HasPrefix(k, apiconst.Domain+"/") {
-			return true
-		}
-	}
-	return false
-}
-
 // m1AssertNoResidualSnapshotObjects asserts (with a short grace period for async cleanup)
 // that a run left nothing behind in the given namespaces: no VolumeSnapshots, no
 // VolumeSnapshotContents pointing back at them, and no temporary clone PVCs (a
@@ -327,7 +315,7 @@ func m1AssertNoResidualSnapshotObjects(namespaces ...string) {
 			})
 			g.Expect(k8s.List(ctx, vs, client.InNamespace(ns))).To(Succeed())
 			for i := range vs.Items {
-				g.Expect(m1HasCrystalLabel(vs.Items[i].GetLabels())).To(BeFalse(),
+				g.Expect(m1IsExposureResidue(vs.Items[i].GetLabels())).To(BeFalse(),
 					"residual VolumeSnapshot %s/%s (labels %v)", ns, vs.Items[i].GetName(), vs.Items[i].GetLabels())
 			}
 		}
@@ -342,7 +330,7 @@ func m1AssertNoResidualSnapshotObjects(namespaces ...string) {
 		g.Expect(k8s.List(ctx, vsc)).To(Succeed())
 		for i := range vsc.Items {
 			item := &vsc.Items[i]
-			labelled := m1HasCrystalLabel(item.GetLabels())
+			labelled := m1IsExposureResidue(item.GetLabels())
 			refNS, _, _ := unstructured.NestedString(item.Object, "spec", "volumeSnapshotRef", "namespace")
 			// The forensics below exist because one real leak cost three paid crucible rounds to
 			// attribute: the failure message must carry everything needed to identify the residue's
@@ -365,7 +353,7 @@ func m1AssertNoResidualSnapshotObjects(namespaces ...string) {
 			g.Expect(k8s.List(ctx, &pvcs, client.InNamespace(ns))).To(Succeed())
 			for i := range pvcs.Items {
 				p := &pvcs.Items[i]
-				residual := m1HasCrystalLabel(p.Labels) && p.Labels[m1SeedLabel] == ""
+				residual := m1IsExposureResidue(p.Labels) && p.Labels[m1SeedLabel] == ""
 				g.Expect(residual).To(BeFalse(),
 					"residual temporary clone PVC %s/%s (labels %v)", ns, p.Name, p.Labels)
 			}
