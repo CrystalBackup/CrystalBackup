@@ -35,19 +35,57 @@
 #   default StorageClass is local-path or otherwise node-backed, that PVC IS node disk — the cap
 #   is then the only thing standing between this and a DiskPressure eviction, so keep it.
 #
+# THE REDACTION SALT — --salt-method
+#
+#   Identifiers in the exported archive are HMAC tokens. The salt is what makes the same namespace
+#   the same token on day 2 and on day 13, which is the entire product of a soak, so where it
+#   comes from is a NAMED choice and not something inferred from which flags happen to be set:
+#
+#     --salt-method=auto          (DEFAULT)  derived from the operator namespace's UID
+#     --salt-method=from-secret              read from a Secret you create
+#     --redaction-salt-file=<path>           required by, and only by, from-secret
+#
+#   The collector prints which method it resolved on startup and records it in the archive's
+#   manifest, so soak-export reproduces the same salt without being told.
+#
+#   auto derives SHA256("crystalbackup-soak-salt-v1" || the namespace UID). The UID is unique per
+#   cluster, constant for the life of the namespace, and — the point — NOTHING GENERATES IT, so
+#   there is nothing to lose and nothing to regenerate. A Secret can be deleted by a `helm
+#   uninstall`, lost with a recreated namespace, or redone "to be safe"; when that happens
+#   mid-soak the correlation breaks silently and you are left with seven days of tokens on one
+#   side, seven on the other, and no way to join them.
+#
+#   Nothing should ever GENERATE this Secret for you, and that includes the chart when the
+#   collector eventually moves into it. templates/webhook.yaml already explains why for the
+#   certificate it does generate: "`lookup` would not fix it: Argo CD renders with `helm
+#   template`, which has no cluster to look anything up in." A generated salt would change on
+#   every refresh — three minutes by default — and it would be WORSE than the certificate,
+#   because a new certificate rolls the Deployment and gets noticed while a new salt changes
+#   nothing visible at all.
+#
+#   WHAT THE DERIVED SALT PROTECTS AGAINST, PLAINLY. Against a stranger reading a public issue,
+#   the UID is 122 bits they do not have. Against anyone who can `get` the operator's namespace,
+#   the tokens are REVERSIBLE BY DICTIONARY in seconds, because namespace names come from a small
+#   guessable set. Every exported report says so in its own redaction block. If a report is
+#   leaving the cluster for a wider audience, re-run it with no fixed salt at all.
+#
 # ORDER OF INSTALLATION
 #
-#   1. openssl rand -out soak-salt.bin 32
-#   2. kubectl -n crystal-backup-system create secret generic crystal-backup-soak-salt \
-#        --from-file=salt=soak-salt.bin
-#   3. edit the image below to the digest your operator actually runs
-#   4. kubectl apply -f collector.yaml
-#   5. kubectl -n crystal-backup-system exec deploy/crystal-backup-soak -- \
+#   1. edit the image below to the digest your operator actually runs
+#   2. kubectl apply -f collector.yaml
+#   3. kubectl -n crystal-backup-system exec deploy/crystal-backup-soak -- \
 #        /manager soak-export --status        # on day 1, and again on day 2
 #
-#   KEEP soak-salt.bin on your own machine and DO NOT put it in the archive you send. The tokens
-#   in the archive are HMACs under that salt; with it, every one of them is reversible in seconds
-#   by dictionary (`production`, `staging`, your customer's name). Without it, by nobody.
+#   For --salt-method=from-secret, first:
+#
+#     openssl rand -out soak-salt.bin 32
+#     kubectl -n crystal-backup-system create secret generic crystal-backup-soak-salt \
+#       --from-file=salt=soak-salt.bin
+#
+#   then uncomment the --salt-method, volumeMounts and volumes blocks marked `from-secret` below.
+#   KEEP soak-salt.bin on your own machine and DO NOT put it in the archive you send: with it,
+#   every token is reversible in seconds by dictionary. Without it, by nobody — which is the one
+#   thing from-secret buys over auto.
 # ---------------------------------------------------------------------------------------------
 apiVersion: v1
 kind: ServiceAccount
@@ -290,11 +328,20 @@ spec:
             - --mover-sample-interval=15s
             - --selfcheck-interval=24h
             - --state-interval=1h
-            # The salt is needed by soak-export, not by soak-collect — what lands on the PVC is
-            # UNREDACTED, because it is your cluster's own data on your own volume, and because
-            # you cannot re-redact a token afterwards. Redaction happens once, at export. The
-            # flag is here so the export can find the file without being told.
-            - --redaction-salt-file=/etc/crystal-backup/soak/salt
+            # Where the redaction salt comes from. `auto` is the default and needs no Secret:
+            # the salt is derived from this namespace's UID, which nothing generates and nothing
+            # can regenerate. Written out rather than left to the flag's default, because this is
+            # the line somebody reads to find out what the archive's tokens promise.
+            #
+            # What lands on the PVC is UNREDACTED either way — it is your cluster's own data on
+            # your own volume, and a token cannot be re-redacted afterwards. Redaction happens
+            # once, at export, and soak-export re-derives the same salt from the manifest.
+            - --salt-method=auto
+            # from-secret: swap the line above for these two, and uncomment the `salt` volume and
+            # volumeMount below. Passing --redaction-salt-file WITHOUT --salt-method=from-secret
+            # is refused at startup rather than silently ignored.
+            # - --salt-method=from-secret
+            # - --redaction-salt-file=/etc/crystal-backup/soak/salt
             # Off by default; see the kubelet-stats ClusterRole above.
             # - --kubelet-stats
           env:
@@ -326,9 +373,10 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /var/lib/crystal-backup-soak
-            - name: salt
-              mountPath: /etc/crystal-backup/soak
-              readOnly: true
+            # from-secret only.
+            # - name: salt
+            #   mountPath: /etc/crystal-backup/soak
+            #   readOnly: true
             - name: tmp
               mountPath: /tmp
           livenessProbe:
@@ -348,13 +396,14 @@ spec:
         - name: data
           persistentVolumeClaim:
             claimName: crystal-backup-soak-data
-        - name: salt
-          secret:
-            secretName: crystal-backup-soak-salt
-            defaultMode: 0400
-            items:
-              - key: salt
-                path: salt
+        # from-secret only.
+        # - name: salt
+        #   secret:
+        #     secretName: crystal-backup-soak-salt
+        #     defaultMode: 0400
+        #     items:
+        #       - key: salt
+        #         path: salt
         # readOnlyRootFilesystem: true, and the export builds its tarball as a stream — but Go's
         # tempdir has to exist somewhere.
         - name: tmp

@@ -52,9 +52,14 @@ type CollectorInfo struct {
 	SelfcheckInterval   string    `json:"selfcheckInterval"`
 	StateInterval       string    `json:"stateInterval"`
 	KubeletStats        bool      `json:"kubeletStats"`
-	SaltFile            string    `json:"redactionSaltFile"`
-	MaxBytes            int64     `json:"maxBytes"`
-	SelfcheckEnabled    bool      `json:"selfcheckEnabled"`
+	// SaltMethod is which named method produced the redaction salt (soak.SaltMethod*). Recorded
+	// so soak-export reproduces the SAME salt days later without being told how, and so an
+	// archive states the choice rather than leaving it to be inferred from whether a file path
+	// happens to be set. Empty in archives written before the methods existed.
+	SaltMethod       string `json:"saltMethod,omitempty"`
+	SaltFile         string `json:"redactionSaltFile"`
+	MaxBytes         int64  `json:"maxBytes"`
+	SelfcheckEnabled bool   `json:"selfcheckEnabled"`
 }
 
 func (c CollectorInfo) resolution() time.Duration {

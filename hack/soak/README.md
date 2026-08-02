@@ -28,7 +28,10 @@ Three things go in:
 |---|---|---|
 | CrystalBackup 0.6.1 | the operator itself, per the install docs | one pod |
 | `manifests/collector.yaml` | the soak collector: one pod, one 1Gi PVC, read-only cluster RBAC | one pod, 1Gi |
-| a Secret | 32 random bytes; the salt that makes the pseudonyms stable | — |
+
+The redaction salt — what makes the same namespace the same token on day 2 and on day 13 — is
+**derived from your operator namespace's UID** and needs no Secret. `--salt-method=from-secret`
+is there if you would rather hold the salt yourself; see below.
 
 Nothing else. No Prometheus is required — the collector scrapes the operator's `/metrics`
 itself, so this works on a cluster whose monitoring keeps 24 hours of history, or none.
@@ -57,10 +60,12 @@ the archive, because it changes how every duration in it reads).
 Do these in order. The first two take a minute and save the fortnight.
 
 ```sh
-# 1. the salt. 32 bytes, once, and keep the file.
-openssl rand -out soak-salt.bin 32
-kubectl -n crystal-backup-system create secret generic crystal-backup-soak-salt \
-  --from-file=salt=soak-salt.bin
+# 1. reproduce the salt LOCALLY, so you can verify the archive at the end. Nothing is created:
+#    this recomputes what the collector derives, SHA256("crystalbackup-soak-salt-v1" || the
+#    namespace UID). Keep the file; it is not needed to RUN the soak, only to check it.
+{ printf 'crystalbackup-soak-salt-v1'
+  kubectl get ns crystal-backup-system -o jsonpath='{.metadata.uid}'
+} | openssl dgst -sha256 -binary > soak-salt.bin
 
 # 2. does this build have the collector?
 kubectl -n crystal-backup-system exec deploy/crystal-backup -- /manager soak-collect --help
@@ -71,9 +76,13 @@ kubectl -n crystal-backup-system exec deploy/crystal-backup -- /manager soak-col
 # 3. install the collector (edit the image to the digest your operator runs, first)
 kubectl apply -f manifests/collector.yaml
 
-# 4. the baseline self-check, kept as day zero
+# 4. the baseline self-check, kept as day zero. It has to be salted the SAME way as the soak or
+#    day zero shares no tokens with day one, so hand it the file you just derived.
+kubectl -n crystal-backup-system cp soak-salt.bin \
+  "$(kubectl -n crystal-backup-system get pod -l app.kubernetes.io/name=crystal-backup \
+     -o jsonpath='{.items[0].metadata.name}')":/tmp/soak-salt.bin
 kubectl -n crystal-backup-system exec deploy/crystal-backup -- \
-  /manager selfcheck --redaction-salt-file=/etc/crystal-backup/soak/salt > soak-day0.json
+  /manager selfcheck --redaction-salt-file=/tmp/soak-salt.bin > soak-day0.json
 
 # 5. write down, in a text file you will send with the archive:
 #      - the incumbent tool and its version
@@ -94,8 +103,32 @@ that nothing was collected, and it is the single step most worth not skipping.
 
 **KEEP `soak-salt.bin`.** You need it at the end, and it must never be in the archive: the tokens
 are HMACs under it, and the value space (`production`, `staging`, your customer's name) is small
-enough that anyone holding the salt reverses the whole archive in seconds. Anyone without it,
-never.
+enough that anyone holding the salt reverses the whole archive in seconds.
+
+With the **derived** default, be clear-eyed about what that sentence means. The salt's only input
+is your operator namespace's UID, so **anyone who can `get` that namespace can recompute it and
+reverse every token** — step 1 above is the whole attack, in one command. Against a stranger
+reading a public issue it is 122 bits they do not have; against anyone with read access to your
+cluster it is nothing. Every exported report says exactly this in its own redaction block. If an
+archive is going anywhere wider than the maintainer, take it with no fixed salt at all.
+
+**Why derived rather than a Secret you create.** A Secret can be deleted by a `helm uninstall`,
+lost with a recreated namespace, or redone "to be safe" — and when that happens mid-soak the
+correlation breaks with nothing to signal it: seven days of tokens on one side, seven on the
+other, and no way to join them. Nothing generates a namespace UID, so nothing can regenerate it.
+To hold the salt yourself instead, create the Secret and switch the collector to
+`--salt-method=from-secret` (both blocks are in `manifests/collector.yaml`, commented, ready to
+uncomment):
+
+```sh
+openssl rand -out soak-salt.bin 32
+kubectl -n crystal-backup-system create secret generic crystal-backup-soak-salt \
+  --from-file=salt=soak-salt.bin
+```
+
+Passing `--redaction-salt-file` without `--salt-method=from-secret` is refused at startup rather
+than silently ignored: the two produce archives with different guarantees, and a running
+collector looks identical either way.
 
 ## During the soak — the rule that matters
 

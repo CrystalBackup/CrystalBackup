@@ -91,13 +91,15 @@ type Report struct {
 
 // Redaction states the mode and the algorithm — and, by its silence, the salt.
 type Redaction struct {
-	// Mode is "hashed" (the default) or "full".
+	// Mode is ModeHashed (the default) or ModeFull.
 	Mode string `json:"mode"`
-	// SaltSource distinguishes the two hashed modes, which make DIFFERENT promises and are otherwise
-	// indistinguishable from the outside: tokens from a random salt are meaningless outside their
-	// own report, tokens from a caller-supplied one correlate across every report built on the same
-	// salt. A reader deciding whether a file is safe to attach to a public issue is deciding on
-	// this field. Empty in full mode, where nothing is salted at all.
+	// SaltSource distinguishes the THREE hashed modes, which make different promises and are
+	// otherwise indistinguishable from the outside: tokens from a random salt are meaningless
+	// outside their own report; tokens from a caller-supplied one correlate across every report
+	// built on the same salt and can be reversed only by whoever holds the file; tokens from a
+	// namespace-UID-derived one correlate the same way and can be reversed by anyone who can read
+	// that namespace. A reader deciding whether a file is safe to attach to a public issue is
+	// deciding on this field. Empty in full mode, where nothing is salted at all.
 	SaltSource string `json:"saltSource,omitempty"`
 	// Algorithm names the construction so a reader can reason about what a token does and does not
 	// reveal, without having to trust a one-word mode name.
@@ -109,6 +111,15 @@ type Redaction struct {
 	Note string `json:"note,omitempty"`
 }
 
+// The two redaction modes. Named because three call sites now emit the hashed one and a typo in
+// any of them would render a report whose mode nothing recognises.
+const (
+	// ModeHashed replaces identifiers with tokens. The default in every path.
+	ModeHashed = "hashed"
+	// ModeFull passes identifiers through verbatim.
+	ModeFull = "full"
+)
+
 // The values of Redaction.SaltSource. They are compared by the renderer and by anything reading a
 // stack of these files, so they are constants rather than repeated string literals.
 const (
@@ -117,7 +128,21 @@ const (
 	// SaltCallerSupplied means --redaction-salt-file was used and the tokens correlate across every
 	// report produced from that same file.
 	SaltCallerSupplied = "caller-supplied"
+	// SaltNamespaceUID means the salt was DERIVED from the operator namespace's UID rather than
+	// generated or supplied. It correlates like a caller-supplied salt does — that is its purpose,
+	// it is the soak collector's default — but it is reversible to anyone who can read the
+	// namespace, which a caller-supplied salt is not. Stated as its own value rather than folded
+	// into caller-supplied precisely because those two promises are different.
+	SaltNamespaceUID = "namespace-uid"
 )
+
+// SaltNamespaceUIDDomain is the domain separator the namespace-UID derivation hashes under:
+// SHA256(SaltNamespaceUIDDomain || uid). It lives here, beside the SaltSource value it explains,
+// because the report's Algorithm line quotes it and the derivation (internal/soak) computes with
+// it — one definition, so the sentence a reader is given and the bytes they were given can never
+// describe different constructions. The "-v1" is load-bearing: revising the derivation means a
+// new domain, not the same key computed differently.
+const SaltNamespaceUIDDomain = "crystalbackup-soak-salt-v1"
 
 // Operator is what the binary that produced this report knows about itself, from three
 // independent sources — because they disagree, and the disagreement is diagnostic.

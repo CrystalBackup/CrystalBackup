@@ -24,16 +24,27 @@
 #
 # PRIVACY
 #
-#   The archive is redacted inside the cluster, by the operator's own redactor, under the salt
-#   you created — so a namespace is the same token in a metric, in an event, in a log line and in
-#   day 9's self-check, and no token can be reversed by anyone who does not hold the salt.
+#   The archive is redacted inside the cluster, by the operator's own redactor, under the
+#   collector's salt — so a namespace is the same token in a metric, in an event, in a log line
+#   and in day 9's self-check. Each report states, in its own redaction block, WHICH salt that
+#   was and therefore who can reverse it:
+#
+#     saltSource: namespace-uid     (the collector's default) derived from the operator
+#                                   namespace's UID. Opaque to a stranger; REVERSIBLE BY
+#                                   DICTIONARY to anyone who can `get` that namespace, since they
+#                                   can recompute the salt. See ../README.md.
+#     saltSource: caller-supplied   a Secret you created. Reversible only by whoever holds it.
+#     saltSource: random-per-report reversible by nobody, correlates with nothing.
+#
+#   Read that field before you send the archive anywhere; it is the whole answer to "is this safe
+#   to attach".
 #
 #   What cannot be tokenised, and what the manifest will say in its own words: free text nobody
 #   enumerated — a path inside a volume, a restic snapshot ID, a URL inside a library's error
 #   string. That is why step 4 exists.
 #
 #   DO NOT send the salt file with the archive. With it, every token is reversible by dictionary
-#   in seconds. Without it, by nobody.
+#   in seconds.
 #
 # USAGE
 #
@@ -44,7 +55,9 @@
 #     --salt-file PATH   the salt, used LOCALLY and only to check that the tokens in the archive
 #                        are the ones your identifiers should have produced. Never uploaded,
 #                        never written into the archive. Without it that check is reported as
-#                        NOT MADE — which is not the same as passing.
+#                        NOT MADE — which is not the same as passing. Under the derived default
+#                        you do not hold a salt file, but you can reproduce one in a command:
+#                        see step 1 of ../README.md ("Before you start: the baseline").
 #     --review-dir DIR   where the archive is unpacked for inspection (default <out>.review)
 #     --since DURATION   passed to soak-export (default: everything)
 #     --full             export WITHOUT redaction. Identifiers verbatim. Says so everywhere.

@@ -40,7 +40,8 @@ crystal-backup soak-export  [flags]     # writes one tar.gz to stdout, or --stat
 | `--selfcheck-interval` | `24h` | |
 | `--state-interval` | `1h` | CR snapshots. |
 | `--operator-namespace` | `$POD_NAMESPACE` | same resolution as everywhere else. |
-| `--redaction-salt-file` | — | not used by `soak-collect` itself; recorded so `soak-export` in the same container finds it without being told. |
+| `--salt-method` | `auto` | where the redaction salt comes from: `auto` (derived from the operator namespace's UID) or `from-secret`. §6. |
+| `--redaction-salt-file` | — | REQUIRED by, and only by, `--salt-method=from-secret`. Recorded so `soak-export` in the same container finds it without being told; passing it under `auto` is refused rather than ignored. |
 | `--kubelet-stats` | `false` | opt-in; needs `nodes/proxy`. §5. |
 | `--heartbeat-check` | `false` | not a collector: reads the heartbeat file, exits 0 if it is fresh, non-zero if it is not, prints nothing. This is the liveness probe. |
 
@@ -48,6 +49,22 @@ Exit non-zero at startup — loudly, with the reason — if `--data-dir` is not 
 free space there is below `--max-bytes`, or if `--metrics-url` cannot be scraped after the first
 three attempts. A collector that starts happily and collects nothing is the failure mode this
 whole kit exists to avoid, and it must not be possible to reach it by accident.
+
+The salt flags are the same discipline applied to a different failure: an unknown `--salt-method`,
+a `from-secret` with no readable Secret, an `auto` that cannot read its namespace, and a
+`--redaction-salt-file` passed under `auto` (where it would be silently ignored) are all startup
+REFUSALS. None of them falls back to another method: a collector that quietly changed method
+would produce an archive claiming one guarantee and holding another, and nothing about the
+running pod would show it.
+
+**These are flags, not chart values.** The collector is `hack/soak/manifests/collector.yaml`,
+applied with `kubectl`; nothing in `charts/crystal-backup/` renders it today. Moving it into the
+chart is its own lot — Deployment, PVC, ServiceAccount, ClusterRole and bindings, the two
+NetworkPolicies, all release-prefixed, and the image digest, which is the whole reason to do it
+(the standalone manifest makes an administrator hand-copy four things the chart already knows,
+and soaking a different build from the one under test for a fortnight has nothing to signal it).
+That lot maps these flags onto values; a value added before anything renders it would be an inert
+knob.
 
 ## 2. Metrics — scrape, auth, TLS
 
@@ -266,9 +283,48 @@ collection time would throw away the ability to do it better later, and would ma
 useless to the admin who wants to read their own soak.
 
 **`soak-export` redacts, once, on the way out**, using `internal/selfcheck`'s `Redactor` seeded
-from `--redaction-salt-file` — the same construction and the same salt as the daily self-check,
-so a namespace is the same token in a metrics series, in an event, in a log line and in day 9's
-report. That cross-stream identity is the whole reason the salt is stable.
+from the salt `--salt-method` resolved — the same construction and the same salt as the daily
+self-check, so a namespace is the same token in a metrics series, in an event, in a log line and
+in day 9's report. That cross-stream identity is the whole reason the salt is stable.
+
+### Where the salt comes from — a named method, never an implicit one
+
+| `--salt-method` | the salt | `saltSource` in every report |
+|---|---|---|
+| `auto` (default) | `SHA256("crystalbackup-soak-salt-v1" ‖ the operator namespace's UID)` | `namespace-uid` |
+| `from-secret` | the bytes of `--redaction-salt-file`, verbatim, ≥ 32 | `caller-supplied` |
+| — (one-shot `crystal-backup selfcheck`, unchanged) | 32 bytes from `crypto/rand`, per report | `random-per-report` |
+
+`auto` is the collector's default because a soak's product IS the correlation, and a Secret is a
+thing that can be lost or silently regenerated — a `helm uninstall`, a recreated namespace,
+somebody redoing it "to be safe". When that happens mid-soak the series breaks with nothing to
+signal it: seven days of tokens on one side, seven on the other, no way to join them. A namespace
+UID is unique per cluster, constant for the life of the namespace, and **nothing generates it**,
+so there is nothing to regenerate.
+
+The UID is **not** the key. It is a 36-character string that would clear the 32-byte floor by
+accident rather than by construction, and a raw UID used as a key here could not be reused for
+anything else. Hashing under a versioned domain separator fixes both, and lets the derivation be
+revised later without colliding with archives made under v1.
+
+**Nothing may ever generate this Secret for the admin, chart included.**
+`charts/crystal-backup/templates/webhook.yaml` already states the reason for the certificate it
+does generate: "`lookup` would not fix it: Argo CD renders with `helm template`, which has no
+cluster to look anything up in." Under continuous rendering the salt would change every refresh —
+three minutes by default — and it would be **worse** than the certificate case, because a
+regenerated certificate rolls the Deployment and gets noticed while a regenerated salt changes
+nothing visible: the collector keeps running, the reports keep being written, and only the
+correlation dies. This project ships Argo CD and Flux install pages, so those are its users.
+
+**What `namespace-uid` promises, stated for somebody about to paste the file somewhere.** Against
+a stranger reading a public issue, the UID is 122 bits they do not have. Against anyone who can
+`get` the operator's namespace — anyone with cluster read access, now or later — the tokens are
+**reversible by dictionary in seconds**, because namespace names come from a small guessable set.
+Every report says exactly that in its redaction note. A report that leaves the cluster should be
+re-run without a fixed salt at all.
+
+Stated **positively** in all three cases, never inferred from an absent field, because the three
+make different promises and are otherwise indistinguishable from the outside.
 
 Two extensions to `internal/selfcheck/redact.go` are needed, and both are small:
 
@@ -277,10 +333,12 @@ Two extensions to `internal/selfcheck/redact.go` are needed, and both are small:
    silently defeated tenancy once already), `pod`, `instance`, `node`. Map them to `ns`, `pod`,
    `host`, `host`. Everything else stays passed-through-verbatim for the reason the existing
    comment gives: `origin`, `scope` and `result` carry the meaning of a series.
-2. A constructor taking a caller-supplied salt. `NewRedactor` generates its own 32 random bytes;
-   the soak needs `NewRedactorWithSalt(salt []byte, full bool)`, minimum 32 bytes, error below
-   that. This is the same thing `selfcheck --redaction-salt-file` needs, so it will already
-   exist by the time this lot starts.
+2. A constructor taking a caller-supplied salt AND its provenance. `NewRedactor` generates its
+   own 32 random bytes; the soak needs `NewRedactorWithSource(full bool, salt []byte, source
+   string)`, minimum 32 bytes, error below that. The source is reported and never branched on:
+   32 bytes from a file and 32 bytes derived from a namespace UID are the same bytes to that
+   package and make different promises to a reader, so it cannot be inferred and has to be
+   passed.
 
 `soak-export --full` disables redaction, exactly as `selfcheck --full` does, and the manifest
 says so in a field `collect.sh` refuses to be quiet about.

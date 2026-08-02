@@ -257,6 +257,43 @@ func TestSuppliedSaltMakesTokensCorrelateAcrossReports(t *testing.T) {
 	assertNoSecrets(t, "JSON (supplied salt)", string(body))
 }
 
+// TestADerivedSaltLeaksNothingEither runs the SAME leak assertions over the third mode.
+//
+// A derived salt is the soak collector's default, so it is the mode most archives will actually
+// be built with — and the one whose salt has an input (a namespace UID) that a reader might
+// separately be able to obtain. Neither the salt nor its input may appear anywhere in the report,
+// and the report must say which mode produced it rather than inheriting a sentence about a random
+// salt it does not have.
+func TestADerivedSaltLeaksNothingEither(t *testing.T) {
+	// Whatever soak.DeriveNamespaceSalt produces is 32 bytes; this stands in for it, because this
+	// package must not import the one that derives it.
+	derived := []byte("0123456789abcdef0123456789abcdef")
+	rep := collectFixtureSaltedFrom(t, false, derived, SaltNamespaceUID)
+
+	if rep.Redaction.SaltSource != SaltNamespaceUID {
+		t.Errorf("saltSource = %q, want %q: a derived-salt report claiming another mode is a false "+
+			"provenance line", rep.Redaction.SaltSource, SaltNamespaceUID)
+	}
+	body, err := json.Marshal(rep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertNoSecrets(t, "JSON (derived salt)", string(body))
+	if strings.Contains(string(body), string(derived)) {
+		t.Error("the derived salt is in the report")
+	}
+	// It correlates like the supplied mode does — that is its purpose — and differs from it, so
+	// two archives salted by different methods cannot be matched against each other.
+	again := collectFixtureSaltedFrom(t, false, derived, SaltNamespaceUID)
+	supplied := collectFixtureSalted(t, false, soakSalt)
+	if tokens(rep)[0] != tokens(again)[0] {
+		t.Error("two reports from the same derived salt disagree; there is no series to read")
+	}
+	if tokens(rep)[0] == tokens(supplied)[0] {
+		t.Error("a derived salt and a supplied one produced the same token")
+	}
+}
+
 // TestADifferentSaltIsADifferentPseudonym. Correlation must be scoped to the salt, or two unrelated
 // installations salted differently could still be matched against each other.
 func TestADifferentSaltIsADifferentPseudonym(t *testing.T) {
@@ -920,15 +957,27 @@ func collectFixture(t *testing.T, full bool) *Report {
 
 // collectFixtureSalted is collectFixture with the salt exposed: nil is the default random one, and
 // a non-nil salt is what the --redaction-salt-file tests hold constant between two collections.
+// collectFixtureSalted passes NO source, exactly as `crystal-backup selfcheck
+// --redaction-salt-file` does. The default has to be caller-supplied, because that is what the
+// flag means; a default that drifted to another mode would put a false provenance line on every
+// report taken through that path.
 func collectFixtureSalted(t *testing.T, full bool, salt []byte) *Report {
 	t.Helper()
+	return collectFixtureSaltedFrom(t, full, salt, "")
+}
+
+// collectFixtureSaltedFrom is collectFixtureSalted with the salt's PROVENANCE stated, so the
+// leak assertions can be run over every mode rather than only the one that existed first.
+func collectFixtureSaltedFrom(t *testing.T, full bool, salt []byte, source string) *Report {
+	t.Helper()
 	rep, err := Collect(context.Background(), Options{
-		Reader:            fixtureClient(t),
-		OperatorNamespace: operatorNS,
-		Now:               fixtureNow(),
-		Full:              full,
-		RedactionSalt:     salt,
-		Discovery:         fakeDiscovery{},
+		Reader:              fixtureClient(t),
+		OperatorNamespace:   operatorNS,
+		Now:                 fixtureNow(),
+		Full:                full,
+		RedactionSalt:       salt,
+		RedactionSaltSource: source,
+		Discovery:           fakeDiscovery{},
 		DeclaredImages: map[string]string{
 			"mover": "registry.acme-internal.example/crystal-backup/mover:0.6.0",
 			"sync":  "registry.acme-internal.example/crystal-backup/sync:0.6.0",

@@ -41,7 +41,6 @@ import (
 
 	cbv1 "github.com/CrystalBackup/CrystalBackup/api/v1alpha1"
 	"github.com/CrystalBackup/CrystalBackup/internal/apiconst"
-	"github.com/CrystalBackup/CrystalBackup/internal/selfcheck"
 )
 
 // The subcommand names, so cmd/main.go's dispatch and the usage text below cannot drift.
@@ -65,7 +64,10 @@ const Usage = `crystal-backup ` + CommandCollect + ` [flags]
         --selfcheck-interval <dur>       daily self-check (default 24h)
         --state-interval <dur>           CR snapshots (default 1h)
         --operator-namespace <ns>        default $POD_NAMESPACE
-        --redaction-salt-file <path>     the stable salt; recorded so soak-export finds it
+        --salt-method <auto|from-secret>  where the redaction salt comes from (default auto:
+                                         derived from the operator namespace's UID)
+        --redaction-salt-file <path>     REQUIRED by --salt-method=from-secret; recorded so
+                                         soak-export finds it
         --kubelet-stats                  read the restic cache high-water (needs nodes/proxy)
         --heartbeat-check                the liveness probe: exit 0 if the heartbeat is fresh
 
@@ -73,7 +75,9 @@ crystal-backup ` + CommandExport + ` [flags]
         Writes ONE tar.gz to STDOUT. Progress goes to stderr; nothing else touches stdout.
 
         --data-dir <dir>                 the PVC mount
-        --redaction-salt-file <path>     REQUIRED unless --full
+        --salt-method <auto|from-secret>  must match the collector's; defaults to what the
+                                         collector recorded
+        --redaction-salt-file <path>     REQUIRED by --salt-method=from-secret, unless --full
         --full                           DISABLE redaction. Identifiers verbatim.
         --since <dur>                    only this far back (default: everything)
         --status                         no archive: one screen on stderr saying what is there
@@ -118,7 +122,8 @@ func RunCollect(ctx context.Context, args []string, stderr io.Writer) int {
 		selfIvl     = fs.Duration("selfcheck-interval", defaultSelfcheckInterval, "daily self-check cadence")
 		stateIvl    = fs.Duration("state-interval", defaultStateInterval, "CR snapshot cadence")
 		namespace   = fs.String("operator-namespace", defaultNamespace(), "where the operator and its mover Jobs live")
-		saltFile    = fs.String("redaction-salt-file", "", "the stable redaction salt (>= 32 raw bytes)")
+		saltMethod  = fs.String("salt-method", SaltMethodAuto, "where the redaction salt comes from: auto | from-secret")
+		saltFile    = fs.String("redaction-salt-file", "", "the stable redaction salt (>= 32 raw bytes); required by --salt-method=from-secret")
 		kubeletStat = fs.Bool("kubelet-stats", false, "read the restic cache high-water from the kubelet (needs nodes/proxy)")
 		heartbeat   = fs.Bool("heartbeat-check", false, "exit 0 if the heartbeat is fresh, non-zero if it is not; print nothing")
 	)
@@ -160,8 +165,10 @@ func RunCollect(ctx context.Context, args []string, stderr io.Writer) int {
 			return 2
 		}
 	}
-	salt, err := selfcheck.LoadRedactionSalt(*saltFile)
-	if err != nil {
+	// The salt method is validated BEFORE anything opens a file, builds a client or spends three
+	// scrape attempts: an unknown value is a typo in a manifest, and finding out about it now
+	// beats finding out on day fourteen from an archive whose tokens correlate with nothing.
+	if err := checkSaltFlags(*saltMethod, *saltFile); err != nil {
 		_, _ = fmt.Fprintf(stderr, "soak-collect: %v\n", err)
 		return 2
 	}
@@ -191,6 +198,17 @@ func RunCollect(ctx context.Context, args []string, stderr io.Writer) int {
 		return 1
 	}
 
+	// The salt, from the named method. A REFUSAL either way — see ResolveSalt: there is no
+	// fallback from fromSecret to auto and none from auto to random, because both would produce
+	// an archive that claims one guarantee and holds another. It comes after the client because
+	// `auto` reads the namespace, and before anything is written because the whole fortnight is
+	// keyed on it.
+	salt, saltSource, err := ResolveSalt(*saltMethod, *saltFile, namespaceUID(ctx, cs, *namespace))
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "soak-collect: %v\n", err)
+		return 2
+	}
+
 	scraper := NewScraper(*metricsURL, *skipVerify)
 	if err := proveScrape(ctx, scraper, stderr); err != nil {
 		_, _ = fmt.Fprintf(stderr, "soak-collect: %v\n", err)
@@ -209,6 +227,7 @@ func RunCollect(ctx context.Context, args []string, stderr io.Writer) int {
 		SelfcheckInterval:   selfIvl.String(),
 		StateInterval:       stateIvl.String(),
 		KubeletStats:        *kubeletStat,
+		SaltMethod:          *saltMethod,
 		SaltFile:            *saltFile,
 		MaxBytes:            cap,
 		SelfcheckEnabled:    len(salt) > 0,
@@ -237,20 +256,20 @@ func RunCollect(ctx context.Context, args []string, stderr io.Writer) int {
 		MetricsInterval: *metricsIvl, MoverInterval: *moverIvl, StateInterval: *stateIvl,
 		Progress: stderr,
 	}
-	if len(salt) > 0 {
-		var disco discovery.DiscoveryInterface
-		if d, err := discovery.NewDiscoveryClientForConfig(cfg); err == nil {
-			disco = d
-		}
-		c.Selfcheck = &SelfcheckRunner{
-			Reader: reader, Discovery: disco, Namespace: *namespace,
-			Salt: salt, Interval: *selfIvl, Store: store,
-		}
-	} else {
-		_, _ = fmt.Fprint(stderr,
-			"soak-collect: no --redaction-salt-file, so the daily self-check stream is DISABLED. "+
-				"Everything else collects normally; the manifest will say so.\n")
+	// Unconditional now, and it was effectively unconditional before: the previous code loaded the
+	// salt with LoadRedactionSalt(""), which cannot succeed, so the "self-check DISABLED" branch it
+	// carried was unreachable — soak-collect simply refused to start without a Secret. Both methods
+	// either yield a salt or refuse, so the stream is always on.
+	var disco discovery.DiscoveryInterface
+	if d, err := discovery.NewDiscoveryClientForConfig(cfg); err == nil {
+		disco = d
 	}
+	c.Selfcheck = &SelfcheckRunner{
+		Reader: reader, Discovery: disco, Namespace: *namespace,
+		Salt: salt, SaltSource: saltSource, Interval: *selfIvl, Store: store,
+	}
+	_, _ = fmt.Fprintf(stderr, "soak-collect: redaction salt from --salt-method=%s (saltSource: %s)\n",
+		*saltMethod, saltSource)
 
 	runCtx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -309,11 +328,12 @@ func RunExport(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet(CommandExport, flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	var (
-		dataDir  = fs.String("data-dir", defaultDataDir, "the PVC mount")
-		saltFile = fs.String("redaction-salt-file", "", "the stable redaction salt (>= 32 raw bytes)")
-		full     = fs.Bool("full", false, "DISABLE redaction: identifiers appear verbatim")
-		since    = fs.Duration("since", 0, "only export this far back (default: everything)")
-		status   = fs.Bool("status", false, "write a status screen to stderr instead of an archive")
+		dataDir    = fs.String("data-dir", defaultDataDir, "the PVC mount")
+		saltMethod = fs.String("salt-method", "", "where the redaction salt comes from: auto | from-secret (default: what the collector recorded)")
+		saltFile   = fs.String("redaction-salt-file", "", "the stable redaction salt (>= 32 raw bytes)")
+		full       = fs.Bool("full", false, "DISABLE redaction: identifiers appear verbatim")
+		since      = fs.Duration("since", 0, "only export this far back (default: everything)")
+		status     = fs.Bool("status", false, "write a status screen to stderr instead of an archive")
 	)
 	fs.Usage = func() { _, _ = fmt.Fprint(stderr, Usage) }
 	if err := fs.Parse(args); err != nil {
@@ -333,18 +353,37 @@ func RunExport(args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 
-	// The salt file the collector was given, if this invocation was not told one. That is the
-	// entire reason soak-collect records --redaction-salt-file: `kubectl exec … soak-export`
-	// should not have to repeat a path the running collector already knows.
-	if *saltFile == "" {
-		if info, err := ReadCollectorInfo(*dataDir); err == nil {
+	// The method and the salt file the COLLECTOR was given, if this invocation was not told them.
+	// That is the entire reason soak-collect records both: `kubectl exec … soak-export` must
+	// reproduce the same salt days later, and asking the operator to remember how the running
+	// collector was configured is asking them to break the correlation by hand.
+	namespace := defaultNamespace()
+	if info, err := ReadCollectorInfo(*dataDir); err == nil {
+		if *saltFile == "" {
 			*saltFile = info.SaltFile
 		}
+		if *saltMethod == "" {
+			*saltMethod = info.SaltMethod
+		}
+		if info.OperatorNamespace != "" {
+			namespace = info.OperatorNamespace
+		}
 	}
-	salt, err := selfcheck.LoadRedactionSalt(*saltFile)
-	if err != nil && !*full {
-		_, _ = fmt.Fprintf(stderr, "soak-export: %v\n", err)
-		return 2
+	if *saltMethod == "" {
+		// An archive from a collector older than the methods. It had a Secret or it had nothing,
+		// and its manifest names the file — so fromSecret is what it actually used, and saying so
+		// is a statement about that archive rather than a default applied to it.
+		*saltMethod = SaltMethodFromSecret
+	}
+
+	var salt []byte
+	if !*full {
+		var err error
+		salt, _, err = ResolveSalt(*saltMethod, *saltFile, exportNamespaceUID(namespace))
+		if err != nil {
+			_, _ = fmt.Fprintf(stderr, "soak-export: %v\n", err)
+			return 2
+		}
 	}
 
 	opts := ExportOptions{DataDir: *dataDir, Salt: salt, Full: *full, Since: *since, Now: time.Now()}

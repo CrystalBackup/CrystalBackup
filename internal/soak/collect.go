@@ -209,8 +209,12 @@ type SelfcheckRunner struct {
 	Discovery discovery.DiscoveryInterface
 	Namespace string
 	Salt      []byte
-	Interval  time.Duration
-	Store     *Store
+	// SaltSource travels with the salt so every daily report states which method produced it. It
+	// is not derivable from the bytes, and a report that named the wrong one would describe a
+	// guarantee it does not hold.
+	SaltSource string
+	Interval   time.Duration
+	Store      *Store
 
 	next time.Time
 }
@@ -232,8 +236,9 @@ func (r *SelfcheckRunner) MaybeRun(ctx context.Context, now time.Time) {
 		// Hashed, under the SAME salt as the export. That is what makes a namespace the same
 		// token in a metric here and in day 9's report — §6's cross-stream identity, which is the
 		// whole reason the salt is stable.
-		RedactionSalt: r.Salt,
-		Discovery:     info,
+		RedactionSalt:       r.Salt,
+		RedactionSaltSource: r.SaltSource,
+		Discovery:           info,
 	})
 	if err != nil {
 		r.Store.RecordError(StreamSelfcheck, err.Error(), now)

@@ -55,8 +55,30 @@ func TestSoakCollectRefusesToStartBlind(t *testing.T) {
 		{
 			"a salt file that is not there",
 			[]string{"--data-dir=" + t.TempDir(), "--metrics-url=https://x/metrics",
-				"--redaction-salt-file=/nonexistent/salt"},
+				"--salt-method=from-secret", "--redaction-salt-file=/nonexistent/salt"},
 			2, "read redaction salt file",
+		},
+		{
+			// A silent fallback to the derived salt here would produce an archive claiming one
+			// guarantee and holding another — the defect the no-fallback rule exists to prevent.
+			"fromSecret with no Secret named",
+			[]string{"--data-dir=" + t.TempDir(), "--metrics-url=https://x/metrics",
+				"--salt-method=from-secret"},
+			2, "needs --redaction-salt-file",
+		},
+		{
+			"an unknown salt method",
+			[]string{"--data-dir=" + t.TempDir(), "--metrics-url=https://x/metrics",
+				"--salt-method=random"},
+			2, `valid values are "auto" and "from-secret"`,
+		},
+		{
+			// The Secret is mounted, the flag is set, the manifest looks like a fromSecret
+			// collector — and the salt would come from the namespace UID instead, invisibly.
+			"a salt file under the derived method",
+			[]string{"--data-dir=" + t.TempDir(), "--metrics-url=https://x/metrics",
+				"--redaction-salt-file=/etc/crystal-backup/soak/salt"},
+			2, "would IGNORE that file",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -151,7 +173,8 @@ func TestUsageNamesEveryFlagTheManifestPasses(t *testing.T) {
 	for _, flag := range []string{
 		"--data-dir", "--max-bytes", "--metrics-url", "--metrics-insecure-skip-verify",
 		"--metrics-interval", "--metrics-resolution", "--mover-sample-interval",
-		"--selfcheck-interval", "--state-interval", "--redaction-salt-file", "--kubelet-stats",
+		"--selfcheck-interval", "--state-interval", "--salt-method", "--redaction-salt-file",
+		"--kubelet-stats",
 		"--heartbeat-check", "--full", "--since", "--status", "--operator-namespace",
 	} {
 		if !strings.Contains(Usage, flag) {
