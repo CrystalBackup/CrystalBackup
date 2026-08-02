@@ -16,7 +16,7 @@
     <span><b>Generated</b> {{ ts .GeneratedAt }}</span>
     <span><b>Operator</b> {{ with .Operator.AppVersion }}{{ . }}{{ else }}{{ .Operator.BuildVersion }}{{ end }}</span>
     <span><b>Kubernetes</b> {{ with .Cluster.KubernetesVersion }}{{ . }}{{ else }}unknown{{ end }}</span>
-    <span><b>Redaction</b> {{ .Redaction.Mode }}</span>
+    <span><b>Redaction</b> {{ .Redaction.Mode }}{{ if eq .Redaction.SaltSource "caller-supplied" }} · caller-supplied salt{{ end }}</span>
   </div>
 
   <section class="verdict {{ if eq .Verdict.Status "unhealthy" }}unhealthy{{ else if eq .Verdict.Status "degraded" }}degraded{{ end }}">
@@ -29,7 +29,7 @@
   </section>
 
   {{ if eq .Redaction.Mode "hashed" }}
-  <div class="note"><b>Identifiers are redacted.</b> {{ .Redaction.Note }}</div>
+  <div class="note"><b>Identifiers are redacted{{ if eq .Redaction.SaltSource "caller-supplied" }} with a caller-supplied salt.</b> {{ else }}.</b> {{ end }}{{ .Redaction.Note }}</div>
   {{ else }}
   <div class="note"><b>This report is UNREDACTED.</b> {{ .Redaction.Note }}</div>
   {{ end }}

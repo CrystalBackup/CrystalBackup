@@ -498,6 +498,38 @@ func Operations() []Operation {
 	return out
 }
 
+// ClassOf names the sizing class an operation belongs to, and reports whether the operation is
+// one this table knows at all.
+//
+// It exists for internal/soak, which measures peak memory per CLASS rather than per operation:
+// the four classes are where the sizing argument actually happens, and a curve for `prune`
+// separate from one for `check` would be two thin samples of the same 8Gi decision instead of one
+// good one. The `ok` return is what keeps a class from being GUESSED — a pod whose operation
+// cannot be recovered is filed as unknown, because a `data` peak reported under `repo-heavy`
+// would be read as evidence that prune's limit is right when it is evidence about backup's.
+func ClassOf(op Operation) (string, bool) {
+	spec, ok := builtinSpecs[op]
+	if !ok {
+		return "", false
+	}
+	return spec.class, true
+}
+
+// Classes returns the four sizing classes, sorted. The soak's high-water table is keyed on them
+// and has to be able to say "this class had no movers at all" rather than omitting the row.
+func Classes() []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, 4)
+	for _, spec := range builtinSpecs {
+		if !seen[spec.class] {
+			seen[spec.class] = true
+			out = append(out, spec.class)
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
 // String renders one profile as the operator logs it and as the generated docs table shows it —
 // one definition so the log line and the documentation cannot describe different pods.
 func (p Profile) String() string {

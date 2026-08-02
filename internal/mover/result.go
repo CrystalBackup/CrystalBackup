@@ -80,7 +80,86 @@ type MoverResult struct {
 	// Error is a human-readable failure reason, set only when OK is false. It is advisory
 	// (for status/events); control flow keys off OK, not off this string.
 	Error string `json:"error,omitempty"`
+
+	// ------------------------------------------------------------------------------------
+	// What this mover cost, measured by the mover itself.
+	//
+	// WHY IT IS HERE AND NOT IN A METRIC. Peak mover memory cannot be obtained by polling.
+	// metrics-server exposes a pod only after its own scrape has covered it, on its own ~15s
+	// cadence, and a mover lives seconds: measured on a real cluster, 63 mover pods with
+	// lifetimes from 0.9s to 17s produced ZERO samples each, with metrics-server healthy and
+	// answering for long-lived pods throughout. Sampling faster changes nothing — the data is
+	// not there to be sampled. The process that CAN answer is the one that ran, from its own
+	// kernel accounting, and the termination message is a channel it already writes to.
+	//
+	// Every field below is omitted when it could not be read. Absence is "not measured",
+	// never zero — see MemorySource, which is the field that says which readers succeeded.
+	// ------------------------------------------------------------------------------------
+
+	// PeakRSSBytes is the high-water RESIDENT SET SIZE of the restic process, from the kernel's
+	// own per-process accounting (wait4's ru_maxrss, exact rather than sampled).
+	//
+	// THIS IS THE SIZING NUMBER. RSS is anonymous memory plus mapped file pages; it does NOT
+	// include the page cache a backup streams through, which is what makes it — and not the
+	// cgroup peak below — the figure that predicts an OOM kill. The kernel reclaims page cache
+	// before it kills anything, so what a memory limit must cover is the part that cannot be
+	// reclaimed, and that is essentially this.
+	//
+	// It is restic's alone. The shim's own footprint is ShimPeakRSSBytes and the two are
+	// resident AT THE SAME TIME (the shim waits while restic runs), so a limit has to cover
+	// their sum.
+	PeakRSSBytes int64 `json:"peakRSSBytes,omitempty"`
+	// ShimPeakRSSBytes is the same measurement for the crystal-mover process itself, reported
+	// separately so nobody has to wonder whether PeakRSSBytes includes it. It is small for a
+	// data or maintenance operation and is NOT small for a manifest capture, which holds a
+	// namespace's objects in this process before restic ever starts.
+	ShimPeakRSSBytes int64 `json:"shimPeakRSSBytes,omitempty"`
+	// CgroupPeakBytes is the peak of the container cgroup's memory.current (cgroup v2
+	// memory.peak): anonymous memory PLUS page cache plus kernel memory, for the whole
+	// container.
+	//
+	// IT IS AN UPPER BOUND, NOT A SIZING TARGET, and it can exceed PeakRSSBytes by an order of
+	// magnitude for exactly the reason this operator exists: a backup streams a volume through
+	// the page cache, every one of those pages is charged to this cgroup, and the cgroup is
+	// free to keep them right up to its limit because they are RECLAIMABLE. Sizing a limit to
+	// this number raises a ceiling that was never the constraint. What it is good for is the
+	// opposite question — it bounds everything the container could possibly have needed.
+	CgroupPeakBytes int64 `json:"cgroupPeakBytes,omitempty"`
+	// MemoryLimitHits is cgroup v2 memory.events `max`: how many times the cgroup reached its
+	// memory limit and the kernel had to reclaim to stay under it.
+	//
+	// This is what turns the pair above into an answer. Zero means the limit was never pressed
+	// at all, so a high CgroupPeakBytes is cache the cgroup was merely ALLOWED to keep. Non-zero
+	// with MemoryOOMKills at zero means the limit WAS reached and reclaim was enough — the
+	// workload is running at its ceiling and paying for it in I/O.
+	MemoryLimitHits int64 `json:"memoryLimitHits,omitempty"`
+	// MemoryOOMKills is cgroup v2 memory.events `oom_kill`: processes the cgroup OOM killer
+	// killed. It is not redundant with the kubelet's OOMKilled container reason: when restic is
+	// the one killed and this shim survives to report, the container exits 1 and Kubernetes
+	// records no OOM anywhere. This is then the only trace.
+	MemoryOOMKills int64 `json:"memoryOOMKills,omitempty"`
+	// MemorySource names which readers succeeded, so a reader never has to infer measurement
+	// from a zero: "rusage" (the two RSS peaks), "cgroup2" (the cgroup peak and the two
+	// counters), "rusage+cgroup2" for both, and ABSENT when nothing could be read at all.
+	//
+	// The counters in particular are only meaningful when this names cgroup2: without it,
+	// MemoryLimitHits and MemoryOOMKills are absent because nothing looked, not because
+	// nothing happened.
+	MemorySource string `json:"memorySource,omitempty"`
 }
+
+// The MemorySource values. Named here rather than spelled at each end, because the shim writes
+// them and internal/soak reads them: a misspelling would not fail, it would silently file a
+// measured peak as unmeasured provenance.
+const (
+	// MemorySourceRusage — the two RSS peaks came from the kernel's per-process accounting.
+	MemorySourceRusage = "rusage"
+	// MemorySourceCgroup2 — the cgroup peak and the two memory.events counters came from the
+	// container's own cgroup v2 directory.
+	MemorySourceCgroup2 = "cgroup2"
+	// MemorySourceBoth — both readers succeeded, which is the normal case on a cgroup v2 node.
+	MemorySourceBoth = MemorySourceRusage + "+" + MemorySourceCgroup2
+)
 
 // ResourceEntry is one manifest's outcome on the wire. It mirrors the API's
 // RestoreResourceEntry but is declared here because this is the transport format, and the

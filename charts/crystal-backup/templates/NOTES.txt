@@ -21,3 +21,16 @@ RBAC installed (cluster-scoped names are stable):
 
 CRDs: packaged under crds/ (installed by Helm on first install). Regenerate/refresh
       them into the chart with `make chart-crds` before packaging.
+{{- if .Values.soak.enabled }}
+
+Soak collector: ON. It runs the SAME image as the operator above, keeps five streams on a
+{{ .Values.soak.storage }} volume capped at {{ .Values.soak.maxBytes }}, and holds cluster-wide READ-ONLY RBAC for as long as it
+is enabled. Redaction salt: --salt-method={{ if eq .Values.soak.saltMethod "fromSecret" }}from-secret (Secret {{ .Values.soak.saltSecret }}){{ else }}auto (derived from this namespace's UID){{ end }}.
+
+Check on day one AND day two that it is really collecting — this is the cheapest defence
+against finding out on day fourteen that nothing was:
+
+  kubectl -n {{ include "crystal-backup.namespace" . }} exec deploy/{{ include "crystal-backup.fullname" . }}-soak -- /manager soak-export --status
+
+Then collect with hack/soak/collect.sh. The protocol is hack/soak/README.md.
+{{- end }}

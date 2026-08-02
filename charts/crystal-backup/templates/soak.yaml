@@ -1,0 +1,495 @@
+{{- /*
+The resident soak collector (hack/soak/SPEC.md), off by default.
+
+WHY THIS IS IN THE CHART AT ALL. It shipped first as hack/soak/manifests/collector.yaml, applied
+with kubectl, and that file made an administrator hand-copy four things this chart already knows:
+the operator image, the metrics Service name, the namespace, and the metrics-reader ClusterRole
+name. Three of those are release-scoped through `crystal-backup.fullname`, so a second install in
+one cluster gets different names for all of them and the hand-copied file silently points at the
+first install. The fourth is worse: the image. A collector built from a different commit than the
+operator under test describes a cluster that does not exist, for a fortnight, with nothing to
+signal it — and the standalone file's answer was a comment saying "MUST be the image your operator
+is actually running" next to a kubectl command to go and look it up. Here it is
+`crystal-backup.image`, the same digest the operator Deployment resolves, and there is no second
+value to get wrong.
+
+WHAT IT COSTS THE CLUSTER, STATED UP FRONT. One pod at 200m CPU / 384Mi memory, requests equal to
+limits. One 1Gi RWO volume of which the collector uses at most `soak.maxBytes`, rotating the
+oldest data away rather than growing. Cluster-wide READ-ONLY RBAC, held for the duration rather
+than for four seconds a day — enumerated below, verb by verb.
+
+The one thing a soak collector must never do is cause the incident it was deployed to observe.
+That is why the footprint is capped rather than trusted, why the data lives on a PVC and never on
+the node's ephemeral disk, and why the resource requests are real. If your default StorageClass is
+local-path or otherwise node-backed, that PVC IS node disk — the cap is then the only thing
+standing between this and a DiskPressure eviction, so keep it.
+*/ -}}
+{{- if .Values.soak.enabled }}
+{{- $ns := include "crystal-backup.namespace" . }}
+{{- $name := printf "%s-soak" (include "crystal-backup.fullname" .) }}
+{{- $saltMountDir := "/etc/crystal-backup/soak" }}
+{{- $dataDir := "/var/lib/crystal-backup-soak" }}
+
+{{- /*
+The salt method, normalised and then REFUSED if it does not make sense — at template time, which
+is the only place a broken combination can still be cheap. soak-collect refuses the same three
+combinations at startup (internal/soak/salt.go, checkSaltFlags); by the time it does, the pod is
+in CrashLoopBackOff and somebody has to read logs to find out why.
+
+The flag's vocabulary is `from-secret`; this chart's values are camelCase, so `fromSecret` arrives
+too and means the same thing. Both are accepted and normalised to the flag's spelling. Anything
+else is named and rejected rather than passed through — an unrecognised method would otherwise
+reach --salt-method and be refused later, in a pod, on a cluster.
+*/ -}}
+{{- $method := .Values.soak.saltMethod | default "auto" }}
+{{- if eq $method "fromSecret" }}{{- $method = "from-secret" }}{{- end }}
+{{- if not (has $method (list "auto" "from-secret")) }}
+{{- fail (printf "soak.saltMethod: %q is not a salt method. Use \"auto\" (derived from the operator namespace's UID; generates nothing) or \"fromSecret\" (a Secret you created; set soak.saltSecret to its name)." .Values.soak.saltMethod) }}
+{{- end }}
+{{- if and (eq $method "from-secret") (not .Values.soak.saltSecret) }}
+{{- fail "soak.saltMethod=fromSecret needs soak.saltSecret: the name of a Secret you created, holding at least 32 raw bytes under the key \"salt\".\n\n  openssl rand -out soak-salt.bin 32\n  kubectl -n <namespace> create secret generic crystal-backup-soak-salt --from-file=salt=soak-salt.bin\n\nKEEP that file: it is what reverses the archive's tokens at the end, and it must never travel with the archive. If you would rather hold nothing, soak.saltMethod=auto derives the salt from the namespace UID and needs no Secret." }}
+{{- end }}
+{{- if and (eq $method "auto") .Values.soak.saltSecret }}
+{{- fail "soak.saltSecret is set but soak.saltMethod is \"auto\", which derives the salt from the namespace UID and would never read the Secret. soak-collect refuses the same pair at startup rather than silently ignoring one of them: the two methods produce archives with different guarantees, and a running collector looks identical either way. Set soak.saltMethod=fromSecret, or clear soak.saltSecret." }}
+{{- end }}
+
+{{- /*
+Two things the collector cannot work without, and which this chart may not have rendered. Both are
+template-time refusals for the same reason as the salt: soak-collect's own refusal is correct,
+loud and three attempts too late (internal/soak/cli.go, proveScrape).
+*/ -}}
+{{- if not .Values.metrics.service.create }}
+{{- fail "soak.enabled requires metrics.service.create: the collector scrapes the operator's /metrics through that Service, and with no Service there is no URL to give it. This is the stream that cannot be reconstructed afterwards." }}
+{{- end }}
+{{- if not .Values.rbac.create }}
+{{- fail "soak.enabled requires rbac.create: the collector's scrape is a SubjectAccessReview on /metrics, answered by the <fullname>-metrics-reader ClusterRole this chart renders under rbac.create. Without it every scrape is a 403 and soak-collect refuses to start." }}
+{{- end }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "crystal-backup.soak.labels" . | nindent 4 }}
+automountServiceAccountToken: true
+---
+# The standing read grant. Read it as what it is: for two weeks, a pod in your cluster may GET and
+# LIST these kinds cluster-wide. Every verb here is a read. There is no create, no update, no
+# delete, no patch, no exec, no portforward, and no access to Secrets anywhere — the self-check
+# does not read Secret objects (it reports the NAMES that appear in CR specs, which it gets from
+# the specs).
+#
+# This is a SEPARATE identity from the operator's, and that is the opposite of the decision the
+# earlier CronJob shape made. The reason is the standing part: a one-shot job that lives four
+# seconds a day can borrow the operator's identity without meaningfully widening anything, but a
+# process that holds a token for fourteen days should hold its own, so that revoking it is
+# deleting one ClusterRoleBinding and not editing the operator's.
+#
+# THE VERBS WERE CHECKED AGAINST THE CODE, not carried over. Three rules that
+# hack/soak/manifests/collector.yaml granted are gone, because nothing reads them:
+#
+#   * `watch` everywhere. Nothing in internal/soak watches. The events stream LISTS on a resync
+#     interval and says why (streams.go: a watch "drops silently on an apiserver rollover … and a
+#     collector that lost its watch on day four would record nothing for ten days while looking
+#     perfectly healthy"); the CR-state stream lists on an interval; the high-water sampler lists;
+#     and the API reader is client.New — uncached, so it opens no informers.
+#   * `storage.k8s.io` storageclasses/volumeattachments. Those are read by the operator
+#     (internal/rexposer, the restore and backup controllers), never by internal/selfcheck or
+#     internal/soak.
+#   * the `nodes` resource. The node a mover landed on comes off pod.Spec.NodeName
+#     (highwater.go); the only thing that touches a node object is the kubelet-stats path, and
+#     that is nodes/proxy in the opt-in ClusterRole below, which does not need `nodes` itself.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $name }}-collector
+  labels:
+    {{- include "crystal-backup.soak.labels" . | nindent 4 }}
+rules:
+  # The product's own objects, and their status. This is the CR-state stream and most of the
+  # self-check's inventory (soak/streams.go StateStream, selfcheck/collect.go).
+  - apiGroups: ["crystalbackup.io"]
+    resources: ["*"]
+    verbs: ["get", "list"]
+  # Namespaces: GET for the derived salt (salt.go reads the operator namespace's UID), LIST for
+  # the self-check's coverage census. PVCs and pods for the exposure and pileup story and for
+  # mover lifecycle — restarts, OOM kills, evictions. Events for the stream that expires after an
+  # hour, listed cluster-wide with type=Warning.
+  - apiGroups: [""]
+    resources: ["namespaces", "persistentvolumeclaims", "pods", "events"]
+    verbs: ["get", "list"]
+  # The operator's own error-level log lines, read continuously from the API rather than scraped
+  # off a node at the end. This is what makes the log stream survive the kubelet's rotation.
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  # Mover Jobs: what a mover pod was DOING is on its Job, and without it a peak memory sample is a
+  # number attributed to nothing.
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list"]
+  # The self-check's snapshot-leak census.
+  - apiGroups: ["snapshot.storage.k8s.io"]
+    resources: ["volumesnapshots", "volumesnapshotcontents", "volumesnapshotclasses"]
+    verbs: ["get", "list"]
+  # Whether this product's CRDs are installed at all, and at which version.
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources: ["customresourcedefinitions"]
+    verbs: ["get", "list"]
+  # Peak memory per mover, from metrics-server. Reached as a namespaced pod LIST
+  # (/apis/metrics.k8s.io/v1beta1/namespaces/<ns>/pods, kube.go). If metrics-server is not
+  # installed the collector records the high-water marks as NOT MEASURED — never as zero.
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $name }}-collector
+  labels:
+    {{- include "crystal-backup.soak.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ $name }}-collector
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}
+    namespace: {{ $ns }}
+---
+# /metrics on the operator is authenticated and authorized: the manager runs with --metrics-secure
+# (the default) and controller-runtime's filters.WithAuthenticationAndAuthorization, so a scrape is
+# a TokenReview followed by a SubjectAccessReview on the non-resource URL /metrics. rbac.yaml ships
+# the ClusterRole that answers it and deliberately binds it to nobody ("Scrapers bind this to read
+# /metrics"). This is that binding, for this one ServiceAccount — and it is the second of the four
+# names the standalone manifest asked an administrator to look up by hand.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $name }}-metrics-reader
+  labels:
+    {{- include "crystal-backup.soak.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "crystal-backup.fullname" . }}-metrics-reader
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}
+    namespace: {{ $ns }}
+---
+# OPT-IN, and rendered UNBOUND unless soak.kubeletStats is true.
+#
+# The restic cache high-water mark cannot be read from the API: the cache is an emptyDir inside a
+# mover pod, and the only in-cluster source for its size is the kubelet's own stats/summary
+# endpoint. Reaching it needs nodes/proxy, which is not a small grant — it is access to the kubelet
+# API, and on most clusters that transitively includes running commands in containers. It is
+# therefore written down here and left unbound by default. Without it the collector reports the
+# cache high-water as NOT MEASURED and everything else unchanged. The 20Gi cache ceiling in
+# internal/mover/profiles.go is explicitly "a CEILING AGAINST A RUNAWAY, not a sizing estimate", so
+# measuring it is the point of the exercise — but not at the price of a grant you did not want to
+# give.
+#
+# The grant and the flag move together, which the standalone manifest could not enforce: there,
+# uncommenting --kubelet-stats without creating the binding got you a fortnight of NOT MEASURED.
+# Here `soak.kubeletStats: true` is both, and nothing else is.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $name }}-kubelet-stats
+  labels:
+    {{- include "crystal-backup.soak.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["nodes/proxy"]
+    verbs: ["get"]
+{{- if .Values.soak.kubeletStats }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $name }}-kubelet-stats
+  labels:
+    {{- include "crystal-backup.soak.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ $name }}-kubelet-stats
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}
+    namespace: {{ $ns }}
+{{- end }}
+---
+# soak.storage, of which the collector uses at most soak.maxBytes.
+#
+# The sizing, since a number with no reasoning behind it is how a PVC ends up full: the metrics
+# stream dominates, and it is bounded by (distinct series) × (points per day) × (bytes per point).
+# A cluster with 40 protected namespaces emits on the order of a thousand crystalbackup_ series; at
+# one point per five minutes that is 288 points per series per day, ~20 bytes each gzipped — about
+# 6 MB a day, 80 MB for a fortnight. Events, CR snapshots, error lines and the fourteen self-checks
+# together are under 50 MB. 512Mi is therefore roughly five times the expected volume, and 1Gi
+# leaves the filesystem room to breathe above the cap.
+#
+# A cluster ten times that size will hit the cap, and that is a designed outcome rather than an
+# error: the collector drops the OLDEST day's raw samples and keeps the aggregates and the
+# high-water marks, which are the part that cannot be reconstructed. What it never does is fill the
+# volume.
+#
+# No storageClassName, deliberately, and no value for one: the cluster default is the right choice
+# here and naming one would be wrong on every cluster but the one this was written on.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ $name }}-data
+  namespace: {{ $ns }}
+  labels:
+    {{- include "crystal-backup.soak.labels" . | nindent 4 }}
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: {{ .Values.soak.storage }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "crystal-backup.soak.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  # Recreate, not RollingUpdate. The volume is ReadWriteOnce: a rolling update would start the new
+  # pod before the old one released the PVC, and it would sit Pending on a multi-attach error until
+  # someone noticed — with the soak silently stopped in the meantime.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "crystal-backup.soak.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        # The selector labels and nothing else that carries meaning elsewhere. In particular NOT
+        # app.kubernetes.io/name: it plus the instance label is the podSelector of the chart's
+        # own `-operator` NetworkPolicy and the selector of the metrics Service, and a collector
+        # wearing either would be confined by a policy written for a different pod and offered as
+        # a scrape target serving no metrics.
+        {{- include "crystal-backup.soak.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/part-of: crystal-backup
+        app.kubernetes.io/component: soak
+    spec:
+      serviceAccountName: {{ $name }}
+      automountServiceAccountToken: true
+      {{- with .Values.imagePullSecrets }}
+      # The same secrets as the operator: this is the same image, from the same registry.
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      # No priorityClassName, and no value for one. Under node pressure this pod should not
+      # outrank the workload it is measuring; its Guaranteed QoS already puts it behind Burstable
+      # and BestEffort pods in the eviction order, which is the right place for it.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: collector
+          # THE WHOLE REASON THIS IS IN THE CHART. The operator Deployment resolves the same
+          # helper, so the collector is by construction the build under test — there is no field
+          # to hand-copy and no way for the two to disagree.
+          image: {{ include "crystal-backup.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - soak-collect
+            - --data-dir={{ $dataDir }}
+            # The hard cap on the on-disk footprint. On reaching it the collector deletes the
+            # oldest raw segment and records the drop in its own manifest, so an archive that lost
+            # its first three days SAYS it lost its first three days.
+            - --max-bytes={{ .Values.soak.maxBytes }}
+            # The operator's metrics Service, resolved rather than looked up: the third of the four
+            # names the standalone manifest asked for by hand, and the one that silently points at
+            # the wrong install when two releases share a cluster.
+            - --metrics-url=https://{{ include "crystal-backup.fullname" . }}-metrics.{{ $ns }}.svc:{{ .Values.metrics.port }}/metrics
+            # The metrics server presents a self-signed certificate (this chart requires no
+            # cert-manager, and the ServiceMonitor it ships sets insecureSkipVerify for the same
+            # reason). Not a value: it is a property of what this chart renders, not a choice, and
+            # a knob here would only ever be turned to break the scrape. The connection is
+            # pod-to-pod inside one namespace and is authenticated in the direction that matters —
+            # the collector proves who it is with a bearer token.
+            - --metrics-insecure-skip-verify
+            - --metrics-interval={{ .Values.soak.metricsInterval }}
+            # Raw scrapes are NOT kept. Each series is reduced to one point per resolution window,
+            # plus the min and max seen inside it, which is what keeps a fortnight of a thousand
+            # series inside the cap while still showing a spike that lasted four minutes.
+            - --metrics-resolution={{ .Values.soak.metricsResolution }}
+            # Mover pods are short-lived and their peak is what we came for. 15s is a compromise:
+            # fast enough to catch the peak of an eleven-minute backup, slow enough that the
+            # metrics-server load is negligible.
+            - --mover-sample-interval={{ .Values.soak.moverSampleInterval }}
+            - --selfcheck-interval={{ .Values.soak.selfcheckInterval }}
+            - --state-interval={{ .Values.soak.stateInterval }}
+            # Where the redaction salt comes from. Written out rather than left to the flag's
+            # default, because this is the line somebody reads to find out what the archive's
+            # tokens promise.
+            #
+            # What lands on the PVC is UNREDACTED either way — it is your cluster's own data on
+            # your own volume, and a token cannot be re-redacted afterwards. Redaction happens
+            # once, at export, and soak-export re-derives the same salt from the manifest.
+            - --salt-method={{ $method }}
+            {{- if eq $method "from-secret" }}
+            - --redaction-salt-file={{ $saltMountDir }}/salt
+            {{- end }}
+            {{- if .Values.soak.kubeletStats }}
+            - --kubelet-stats
+            {{- end }}
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            # 80% of the limit below. The operator learned this on its own mover Jobs: a Go process
+            # with a memory limit and no GOMEMLIMIT grows into the cgroup ceiling and is killed
+            # instead of collecting. A process that parses a metrics exposition every minute for
+            # two weeks is exactly that shape. Literal, and paired with a literal limit — a value
+            # for the resources would be a second number that has to be kept at 80% of the first
+            # by hand, and the failure when it is not is an OOMKill on day nine.
+            - name: GOMEMLIMIT
+              value: "300MiB"
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          # requests == limits (Guaranteed). A collector evicted under node pressure loses
+          # precisely the hours most worth having.
+          resources:
+            requests:
+              cpu: 200m
+              memory: 384Mi
+            limits:
+              cpu: 200m
+              memory: 384Mi
+          volumeMounts:
+            - name: data
+              mountPath: {{ $dataDir }}
+            {{- if eq $method "from-secret" }}
+            - name: salt
+              mountPath: {{ $saltMountDir }}
+              readOnly: true
+            {{- end }}
+            - name: tmp
+              mountPath: /tmp
+          livenessProbe:
+            exec:
+              # The collector touches this file every loop. A process that is alive but has stopped
+              # collecting is the failure this probe exists for, and it is not one an HTTP handler
+              # on the same process would ever catch.
+              command:
+                - /manager
+                - soak-collect
+                - --heartbeat-check
+                - --data-dir={{ $dataDir }}
+            initialDelaySeconds: 60
+            periodSeconds: 300
+            failureThreshold: 3
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ $name }}-data
+        {{- if eq $method "from-secret" }}
+        # The Secret YOU created. The chart never generates it, and that is a decision rather than
+        # an omission: templates/webhook.yaml explains, about the certificate it does generate,
+        # that "`lookup` would not fix it: Argo CD renders with `helm template`, which has no
+        # cluster to look anything up in." A generated salt would change on every refresh — three
+        # minutes by default — and it would be WORSE than the certificate, because a new
+        # certificate rolls the Deployment and gets noticed while a new salt changes nothing
+        # visible at all: the collector keeps running, the reports keep being written, and only the
+        # correlation the whole soak exists for silently dies.
+        - name: salt
+          secret:
+            secretName: {{ .Values.soak.saltSecret }}
+            defaultMode: 0400
+            items:
+              - key: salt
+                path: salt
+        {{- end }}
+        # readOnlyRootFilesystem: true, and the export builds its tarball as a stream — but Go's
+        # tempdir has to exist somewhere.
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+---
+# networkpolicy.yaml installs a default-deny over every pod in this namespace, including ones that
+# did not exist when it was applied — this one. Without the two rules below the collector reaches
+# neither the API server nor the operator's /metrics, and it would spend fourteen days recording
+# that it could not see anything.
+#
+# Rendered whether or not networkPolicy.create is on, and whether or not you believe you have
+# NetworkPolicies: they grant egress to the API server and to one port on one pod, so on a cluster
+# with no default-deny they change nothing. DNS is already covered for every pod in the namespace
+# by the chart's own allow-dns policy.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $name }}-egress
+  namespace: {{ $ns }}
+  labels:
+    {{- include "crystal-backup.soak.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "crystal-backup.soak.selectorLabels" . | nindent 6 }}
+  policyTypes: [Egress]
+  egress:
+    # The API server. Both ports, because it is reached on 443 through the in-cluster Service on
+    # most distributions and on 6443 on several others.
+    - ports:
+        - port: 443
+          protocol: TCP
+        - port: 6443
+          protocol: TCP
+      to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+    # The operator's metrics port.
+    - ports:
+        - port: {{ .Values.metrics.port }}
+          protocol: TCP
+      to:
+        - podSelector:
+            matchLabels:
+              {{- include "crystal-backup.selectorLabels" . | nindent 14 }}
+              control-plane: controller-manager
+---
+# The operator's own policy allows ingress on the metrics port only from the namespace named in
+# networkPolicy.monitoringNamespace, when one is named. NetworkPolicies are additive, so this adds
+# the collector as a permitted source without touching that policy.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $name }}-metrics-ingress
+  namespace: {{ $ns }}
+  labels:
+    {{- include "crystal-backup.soak.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "crystal-backup.selectorLabels" . | nindent 6 }}
+      control-plane: controller-manager
+  policyTypes: [Ingress]
+  ingress:
+    - ports:
+        - port: {{ .Values.metrics.port }}
+          protocol: TCP
+      from:
+        - podSelector:
+            matchLabels:
+              {{- include "crystal-backup.soak.selectorLabels" . | nindent 14 }}
+{{- end }}

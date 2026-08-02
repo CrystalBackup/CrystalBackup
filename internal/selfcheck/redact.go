@@ -23,6 +23,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net/url"
+	"os"
 	"strings"
 )
 
@@ -35,13 +36,40 @@ import (
 // `default`, `kube-system`, the fifty most common tenant names, the customer's own name. Any of
 // those is recovered by hashing a dictionary and comparing, in seconds, by anyone who reads the
 // issue. Deriving the salt from something in the cluster is the same defect wearing a hat, because
-// the derivation is in this file and the inputs are in the report.
+// the derivation is in this file and the inputs are in the cluster.
+//
+// That last sentence is now load-bearing rather than rhetorical: SaltNamespaceUID exists and
+// derives exactly that way. It is not a reversal of this paragraph, it is the paragraph applied.
+// The derived mode is for a SOAK ARCHIVE, whose product is a fortnight read as one series and
+// which goes to a maintainer; against a stranger holding only the file, the namespace UID is 122
+// bits they do not have, and against anyone who can read the namespace, the tokens fall to a
+// dictionary in seconds. Describe() says that in those words, so the mode is chosen with its cost
+// rather than instead of it — and the default for a one-shot `crystal-backup selfcheck`, the
+// report that gets attached to a public issue, is still the random salt.
 //
 // So the salt is 32 bytes from crypto/rand, generated per report and thrown away with the process.
 // The consequence is deliberate and is the whole design: correlation is preserved WITHIN a report
 // (the same namespace is the same token in the inventory, in the leak samples and in every alert
 // breach) and destroyed BETWEEN reports. Two reports from the same cluster share no tokens. Nobody,
 // including the person who ran it, can reverse one afterwards.
+//
+// # And why there is nevertheless an opt-in stable salt
+//
+// That property is right for the case it was built for — one report, attached to one public issue.
+// It is wrong for a soak. Fourteen daily self-checks with fourteen salts share no tokens at all, so
+// nothing in them can be read as a series: a namespace that grew, a namespace that drifted, a
+// namespace that stopped being backed up on day nine all look like fourteen unrelated strangers.
+// The exercise measures change over time and the redaction destroys exactly that axis.
+//
+// --redaction-salt-file therefore lets an administrator supply the salt once, from a file, and the
+// reasoning above is not weakened by it — it is accepted and paid for. A caller-supplied salt IS a
+// stable pseudonym for as long as the file exists, and IS dictionary-reversible by whoever holds
+// the file. Two things keep that honest rather than merely convenient. The salt never enters the
+// report in any form (not the bytes, not a digest of them, not the path), so a reader who does not
+// already have the file gains nothing. And Describe() says which of the two constructions produced
+// the file in front of it, because "HMAC-SHA256 over a 32-byte random salt" printed over a fixed
+// salt is a false provenance line, and a false provenance line on a redacted report is worse than
+// no line at all.
 //
 // # What is never redacted, because it is never anyone's identity
 //
@@ -53,6 +81,12 @@ import (
 type Redactor struct {
 	salt []byte
 	full bool
+	// saltSource records WHERE the salt came from — crypto/rand, a caller's file, or a derivation
+	// from something in the cluster. It changes nothing about how a token is computed and
+	// everything about what a token PROMISES, so it exists to be reported, not to be branched on.
+	// It is a value rather than a bool because there are now three answers and they make three
+	// different promises; a bool would have forced two of them to share a sentence.
+	saltSource string
 	// known is every identifier the collector has registered through Learn, sorted longest-first so
 	// Detail's free-text substitution cannot corrupt a name that contains a shorter one.
 	known []knownName
@@ -66,10 +100,55 @@ type Redactor struct {
 // `ns-a3f2c1d9` against the same token six sections away.
 const tokenBytes = 4
 
-// NewRedactor builds a redactor. full=true disables hashing entirely — for a report shared
-// privately, with someone the operator has decided to trust with their namespace names.
-func NewRedactor(full bool) (*Redactor, error) {
-	salt := make([]byte, 32)
+// MinSaltBytes is the shortest caller-supplied salt this package will accept.
+//
+// It is the length crypto/rand produces above, and the floor is not ceremony: the salt an
+// administrator supplies is the one somebody eventually types by hand, and a typed salt is short,
+// low-entropy and guessable — which would put the token space back inside dictionary range for a
+// reader who has nothing but the report. Accepting a short one silently is the failure mode.
+const MinSaltBytes = 32
+
+// NewRedactor builds a redactor.
+//
+// full=true disables hashing entirely — for a report shared privately, with someone the operator
+// has decided to trust with their namespace names.
+//
+// salt=nil is the default and the documented behaviour of this command: 32 fresh bytes from
+// crypto/rand, per report. A non-nil salt is the caller's, must be at least MinSaltBytes long, and
+// buys cross-report correlation at the cost of the guarantees the type comment sets out.
+func NewRedactor(full bool, salt []byte) (*Redactor, error) {
+	return NewRedactorWithSource(full, salt, SaltCallerSupplied)
+}
+
+// NewRedactorWithSource is NewRedactor for a caller that knows something more specific about
+// where its salt came from than "the caller supplied it".
+//
+// The source is REPORTED, never branched on, and it is a parameter rather than something this
+// package infers because it cannot be inferred: 32 bytes from a file and 32 bytes derived from a
+// namespace UID are the same 32 bytes to everything here, and they make different promises to a
+// reader. source is ignored when salt is nil (a random salt describes itself).
+func NewRedactorWithSource(full bool, salt []byte, source string) (*Redactor, error) {
+	if len(salt) > 0 {
+		if source == "" {
+			// A salt with no stated provenance would render as the random-salt note, which is the
+			// one sentence that is certainly false about it.
+			return nil, fmt.Errorf("a supplied redaction salt must name its source")
+		}
+		if full {
+			// The type would otherwise hold a salt it can never use, and a caller who asked for both
+			// has a wrong mental model of what they are about to get — see RunSelfcheck, which
+			// catches this first with a message naming the two flags.
+			return nil, fmt.Errorf("a redaction salt is meaningless in full mode: nothing is hashed")
+		}
+		if len(salt) < MinSaltBytes {
+			return nil, fmt.Errorf("redaction salt is %d bytes, need at least %d", len(salt), MinSaltBytes)
+		}
+		// full is provably false here, and is carried anyway rather than left to the zero value: a
+		// Redactor whose flags disagree with its constructor's arguments is a trap for whoever
+		// relaxes the check above.
+		return &Redactor{salt: salt, full: full, saltSource: source}, nil
+	}
+	salt = make([]byte, MinSaltBytes)
 	if _, err := rand.Read(salt); err != nil {
 		// Failing closed is the only acceptable behaviour here. A redactor that quietly fell back
 		// to a fixed salt would produce a report that LOOKS redacted and is reversible by anyone
@@ -77,6 +156,29 @@ func NewRedactor(full bool) (*Redactor, error) {
 		return nil, fmt.Errorf("generate redaction salt: %w", err)
 	}
 	return &Redactor{salt: salt, full: full}, nil
+}
+
+// LoadRedactionSalt reads a salt file, whole and verbatim.
+//
+// The file's bytes ARE the salt — no trimming, no hex decoding, no newline stripping. That is the
+// contract because it is the only one that stays true when the file is copied between machines: a
+// loader that quietly dropped a trailing newline would agree with one that did not on every file
+// except the ones an administrator actually creates with a shell redirect.
+//
+// Every error here is fatal to the run by design. A missing or unreadable salt file must never
+// degrade into "generate a random one instead": the report that came back would look exactly like a
+// correlatable one, would be filed beside thirteen others, and the gap would only be noticed by the
+// person who later cannot explain why day nine has no tokens in common with day eight.
+func LoadRedactionSalt(path string) ([]byte, error) {
+	salt, err := os.ReadFile(path) //nolint:gosec // an operator-supplied path is the entire feature
+	if err != nil {
+		return nil, fmt.Errorf("read redaction salt file: %w", err)
+	}
+	if len(salt) < MinSaltBytes {
+		return nil, fmt.Errorf("redaction salt file %s holds %d bytes, need at least %d: "+
+			"generate one with `head -c 32 /dev/urandom > %s`", path, len(salt), MinSaltBytes, path)
+	}
+	return salt, nil
 }
 
 // Full reports whether identifiers are being passed through unredacted.
@@ -87,15 +189,57 @@ func (r *Redactor) Full() bool { return r.full }
 func (r *Redactor) Describe() Redaction {
 	if r.full {
 		return Redaction{
-			Mode:          "full",
+			Mode:          ModeFull,
 			SaltDisclosed: false,
 			Note: "UNREDACTED. Namespace, tenant, PVC, location, bucket, endpoint and cluster " +
 				"identifiers appear verbatim. Share privately only. Secrets, repository passwords, " +
 				"S3 credentials and key material are still never included — they are not read.",
 		}
 	}
+	if r.saltSource == SaltNamespaceUID {
+		return Redaction{
+			Mode:       ModeHashed,
+			SaltSource: SaltNamespaceUID,
+			Algorithm: "HMAC-SHA256 over SHA256(\"" + SaltNamespaceUIDDomain + "\" || the operator " +
+				"namespace's UID), truncated to 8 hex characters, prefixed by kind",
+			SaltDisclosed: false,
+			Note: "Identifiers are replaced by tokens computed from a salt DERIVED FROM THIS " +
+				"CLUSTER — the UID of the operator's own namespace — rather than from a random one. " +
+				"That is deliberate and it is what makes a fortnight of reports readable as one " +
+				"series: the same namespace is the same token here, in every other report from this " +
+				"cluster, and in every stream of the same soak archive. Nothing generates the UID, so " +
+				"nothing can regenerate it and break the series halfway through. WHAT IT PROTECTS " +
+				"AGAINST, PLAINLY: against a stranger reading a public issue, the UID is 122 bits " +
+				"they do not have and the tokens are opaque. Against ANYONE WHO CAN `get` THE " +
+				"OPERATOR'S NAMESPACE — anyone with cluster read access, now or later — the tokens " +
+				"are REVERSIBLE BY DICTIONARY in seconds, because namespace names come from a small " +
+				"guessable set (`production`, `staging`, `default`, your customer's name). The salt " +
+				"is not in this file in any form, but it does not have to be. Before a report leaves " +
+				"the cluster, re-run it WITHOUT a fixed salt at all: the default is random per report " +
+				"and leaves nothing to correlate and nothing to reverse.",
+		}
+	}
+	if r.saltSource == SaltCallerSupplied {
+		return Redaction{
+			Mode:          ModeHashed,
+			SaltSource:    SaltCallerSupplied,
+			Algorithm:     "HMAC-SHA256 over a caller-supplied salt, truncated to 8 hex characters, prefixed by kind",
+			SaltDisclosed: false,
+			Note: "Identifiers are replaced by tokens computed from a salt SUPPLIED BY WHOEVER RAN " +
+				"THIS (--redaction-salt-file), not the usual random one. The tokens are therefore " +
+				"stable within this report AND ACROSS EVERY REPORT MADE WITH THE SAME SALT FILE — " +
+				"which is the point when you are reading a fortnight of them as one series, and is " +
+				"the risk everywhere else: anyone holding two such reports can follow a single " +
+				"namespace from one to the other, and anyone holding the salt file can recover the " +
+				"names outright, because namespace names come from a small guessable set. The salt " +
+				"itself is not in this file, in any form. Before attaching this to a public issue, " +
+				"re-run WITHOUT --redaction-salt-file: the default salt is random per report and " +
+				"leaves nothing to correlate.",
+		}
+	}
 	return Redaction{
-		Mode:          "hashed",
+		Mode:          ModeHashed,
+		SaltSource:    SaltRandomPerReport,
 		Algorithm:     "HMAC-SHA256 over a 32-byte random salt, truncated to 8 hex characters, prefixed by kind",
 		SaltDisclosed: false,
 		Note: "Identifiers are replaced by tokens that are STABLE WITHIN this report and " +
@@ -174,6 +318,11 @@ func (r *Redactor) Location(s string) string  { return r.token(kindLocation, s) 
 func (r *Redactor) Schedule(s string) string  { return r.token(kindSchedule, s) }
 func (r *Redactor) Sync(s string) string      { return r.token(kindSync, s) }
 func (r *Redactor) PVC(s string) string       { return r.token(kindPVC, s) }
+
+// Host redacts a node name. internal/soak needs it: a mover pod's peak memory is only
+// interpretable next to the node it ran on, and a node name identifies the cluster as surely as a
+// namespace identifies a tenant.
+func (r *Redactor) Host(s string) string      { return r.token(kindHost, s) }
 func (r *Redactor) Bucket(s string) string    { return r.token(kindBucket, s) }
 func (r *Redactor) Prefix(s string) string    { return r.token(kindPrefix, s) }
 func (r *Redactor) ClusterID(s string) string { return r.token(kindCluster, s) }
@@ -380,3 +529,35 @@ func isNameByte(c byte) bool {
 	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' ||
 		c == '-' || c == '.'
 }
+
+// ---------------------------------------------------------------------------
+// The surface internal/soak needs.
+//
+// The kind constants above are unexported because nothing outside this package had a reason to
+// name one: every identifier reached the report through a typed helper (Namespace, PVC, Location…)
+// that already knew its own kind.
+//
+// internal/soak broke that assumption, and for a good reason. It watches every namespace, PVC,
+// location and CR name in the cluster for a fortnight, so its registry of identifiers is far
+// better than anything this package could reconstruct at export time — but registering one
+// requires naming its kind, and a caller that could not name one would have to invent a prefix,
+// which would break the very correlation the construction exists for.
+//
+// So they are exported as ALIASES rather than a second set of literals: the two cannot drift, and
+// a rename here is still a single edit.
+// ---------------------------------------------------------------------------
+
+const (
+	KindNamespace = kindNamespace
+	KindTenant    = kindTenant
+	KindLocation  = kindLocation
+	KindSchedule  = kindSchedule
+	KindSync      = kindSync
+	KindPVC       = kindPVC
+	KindBucket    = kindBucket
+	KindHost      = kindHost
+	KindPrefix    = kindPrefix
+	KindCluster   = kindCluster
+	KindPod       = kindPod
+	KindObject    = kindObject
+)

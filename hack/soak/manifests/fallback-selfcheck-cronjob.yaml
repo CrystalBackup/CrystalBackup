@@ -1,0 +1,249 @@
+# CrystalBackup soak — the FALLBACK daily self-check.
+# SPDX-License-Identifier: Apache-2.0
+#
+# ---------------------------------------------------------------------------------------------
+# READ THIS FIRST: THE CHART'S soak.enabled IS THE SOAK KIT. THIS IS THE DEGRADED MODE.
+#
+#   The soak is collected by a resident Deployment — `--set soak.enabled=true` on the operator's
+#   own chart — which does everything this CronJob does and four things it cannot: it collects
+#   Warning Events on a cadence of minutes (they expire after about an hour, so a daily job sees
+#   almost none), it holds high-water marks for mover memory and the restic cache (a peak inside
+#   an eleven-minute pod is invisible to daily sampling), it scrapes the operator's /metrics
+#   itself so the kit needs no Prometheus, and it keeps the operator's error lines past the
+#   kubelet's log rotation.
+#
+#   This file is kept for exactly one situation, and it is a real one: `soak-collect` is a
+#   subcommand that does not exist in every build. If the operator image you are soaking has
+#   `selfcheck --redaction-salt-file` but not `soak-collect`, this CronJob is all of the kit that
+#   will run — a fourteen-day series of self-checks with stable pseudonyms, which is worth having
+#   and is strictly better than nothing.
+#
+#   RUN ONE OR THE OTHER, NEVER BOTH. Both write daily reports under the same salt, and two
+#   copies of every day makes a gap in one of them look like a gap in the soak.
+#
+#   Check first:
+#     kubectl -n crystal-backup-system exec deploy/crystal-backup -- /manager soak-collect --help
+#   If that prints usage, use `--set soak.enabled=true` and delete this CronJob.
+#
+# WHAT IT IS
+#
+#   One CronJob that runs `crystal-backup selfcheck` once a day against the cluster it is
+#   installed on, with a STABLE redaction salt, and prints the JSON report to stdout. Nothing
+#   else. It creates no object, mounts no volume of yours, and writes nowhere.
+#
+#   Fourteen of those reports, side by side, are the only way to see a slow drift — a repository
+#   that stopped deduplicating on day 6, a schedule that went inactive and nobody noticed, a
+#   digest that changed under you. One report on the last day cannot show any of that.
+#
+# WHY STDOUT AND NOT A PVC OR A ConfigMap
+#
+#   The operator image is distroless: it contains /manager and nothing else — no shell, no
+#   kubectl, no tar. So the job cannot post a ConfigMap (that needs an API client this subcommand
+#   does not have, plus a write grant the operator does not hold and should not be given), and a
+#   PVC could be WRITTEN to but not read back without introducing a second image with a shell in
+#   it just to fetch the files. stdout is the one sink that needs no extra image, no extra RBAC,
+#   and no storage on a cluster you are trying to observe rather than disturb.
+#
+#   The cost is real and is named here rather than discovered later: container logs die with the
+#   pod. `successfulJobsHistoryLimit` below keeps 30 days of Job+Pod objects, and there is
+#   deliberately NO `ttlSecondsAfterFinished`. But a drained or replaced node takes its pods'
+#   logs with it. THEREFORE: run `collect.sh` weekly, not only at the end. It is idempotent and
+#   merges into the same working directory.
+#
+# THE SALT — create it once, before you apply this
+#
+#   The self-check replaces every identifier with an HMAC token. Without a fixed salt it picks a
+#   random one per run, so day 3's `ns-a3f2c1d9` and day 4's are different tokens for the same
+#   namespace and nothing can be compared. `--redaction-salt-file` fixes that.
+#
+#     openssl rand -out soak-salt.bin 32
+#     kubectl -n crystal-backup-system create secret generic crystal-backup-soak-salt \
+#       --from-file=salt=soak-salt.bin
+#
+#   KEEP soak-salt.bin on the machine you will run collect.sh from — collect.sh needs the same
+#   bytes to produce the same tokens for the metrics and the log lines. DO NOT put it in the
+#   archive you send. The token space is small and guessable (`production`, `staging`, the
+#   customer's own name); with the salt, every token in the archive is reversible by anyone in
+#   seconds. Without it, by nobody.
+#
+# BEFORE YOU START THE SOAK, RUN IT ONCE BY HAND
+#
+#     kubectl -n crystal-backup-system create job --from=cronjob/crystal-backup-soak-selfcheck \
+#       soak-selfcheck-baseline
+#     kubectl -n crystal-backup-system logs job/soak-selfcheck-baseline | head -20
+#
+#   You should see JSON beginning with `"reportVersion"`. If you see a usage message instead,
+#   the image below predates `--redaction-salt-file` and every day of the soak would have failed
+#   silently until collection day. Keep that first report: it is the baseline.
+# ---------------------------------------------------------------------------------------------
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: crystal-backup-soak-selfcheck
+  # The operator's own namespace. selfcheck defaults --operator-namespace to $POD_NAMESPACE
+  # (set below via the downward API), which is where the platform Secrets and every mover Job
+  # live — the same resolution the operator itself does.
+  namespace: crystal-backup-system
+  labels:
+    app.kubernetes.io/part-of: crystal-backup
+    app.kubernetes.io/component: soak
+    crystalbackup.io/soak: selfcheck
+spec:
+  # 06:17 UTC: off the hour so it does not land in the same minute as every other CronJob on the
+  # cluster, and AFTER the usual overnight backup window so each report describes the night that
+  # has just finished rather than one in progress. Change it if your window is elsewhere; keep
+  # it once the soak has started, because a report is only comparable with one taken at the same
+  # point in the daily cycle.
+  schedule: "17 6 * * *"
+  # UTC explicitly, so the two clock changes a fourteen-day soak can straddle do not shift the
+  # sampling point in the middle of the series.
+  timeZone: "Etc/UTC"
+  concurrencyPolicy: Forbid
+  # An hour of grace. Unset, the CronJob controller counts missed starts back to the beginning of
+  # time and permanently gives up at 100 — a control-plane outage during the soak would silently
+  # stop the daily report for good. Bounded, a controller that was down for less than an hour
+  # still produces the day's report, and one that was down longer skips exactly that day.
+  startingDeadlineSeconds: 3600
+  # Thirty days of Job and Pod objects, so a fourteen-day soak collected late still has every
+  # day. There is deliberately no ttlSecondsAfterFinished: it would delete the Jobs, and the
+  # logs with them, which is the entire record.
+  successfulJobsHistoryLimit: 30
+  failedJobsHistoryLimit: 30
+  jobTemplate:
+    metadata:
+      labels:
+        app.kubernetes.io/part-of: crystal-backup
+        crystalbackup.io/soak: selfcheck
+    spec:
+      backoffLimit: 2
+      # Ten minutes is generous for a read-only pass over one cluster and short enough that a
+      # wedged run does not sit against the next day's Forbid.
+      activeDeadlineSeconds: 600
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/part-of: crystal-backup
+            # What collect.sh selects on. NOT `control-plane: controller-manager` — that label
+            # is the operator metrics Service's selector, and wearing it would make this pod a
+            # scrape target that serves no metrics.
+            crystalbackup.io/soak: selfcheck
+        spec:
+          restartPolicy: Never
+          # The OPERATOR's ServiceAccount, reused deliberately.
+          #
+          # selfcheck's contract is that it reads what the operator reads, with the operator's
+          # own RBAC — a report gathered under a different identity would show "could not read"
+          # diagnostics that are facts about this CronJob, not about the installation, and they
+          # look exactly like product defects. A dedicated SA could only be made equivalent by
+          # binding it to the very same ClusterRole (crystal-backup-operator), which reduces no
+          # privilege at all and adds a cluster-scoped binding that must be created, kept in step
+          # with the operator's ClusterRole across upgrades, and deleted afterwards. This job
+          # needs no write anywhere, so there is nothing a separate identity would contain.
+          serviceAccountName: crystal-backup-operator
+          # Stated rather than inherited: the chart's serviceAccount.automount can be false, and
+          # this pod cannot reach the API server without a token.
+          automountServiceAccountToken: true
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            fsGroup: 65532
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: selfcheck
+              # MUST be the image your operator is actually running. A report produced by a
+              # different build than the one under soak describes a cluster that does not exist.
+              # Read the digest off the running Deployment and paste it here:
+              #   kubectl -n crystal-backup-system get deploy crystal-backup \
+              #     -o jsonpath='{.spec.template.spec.containers[0].image}'
+              image: ghcr.io/crystalbackup/operator:0.6.1
+              imagePullPolicy: IfNotPresent
+              args:
+                - selfcheck
+                # The stable pseudonyms. Without this flag the salt is random per run and the
+                # fourteen reports share no tokens, which is the whole reason this CronJob exists.
+                - --redaction-salt-file=/etc/crystal-backup/soak/salt
+                # NOT --full. The reports leave your cluster; redacted is the default and the
+                # correct choice. If you decide to share unredacted, do it once, knowingly, and
+                # over a private channel — not by leaving a flag in a CronJob for two weeks.
+                #
+                # Optional, and worth setting: the images the operator was CONFIGURED with. The
+                # report compares them against what is actually running, and the pair is the
+                # finding. Copy them from your Helm values.
+                # - --mover-image=ghcr.io/crystalbackup/mover@sha256:...
+                # - --sync-image=ghcr.io/crystalbackup/sync@sha256:...
+              env:
+                - name: POD_NAMESPACE
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.namespace
+                # 80% of the memory limit. The operator learned this the hard way on its mover
+                # Jobs: a Go process with a memory limit and no GOMEMLIMIT lets the heap grow
+                # into the cgroup ceiling and is killed instead of collecting. A one-shot
+                # cluster-wide list is exactly the shape that does it.
+                - name: GOMEMLIMIT
+                  value: "200MiB"
+              securityContext:
+                runAsNonRoot: true
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop:
+                    - ALL
+              # requests == limits (Guaranteed). A soak job that gets evicted under node
+              # pressure loses the day it was measuring, which is the day most worth having.
+              resources:
+                requests:
+                  cpu: 200m
+                  memory: 256Mi
+                limits:
+                  cpu: 200m
+                  memory: 256Mi
+              volumeMounts:
+                - name: salt
+                  mountPath: /etc/crystal-backup/soak
+                  readOnly: true
+          volumes:
+            - name: salt
+              secret:
+                secretName: crystal-backup-soak-salt
+                defaultMode: 0400
+                items:
+                  - key: salt
+                    path: salt
+---
+# The chart installs a default-deny NetworkPolicy over EVERY pod in crystal-backup-system,
+# including ones that did not exist when it was applied — this one. The operator's own allowance
+# selects on its release labels, which this pod deliberately does not wear, so without the policy
+# below the daily report cannot reach the API server and fails every day with a connection
+# timeout that looks like an operator problem.
+#
+# Apply it whether or not you think you have NetworkPolicies: it grants egress to the API server
+# and nothing else, so on a cluster with no default-deny it changes nothing at all.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: crystal-backup-soak-selfcheck-apiserver
+  namespace: crystal-backup-system
+  labels:
+    app.kubernetes.io/part-of: crystal-backup
+    app.kubernetes.io/component: soak
+spec:
+  podSelector:
+    matchLabels:
+      crystalbackup.io/soak: selfcheck
+  policyTypes: [Egress]
+  egress:
+    # Both ports, because the API server's advertised port is 443 through the in-cluster Service
+    # on most distributions and 6443 on several others (RKE2, k3s, kubeadm reached directly).
+    # Narrow this to your API server's address with an ipBlock if you want it tight; the chart's
+    # networkPolicy.apiServerCIDRs is the same decision.
+    - ports:
+        - port: 443
+          protocol: TCP
+        - port: 6443
+          protocol: TCP
+      to:
+        - ipBlock:
+            cidr: 0.0.0.0/0

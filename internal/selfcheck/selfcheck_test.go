@@ -19,6 +19,9 @@ package selfcheck
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -187,6 +190,273 @@ func TestSaltIsPerReport(t *testing.T) {
 		t.Errorf("two reports produced the same token %q for the same location: the salt is not "+
 			"per-report, so the tokens are a stable pseudonym across every report this cluster ever "+
 			"emits", a.Inventory.Locations[0].Name)
+	}
+	if a.Operator.Namespace == b.Operator.Namespace {
+		t.Errorf("two reports produced the same token %q for the same namespace: the default salt is "+
+			"no longer per-report", a.Operator.Namespace)
+	}
+	if a.Redaction.SaltSource != SaltRandomPerReport {
+		t.Errorf("saltSource = %q, want %q — a reader cannot tell which of the two hashed modes "+
+			"produced this file", a.Redaction.SaltSource, SaltRandomPerReport)
+	}
+}
+
+// --- caller-supplied salt -----------------------------------------------------------------------
+//
+// The salt is 40 bytes rather than 32 so the tests below cannot pass by accident on a boundary, and
+// it is printable ASCII so that a leak of it into the JSON or the HTML is visible in a diff rather
+// than being a run of bytes nobody recognises.
+var soakSalt = []byte("SOAK-SALT-DO-NOT-LEAK-0123456789abcdefgh")
+
+func writeSalt(t *testing.T, name string, body []byte) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), name)
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatalf("write salt fixture: %v", err)
+	}
+	return path
+}
+
+// tokens is every identifier token in a report that two collections can be compared on. Taking
+// several rather than one means a test cannot pass because a single field happened to match.
+func tokens(rep *Report) []string {
+	out := make([]string, 0, 2+len(rep.Inventory.Locations)+2*len(rep.Inventory.Schedules))
+	out = append(out, rep.Operator.Namespace, rep.Cluster.ClusterID)
+	for _, l := range rep.Inventory.Locations {
+		out = append(out, l.Name)
+	}
+	for _, s := range rep.Inventory.Schedules {
+		out = append(out, s.Name, s.Namespace)
+	}
+	return out
+}
+
+// TestSuppliedSaltMakesTokensCorrelateAcrossReports is the whole reason the flag exists: a soak
+// takes one of these a day for a fortnight, and unless the same namespace is the same token in all
+// fourteen there is no series to read — no drift, no growth, and no way to see the namespace that
+// stopped being backed up on day nine.
+func TestSuppliedSaltMakesTokensCorrelateAcrossReports(t *testing.T) {
+	a := collectFixtureSalted(t, false, soakSalt)
+	b := collectFixtureSalted(t, false, soakSalt)
+
+	got, want := tokens(a), tokens(b)
+	if len(got) == 0 {
+		t.Fatal("the fixture yielded no tokens to compare, so this test proves nothing")
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			t.Fatalf("two reports from the same salt disagree at token %d: %q vs %q — the supplied "+
+				"salt is not being used, so a soak's reports still share nothing", i, got[i], want[i])
+		}
+	}
+	// And the tokens must still be tokens, not the names.
+	body, err := json.Marshal(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertNoSecrets(t, "JSON (supplied salt)", string(body))
+}
+
+// TestADerivedSaltLeaksNothingEither runs the SAME leak assertions over the third mode.
+//
+// A derived salt is the soak collector's default, so it is the mode most archives will actually
+// be built with — and the one whose salt has an input (a namespace UID) that a reader might
+// separately be able to obtain. Neither the salt nor its input may appear anywhere in the report,
+// and the report must say which mode produced it rather than inheriting a sentence about a random
+// salt it does not have.
+func TestADerivedSaltLeaksNothingEither(t *testing.T) {
+	// Whatever soak.DeriveNamespaceSalt produces is 32 bytes; this stands in for it, because this
+	// package must not import the one that derives it.
+	derived := []byte("0123456789abcdef0123456789abcdef")
+	rep := collectFixtureSaltedFrom(t, false, derived, SaltNamespaceUID)
+
+	if rep.Redaction.SaltSource != SaltNamespaceUID {
+		t.Errorf("saltSource = %q, want %q: a derived-salt report claiming another mode is a false "+
+			"provenance line", rep.Redaction.SaltSource, SaltNamespaceUID)
+	}
+	body, err := json.Marshal(rep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertNoSecrets(t, "JSON (derived salt)", string(body))
+	if strings.Contains(string(body), string(derived)) {
+		t.Error("the derived salt is in the report")
+	}
+	// It correlates like the supplied mode does — that is its purpose — and differs from it, so
+	// two archives salted by different methods cannot be matched against each other.
+	again := collectFixtureSaltedFrom(t, false, derived, SaltNamespaceUID)
+	supplied := collectFixtureSalted(t, false, soakSalt)
+	if tokens(rep)[0] != tokens(again)[0] {
+		t.Error("two reports from the same derived salt disagree; there is no series to read")
+	}
+	if tokens(rep)[0] == tokens(supplied)[0] {
+		t.Error("a derived salt and a supplied one produced the same token")
+	}
+}
+
+// TestADifferentSaltIsADifferentPseudonym. Correlation must be scoped to the salt, or two unrelated
+// installations salted differently could still be matched against each other.
+func TestADifferentSaltIsADifferentPseudonym(t *testing.T) {
+	a := collectFixtureSalted(t, false, soakSalt)
+	b := collectFixtureSalted(t, false, []byte("A-COMPLETELY-DIFFERENT-SALT-0123456789ab"))
+	if a.Inventory.Locations[0].Name == b.Inventory.Locations[0].Name {
+		t.Errorf("two different salts produced the same token %q: the salt is not reaching the HMAC",
+			a.Inventory.Locations[0].Name)
+	}
+}
+
+// TestSuppliedSaltSaysSoInTheReport is the honesty requirement. The two hashed modes make different
+// promises and are otherwise indistinguishable from the outside, so the file has to say which one
+// it is — a report that claims "a 32-byte random salt" over a fixed one is worse than one that
+// claims nothing.
+func TestSuppliedSaltSaysSoInTheReport(t *testing.T) {
+	fixed := collectFixtureSalted(t, false, soakSalt).Redaction
+	random := collectFixture(t, false).Redaction
+
+	if fixed.SaltSource != SaltCallerSupplied {
+		t.Errorf("saltSource = %q, want %q", fixed.SaltSource, SaltCallerSupplied)
+	}
+	if fixed.Algorithm == random.Algorithm {
+		t.Errorf("both modes report the same algorithm %q — the fixed-salt report is claiming a "+
+			"random salt it does not have", fixed.Algorithm)
+	}
+	if strings.Contains(fixed.Algorithm, "random") {
+		t.Errorf("the fixed-salt algorithm string still says random: %q", fixed.Algorithm)
+	}
+	if fixed.Note == random.Note {
+		t.Error("both modes carry the same note; a reader cannot tell what they are about to paste")
+	}
+	// The note has to warn about the property that differs, in words, not by omission.
+	for _, want := range []string{"ACROSS EVERY REPORT", "--redaction-salt-file", "public issue"} {
+		if !strings.Contains(fixed.Note, want) {
+			t.Errorf("the fixed-salt note does not mention %q: %q", want, fixed.Note)
+		}
+	}
+	if fixed.SaltDisclosed || random.SaltDisclosed {
+		t.Error("saltDisclosed is true in a mode that does not disclose the salt")
+	}
+	// And it has to survive into the page, which is what a maintainer actually reads.
+	page, err := Render(collectFixtureSalted(t, false, soakSalt))
+	if err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	if !strings.Contains(string(page), "caller-supplied salt") {
+		t.Error("the rendered page does not say the salt was caller-supplied")
+	}
+}
+
+// TestSuppliedSaltNeverReachesTheOutput. The salt is the one secret this feature introduces: with
+// it, every token in every report built on it is reversible by dictionary. It is asserted on the
+// SERIALISED bytes of both outputs, so a field added later leaks into this test's view rather than
+// past it, and against the encodings something well-meaning might have used.
+func TestSuppliedSaltNeverReachesTheOutput(t *testing.T) {
+	path := writeSalt(t, "soak.salt", soakSalt)
+	salt, err := LoadRedactionSalt(path)
+	if err != nil {
+		t.Fatalf("load salt: %v", err)
+	}
+	rep := collectFixtureSalted(t, false, salt)
+
+	body, err := json.MarshalIndent(rep, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	page, err := Render(rep)
+	if err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	forbidden := map[string]string{
+		"the salt verbatim":  string(soakSalt),
+		"the salt in hex":    hex.EncodeToString(soakSalt),
+		"the salt in base64": base64.StdEncoding.EncodeToString(soakSalt),
+		"SHA-256 of the salt": func() string {
+			sum := sha256.Sum256(soakSalt)
+			return hex.EncodeToString(sum[:])
+		}(),
+		"the salt file path": path,
+	}
+	for _, out := range []struct{ where, body string }{{"JSON", string(body)}, {"HTML", string(page)}} {
+		for what, s := range forbidden {
+			if strings.Contains(out.body, s) {
+				t.Errorf("%s carries %s (%q): every token in every report built on this salt is now "+
+					"reversible by whoever reads the file", out.where, what, s)
+			}
+		}
+	}
+}
+
+// TestShortSaltFileIsRefusedByLength. The salt somebody types by hand is the failure mode here, and
+// it fails silently: a four-character salt still produces tokens that LOOK exactly like good ones.
+// The error names the length found because "too short" leaves the admin guessing at both the
+// requirement and what they actually gave.
+func TestShortSaltFileIsRefusedByLength(t *testing.T) {
+	for _, n := range []int{0, 1, MinSaltBytes - 1} {
+		path := writeSalt(t, "short.salt", bytes.Repeat([]byte("x"), n))
+		_, err := LoadRedactionSalt(path)
+		if err == nil {
+			t.Fatalf("a %d-byte salt file was accepted", n)
+		}
+		if !strings.Contains(err.Error(), fmt.Sprintf("%d bytes", n)) {
+			t.Errorf("the error for a %d-byte salt does not name the length found: %v", n, err)
+		}
+		if !strings.Contains(err.Error(), fmt.Sprintf("%d", MinSaltBytes)) {
+			t.Errorf("the error for a %d-byte salt does not name the requirement: %v", n, err)
+		}
+	}
+}
+
+// TestMissingSaltFileIsRefusedRatherThanFallingBack is the one that matters most, because the
+// fallback would be invisible: a report built on a fresh random salt is indistinguishable at a
+// glance from one built on the soak's, and the gap is discovered a fortnight later by the person
+// who cannot work out why day nine correlates with nothing.
+func TestMissingSaltFileIsRefusedRatherThanFallingBack(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "does-not-exist.salt")
+	if _, err := LoadRedactionSalt(missing); err == nil {
+		t.Fatal("a missing salt file was accepted; the run would have silently used a random salt")
+	}
+
+	// A directory stands in for the unreadable case: it exists, and reading it fails.
+	if _, err := LoadRedactionSalt(t.TempDir()); err == nil {
+		t.Fatal("an unreadable salt file was accepted")
+	}
+
+	// And the command exits non-zero rather than producing a report — checked through the CLI,
+	// because that is where a fallback would have been written.
+	var stdout, stderr bytes.Buffer
+	code := RunSelfcheck(context.Background(), []string{"--redaction-salt-file", missing}, &stdout, &stderr)
+	if code == 0 {
+		t.Errorf("selfcheck exited 0 with an unreadable salt file")
+	}
+	if stdout.Len() > 0 {
+		t.Errorf("a report was written despite the unreadable salt file: %q", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "redaction salt file") {
+		t.Errorf("stderr does not name the problem: %q", stderr.String())
+	}
+}
+
+// TestSaltFileAndFullAreMutuallyExclusive. Accepting both would mean a soak script that still
+// carried --full from a debugging session emitted a fortnight of VERBATIM namespace inventories
+// while its author believed they were pseudonyms.
+func TestSaltFileAndFullAreMutuallyExclusive(t *testing.T) {
+	path := writeSalt(t, "soak.salt", soakSalt)
+	var stdout, stderr bytes.Buffer
+	code := RunSelfcheck(context.Background(),
+		[]string{"--full", "--redaction-salt-file", path}, &stdout, &stderr)
+	if code != 2 {
+		t.Errorf("exit code = %d, want 2 (usage error)", code)
+	}
+	if stdout.Len() > 0 {
+		t.Errorf("a report was written for a rejected flag combination: %q", stdout.String())
+	}
+	for _, want := range []string{"--full", "--redaction-salt-file"} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Errorf("stderr does not name %s: %q", want, stderr.String())
+		}
+	}
+	// The same rule, held by the type that would otherwise carry a salt it never uses.
+	if _, err := NewRedactor(true, soakSalt); err == nil {
+		t.Error("NewRedactor accepted a salt in full mode")
 	}
 }
 
@@ -682,12 +952,32 @@ func fixtureNow() time.Time { return time.Date(2026, 7, 30, 12, 0, 0, 0, time.UT
 
 func collectFixture(t *testing.T, full bool) *Report {
 	t.Helper()
+	return collectFixtureSalted(t, full, nil)
+}
+
+// collectFixtureSalted is collectFixture with the salt exposed: nil is the default random one, and
+// a non-nil salt is what the --redaction-salt-file tests hold constant between two collections.
+// collectFixtureSalted passes NO source, exactly as `crystal-backup selfcheck
+// --redaction-salt-file` does. The default has to be caller-supplied, because that is what the
+// flag means; a default that drifted to another mode would put a false provenance line on every
+// report taken through that path.
+func collectFixtureSalted(t *testing.T, full bool, salt []byte) *Report {
+	t.Helper()
+	return collectFixtureSaltedFrom(t, full, salt, "")
+}
+
+// collectFixtureSaltedFrom is collectFixtureSalted with the salt's PROVENANCE stated, so the
+// leak assertions can be run over every mode rather than only the one that existed first.
+func collectFixtureSaltedFrom(t *testing.T, full bool, salt []byte, source string) *Report {
+	t.Helper()
 	rep, err := Collect(context.Background(), Options{
-		Reader:            fixtureClient(t),
-		OperatorNamespace: operatorNS,
-		Now:               fixtureNow(),
-		Full:              full,
-		Discovery:         fakeDiscovery{},
+		Reader:              fixtureClient(t),
+		OperatorNamespace:   operatorNS,
+		Now:                 fixtureNow(),
+		Full:                full,
+		RedactionSalt:       salt,
+		RedactionSaltSource: source,
+		Discovery:           fakeDiscovery{},
 		DeclaredImages: map[string]string{
 			"mover": "registry.acme-internal.example/crystal-backup/mover:0.6.0",
 			"sync":  "registry.acme-internal.example/crystal-backup/sync:0.6.0",

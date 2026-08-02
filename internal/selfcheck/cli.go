@@ -54,6 +54,11 @@ const Usage = `crystal-backup ` + CommandSelfcheck + ` [flags]
         --mover-image          the configured mover image, recorded beside what is running
         --sync-image           the configured sync image, likewise
         --full                 DISABLE redaction. Identifiers appear verbatim; share privately only.
+        --redaction-salt-file  salt the tokens from this file (>= 32 raw bytes) instead of from a
+                               fresh random salt, so reports taken on different days share tokens
+                               and can be read as one series. For a soak you keep. NOT for a public
+                               issue: the tokens become a stable pseudonym, and anyone with the file
+                               can reverse them. Cannot be combined with --full.
 
 crystal-backup ` + CommandReport + ` --from <file> [--output <file>]
         Renders a self-contained HTML page from a report JSON. Needs NO cluster access: attach the
@@ -77,10 +82,34 @@ func RunSelfcheck(ctx context.Context, args []string, stdout, stderr io.Writer) 
 		syncImage  = fs.String("sync-image", "", "the configured sync image, likewise")
 		full       = fs.Bool("full", false,
 			"DISABLE redaction: namespace, tenant, PVC, bucket, endpoint and cluster identifiers appear verbatim")
+		saltFile = fs.String("redaction-salt-file", "",
+			"salt the tokens from this file (>= 32 raw bytes) so reports taken on different days correlate")
 	)
 	fs.Usage = func() { _, _ = fmt.Fprint(stderr, Usage) }
 	if err := fs.Parse(args); err != nil {
 		return 2
+	}
+
+	// Both flags together is an error rather than a precedence rule, and the choice is not a style
+	// one. --full ignores the salt because there is nothing to salt — so a soak script that kept
+	// --full from an earlier debugging session would emit a fortnight of VERBATIM namespace
+	// inventories while its author believed they were reading pseudonyms. Refusing costs one line
+	// in a script; accepting silently costs somebody their customer list.
+	if *full && *saltFile != "" {
+		_, _ = fmt.Fprint(stderr,
+			"selfcheck: --full and --redaction-salt-file are mutually exclusive — --full redacts "+
+				"nothing, so there is nothing for the salt to do. Drop one.\n\n"+Usage)
+		return 2
+	}
+	// Loaded BEFORE the cluster is touched, so a mistyped path fails in the first millisecond rather
+	// than after a full collection, and never falls back to a random salt.
+	var salt []byte
+	if *saltFile != "" {
+		var err error
+		if salt, err = LoadRedactionSalt(*saltFile); err != nil {
+			_, _ = fmt.Fprintf(stderr, "selfcheck: %v\n", err)
+			return 2
+		}
 	}
 
 	cfg, err := ctrl.GetConfig()
@@ -106,6 +135,7 @@ func RunSelfcheck(ctx context.Context, args []string, stdout, stderr io.Writer) 
 		OperatorNamespace: *namespace,
 		Now:               time.Now(),
 		Full:              *full,
+		RedactionSalt:     salt,
 		Discovery:         info,
 		DeclaredImages:    map[string]string{roleMover: *moverImage, roleSync: *syncImage},
 	})
@@ -123,7 +153,17 @@ func RunSelfcheck(ctx context.Context, args []string, stdout, stderr io.Writer) 
 		_, _ = fmt.Fprintf(stderr, "selfcheck: %v\n", err)
 		return 1
 	}
-	if *output != "" && !*full {
+	switch {
+	case *output == "" || *full:
+	case salt != nil:
+		// Said on the way out, not only inside the file, because the person running this in a loop
+		// is reading the terminal and may never open the JSON.
+		_, _ = fmt.Fprintf(stderr,
+			"selfcheck: wrote %s (identifiers redacted with YOUR salt: these tokens match every "+
+				"other report made from the same salt file, so do not attach this to a public "+
+				"issue — re-run without --redaction-salt-file for a copy that correlates with nothing)\n",
+			*output)
+	default:
 		_, _ = fmt.Fprintf(stderr,
 			"selfcheck: wrote %s (identifiers redacted; re-run with --full for an unredacted copy)\n", *output)
 	}

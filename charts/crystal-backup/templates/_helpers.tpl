@@ -72,6 +72,39 @@ Operator ServiceAccount name (defaults to "<fullname>-operator").
 {{- end -}}
 
 {{/*
+Soak collector labels (soak.yaml). Not "crystal-backup.labels": that one hardcodes
+app.kubernetes.io/component: operator, and the collector is a neighbour of the operator
+rather than part of it — it holds its own identity and its own RBAC precisely so that
+revoking it is deleting one binding.
+*/}}
+{{- define "crystal-backup.soak.labels" -}}
+helm.sh/chart: {{ include "crystal-backup.chart" . }}
+app.kubernetes.io/name: {{ include "crystal-backup.name" . }}
+{{ include "crystal-backup.soak.selectorLabels" . }}
+{{- if .Chart.AppVersion }}
+app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+{{- end }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+app.kubernetes.io/part-of: crystal-backup
+app.kubernetes.io/component: soak
+{{- end -}}
+
+{{/*
+Soak collector selector labels — the pod's identity, and what the two soak NetworkPolicies
+select on.
+
+`app.kubernetes.io/name` is deliberately NOT here. name+instance is the podSelector of the
+chart's `-operator` NetworkPolicy and (with control-plane) the selector of the metrics
+Service; a collector wearing them would be confined by a policy written for a different pod
+and offered as a scrape target that serves no metrics. The instance label is what keeps two
+installs in one cluster from selecting each other's collector.
+*/}}
+{{- define "crystal-backup.soak.selectorLabels" -}}
+app.kubernetes.io/instance: {{ .Release.Name }}
+crystalbackup.io/soak: collector
+{{- end -}}
+
+{{/*
 Manifest mover ServiceAccount name (defaults to "<fullname>-manifest-mover").
 
 Named after the chart release like every other cluster-visible object, so two installs in one
