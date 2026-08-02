@@ -58,6 +58,7 @@ import (
 	"github.com/CrystalBackup/CrystalBackup/internal/repo/s3stat"
 	"github.com/CrystalBackup/CrystalBackup/internal/rexposer"
 	"github.com/CrystalBackup/CrystalBackup/internal/selfcheck"
+	"github.com/CrystalBackup/CrystalBackup/internal/soak"
 	"github.com/CrystalBackup/CrystalBackup/internal/tracing"
 	webhookv1alpha1 "github.com/CrystalBackup/CrystalBackup/internal/webhook/v1alpha1"
 	// +kubebuilder:scaffold:imports
@@ -85,7 +86,7 @@ func init() {
 
 // nolint:gocyclo
 func main() {
-	// The two out-of-band subcommands, dispatched before any flag is defined.
+	// The four out-of-band subcommands, dispatched before any flag is defined.
 	//
 	// They are subcommands of the OPERATOR binary rather than a new artifact on purpose: `selfcheck`
 	// has to read what the collectors read, with the RBAC the operator already holds, and shipping
@@ -94,17 +95,30 @@ func main() {
 	// audience (a tenant, from outside the cluster); these two run as the operator, and `report`
 	// runs nowhere near a cluster at all.
 	//
+	// The soak pair follows the same rule for the same reason, plus one of its own: `soak-export`
+	// writes its tarball to STDOUT precisely because the operator image is distroless — no shell,
+	// no tar, no kubectl — so `kubectl exec … > archive.tar.gz` is the only way an archive gets out
+	// of that container, and `kubectl cp` (which needs tar inside) is not available. `soak-collect`
+	// runs as a NEIGHBOUR of the operator, in its own Deployment with its own read-only identity,
+	// out of this same image so the collector and the build under test can never be different
+	// builds.
+	//
 	// The dispatch is a bare os.Args switch and not a CLI framework because the manager path below
 	// owns flag.CommandLine — zap's BindFlags registers onto it — and a subcommand router that
 	// touched the global FlagSet would change the operator's own command line as a side effect.
-	// Everything else lives in internal/selfcheck; `go build cmd/main.go` compiles ONE file, so a
-	// second file in this package would break the Dockerfile and `make build`.
+	// Everything else lives in internal/selfcheck and internal/soak; `go build cmd/main.go`
+	// compiles ONE file, so a second file in this package would break the Dockerfile and
+	// `make build`.
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
 		case selfcheck.CommandSelfcheck:
 			os.Exit(selfcheck.RunSelfcheck(context.Background(), os.Args[2:], os.Stdout, os.Stderr))
 		case selfcheck.CommandReport:
 			os.Exit(selfcheck.RunReport(os.Args[2:], os.Stdout, os.Stderr))
+		case soak.CommandCollect:
+			os.Exit(soak.RunCollect(context.Background(), os.Args[2:], os.Stderr))
+		case soak.CommandExport:
+			os.Exit(soak.RunExport(os.Args[2:], os.Stdout, os.Stderr))
 		}
 	}
 

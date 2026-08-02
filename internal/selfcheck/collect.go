@@ -62,6 +62,11 @@ type Options struct {
 	Now time.Time
 	// Full disables redaction.
 	Full bool
+	// RedactionSalt, when non-empty, replaces the per-report random salt with one the CALLER
+	// holds — see NewRedactorWithSalt for what that buys and what it costs. It is what makes a
+	// namespace the same token in today's report and in the one from day 9 of a soak. Empty is
+	// the normal case and keeps the report unreversible by anybody, forever.
+	RedactionSalt []byte
 	// Discovery is optional. Without it the Kubernetes version is absent and the CRD inventory
 	// loses its fallback — both reported as diagnostics rather than silently omitted.
 	Discovery ServerInfo
@@ -80,7 +85,7 @@ const reaperGrace = 30 * time.Minute
 // Diagnostic and leaves its section empty, because "the operator was not allowed to look" and
 // "there is nothing there" must not render the same way.
 func Collect(ctx context.Context, opts Options) (*Report, error) {
-	red, err := NewRedactor(opts.Full)
+	red, err := newRedactorFor(opts)
 	if err != nil {
 		return nil, err
 	}
@@ -106,6 +111,17 @@ func Collect(ctx context.Context, opts Options) (*Report, error) {
 	rep.Redaction = red.Describe()
 	rep.Diagnostics = c.diags
 	return rep, nil
+}
+
+// newRedactorFor picks the salt. A supplied one that is too short is an ERROR and not a silent
+// fallback to a random one: an operator who passed --redaction-salt-file and got a report whose
+// tokens correlate with nothing would have no way of noticing until the analysis, by which point
+// the fortnight is over.
+func newRedactorFor(opts Options) (*Redactor, error) {
+	if len(opts.RedactionSalt) > 0 {
+		return NewRedactorWithSalt(opts.RedactionSalt, opts.Full)
+	}
+	return NewRedactor(opts.Full)
 }
 
 type collector struct {

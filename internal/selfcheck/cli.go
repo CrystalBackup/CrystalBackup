@@ -53,6 +53,8 @@ const Usage = `crystal-backup ` + CommandSelfcheck + ` [flags]
         --operator-namespace   where the operator and its mover Jobs live (default $POD_NAMESPACE)
         --mover-image          the configured mover image, recorded beside what is running
         --sync-image           the configured sync image, likewise
+        --redaction-salt-file  redact under a salt YOU hold (>= 32 raw bytes) instead of a random
+                               one, so tokens correlate across reports. Never send it with them.
         --full                 DISABLE redaction. Identifiers appear verbatim; share privately only.
 
 crystal-backup ` + CommandReport + ` --from <file> [--output <file>]
@@ -75,11 +77,22 @@ func RunSelfcheck(ctx context.Context, args []string, stdout, stderr io.Writer) 
 		namespace  = fs.String("operator-namespace", defaultNamespace(), "namespace holding the operator and its mover Jobs")
 		moverImage = fs.String("mover-image", "", "the configured mover image, recorded beside what is actually running")
 		syncImage  = fs.String("sync-image", "", "the configured sync image, likewise")
-		full       = fs.Bool("full", false,
+		saltFile   = fs.String("redaction-salt-file", "",
+			"redact under the salt in this file (>= 32 raw bytes) rather than a random one, so tokens "+
+				"correlate across reports and across a soak's streams")
+		full = fs.Bool("full", false,
 			"DISABLE redaction: namespace, tenant, PVC, bucket, endpoint and cluster identifiers appear verbatim")
 	)
 	fs.Usage = func() { _, _ = fmt.Fprint(stderr, Usage) }
 	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	// Read before touching the cluster. A salt file that is missing or short must fail here, on
+	// the operator's terminal, and not after a full collection has already been done under a
+	// random salt the caller did not ask for.
+	salt, err := ReadSaltFile(*saltFile)
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "selfcheck: %v\n", err)
 		return 2
 	}
 
@@ -88,6 +101,7 @@ func RunSelfcheck(ctx context.Context, args []string, stdout, stderr io.Writer) 
 		_, _ = fmt.Fprintf(stderr, "selfcheck: no Kubernetes configuration: %v\n", err)
 		return 1
 	}
+
 	// A DIRECT client, not a manager cache. Starting informers for a one-shot command would mean
 	// waiting for a full cluster-wide sync before printing anything, and would need list/watch where
 	// this only needs list.
@@ -106,6 +120,7 @@ func RunSelfcheck(ctx context.Context, args []string, stdout, stderr io.Writer) 
 		OperatorNamespace: *namespace,
 		Now:               time.Now(),
 		Full:              *full,
+		RedactionSalt:     salt,
 		Discovery:         info,
 		DeclaredImages:    map[string]string{roleMover: *moverImage, roleSync: *syncImage},
 	})
@@ -197,6 +212,29 @@ func Parse(raw []byte) (*Report, error) {
 		return nil, fmt.Errorf("not a selfcheck report: no reportVersion field")
 	}
 	return &rep, nil
+}
+
+// ReadSaltFile reads a redaction salt. An empty path is not an error — it means "use a random
+// salt" — and returns nil, which is what Options.RedactionSalt reads as absence.
+//
+// The length check is here rather than in the caller so that every entry point enforces the same
+// floor with the same words: `selfcheck --redaction-salt-file`, `soak-collect` and `soak-export`
+// all go through this, and hack/soak/collect.sh checks the same 32 bytes before it will even
+// attempt the token check. A salt short enough to disagree about is a salt short enough to guess.
+func ReadSaltFile(path string) ([]byte, error) {
+	if path == "" {
+		return nil, nil
+	}
+	salt, err := os.ReadFile(path) // #nosec G304 -- an operator-supplied path is the whole point
+	if err != nil {
+		return nil, fmt.Errorf("read the redaction salt: %w", err)
+	}
+	if len(salt) < MinSaltBytes {
+		return nil, fmt.Errorf(
+			"the redaction salt file %s is %d bytes; %d is the minimum (openssl rand -out soak-salt.bin %d)",
+			path, len(salt), MinSaltBytes, MinSaltBytes)
+	}
+	return salt, nil
 }
 
 func emit(path string, body []byte, stdout io.Writer) error {

@@ -56,6 +56,9 @@ type Redactor struct {
 	// known is every identifier the collector has registered through Learn, sorted longest-first so
 	// Detail's free-text substitution cannot corrupt a name that contains a shorter one.
 	known []knownName
+	// stableSalt records that the salt came from the caller rather than from crypto/rand, so
+	// Describe can say which of the two very different privacy properties this document has.
+	stableSalt bool
 }
 
 // tokenBytes is how much of the HMAC ends up in a token: 4 bytes, 8 hex characters.
@@ -69,7 +72,7 @@ const tokenBytes = 4
 // NewRedactor builds a redactor. full=true disables hashing entirely — for a report shared
 // privately, with someone the operator has decided to trust with their namespace names.
 func NewRedactor(full bool) (*Redactor, error) {
-	salt := make([]byte, 32)
+	salt := make([]byte, MinSaltBytes)
 	if _, err := rand.Read(salt); err != nil {
 		// Failing closed is the only acceptable behaviour here. A redactor that quietly fell back
 		// to a fixed salt would produce a report that LOOKS redacted and is reversible by anyone
@@ -77,6 +80,37 @@ func NewRedactor(full bool) (*Redactor, error) {
 		return nil, fmt.Errorf("generate redaction salt: %w", err)
 	}
 	return &Redactor{salt: salt, full: full}, nil
+}
+
+// MinSaltBytes is the floor on a caller-supplied salt, and it is the same number NewRedactor
+// generates. A shorter salt is a guessable one, and against a value space of `production`,
+// `staging` and the customer's own name a guessable salt makes every token in the document
+// reversible by dictionary — which is precisely the property the whole construction exists to
+// deny. hack/soak/collect.sh enforces the same floor on the file it reads.
+const MinSaltBytes = 32
+
+// NewRedactorWithSalt builds a redactor over a salt the CALLER holds, which buys the one thing
+// NewRedactor deliberately destroys: correlation ACROSS documents.
+//
+// That is a real weakening and it is opt-in for a reason. A random per-report salt means nobody,
+// including the person who ran the command, can reverse a token afterwards; a caller-held salt
+// means anyone holding the file can, by dictionary, in seconds. It is worth it in exactly one
+// situation — a soak, where the same namespace has to be the same token in a metrics series, in
+// an event, in a log line and in day 9's self-check, across fourteen days and however many
+// process restarts — and the price is that the salt file becomes a secret that must never travel
+// with what it redacted.
+//
+// The salt is COPIED. A caller that reads it out of a mounted Secret and then zeroes its buffer
+// must not find the redactor's tokens changing underneath it.
+func NewRedactorWithSalt(salt []byte, full bool) (*Redactor, error) {
+	if len(salt) < MinSaltBytes {
+		return nil, fmt.Errorf(
+			"redaction salt is %d bytes; %d is the minimum (openssl rand -out soak-salt.bin %d)",
+			len(salt), MinSaltBytes, MinSaltBytes)
+	}
+	cp := make([]byte, len(salt))
+	copy(cp, salt)
+	return &Redactor{salt: cp, full: full, stableSalt: true}, nil
 }
 
 // Full reports whether identifiers are being passed through unredacted.
@@ -92,6 +126,19 @@ func (r *Redactor) Describe() Redaction {
 			Note: "UNREDACTED. Namespace, tenant, PVC, location, bucket, endpoint and cluster " +
 				"identifiers appear verbatim. Share privately only. Secrets, repository passwords, " +
 				"S3 credentials and key material are still never included — they are not read.",
+		}
+	}
+	if r.stableSalt {
+		return Redaction{
+			Mode:          "hashed",
+			Algorithm:     "HMAC-SHA256 over a caller-supplied salt, truncated to 8 hex characters, prefixed by kind",
+			SaltDisclosed: false,
+			Note: "Identifiers are replaced by tokens computed under a salt SUPPLIED BY THE " +
+				"OPERATOR and held only by them: the same namespace is the same token here, in " +
+				"every other document produced under that salt, and in every stream of the same " +
+				"soak. The salt is not written into this document. Anyone holding it can reverse " +
+				"every token by dictionary in seconds — so it must never travel with the files it " +
+				"redacted.",
 		}
 	}
 	return Redaction{
@@ -124,6 +171,29 @@ const (
 	kindPod       = "pod"
 	kindObject    = "obj"
 	kindImage     = "img"
+)
+
+// The same kinds, exported, for callers OUTSIDE this package that hold a Redactor and have to
+// Learn identifiers of their own before redacting free text beside them.
+//
+// internal/soak is the caller that needs them: it has watched every namespace, PVC, location and
+// CR name in the cluster for a fortnight, so its registry is far better than anything a later
+// reader could reconstruct — but Learn takes a kind, and a caller that could not name one would
+// have to invent a prefix, which would break the correlation this whole construction is for.
+// They are aliases rather than a second set of literals so the two cannot drift.
+const (
+	KindNamespace = kindNamespace
+	KindTenant    = kindTenant
+	KindLocation  = kindLocation
+	KindSchedule  = kindSchedule
+	KindSync      = kindSync
+	KindPVC       = kindPVC
+	KindBucket    = kindBucket
+	KindHost      = kindHost
+	KindPrefix    = kindPrefix
+	KindCluster   = kindCluster
+	KindPod       = kindPod
+	KindObject    = kindObject
 )
 
 // token is the one construction every helper below funnels through, and it does two things rather
@@ -180,6 +250,11 @@ func (r *Redactor) ClusterID(s string) string { return r.token(kindCluster, s) }
 func (r *Redactor) Secret(s string) string    { return r.token(kindSecret, s) }
 func (r *Redactor) Pod(s string) string       { return r.token(kindPod, s) }
 func (r *Redactor) Object(s string) string    { return r.token(kindObject, s) }
+
+// Host redacts a bare hostname or node name. Endpoint below is the right entry point for a URL;
+// this one is for the `node` and `instance` labels a scrape carries, which are hostnames with no
+// scheme around them.
+func (r *Redactor) Host(s string) string { return r.token(kindHost, s) }
 
 // Endpoint keeps the scheme and the port and redacts the host.
 //
@@ -241,18 +316,36 @@ const (
 	labelSync        = "sync"
 	labelPVC         = "pvc"
 	labelCluster     = "cluster"
+
+	// The four a SCRAPE adds, which no collector in this operator emits and which therefore had
+	// no entry here until internal/soak started reading /metrics directly.
+	//
+	// `exported_namespace` is the one that matters. Prometheus renames a target label that
+	// collides with a series label rather than dropping it, so a ServiceMonitor without
+	// honorLabels turns every `namespace` this operator emits into `exported_namespace` — the
+	// chart's own comment records that silently defeating tenancy once already. A redactor that
+	// knew `namespace` and not `exported_namespace` would pass every tenant name through in clear
+	// on exactly the clusters where the mistake had already been made.
+	labelExportedNamespace = "exported_namespace"
+	labelPod               = "pod"
+	labelInstance          = "instance"
+	labelNode              = "node"
 )
 
 var labelKinds = map[string]string{
-	labelNamespace:   kindNamespace,
-	labelTenant:      kindTenant,
-	labelLocation:    kindLocation,
-	labelSource:      kindLocation,
-	labelDestination: kindLocation,
-	labelSchedule:    kindSchedule,
-	labelSync:        kindSync,
-	labelPVC:         kindPVC,
-	labelCluster:     kindCluster,
+	labelNamespace:         kindNamespace,
+	labelTenant:            kindTenant,
+	labelLocation:          kindLocation,
+	labelSource:            kindLocation,
+	labelDestination:       kindLocation,
+	labelSchedule:          kindSchedule,
+	labelSync:              kindSync,
+	labelPVC:               kindPVC,
+	labelCluster:           kindCluster,
+	labelExportedNamespace: kindNamespace,
+	labelPod:               kindPod,
+	labelInstance:          kindHost,
+	labelNode:              kindHost,
 }
 
 // Labels redacts a breach's metric labels by label name.
