@@ -268,6 +268,11 @@ func (r *Redactor) Location(s string) string  { return r.token(kindLocation, s) 
 func (r *Redactor) Schedule(s string) string  { return r.token(kindSchedule, s) }
 func (r *Redactor) Sync(s string) string      { return r.token(kindSync, s) }
 func (r *Redactor) PVC(s string) string       { return r.token(kindPVC, s) }
+
+// Host redacts a node name. internal/soak needs it: a mover pod's peak memory is only
+// interpretable next to the node it ran on, and a node name identifies the cluster as surely as a
+// namespace identifies a tenant.
+func (r *Redactor) Host(s string) string      { return r.token(kindHost, s) }
 func (r *Redactor) Bucket(s string) string    { return r.token(kindBucket, s) }
 func (r *Redactor) Prefix(s string) string    { return r.token(kindPrefix, s) }
 func (r *Redactor) ClusterID(s string) string { return r.token(kindCluster, s) }
@@ -474,3 +479,35 @@ func isNameByte(c byte) bool {
 	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' ||
 		c == '-' || c == '.'
 }
+
+// ---------------------------------------------------------------------------
+// The surface internal/soak needs.
+//
+// The kind constants above are unexported because nothing outside this package had a reason to
+// name one: every identifier reached the report through a typed helper (Namespace, PVC, Location…)
+// that already knew its own kind.
+//
+// internal/soak broke that assumption, and for a good reason. It watches every namespace, PVC,
+// location and CR name in the cluster for a fortnight, so its registry of identifiers is far
+// better than anything this package could reconstruct at export time — but registering one
+// requires naming its kind, and a caller that could not name one would have to invent a prefix,
+// which would break the very correlation the construction exists for.
+//
+// So they are exported as ALIASES rather than a second set of literals: the two cannot drift, and
+// a rename here is still a single edit.
+// ---------------------------------------------------------------------------
+
+const (
+	KindNamespace = kindNamespace
+	KindTenant    = kindTenant
+	KindLocation  = kindLocation
+	KindSchedule  = kindSchedule
+	KindSync      = kindSync
+	KindPVC       = kindPVC
+	KindBucket    = kindBucket
+	KindHost      = kindHost
+	KindPrefix    = kindPrefix
+	KindCluster   = kindCluster
+	KindPod       = kindPod
+	KindObject    = kindObject
+)
