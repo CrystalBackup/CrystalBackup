@@ -88,6 +88,52 @@ func listScheduleBackups(namespace, name string) []cbv1.Backup {
 	return list.Items
 }
 
+// seedScheduleBackup creates a Backup out-of-band — one no schedule stamped — and does not return
+// until the reconciler's cache has OBSERVED it.
+//
+// The wait is the whole helper, and the specs that use it must call it BEFORE creating the schedule
+// whose behaviour they measure. Both halves of that are load-bearing.
+//
+// A spec seeds a fixture Backup to put the schedule controller in a particular state — a run in
+// flight, a projection sitting at an empty phase, another tenant's run — and then pokes the schedule
+// to make it reconcile in that state. But k8sClient writes straight to the apiserver while the
+// controller Lists from the shared informer cache, and the fixture's watch event and the poke's
+// arrive on two different connections with nothing sequencing them. Whenever the poke wins, the
+// controller reconciles against a list that does NOT contain the fixture: it is not in the state the
+// spec set up, and whatever it does next is being judged against a premise that was never
+// established. Instrumented on the Forbid fixture, that was 21 wrong answers in 200 runs — every one
+// with the seeded Backup non-terminal (Pending) and the schedule emitting BackupStamped where the
+// spec expected ConcurrencySkip. Not a slow controller: a blind one.
+//
+// Waiting on cachedReader closes that, but not the rest of it. Reconcile Lists the backups and only
+// THEN reads the clock, so a pass that listed an empty namespace before the seed can still be
+// sitting in that window when scheduleClock jumps, wake up with a tick due and nothing to block it,
+// and stamp. No barrier reaches a reconcile that already started — measured, that residue was 1 in
+// 200. Seeding first removes the window instead of narrowing it: with no schedule object there is
+// nothing to reconcile, so every pass that ever runs began after the cache had the fixture.
+func seedScheduleBackup(b *cbv1.Backup) {
+	GinkgoHelper()
+	Expect(k8sClient.Create(ctx, b)).To(Succeed())
+	DeferCleanup(func() { _ = k8sClient.Delete(context.Background(), b) })
+	key := client.ObjectKeyFromObject(b)
+	Eventually(func(g Gomega) {
+		g.Expect(cachedReader.Get(ctx, key, &cbv1.Backup{})).To(Succeed())
+	}, eventuallyTimeout, eventuallyPoll).Should(Succeed())
+}
+
+// scheduleTickPair returns the next two minute activations of a `* * * * *` schedule about to be
+// created, so a spec can name its fixture Backup before the schedule it belongs to exists.
+//
+// Deriving the ticks from wall-clock rather than from the schedule's creationTimestamp costs
+// nothing in precision: DueTick returns the LATEST activation at or before now, so with the clock
+// parked at second+30s it answers `second` whether the schedule's creationTimestamp landed in this
+// minute or the next one. The spec is therefore immune to a minute rolling over mid-setup — which
+// the creationTimestamp form was not, one tick being all it had.
+func scheduleTickPair() (first, second time.Time) {
+	base := time.Now().UTC().Truncate(time.Minute)
+	return base.Add(time.Minute), base.Add(2 * time.Minute)
+}
+
 // pokeTenantSchedule forces a reconcile by writing an annotation (envtest requeues run on real
 // time, so moving the fake clock alone would not re-trigger the controller).
 func pokeTenantSchedule(namespace, name string) {
@@ -274,13 +320,16 @@ var _ = Describe("BackupScheduleReconciler", func() {
 			name = "overlapping"
 		)
 		createTenantNamespace(ns)
-		createTenantSchedule(newTenantSchedule(ns, name, "* * * * *", "bs-forbid-loc"))
-		created := getTenantScheduleNow(ns, name)
+		firstTick, secondTick := scheduleTickPair()
 
 		// A non-terminal Backup carrying the schedule label: exactly what an in-flight run looks
-		// like to this controller.
-		firstTick := created.CreationTimestamp.UTC().Truncate(time.Minute).Add(time.Minute)
-		inflight := &cbv1.Backup{
+		// like to this controller. It stays non-terminal for the whole spec by construction —
+		// bs-forbid-loc does not exist and the Backup carries no spec.run, so the Backup reconciler
+		// parks it at Pending on a gate and never advances it.
+		//
+		// Seeded BEFORE the schedule exists, which is the only ordering that makes the assertion
+		// below sound. See seedScheduleBackup.
+		seedScheduleBackup(&cbv1.Backup{
 			ObjectMeta: metav1.ObjectMeta{
 				Namespace: ns,
 				Name:      apiconst.RunName(name, firstTick),
@@ -289,11 +338,9 @@ var _ = Describe("BackupScheduleReconciler", func() {
 			Spec: cbv1.BackupSpec{
 				LocationRef: cbv1.LocationReference{Kind: kindBackupLocation, Name: "bs-forbid-loc"},
 			},
-		}
-		Expect(k8sClient.Create(ctx, inflight)).To(Succeed())
-		DeferCleanup(func() { _ = k8sClient.Delete(context.Background(), inflight) })
+		})
+		createTenantSchedule(newTenantSchedule(ns, name, "* * * * *", "bs-forbid-loc"))
 
-		secondTick := firstTick.Add(time.Minute)
 		scheduleClock.SetTime(secondTick.Add(30 * time.Second))
 		pokeTenantSchedule(ns, name)
 
@@ -310,14 +357,18 @@ var _ = Describe("BackupScheduleReconciler", func() {
 			name = "unblocked"
 		)
 		createTenantNamespace(ns)
-		createTenantSchedule(newTenantSchedule(ns, name, "* * * * *", "bs-projection-loc"))
-		created := getTenantScheduleNow(ns, name)
+		firstTick, secondTick := scheduleTickPair()
 
 		// A projection has no phase and never will: it is a materialized view of snapshots that
 		// already exist. Counting one as "active" would wedge the schedule permanently — every
 		// future tick skipped, forever, with a Forbid Event as the only clue.
-		firstTick := created.CreationTimestamp.UTC().Truncate(time.Minute).Add(time.Minute)
-		projection := &cbv1.Backup{
+		//
+		// Seeded before the schedule for the reason spelled out in seedScheduleBackup, and here that
+		// ordering is what gives the spec any teeth at all: a projection the controller has not
+		// observed is indistinguishable from no projection, so the tick would be stamped whether the
+		// skip in activeBackup existed or not, and the spec would go green on a controller that had
+		// lost it.
+		seedScheduleBackup(&cbv1.Backup{
 			ObjectMeta: metav1.ObjectMeta{
 				Namespace:   ns,
 				Name:        apiconst.RunName(name, firstTick),
@@ -327,11 +378,9 @@ var _ = Describe("BackupScheduleReconciler", func() {
 			Spec: cbv1.BackupSpec{
 				LocationRef: cbv1.LocationReference{Kind: kindBackupLocation, Name: "bs-projection-loc"},
 			},
-		}
-		Expect(k8sClient.Create(ctx, projection)).To(Succeed())
-		DeferCleanup(func() { _ = k8sClient.Delete(context.Background(), projection) })
+		})
+		createTenantSchedule(newTenantSchedule(ns, name, "* * * * *", "bs-projection-loc"))
 
-		secondTick := firstTick.Add(time.Minute)
 		scheduleClock.SetTime(secondTick.Add(30 * time.Second))
 		pokeTenantSchedule(ns, name)
 
@@ -349,32 +398,31 @@ var _ = Describe("BackupScheduleReconciler", func() {
 		)
 		createTenantNamespace(nsA)
 		createTenantNamespace(nsB)
-		createTenantSchedule(newTenantSchedule(nsA, name, "* * * * *", "bs-iso-loc"))
-		createTenantSchedule(newTenantSchedule(nsB, name, "* * * * *", "bs-iso-loc"))
-		createdA := getTenantScheduleNow(nsA, name)
+		firstTick, secondTick := scheduleTickPair()
 
 		// An in-flight Backup in A must not gate B's tick. A cluster-wide list would make one
-		// tenant's slow backup silently suppress another tenant's schedule.
-		tick := createdA.CreationTimestamp.UTC().Truncate(time.Minute).Add(time.Minute)
-		inflight := &cbv1.Backup{
+		// tenant's slow backup silently suppress another tenant's schedule. Seeded before either
+		// schedule exists, per seedScheduleBackup: a Backup in A that no reconcile has observed gates
+		// nothing anywhere, so B firing over one would prove nothing about the namespace scoping.
+		seedScheduleBackup(&cbv1.Backup{
 			ObjectMeta: metav1.ObjectMeta{
 				Namespace: nsA,
-				Name:      apiconst.RunName(name, tick),
+				Name:      apiconst.RunName(name, firstTick),
 				Labels:    map[string]string{apiconst.LabelSchedule: name},
 			},
 			Spec: cbv1.BackupSpec{
 				LocationRef: cbv1.LocationReference{Kind: kindBackupLocation, Name: "bs-iso-loc"},
 			},
-		}
-		Expect(k8sClient.Create(ctx, inflight)).To(Succeed())
-		DeferCleanup(func() { _ = k8sClient.Delete(context.Background(), inflight) })
+		})
+		createTenantSchedule(newTenantSchedule(nsA, name, "* * * * *", "bs-iso-loc"))
+		createTenantSchedule(newTenantSchedule(nsB, name, "* * * * *", "bs-iso-loc"))
 
-		scheduleClock.SetTime(tick.Add(30 * time.Second))
+		scheduleClock.SetTime(secondTick.Add(30 * time.Second))
 		pokeTenantSchedule(nsB, name)
 
 		Eventually(func(g Gomega) {
 			g.Expect(k8sClient.Get(ctx,
-				client.ObjectKey{Namespace: nsB, Name: apiconst.RunName(name, tick)}, &cbv1.Backup{})).To(Succeed())
+				client.ObjectKey{Namespace: nsB, Name: apiconst.RunName(name, secondTick)}, &cbv1.Backup{})).To(Succeed())
 		}, eventuallyTimeout, eventuallyPoll).Should(Succeed())
 	})
 
