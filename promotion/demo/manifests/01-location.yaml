@@ -1,0 +1,29 @@
+# Le dépôt DR de la plateforme — pointe sur le S3 in-cluster (SeaweedFS, installé par
+# 00-prep.sh via test/e2e). clusterID/endpoint/bucket/prefix/mode sont IMMUABLES après
+# création (ils composent le chemin du dépôt).
+# discovery.interval est à 1m pour la démo (défaut : 1h).
+apiVersion: crystalbackup.io/v1alpha1
+kind: ClusterBackupLocation
+metadata:
+  name: dr-primary
+spec:
+  default: true
+  mode: Standard
+  clusterID: meetup-demo
+  s3:
+    endpoint: http://seaweedfs.crystalbackup-e2e.svc.cluster.local:8333
+    bucket: e2e-dr
+    prefix: crystal
+    region: us-east-1
+    forcePathStyle: true
+    credentialsSecretRef:
+      name: dr-s3
+  encryption:
+    clusterKEKSecretRef:
+      name: cluster-kek
+  discovery:
+    enabled: true
+    interval: 1m
+  retention:
+    keepDaily: 7
+    keepWeekly: 4

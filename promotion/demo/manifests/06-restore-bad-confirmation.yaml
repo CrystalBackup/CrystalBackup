@@ -1,0 +1,16 @@
+# LA TRICHE N°2 — une confirmation qui ne nomme pas le namespace (R23). Refusée net à
+# l'admission (CEL). Détail structurel à faire remarquer sur scène : ce Restore n'a NI
+# champ location, NI champ target-namespace — cette absence EST le confinement tenant.
+#
+# Variante deux temps (facultative) : enlever `confirmation` → l'objet est ADMIS mais le
+# contrôleur le parque en phase AwaitingConfirmation jusqu'à ce qu'on l'édite.
+apiVersion: crystalbackup.io/v1alpha1
+kind: Restore
+metadata:
+  name: not-so-fast
+  namespace: demo
+spec:
+  source:
+    backup: whatever-run
+  mode: Overwrite
+  confirmation: another-namespace

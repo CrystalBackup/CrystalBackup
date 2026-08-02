@@ -1,0 +1,23 @@
+# La restauration DR : cible une COORDONNÉE DE DÉPÔT (location + namespace + run), pas
+# un objet Kubernetes — le namespace `demo` n'existe plus au moment où on l'applique.
+# `confirmation` doit nommer exactement le namespace CIBLE (R23, vérifié par CEL dans
+# l'API server). __RUN__ est remplacé par 10-demo.sh.
+#
+# Honnêteté (docs/RESTORE.md) : un ClusterRestore restaure les volumes et les ressources
+# cluster-scoped, PAS les manifests de workload du namespace — la démo ré-applique
+# 00-seed-app.yaml par-dessus le PVC restauré (le pod retrouve ses données).
+apiVersion: crystalbackup.io/v1alpha1
+kind: ClusterRestore
+metadata:
+  name: __RUN__-restore
+spec:
+  source:
+    locationRef:
+      name: dr-primary
+    namespace: demo
+    backup: __RUN__
+  target:
+    namespace: demo
+    createNamespace: true
+  mode: Recreate
+  confirmation: demo

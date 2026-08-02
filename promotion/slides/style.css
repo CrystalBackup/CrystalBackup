@@ -1,0 +1,220 @@
+/* Crystal Backup — identité visuelle du site (website/src/styles/site.css) portée sur Slidev */
+
+:root {
+  --cb-bg: #060912;
+  --cb-bg-2: #0a1020;
+  --cb-panel: rgba(255, 255, 255, 0.035);
+  --cb-panel-2: rgba(255, 255, 255, 0.055);
+  --cb-brd: rgba(255, 255, 255, 0.09);
+  --cb-brd-2: rgba(255, 255, 255, 0.16);
+  --cb-ice: #cdeeff;
+  --cb-cyan: #3fc8f5;
+  --cb-azure: #3b8cff;
+  --cb-blue: #2b63f0;
+  --cb-text: #e9f0ff;
+  --cb-muted: #9aabce;
+  --cb-muted-2: #6f7fa6;
+  --cb-grad: linear-gradient(135deg, #3fc8f5, #2b63f0);
+  --cb-ok: #57d6a8;
+  --cb-warn: #f2c14e;
+  --cb-no: #7d8bb0;
+  --cb-red: #ff7a8a;
+}
+
+/* ---- fond global : near-black + orbes radiales bleues, comme le site ---- */
+.slidev-layout {
+  background:
+    radial-gradient(720px 420px at 85% -10%, rgba(43, 99, 240, 0.22), transparent 60%),
+    radial-gradient(640px 400px at 8% -6%, rgba(63, 200, 245, 0.14), transparent 55%),
+    linear-gradient(180deg, var(--cb-bg), var(--cb-bg-2));
+  color: var(--cb-text);
+}
+
+.slidev-layout h1,
+.slidev-layout h2,
+.slidev-layout h3 {
+  color: var(--cb-text);
+  font-weight: 800;
+  letter-spacing: -0.02em;
+}
+
+.slidev-layout h1 { font-weight: 850; }
+.slidev-layout p, .slidev-layout li { color: var(--cb-muted); }
+.slidev-layout strong { color: var(--cb-text); font-weight: 650; }
+.slidev-layout a { color: var(--cb-cyan); }
+
+.slidev-layout code:not(pre code) {
+  color: #b9e8fb;
+  background: rgba(63, 200, 245, 0.1);
+  border: 1px solid rgba(63, 200, 245, 0.16);
+  border-radius: 6px;
+  padding: 0.05em 0.35em;
+}
+
+/* ---- signatures du site ---- */
+
+/* dernier segment de titre en dégradé */
+.grad {
+  background: var(--cb-grad);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+/* label "eyebrow" cyan en capitales au-dessus des titres */
+.eyebrow {
+  display: block;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--cb-cyan);
+  margin-bottom: 0.5rem;
+}
+
+/* panneau verre */
+.panel {
+  background: var(--cb-panel);
+  border: 1px solid var(--cb-brd);
+  border-radius: 16px;
+  padding: 0.9rem 1.1rem;
+}
+
+.panel.accent { border-left: 3px solid var(--cb-cyan); }
+.panel.problem { border-left: 3px solid var(--cb-muted-2); }
+.panel.danger { border-left: 3px solid var(--cb-red); }
+
+/* pastilles */
+.pill {
+  display: inline-block;
+  border-radius: 999px;
+  padding: 0.18rem 0.75rem;
+  font-size: 0.72rem;
+  font-weight: 700;
+  border: 1px solid rgba(63, 200, 245, 0.4);
+  color: var(--cb-ice);
+  background: rgba(63, 200, 245, 0.08);
+}
+
+.pill.grad-fill {
+  background: var(--cb-grad);
+  color: #041027;
+  border: none;
+}
+
+/* ---- la cascade en chips (repris du diagramme du site) ---- */
+.chips {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+}
+
+.chip {
+  border: 1px solid var(--cb-brd-2);
+  background: var(--cb-panel-2);
+  border-radius: 10px;
+  padding: 0.35rem 0.7rem;
+  font-family: var(--slidev-code-font-family, monospace);
+  font-size: 0.78rem;
+  color: var(--cb-text);
+  white-space: nowrap;
+}
+
+.chip.accent { border-color: rgba(63, 200, 245, 0.55); color: var(--cb-ice); }
+.chip.repo {
+  background: var(--cb-grad);
+  color: #041027;
+  font-weight: 700;
+  border: none;
+}
+
+.chip small { display: block; font-family: inherit; font-size: 0.6rem; color: inherit; opacity: 0.65; }
+.chip.repo small { opacity: 0.8; }
+
+.sep {
+  width: 22px;
+  height: 2px;
+  background: var(--cb-grad);
+  border-radius: 2px;
+  flex: none;
+}
+
+/* ---- tableau comparatif ---- */
+.slidev-layout table { font-size: 0.78rem; }
+.slidev-layout th { color: var(--cb-ice); border-color: var(--cb-brd) !important; }
+.slidev-layout td { border-color: var(--cb-brd) !important; }
+.mark-ok { color: var(--cb-ok); font-weight: 700; }
+.mark-mid { color: var(--cb-warn); font-weight: 700; }
+.mark-no { color: var(--cb-no); font-weight: 700; }
+
+/* ---- format "drake" maison (deux rangées, sans image sous copyright) ---- */
+.drake { display: grid; grid-template-columns: 5.5rem 1fr; gap: 0.6rem; align-items: stretch; }
+.drake .face {
+  display: flex; align-items: center; justify-content: center;
+  font-size: 2.6rem;
+  background: var(--cb-panel);
+  border: 1px solid var(--cb-brd);
+  border-radius: 16px;
+}
+.drake .say {
+  display: flex; align-items: center;
+  padding: 0.8rem 1.1rem;
+  border-radius: 16px;
+  font-size: 1.05rem;
+}
+.drake .no  { background: rgba(255, 122, 138, 0.07); border: 1px solid rgba(255, 122, 138, 0.35); color: var(--cb-muted); }
+.drake .yes { background: rgba(87, 214, 168, 0.07); border: 1px solid rgba(87, 214, 168, 0.4); color: var(--cb-text); }
+
+/* ---- format "galaxy brain" maison ---- */
+.brain { display: flex; flex-direction: column; gap: 0.5rem; }
+.brain .lvl {
+  display: grid; grid-template-columns: 3.2rem 1fr; gap: 0.7rem; align-items: center;
+  border-radius: 14px; padding: 0.5rem 0.9rem;
+  border: 1px solid var(--cb-brd);
+  background: var(--cb-panel);
+}
+.brain .lvl .ico { font-size: 1.7rem; text-align: center; }
+.brain .lvl.l2 { border-color: rgba(63, 200, 245, 0.25); }
+.brain .lvl.l3 { border-color: rgba(63, 200, 245, 0.5); background: rgba(63, 200, 245, 0.05); }
+.brain .lvl.l4 {
+  border: none;
+  background: var(--cb-grad);
+  color: #041027;
+}
+.brain .lvl.l4 strong, .brain .lvl.l4 span { color: #041027; }
+
+/* ---- war story ---- */
+.warbox {
+  border: 1px solid rgba(255, 122, 138, 0.35);
+  background: rgba(255, 122, 138, 0.05);
+  border-radius: 16px;
+  padding: 0.9rem 1.2rem;
+}
+
+/* ---- grosses citations ---- */
+.qbig {
+  font-size: 1.5rem;
+  font-weight: 650;
+  line-height: 1.35;
+  color: var(--cb-text);
+  letter-spacing: -0.01em;
+}
+
+/* ---- divers ---- */
+.muted { color: var(--cb-muted-2) !important; }
+.tiny { font-size: 0.7rem; }
+.center-abs { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; }
+
+.slidev-layout .footnote {
+  position: absolute;
+  bottom: 0.9rem;
+  left: 0;
+  right: 0;
+  text-align: center;
+  font-size: 0.65rem;
+  color: var(--cb-muted-2);
+}
+
+/* barre de progression Slidev aux couleurs de la marque */
+.slidev-progress-bar { background: var(--cb-cyan) !important; }

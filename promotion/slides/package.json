@@ -1,0 +1,14 @@
+{
+  "name": "crystalbackup-meetup-slides",
+  "private": true,
+  "scripts": {
+    "dev": "slidev slides.md --open",
+    "build": "slidev build slides.md",
+    "export": "slidev export slides.md --with-clicks"
+  },
+  "devDependencies": {
+    "@slidev/cli": "^52.1.0",
+    "@slidev/theme-default": "^0.25.0",
+    "playwright-chromium": "^1.49.0"
+  }
+}

@@ -1,0 +1,22 @@
+# Le chemin « normal » : un cron qui estampe des runs. Montré pendant la démo mais on
+# n'attend pas 02h00 — le run direct est dans 03-backup-now.template.yaml.
+apiVersion: crystalbackup.io/v1alpha1
+kind: ClusterBackupSchedule
+metadata:
+  name: dr-daily
+spec:
+  schedule: "0 2 * * *"
+  timezone: Europe/Paris
+  jitter: true
+  concurrencyPolicy: Forbid
+  template:
+    spec:
+      locationRef:
+        name: dr-primary
+      namespaces:
+        matchLabels:
+          crystalbackup.io/protect: "true"
+      includeManifests: true
+      clusterResources:
+        enabled: true
+      maxConcurrentMovers: 4
