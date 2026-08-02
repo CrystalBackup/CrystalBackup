@@ -60,6 +60,9 @@ type Collector struct {
 	Progress io.Writer
 
 	nextMetrics, nextMover, nextState, nextEvents, nextLogs time.Time
+	// nextHeartbeat is the daily line, kept on its own clock rather than folded into one of the
+	// others so its cadence stays a constant a reader can assume. See heartbeat.go.
+	nextHeartbeat time.Time
 }
 
 // eventPollInterval and logPollInterval are not flags.
@@ -83,6 +86,10 @@ func (c *Collector) Run(ctx context.Context) error {
 	c.Aggregator.Start(now)
 	c.progress("collecting: metrics every %s into %s windows, movers every %s, CR state every %s",
 		c.MetricsInterval, c.Info.MetricsResolution, c.MoverInterval, c.StateInterval)
+	// One line NOW, before the first tick. An administrator who has just applied the manifest
+	// gets their confirmation in seconds rather than a day from now, and the day-one check that
+	// hack/soak/README.md asks for has something to look at.
+	c.heartbeat(now)
 
 	t := time.NewTicker(tick)
 	defer t.Stop()
@@ -157,6 +164,21 @@ func (c *Collector) round(ctx context.Context, now time.Time) {
 	if err := c.Sessions.Beat(now); err != nil {
 		c.Store.RecordError("collector", "write the heartbeat: "+err.Error(), now)
 	}
+	// And once a day, the same fact said OUT LOUD, in the log. The file above is read by the
+	// liveness probe and by the export; this is the one an administrator can see without either.
+	if !now.Before(c.nextHeartbeat) {
+		c.heartbeat(now)
+	}
+}
+
+// heartbeat writes the daily line and arms the next one.
+//
+// The next beat is scheduled from the time this one was WRITTEN, not from a wall-clock boundary,
+// so a collector that was down over midnight does not skip a day silently — its next line lands
+// 24h after its last, and the gap in between is itself the signal.
+func (c *Collector) heartbeat(now time.Time) {
+	c.nextHeartbeat = now.Add(heartbeatInterval)
+	c.progress("%s", collectHeartbeat(c.Store, c.Info, now))
 }
 
 func (c *Collector) scrapeOnce(ctx context.Context, now time.Time) {

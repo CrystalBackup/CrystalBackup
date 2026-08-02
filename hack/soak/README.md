@@ -130,6 +130,45 @@ Passing `--redaction-salt-file` without `--salt-method=from-secret` is refused a
 than silently ignored: the two produce archives with different guarantees, and a running
 collector looks identical either way.
 
+## During the soak — how to check it in ten seconds
+
+The collector writes **one line a day** to its own log, plus one the moment it starts. That is
+the whole health check:
+
+```sh
+kubectl -n crystal-backup-system logs deploy/crystal-backup-soak | grep soak-heartbeat | tail -7
+```
+
+A week of history, one line per day:
+
+```
+INFO soak-heartbeat at=2026-06-04T00:00:00Z day=4 up=100.0% span=3.0d sessions=1 \
+  metrics=3 state=3 events=3 logs=3 selfchecks=3 movers=412 footprint=71Mi/512Mi \
+  degraded=false drops=0 silent=none
+```
+
+What to look at, in order:
+
+- **`silent=`** — the one field that is an alarm. It names any stream that is empty when empty is
+  not a healthy answer. `silent=none` is what you want. `silent=metrics` on day 3 means the
+  scrape has never worked and the fortnight is being wasted; go and look now, not in eleven days.
+  `events=0` and `logs=0` are never named there, because a fortnight with no Warning event and no
+  operator error line is a *good* fortnight.
+- **`up=`** — the fraction of the elapsed span the collector was actually running. Anything below
+  ~90% and the archive will be graded THIN.
+- **`footprint=`** — used against the cap. If it is climbing towards the cap far faster than
+  fourteen days' worth, the sizing was wrong for your cluster and `drops=` will start moving.
+- **`degraded=true`** — the volume is nearly full and raw sampling has stopped. The marks and the
+  events are still being kept, but act on it.
+
+**And the absence is the strongest signal of all.** No heartbeat line for two days means the
+collector is not running, whatever anything else says — no tool-specific knowledge required, and
+it shows up in any log pipeline the cluster already has. Nothing else is logged between the daily
+lines, so a quiet log is a healthy one and a *stale* log is not.
+
+`soak-export --status` still gives the long form (per-stream detail, gaps, drops with reasons) —
+this is the version you can check without thinking about it.
+
 ## During the soak — the rule that matters
 
 > **Do not quietly fix anything.**

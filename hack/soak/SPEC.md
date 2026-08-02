@@ -45,6 +45,11 @@ crystal-backup soak-export  [flags]     # writes one tar.gz to stdout, or --stat
 | `--kubelet-stats` | `false` | opt-in; needs `nodes/proxy`. §5. |
 | `--heartbeat-check` | `false` | not a collector: reads the heartbeat file, exits 0 if it is fresh, non-zero if it is not, prints nothing. This is the liveness probe. |
 
+The collector also writes **one `INFO` line per day** to its own log, plus one at startup — the
+daily health check an administrator can make from `kubectl logs` without exporting anything, and
+the only thing emitted at that level. Its absence is as informative as its content: no line for
+two days means the collector is not running. See §10.
+
 Exit non-zero at startup — loudly, with the reason — if `--data-dir` is not writable, if the
 free space there is below `--max-bytes`, or if `--metrics-url` cannot be scraped after the first
 three attempts. A collector that starts happily and collects nothing is the failure mode this
@@ -421,6 +426,40 @@ reads like a fortnight. `uptime.json` carries the process's start times and ever
 them, derived from the heartbeat file (written every loop, which is also what `--heartbeat-check`
 reads for the liveness probe). `MANIFEST.json` carries the total observed fraction. `collect.sh`
 turns a fraction below 0.9 into a THIN verdict.
+
+### The daily line
+
+The heartbeat FILE above is read by the liveness probe and by the export. Neither is read by a
+human on day 3, and that was the hole: everything the collector knows was available through
+`soak-export --status`, and somebody had to remember to run it. Nobody runs it daily. A collector
+that broke on day 3 was discovered on day 14, with the fortnight already spent.
+
+So the collector also says one thing a day, in its own log:
+
+```
+INFO soak-heartbeat at=<rfc3339> day=N up=P% span=Dd sessions=N \
+  metrics=N state=N events=N logs=N selfchecks=N movers=N \
+  footprint=<used>/<cap> degraded=<bool> drops=N silent=<none|a,b>
+```
+
+Rules, and each of them is the feature rather than a detail:
+
+- **One line, not a block.** Seven fit on a screen and the difference between two days is visible
+  at a glance. The key order is fixed, so an unchanged day produces a byte-identical line but for
+  `at=` and `day=`.
+- **One a day, plus one at startup**, and nothing else at that level between them. A beat per
+  round would be ~5,760 lines a day and would bury what it is for. The startup line is what an
+  administrator sees seconds after applying the manifest, instead of waiting a day.
+- **A fixed 24h cadence**, from the last line written rather than from a wall-clock boundary, so
+  the absence inference holds without knowing how this collector was configured: **no line for
+  two days means the collector is not running.**
+- **`silent=` names the streams that are empty when empty is not a healthy answer**, decided by
+  the same `emptyIsHealthy` table `MANIFEST.json` grades by — so the daily line and the archive
+  can never disagree about whether zero Warning events is good news. Each stream has a grace
+  derived from its own cadence, because a first-day alarm on a stream that has not had time to
+  write anything is how a reader learns to ignore day nine's real one.
+- **No Prometheus, no alert rule, no configuration, no new dependency.** It lands in
+  `kubectl logs` and therefore in whatever log pipeline the cluster already has.
 
 ## 10. What this deliberately does not do
 
