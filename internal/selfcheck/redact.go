@@ -23,6 +23,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net/url"
+	"os"
 	"strings"
 )
 
@@ -43,6 +44,24 @@ import (
 // breach) and destroyed BETWEEN reports. Two reports from the same cluster share no tokens. Nobody,
 // including the person who ran it, can reverse one afterwards.
 //
+// # And why there is nevertheless an opt-in stable salt
+//
+// That property is right for the case it was built for — one report, attached to one public issue.
+// It is wrong for a soak. Fourteen daily self-checks with fourteen salts share no tokens at all, so
+// nothing in them can be read as a series: a namespace that grew, a namespace that drifted, a
+// namespace that stopped being backed up on day nine all look like fourteen unrelated strangers.
+// The exercise measures change over time and the redaction destroys exactly that axis.
+//
+// --redaction-salt-file therefore lets an administrator supply the salt once, from a file, and the
+// reasoning above is not weakened by it — it is accepted and paid for. A caller-supplied salt IS a
+// stable pseudonym for as long as the file exists, and IS dictionary-reversible by whoever holds
+// the file. Two things keep that honest rather than merely convenient. The salt never enters the
+// report in any form (not the bytes, not a digest of them, not the path), so a reader who does not
+// already have the file gains nothing. And Describe() says which of the two constructions produced
+// the file in front of it, because "HMAC-SHA256 over a 32-byte random salt" printed over a fixed
+// salt is a false provenance line, and a false provenance line on a redacted report is worse than
+// no line at all.
+//
 // # What is never redacted, because it is never anyone's identity
 //
 // Phases, conditions, modes, cron expressions, image digests and tags, version strings, counts and
@@ -53,6 +72,10 @@ import (
 type Redactor struct {
 	salt []byte
 	full bool
+	// saltSupplied records that the salt came from the caller rather than from crypto/rand. It
+	// changes nothing about how a token is computed and everything about what a token PROMISES, so
+	// it exists to be reported, not to be branched on.
+	saltSupplied bool
 	// known is every identifier the collector has registered through Learn, sorted longest-first so
 	// Detail's free-text substitution cannot corrupt a name that contains a shorter one.
 	known []knownName
@@ -66,10 +89,39 @@ type Redactor struct {
 // `ns-a3f2c1d9` against the same token six sections away.
 const tokenBytes = 4
 
-// NewRedactor builds a redactor. full=true disables hashing entirely — for a report shared
-// privately, with someone the operator has decided to trust with their namespace names.
-func NewRedactor(full bool) (*Redactor, error) {
-	salt := make([]byte, 32)
+// MinSaltBytes is the shortest caller-supplied salt this package will accept.
+//
+// It is the length crypto/rand produces above, and the floor is not ceremony: the salt an
+// administrator supplies is the one somebody eventually types by hand, and a typed salt is short,
+// low-entropy and guessable — which would put the token space back inside dictionary range for a
+// reader who has nothing but the report. Accepting a short one silently is the failure mode.
+const MinSaltBytes = 32
+
+// NewRedactor builds a redactor.
+//
+// full=true disables hashing entirely — for a report shared privately, with someone the operator
+// has decided to trust with their namespace names.
+//
+// salt=nil is the default and the documented behaviour of this command: 32 fresh bytes from
+// crypto/rand, per report. A non-nil salt is the caller's, must be at least MinSaltBytes long, and
+// buys cross-report correlation at the cost of the guarantees the type comment sets out.
+func NewRedactor(full bool, salt []byte) (*Redactor, error) {
+	if len(salt) > 0 {
+		if full {
+			// The type would otherwise hold a salt it can never use, and a caller who asked for both
+			// has a wrong mental model of what they are about to get — see RunSelfcheck, which
+			// catches this first with a message naming the two flags.
+			return nil, fmt.Errorf("a redaction salt is meaningless in full mode: nothing is hashed")
+		}
+		if len(salt) < MinSaltBytes {
+			return nil, fmt.Errorf("redaction salt is %d bytes, need at least %d", len(salt), MinSaltBytes)
+		}
+		// full is provably false here, and is carried anyway rather than left to the zero value: a
+		// Redactor whose flags disagree with its constructor's arguments is a trap for whoever
+		// relaxes the check above.
+		return &Redactor{salt: salt, full: full, saltSupplied: true}, nil
+	}
+	salt = make([]byte, MinSaltBytes)
 	if _, err := rand.Read(salt); err != nil {
 		// Failing closed is the only acceptable behaviour here. A redactor that quietly fell back
 		// to a fixed salt would produce a report that LOOKS redacted and is reversible by anyone
@@ -77,6 +129,29 @@ func NewRedactor(full bool) (*Redactor, error) {
 		return nil, fmt.Errorf("generate redaction salt: %w", err)
 	}
 	return &Redactor{salt: salt, full: full}, nil
+}
+
+// LoadRedactionSalt reads a salt file, whole and verbatim.
+//
+// The file's bytes ARE the salt — no trimming, no hex decoding, no newline stripping. That is the
+// contract because it is the only one that stays true when the file is copied between machines: a
+// loader that quietly dropped a trailing newline would agree with one that did not on every file
+// except the ones an administrator actually creates with a shell redirect.
+//
+// Every error here is fatal to the run by design. A missing or unreadable salt file must never
+// degrade into "generate a random one instead": the report that came back would look exactly like a
+// correlatable one, would be filed beside thirteen others, and the gap would only be noticed by the
+// person who later cannot explain why day nine has no tokens in common with day eight.
+func LoadRedactionSalt(path string) ([]byte, error) {
+	salt, err := os.ReadFile(path) //nolint:gosec // an operator-supplied path is the entire feature
+	if err != nil {
+		return nil, fmt.Errorf("read redaction salt file: %w", err)
+	}
+	if len(salt) < MinSaltBytes {
+		return nil, fmt.Errorf("redaction salt file %s holds %d bytes, need at least %d: "+
+			"generate one with `head -c 32 /dev/urandom > %s`", path, len(salt), MinSaltBytes, path)
+	}
+	return salt, nil
 }
 
 // Full reports whether identifiers are being passed through unredacted.
@@ -94,8 +169,27 @@ func (r *Redactor) Describe() Redaction {
 				"S3 credentials and key material are still never included — they are not read.",
 		}
 	}
+	if r.saltSupplied {
+		return Redaction{
+			Mode:          "hashed",
+			SaltSource:    SaltCallerSupplied,
+			Algorithm:     "HMAC-SHA256 over a caller-supplied salt, truncated to 8 hex characters, prefixed by kind",
+			SaltDisclosed: false,
+			Note: "Identifiers are replaced by tokens computed from a salt SUPPLIED BY WHOEVER RAN " +
+				"THIS (--redaction-salt-file), not the usual random one. The tokens are therefore " +
+				"stable within this report AND ACROSS EVERY REPORT MADE WITH THE SAME SALT FILE — " +
+				"which is the point when you are reading a fortnight of them as one series, and is " +
+				"the risk everywhere else: anyone holding two such reports can follow a single " +
+				"namespace from one to the other, and anyone holding the salt file can recover the " +
+				"names outright, because namespace names come from a small guessable set. The salt " +
+				"itself is not in this file, in any form. Before attaching this to a public issue, " +
+				"re-run WITHOUT --redaction-salt-file: the default salt is random per report and " +
+				"leaves nothing to correlate.",
+		}
+	}
 	return Redaction{
 		Mode:          "hashed",
+		SaltSource:    SaltRandomPerReport,
 		Algorithm:     "HMAC-SHA256 over a 32-byte random salt, truncated to 8 hex characters, prefixed by kind",
 		SaltDisclosed: false,
 		Note: "Identifiers are replaced by tokens that are STABLE WITHIN this report and " +

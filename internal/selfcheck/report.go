@@ -93,6 +93,12 @@ type Report struct {
 type Redaction struct {
 	// Mode is "hashed" (the default) or "full".
 	Mode string `json:"mode"`
+	// SaltSource distinguishes the two hashed modes, which make DIFFERENT promises and are otherwise
+	// indistinguishable from the outside: tokens from a random salt are meaningless outside their
+	// own report, tokens from a caller-supplied one correlate across every report built on the same
+	// salt. A reader deciding whether a file is safe to attach to a public issue is deciding on
+	// this field. Empty in full mode, where nothing is salted at all.
+	SaltSource string `json:"saltSource,omitempty"`
 	// Algorithm names the construction so a reader can reason about what a token does and does not
 	// reveal, without having to trust a one-word mode name.
 	Algorithm string `json:"algorithm,omitempty"`
@@ -102,6 +108,16 @@ type Redaction struct {
 	// Note is the human sentence: what survives redaction and what does not.
 	Note string `json:"note,omitempty"`
 }
+
+// The values of Redaction.SaltSource. They are compared by the renderer and by anything reading a
+// stack of these files, so they are constants rather than repeated string literals.
+const (
+	// SaltRandomPerReport is the default: 32 bytes from crypto/rand, discarded with the process.
+	SaltRandomPerReport = "random-per-report"
+	// SaltCallerSupplied means --redaction-salt-file was used and the tokens correlate across every
+	// report produced from that same file.
+	SaltCallerSupplied = "caller-supplied"
+)
 
 // Operator is what the binary that produced this report knows about itself, from three
 // independent sources — because they disagree, and the disagreement is diagnostic.

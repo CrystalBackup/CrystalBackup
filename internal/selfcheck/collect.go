@@ -62,6 +62,10 @@ type Options struct {
 	Now time.Time
 	// Full disables redaction.
 	Full bool
+	// RedactionSalt, when non-nil, is used instead of a fresh random salt, which makes this report's
+	// tokens correlate with every other report built on the same bytes. Nil is the default and the
+	// behaviour everything but a soak wants. See redact.go for what it costs.
+	RedactionSalt []byte
 	// Discovery is optional. Without it the Kubernetes version is absent and the CRD inventory
 	// loses its fallback — both reported as diagnostics rather than silently omitted.
 	Discovery ServerInfo
@@ -80,7 +84,7 @@ const reaperGrace = 30 * time.Minute
 // Diagnostic and leaves its section empty, because "the operator was not allowed to look" and
 // "there is nothing there" must not render the same way.
 func Collect(ctx context.Context, opts Options) (*Report, error) {
-	red, err := NewRedactor(opts.Full)
+	red, err := NewRedactor(opts.Full, opts.RedactionSalt)
 	if err != nil {
 		return nil, err
 	}
