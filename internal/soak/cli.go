@@ -239,7 +239,7 @@ func RunCollect(ctx context.Context, args []string, stderr io.Writer) int {
 		}
 	}
 
-	sessions, err := OpenSessionLog(store, now, *moverIvl)
+	sessions, err := OpenSessionLog(store, now, *moverIvl, info.OperatorVersion)
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "soak-collect: cannot record this session: %v\n", err)
 		return 1

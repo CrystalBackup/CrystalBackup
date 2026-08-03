@@ -112,6 +112,19 @@ type heartbeatLine struct {
 	UpFraction float64
 	SpanDays   float64
 	Sessions   int
+	// Version is the build this collector is running, and it earns its place on a line that
+	// deliberately carries almost nothing.
+	//
+	// An upgrade mid-soak invalidates every figure derived across the whole fortnight — the mover
+	// high-water table above all, since marks.json persists across restarts while the version the
+	// archive names does not — and until this key existed the change was discoverable only at
+	// export, by which point the fortnight was spent. Here it is a date: `kubectl logs | grep
+	// soak-heartbeat` shows the day the value changed.
+	//
+	// Fixed position like every other key. §9 promises a byte-identical daily line but for `at=`
+	// and `day=`, and a key that moved would make every day look like a change — which is exactly
+	// the signal this one is for.
+	Version    string
 	Segments   map[string]int
 	Selfchecks int
 	MoverPods  int
@@ -143,6 +156,7 @@ func collectHeartbeat(store *Store, info CollectorInfo, now time.Time) heartbeat
 		UpFraction: up.Fraction,
 		SpanDays:   up.SpanSeconds / 86400,
 		Sessions:   len(up.Sessions),
+		Version:    versionWord(info.OperatorVersion),
 		Segments:   map[string]int{},
 		MaxBytes:   info.MaxBytes,
 		Degraded:   store.Degraded(),
@@ -214,8 +228,9 @@ func collectHeartbeat(store *Store, info CollectorInfo, now time.Time) heartbeat
 // both want the keys visible. No spaces inside a value, so `awk` and `cut` work on it too.
 func (h heartbeatLine) String() string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "%s at=%s day=%d up=%.1f%% span=%.1fd sessions=%d",
-		heartbeatPrefix, h.At.Format(time.RFC3339), h.Day, h.UpFraction*100, h.SpanDays, h.Sessions)
+	fmt.Fprintf(&b, "%s at=%s day=%d up=%.1f%% span=%.1fd sessions=%d version=%s",
+		heartbeatPrefix, h.At.Format(time.RFC3339), h.Day, h.UpFraction*100, h.SpanDays, h.Sessions,
+		h.Version)
 	for _, stream := range heartbeatStreams {
 		fmt.Fprintf(&b, " %s=%d", stream, h.Segments[stream])
 	}

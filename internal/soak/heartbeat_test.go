@@ -52,7 +52,7 @@ func collectorFor(t *testing.T, store *Store, out *bytes.Buffer) *Collector {
 	if err != nil {
 		t.Fatalf("ReadCollectorInfo: %v", err)
 	}
-	sessions, err := OpenSessionLog(store, day0, 15*time.Second)
+	sessions, err := OpenSessionLog(store, day0, 15*time.Second, "test")
 	if err != nil {
 		t.Fatalf("OpenSessionLog: %v", err)
 	}
@@ -96,7 +96,7 @@ func TestTheHeartbeatSaysEnoughToJudgeASoakWithoutExportingIt(t *testing.T) {
 		t.Errorf("the heartbeat is more than one line; seven of them have to fit on a screen:\n%s", line)
 	}
 	for _, key := range []string{
-		"at", "day", "up", "span", "sessions",
+		"at", "day", "up", "span", "sessions", "version",
 		StreamMetrics, StreamState, StreamEvents, StreamLogs,
 		"selfchecks", "movers", "footprint", "degraded", "drops", "silent",
 	} {
@@ -104,6 +104,12 @@ func TestTheHeartbeatSaysEnoughToJudgeASoakWithoutExportingIt(t *testing.T) {
 	}
 	if got := beatValue(t, line, "day"); got != "4" {
 		t.Errorf("day = %s, want 4 (three full days after the start, counting the first as day 1)", got)
+	}
+	// The build, on the line, because an upgrade mid-soak invalidates every figure derived across
+	// the whole fortnight and this is where it becomes a DATE rather than a surprise found at
+	// export: `grep soak-heartbeat` over a week of logs shows the day the value changed.
+	if got := beatValue(t, line, "version"); got != "0.6.1" {
+		t.Errorf("version = %s, want the build the collector recorded for itself (0.6.1)", got)
 	}
 	if got := beatValue(t, line, StreamMetrics); got == "0" {
 		t.Errorf("metrics = 0 over a seeded three-day store:\n%s", line)

@@ -128,7 +128,7 @@ func TestHeartbeatCheckIsTheLivenessProbe(t *testing.T) {
 	})
 
 	s := newTestStore(t, 1<<20)
-	log, err := OpenSessionLog(s, day0, 15*time.Second)
+	log, err := OpenSessionLog(s, day0, 15*time.Second, "0.6.2")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -162,17 +162,23 @@ func TestHeartbeatCheckIsTheLivenessProbe(t *testing.T) {
 // TestSessionLogRecordsEveryRestart: the gap between one process's last beat and the next one's
 // start is computed without the dead process having had to do anything on its way out — which is
 // the only way it can work, since the interesting deaths are the ones with no way out.
+//
+// And the restart here is an UPGRADE, because that is the half of it nothing recorded. The gap was
+// always in the file; that the system on the far side of it was a DIFFERENT BUILD was nowhere, and
+// every figure computed across the whole span — the mover high-water table above all, since
+// marks.json survives the restart the sessions record — quietly covered two systems.
 func TestSessionLogRecordsEveryRestart(t *testing.T) {
 	s := newTestStore(t, 1<<20)
-	first, err := OpenSessionLog(s, day0, 15*time.Second)
+	first, err := OpenSessionLog(s, day0, 15*time.Second, "0.6.2")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := first.Beat(day0.Add(4 * time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	// The process is SIGKILLed here. Nothing is written on the way out.
-	second, err := OpenSessionLog(s, day0.Add(9*time.Hour), 15*time.Second)
+	// The process is SIGKILLed here. Nothing is written on the way out, and what comes back up is
+	// a different image.
+	second, err := OpenSessionLog(s, day0.Add(9*time.Hour), 15*time.Second, "0.6.3")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -192,5 +198,118 @@ func TestSessionLogRecordsEveryRestart(t *testing.T) {
 	}
 	if math.Abs(u.Fraction-(7.0/12.0)) > 0.01 {
 		t.Errorf("fraction = %.3f, want %.3f", u.Fraction, 7.0/12.0)
+	}
+
+	// The session log has to carry the build, or nothing downstream can reconstruct it: the
+	// collector's own configuration file is rewritten in full on every start and remembers only
+	// the last one.
+	for i, want := range []string{"0.6.2", "0.6.3"} {
+		if got := u.Sessions[i].OperatorVersion; got != want {
+			t.Errorf("session %d recorded version %q, want %q. Without it an upgraded soak reports "+
+				"whichever build happened to start last, for the whole fortnight", i, got, want)
+		}
+	}
+	if !u.MixedVersions() {
+		t.Error("MixedVersions() is false over two builds; four places ask this question and all " +
+			"four would report a single-system archive")
+	}
+	if len(u.Versions) != 2 {
+		t.Fatalf("%d version span(s), want 2: %+v", len(u.Versions), u.Versions)
+	}
+	for i, want := range []VersionSpan{
+		{Version: "0.6.2", From: day0, To: day0.Add(4 * time.Hour),
+			ObservedSeconds: (4 * time.Hour).Seconds(), Sessions: 1},
+		{Version: "0.6.3", From: day0.Add(9 * time.Hour), To: day0.Add(12 * time.Hour),
+			ObservedSeconds: (3 * time.Hour).Seconds(), Sessions: 1},
+	} {
+		got := u.Versions[i]
+		if got.Version != want.Version || !got.From.Equal(want.From) || !got.To.Equal(want.To) ||
+			got.ObservedSeconds != want.ObservedSeconds || got.Sessions != want.Sessions {
+			t.Errorf("span %d = %+v, want %+v. The BOUNDARIES are the point: they are what says "+
+				"which half of the soak each figure belongs to", i, got, want)
+		}
+	}
+}
+
+// TestVersionSpansCollapseOnlyWhatIsConsecutive pins the one decision in this that is not obvious.
+//
+// Collapsing every session of a version into one entry would be tidier and would erase a rollback
+// from the record: a soak that went 0.6.2 → 0.6.3 → 0.6.2 would report two spans, with the middle
+// one's dates swallowed, while its gaps sat there in the same file describing three restarts. The
+// spans are consecutive-run boundaries, not a grouping.
+func TestVersionSpansCollapseOnlyWhatIsConsecutive(t *testing.T) {
+	hour := func(n int) time.Time { return day0.Add(time.Duration(n) * time.Hour) }
+
+	t.Run("two restarts on the same build are one span", func(t *testing.T) {
+		u := computeUptime([]Session{
+			{StartedAt: hour(0), LastBeat: hour(2), OperatorVersion: "0.6.2"},
+			{StartedAt: hour(3), LastBeat: hour(5), OperatorVersion: "0.6.2"},
+			{StartedAt: hour(6), LastBeat: hour(8), OperatorVersion: "0.6.3"},
+		}, hour(8))
+		if len(u.Versions) != 2 {
+			t.Fatalf("%d span(s), want 2 — a collector that was OOM-killed and came back on the "+
+				"same image did not change the system being measured: %+v", len(u.Versions), u.Versions)
+		}
+		got := u.Versions[0]
+		if got.Sessions != 2 || !got.From.Equal(hour(0)) || !got.To.Equal(hour(5)) {
+			t.Errorf("the collapsed span is %+v; want it to run hour 0 .. hour 5 over 2 session(s), "+
+				"so the restart inside it is still countable", got)
+		}
+		if got.ObservedSeconds != (4 * time.Hour).Seconds() {
+			t.Errorf("observedSeconds = %v, want %v: the hour the collector was DEAD between the two "+
+				"sessions must not be inside the span's observed time",
+				got.ObservedSeconds, (4 * time.Hour).Seconds())
+		}
+	})
+
+	t.Run("a rollback is three spans, not two", func(t *testing.T) {
+		u := computeUptime([]Session{
+			{StartedAt: hour(0), LastBeat: hour(2), OperatorVersion: "0.6.2"},
+			{StartedAt: hour(3), LastBeat: hour(5), OperatorVersion: "0.6.3"},
+			{StartedAt: hour(6), LastBeat: hour(8), OperatorVersion: "0.6.2"},
+		}, hour(8))
+		if len(u.Versions) != 3 {
+			t.Fatalf("%d span(s), want 3. Merging the two 0.6.2 stretches erases the rollback from "+
+				"the record while leaving its gaps in place: %+v", len(u.Versions), u.Versions)
+		}
+		if !u.Versions[2].From.Equal(hour(6)) {
+			t.Errorf("the third span starts at %s, want hour 6 — the moment the cluster went BACK",
+				u.Versions[2].From)
+		}
+	})
+}
+
+// TestASessionWithNoVersionReadsAsUnknownAndIsNotDropped.
+//
+// Every archive written before the field existed has sessions without it, and so does any session
+// whose binary could not name itself. That time was still collected: dropping the span would make
+// the fortnight's arithmetic disagree with its own uptime, and inferring a version for it would be
+// a guess printed next to measurements — the failure §5 spends three paragraphs forbidding for
+// mover classes.
+func TestASessionWithNoVersionReadsAsUnknownAndIsNotDropped(t *testing.T) {
+	u := computeUptime([]Session{
+		{StartedAt: day0, LastBeat: day0.Add(4 * time.Hour)},
+		{StartedAt: day0.Add(4 * time.Hour), LastBeat: day0.Add(6 * time.Hour),
+			OperatorVersion: "0.6.3"},
+	}, day0.Add(6*time.Hour))
+
+	if len(u.Versions) != 2 {
+		t.Fatalf("%d span(s), want 2: %+v", len(u.Versions), u.Versions)
+	}
+	if u.Versions[0].Version != "" {
+		t.Errorf("the unnamed span reports version %q; a version nobody recorded must not be "+
+			"invented", u.Versions[0].Version)
+	}
+	if u.Versions[0].ObservedSeconds != (4 * time.Hour).Seconds() {
+		t.Errorf("the unnamed span observed %v seconds, want %v — four hours of collection were "+
+			"dropped because nothing could name the build that did it",
+			u.Versions[0].ObservedSeconds, (4 * time.Hour).Seconds())
+	}
+	if got := versionWord(u.Versions[0].Version); got != "unknown" {
+		t.Errorf("an unnamed span renders as %q; a blank in a list of versions reads as a "+
+			"formatting fault rather than as an absence", got)
+	}
+	if !strings.Contains(versionListing(u.Versions), "unknown") {
+		t.Errorf("the listing hides the unnamed span: %q", versionListing(u.Versions))
 	}
 }

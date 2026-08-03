@@ -441,6 +441,10 @@ defence against discovering on day 14 that nothing was collected.
 {
   "schema": "crystalbackup.soak/v1",
   "operatorVersion": "…", "collectorStartedAt": "…", "exportedAt": "…",
+  "operatorVersions": [
+    { "version": "…", "from": "…", "to": "…", "observedSeconds": 0, "sessions": 1 }
+  ],
+  "operatorVersionNote": "present only when there is more than one, or when they disagree",
   "redaction": { "mode": "hashed|full", "saltDisclosed": false, "note": "…" },
   "unredactedNote": "the sentence about what free text could not be tokenised",
   "streams": [
@@ -462,6 +466,12 @@ Rules that are not negotiable:
   `false` for metrics and self-checks);
 - `coverage.observedDays` is computed from the data, not from the flags. The gap between what
   was asked for and what is there is the single most important number in the file.
+- `operatorVersion` is the build running when the archive was **exported**, and nothing more:
+  `collector-id.json` is rewritten on every collector start, so it names whichever build started
+  last. `operatorVersions` is the honest answer — one span per stretch the collector ran a given
+  build, consecutive same-version sessions collapsed, a rollback left as the three spans it was.
+  More than one entry is a **finding**: `highwater/marks.json` persists across restarts, so §5's
+  table then describes more than one system and says so above its first number.
 
 `soak-export` **always writes an archive**, even when every stream is empty. The evidence of
 nothing is evidence, and it must arrive as a file with a manifest that says so — not as a
@@ -475,6 +485,14 @@ them, derived from the heartbeat file (written every loop, which is also what `-
 reads for the liveness probe). `MANIFEST.json` carries the total observed fraction. `collect.sh`
 turns a fraction below 0.9 into a THIN verdict.
 
+Each session also records the **build that ran it**, and `uptime.json` collapses consecutive
+same-version sessions into `versions[]`. The gap between two sessions was always recorded; that
+the measured system CHANGED at that gap was recorded nowhere, and it is the change that matters
+most — `highwater/marks.json` survives a restart, so a fortnight of six days on one build and
+eight on another produced one peak table over two systems and one flat version string above it.
+A version a session cannot name reads as `unknown` and is never dropped, and a mover pod whose
+first sighting falls in no session's window is `unattributed` rather than guessed at.
+
 ### The daily line
 
 The heartbeat FILE above is read by the liveness probe and by the export. Neither is read by a
@@ -485,7 +503,7 @@ that broke on day 3 was discovered on day 14, with the fortnight already spent.
 So the collector also says one thing a day, in its own log:
 
 ```
-INFO soak-heartbeat at=<rfc3339> day=N up=P% span=Dd sessions=N \
+INFO soak-heartbeat at=<rfc3339> day=N up=P% span=Dd sessions=N version=<v|unknown> \
   metrics=N state=N events=N logs=N selfchecks=N movers=N \
   footprint=<used>/<cap> degraded=<bool> drops=N silent=<none|a,b>
 ```
@@ -494,7 +512,9 @@ Rules, and each of them is the feature rather than a detail:
 
 - **One line, not a block.** Seven fit on a screen and the difference between two days is visible
   at a glance. The key order is fixed, so an unchanged day produces a byte-identical line but for
-  `at=` and `day=`.
+  `at=` and `day=`. `version=` is on it for exactly that reason: an upgrade mid-soak invalidates
+  every figure derived across the whole fortnight, and a fixed key makes the day it happened
+  greppable instead of leaving it to be discovered at export.
 - **One a day, plus one at startup**, and nothing else at that level between them. A beat per
   round would be ~5,760 lines a day and would bury what it is for. The startup line is what an
   administrator sees seconds after applying the manifest, instead of waiting a day.

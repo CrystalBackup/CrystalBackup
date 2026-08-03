@@ -81,12 +81,34 @@ type StreamReport struct {
 
 // Manifest is MANIFEST.json.
 type Manifest struct {
-	Schema             string              `json:"schema"`
-	OperatorVersion    string              `json:"operatorVersion"`
-	CollectorStartedAt string              `json:"collectorStartedAt"`
-	ExportedAt         string              `json:"exportedAt"`
-	Mode               string              `json:"mode"`
-	Redaction          selfcheck.Redaction `json:"redaction"`
+	Schema string `json:"schema"`
+	// OperatorVersion is the build that was running when this archive was EXPORTED.
+	//
+	// It is NOT "the build that produced this archive", which is how it was documented and how it
+	// was read. collector-id.json is rewritten in full on every collector start, so this field
+	// carries whichever build happened to start LAST: a fortnight that ran six days of 0.6.2 and
+	// eight of 0.6.3 came out as one flat version, while §5's mover table — built from a
+	// highwater file that PERSISTS across restarts — silently mixed the two systems.
+	//
+	// Kept, and kept in this position, because collect.sh's field-by-field read of this file is a
+	// contract and because one string is what a reader wants when there is only one build. The
+	// question it cannot answer is answered by operatorVersions below.
+	OperatorVersion string `json:"operatorVersion"`
+	// OperatorVersions is every build that collected any part of this archive, in order. One entry
+	// is the ordinary case and says nothing the field above does not; more than one is a FINDING,
+	// because every figure derived across the whole span then describes more than one system.
+	OperatorVersions []VersionSpan `json:"operatorVersions"`
+	// OperatorVersionNote is that finding in the exact words COLLECTION-REPORT.txt, its §5 section
+	// and the --status screen use, and it is a stored field rather than prose each reader builds
+	// for itself for the reason unredactedNote is: the machine-readable half of this archive and
+	// the human-readable half must not be able to say different things about the same fact.
+	//
+	// Empty when there is nothing to say, which is most archives.
+	OperatorVersionNote string              `json:"operatorVersionNote,omitempty"`
+	CollectorStartedAt  string              `json:"collectorStartedAt"`
+	ExportedAt          string              `json:"exportedAt"`
+	Mode                string              `json:"mode"`
+	Redaction           selfcheck.Redaction `json:"redaction"`
 	// UnredactedNote is §6's residual, in the words collect.sh prints back to the admin before
 	// they send the archive. It is not a disclaimer: it is the reason step 4 of that script
 	// exists, and the two directories it names are the only ones an admin genuinely has to read.
@@ -222,4 +244,92 @@ func (r StreamReport) degrade(reason string) StreamReport {
 
 func round2(f float64) float64 {
 	return float64(int64(f*100+0.5)) / 100
+}
+
+// ---------------------------------------------------------------------------------------------
+// which build produced this
+// ---------------------------------------------------------------------------------------------
+
+// versionNote is the ONE wording for "this archive does not describe a single system".
+//
+// Four places have to say it — MANIFEST.json, COLLECTION-REPORT.txt's header, the §5 mover section
+// and the --status screen — and it is a function rather than four strings for the same reason
+// emptyIsHealthy is one table: a reader who meets the same fact stated three ways in one archive
+// has to work out whether they are looking at three facts.
+//
+// It returns "" when there is nothing to say, and that is load-bearing rather than tidy. An archive
+// from a soak that ran one build must read EXACTLY as it did before this existed; a block that
+// appeared on every archive to announce that nothing unusual happened is a block nobody reads on
+// the day something did.
+//
+// `scraped` is the version label of every crystalbackup_build_info point in the archive: the
+// MEASURED operator's account of itself, where the spans are the COLLECTOR binary's. They differ
+// exactly when somebody changed the operator image without changing the collector's, and what
+// follows states that disagreement rather than resolving it.
+func versionNote(spans []VersionSpan, scraped []string) string {
+	var parts []string
+	if len(spans) > 1 {
+		parts = append(parts, fmt.Sprintf(
+			"MORE THAN ONE BUILD collected this archive — %s. Every figure derived across the whole "+
+				"span — the mover high-water table above all — therefore describes more than one "+
+				"system: highwater/marks.json PERSISTS across collector restarts, so a single peak in "+
+				"it can have been set under a build that is not the one this archive names. No figure "+
+				"here has been re-attributed to a version it cannot prove.", versionListing(spans)))
+	}
+	if unclaimed := unclaimedVersions(spans, scraped); len(unclaimed) > 0 {
+		parts = append(parts, fmt.Sprintf(
+			"The operator reported version %s in crystalbackup_build_info and no collector session "+
+				"claims it. The session log records the COLLECTOR binary's build and build_info is the "+
+				"MEASURED operator's; the two come apart exactly when the operator image was changed "+
+				"without the collector's. Neither is corrected against the other here — the "+
+				"disagreement IS the finding.", strings.Join(unclaimed, ", ")))
+	}
+	return strings.Join(parts, " ")
+}
+
+// versionListing names the builds with the time each was observed for, which is the pair that
+// makes a mixed archive readable: "0.6.2 and 0.6.3" says a system changed, "0.6.2 (0.4 day(s)),
+// 0.6.3 (13.6 day(s))" says which one the fortnight is mostly about.
+func versionListing(spans []VersionSpan) string {
+	parts := make([]string, 0, len(spans))
+	for _, sp := range spans {
+		parts = append(parts, fmt.Sprintf("%s (%.1f day(s))",
+			versionWord(sp.Version), sp.ObservedSeconds/86400))
+	}
+	return strings.Join(parts, ", ")
+}
+
+// versionWord renders one build for a human. An unrecorded version is `unknown` and never blank:
+// sessions written before the field existed are still time that was collected, and a blank in a
+// list of versions reads as a formatting fault rather than as an absence.
+func versionWord(v string) string {
+	if v == "" {
+		return "unknown"
+	}
+	return v
+}
+
+// unclaimedVersions is every scraped build_info version that no session accounts for.
+//
+// ONE direction, deliberately. A span whose version never appears in build_info is the ordinary
+// case — the series may not have been scraped at all, and §3b only promises it survives the cap —
+// but a version the OPERATOR reported over a window the collector was up for cannot be explained
+// by anything the collector did.
+func unclaimedVersions(spans []VersionSpan, scraped []string) []string {
+	if len(scraped) == 0 {
+		return nil
+	}
+	claimed := make(map[string]bool, len(spans))
+	for _, sp := range spans {
+		claimed[sp.Version] = true
+	}
+	out := []string{}
+	for _, v := range scraped {
+		if v == "" || claimed[v] {
+			continue
+		}
+		out = append(out, v)
+	}
+	slices.Sort(out)
+	return slices.Compact(out)
 }

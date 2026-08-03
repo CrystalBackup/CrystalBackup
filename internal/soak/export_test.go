@@ -23,6 +23,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"io"
+	"regexp"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -30,6 +32,7 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 
+	"github.com/CrystalBackup/CrystalBackup/internal/metrics"
 	"github.com/CrystalBackup/CrystalBackup/internal/mover"
 )
 
@@ -117,8 +120,12 @@ func seedCollector(t *testing.T, days int, selfcheckEnabled bool) *Store {
 	}
 	writeJSON(t, s, fileCollectorID, info)
 
+	// One session, on the build collector-id.json names. A real collector records the version per
+	// session, and a fixture that left it out would exercise the pre-field shape in every test
+	// that uses it rather than the one a collector writes today.
 	sessions := []Session{{
 		StartedAt: start, LastBeat: start.AddDate(0, 0, days), BeatPeriod: "15s",
+		OperatorVersion: info.OperatorVersion,
 	}}
 	writeJSON(t, s, fileStarts, sessions)
 
@@ -703,5 +710,315 @@ func TestTheArchiveStatesItsOwnAnswer(t *testing.T) {
 	if !strings.Contains(report, "mover-reported") {
 		t.Error("the peak appears without naming its source; an exact process peak and the highest " +
 			"sample anyone caught are different quantities and must never read alike")
+	}
+}
+
+// ---------------------------------------------------------------------------------------------
+// which build produced this
+// ---------------------------------------------------------------------------------------------
+
+// upgradedSessions is the fortnight this whole thing exists for: six days on one build, a restart,
+// and seven on another. Written the way the collector writes them — one record per process, each
+// naming the build that ran it — because the export has no other source for this.
+func upgradedSessions() []Session {
+	return []Session{
+		{StartedAt: day0, LastBeat: day0.AddDate(0, 0, 6), BeatPeriod: "15s",
+			OperatorVersion: "0.6.2"},
+		{StartedAt: day0.AddDate(0, 0, 7), LastBeat: day0.AddDate(0, 0, 14), BeatPeriod: "15s",
+			OperatorVersion: "0.6.3"},
+	}
+}
+
+// marksAcrossVersions builds a high-water table whose pods were FIRST SEEN at three different
+// moments — one under each build and one inside the gap between them — through the same real
+// aggregation marksFixture uses.
+//
+// It has to go through HighWater rather than filling PodMark.FirstSeen by hand for the reason
+// marksFixture states: a hand-built table once produced a shape the collector cannot emit, and the
+// attribution under test reads exactly that field. The lister is mutated between samples because
+// that is how a cluster presents — a pod that does not exist yet is not in the list.
+func marksAcrossVersions(t *testing.T, underFirst, inGap, underSecond time.Time) Marks {
+	t.Helper()
+	f := &fakeLister{metrics: []podMetric{}}
+	h := NewHighWater(newTestStore(t, 1<<20), f, testNS, 15*time.Second, false)
+
+	f.jobs = []batchv1.Job{moverJob("job-backup-a", mover.OpBackup, underFirst, time.Time{})}
+	f.pods = []corev1.Pod{moverPod("job-backup-a-1", "job-backup-a", "worker-1", underFirst)}
+	h.Sample(t.Context(), underFirst)
+
+	f.jobs = append(f.jobs, moverJob("job-snap", mover.OpSnapshots, inGap, time.Time{}))
+	f.pods = append(f.pods, moverPod("job-snap-1", "job-snap", "worker-2", inGap))
+	h.Sample(t.Context(), inGap)
+
+	f.jobs = append(f.jobs, moverJob("job-backup-b", mover.OpBackup, underSecond, time.Time{}))
+	f.pods = append(f.pods, moverPod("job-backup-b-1", "job-backup-b", "worker-1", underSecond))
+	h.Sample(t.Context(), underSecond)
+
+	return h.Marks(underSecond)
+}
+
+// moverProfilesSection is §5 and nothing else, so an assertion about the table cannot be satisfied
+// by a word that appears somewhere else in the report.
+func moverProfilesSection(t *testing.T, report string) string {
+	t.Helper()
+	start := strings.Index(report, "MOVER RESOURCE PROFILES")
+	if start < 0 {
+		t.Fatalf("the report has no §5 section at all:\n%s", report)
+	}
+	rest := report[start:]
+	if end := strings.Index(rest, "COLLECTOR UPTIME"); end > 0 {
+		rest = rest[:end]
+	}
+	return rest
+}
+
+// TestAnUpgradedSoakSaysWhichBuildsProducedIt.
+//
+// `operatorVersion` comes from collector-id.json, which is rewritten in full on every collector
+// start — so it names whichever build started LAST, and a fortnight that ran six days of 0.6.2 and
+// eight of 0.6.3 came back claiming one flat version. The restart was recorded, its gap was
+// recorded, and the one thing that mattered about it — that the measured system CHANGED there —
+// was recorded nowhere. Everything downstream then averaged two systems into one answer.
+func TestAnUpgradedSoakSaysWhichBuildsProducedIt(t *testing.T) {
+	s := seedCollector(t, 14, true)
+	writeJSON(t, s, fileStarts, upgradedSessions())
+
+	a := exportToArchive(t, ExportOptions{
+		DataDir: s.Dir(), Salt: exportSalt, Now: day0.AddDate(0, 0, 14),
+	})
+
+	if len(a.manifest.OperatorVersions) != 2 {
+		t.Fatalf("MANIFEST.json reports %d version span(s), want 2: %+v. collect.sh and every "+
+			"reader after it take this file as the archive's own account of itself",
+			len(a.manifest.OperatorVersions), a.manifest.OperatorVersions)
+	}
+	for i, want := range []string{"0.6.2", "0.6.3"} {
+		if got := a.manifest.OperatorVersions[i].Version; got != want {
+			t.Errorf("operatorVersions[%d].version = %q, want %q", i, got, want)
+		}
+	}
+	if days := a.manifest.OperatorVersions[0].ObservedSeconds / 86400; days < 5.9 || days > 6.1 {
+		t.Errorf("the first build was observed for %.2f day(s), want ~6 — the SHARE each build "+
+			"holds is what says whether a mixed figure is mostly about one of them", days)
+	}
+	if a.manifest.OperatorVersionNote == "" {
+		t.Error("operatorVersionNote is empty over two builds. The JSON half and the prose half of " +
+			"this archive have to say the same thing about it, and this is the field that makes " +
+			"that structural rather than a matter of both being edited together")
+	}
+
+	report := string(a.files["COLLECTION-REPORT.txt"])
+	for _, want := range []string{"0.6.2", "0.6.3", "2 BUILDS", "MORE THAN ONE BUILD"} {
+		if !strings.Contains(report, want) {
+			t.Errorf("COLLECTION-REPORT.txt does not contain %q. It is the file a human opens "+
+				"instead of the JSON:\n%s", want, report)
+		}
+	}
+	// The dates, not just the names: what a reader needs from a mixed soak is which half of the
+	// fortnight each build was measured over, so they can go and look at what else changed then.
+	if !strings.Contains(report, day0.AddDate(0, 0, 7).Format(time.RFC3339)) {
+		t.Errorf("the report names two builds without saying WHEN each ran:\n%s", report)
+	}
+}
+
+// TestTheMoverTableDisclosesTheVersionsBehindIt is the requirement that matters.
+//
+// highwater/marks.json PERSISTS across collector restarts — NewHighWater loads it back — so a soak
+// that was upgraded mid-run produces ONE peak table over TWO systems. §5's table is the finding the
+// fortnight was spent to obtain and it is read as a property of a single build; a table that mixes
+// two and does not say so is worse than no table, because a limit gets sized off it.
+//
+// The disclosure goes above the first number. A reader who has already read the figures has
+// already decided what they mean.
+func TestTheMoverTableDisclosesTheVersionsBehindIt(t *testing.T) {
+	s := seedCollector(t, 14, true)
+	writeJSON(t, s, fileStarts, upgradedSessions())
+	writeMarksFixture(t, s, marksAcrossVersions(t,
+		day0.AddDate(0, 0, 1),                   // under 0.6.2
+		day0.AddDate(0, 0, 6).Add(12*time.Hour), // inside the gap: no build can claim it
+		day0.AddDate(0, 0, 8),                   // under 0.6.3
+	))
+
+	a := exportToArchive(t, ExportOptions{
+		DataDir: s.Dir(), Salt: exportSalt, Now: day0.AddDate(0, 0, 14),
+	})
+	section := moverProfilesSection(t, string(a.files["COLLECTION-REPORT.txt"]))
+
+	disclosure := strings.Index(section, "MORE THAN ONE BUILD")
+	if disclosure < 0 {
+		t.Fatalf("§5 states a peak table built over two builds and says nothing about it. Every "+
+			"number under this heading is being read as a property of one system:\n%s", section)
+	}
+	firstClass := strings.Index(section, "pod(s) over")
+	if firstClass < 0 {
+		t.Fatalf("§5 has no class lines at all; this test would pass against an empty table:\n%s",
+			section)
+	}
+	if disclosure > firstClass {
+		t.Errorf("the disclosure appears AFTER the first class line. A reader who has read the "+
+			"figures has already decided what they mean:\n%s", section)
+	}
+	for _, want := range []string{"0.6.2 (6.0 day(s))", "0.6.3 (7.0 day(s))"} {
+		if !strings.Contains(section, want) {
+			t.Errorf("§5 does not name %q. \"more than one build\" without the versions and the "+
+				"time each holds is a warning nobody can act on:\n%s", want, section)
+		}
+	}
+
+	// Per class, from PodMark.FirstSeen and nothing else. The two backups landed one on each side
+	// of the upgrade, so the class that carries the sizing answer carries both builds.
+	if !strings.Contains(section, "(pods ran under 0.6.2 ×1, 0.6.3 ×1)") {
+		t.Errorf("the `data` line does not attribute its pods to the builds they ran under:\n%s",
+			section)
+	}
+	// And the pod that started inside the GAP is attributed to NOTHING. Filing it under the
+	// neighbouring build would be a guess printed beside measurements — the same rule that makes a
+	// mover of unrecoverable operation `unknown` rather than the class that looks likeliest.
+	if !strings.Contains(section, "repo-light   1 pod(s) over 1 Job(s)  (1 unattributed)") {
+		t.Errorf("a pod first seen while no collector was running was attributed to a build "+
+			"anyway:\n%s", section)
+	}
+}
+
+// TestABuildTheOperatorClaimsAndNoSessionDoesIsAProblem.
+//
+// Two independent records of which build ran: the session log, which is the COLLECTOR binary's own
+// version, and crystalbackup_build_info, which is the MEASURED operator's. They come apart exactly
+// when somebody rolls the operator image forward without touching the collector's — the one case
+// where the session log is unanimous and wrong, and therefore the one case a session-only check
+// could never catch.
+//
+// Nothing picks a winner. The disagreement is the finding, and it goes where the export's other
+// problems go.
+func TestABuildTheOperatorClaimsAndNoSessionDoesIsAProblem(t *testing.T) {
+	// The label name the export reads is a bare string matching a constant internal/metrics keeps
+	// unexported, and a misspelling there fails the way internal/selfcheck's labelKinds describes:
+	// silently, by finding nothing and reporting nothing, for as long as nobody checks. So it is
+	// checked, against the label set that package publishes.
+	if labels := metrics.Catalogue()[metrics.NameBuildInfo]; !slices.Contains(labels, buildInfoVersionLabel) {
+		t.Fatalf("crystalbackup_build_info carries labels %v and this package reads %q. Every "+
+			"corroboration below would find nothing and say nothing", labels, buildInfoVersionLabel)
+	}
+
+	buildInfo := func(t *testing.T, s *Store, day time.Time, version string) {
+		t.Helper()
+		if err := s.Append(streamMetricsCore, day, [][]byte{mustJSON(t, point{
+			T: day.Add(time.Hour).Unix(), Name: metrics.NameBuildInfo,
+			Labels: map[string]string{"version": version}, Last: 1, Min: 1, Max: 1, N: 1,
+		})}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	t.Run("a version no session claims", func(t *testing.T) {
+		s := seedCollector(t, 3, true)
+		buildInfo(t, s, day0.AddDate(0, 0, 1), "0.6.9")
+
+		a := exportToArchive(t, ExportOptions{
+			DataDir: s.Dir(), Salt: exportSalt, Now: day0.AddDate(0, 0, 3),
+		})
+		report := string(a.files["COLLECTION-REPORT.txt"])
+		problems := report[max(strings.Index(report, "PROBLEMS DURING EXPORT"), 0):]
+		if !strings.Contains(report, "PROBLEMS DURING EXPORT") || !strings.Contains(problems, "0.6.9") {
+			t.Errorf("the operator reported a build the collector never ran under and the archive "+
+				"is silent about it. The sessions all say 0.6.1 and every one of them is right; "+
+				"what changed was the thing being measured:\n%s", report)
+		}
+		if a.manifest.OperatorVersionNote == "" {
+			t.Error("MANIFEST.json does not carry the disagreement, so a reader who parses the JSON " +
+				"instead of the prose sees a single-version archive")
+		}
+	})
+
+	t.Run("the version the sessions do claim is not a problem", func(t *testing.T) {
+		s := seedCollector(t, 3, true)
+		buildInfo(t, s, day0.AddDate(0, 0, 1), "0.6.1")
+
+		a := exportToArchive(t, ExportOptions{
+			DataDir: s.Dir(), Salt: exportSalt, Now: day0.AddDate(0, 0, 3),
+		})
+		report := string(a.files["COLLECTION-REPORT.txt"])
+		if strings.Contains(report, "PROBLEMS DURING EXPORT") {
+			t.Errorf("the operator corroborated the session log and the export reported a problem. "+
+				"An alarm that fires on agreement is an alarm nobody reads on the day of a real "+
+				"disagreement:\n%s", report)
+		}
+		if a.manifest.OperatorVersionNote != "" {
+			t.Errorf("operatorVersionNote = %q over one agreed build", a.manifest.OperatorVersionNote)
+		}
+	})
+}
+
+// TestStatusShowsAMidRunUpgradeOnTheDayItHappens.
+//
+// This screen is what the admin runs on day 1 and day 2, and hack/soak/collect.sh captures it as
+// its first cluster interaction. An upgrade found here is a decision somebody can still make —
+// restart the soak, or accept a mixed fortnight knowingly. The same fact found at export is a
+// fortnight already spent.
+func TestStatusShowsAMidRunUpgradeOnTheDayItHappens(t *testing.T) {
+	s := seedCollector(t, 8, true)
+	writeJSON(t, s, fileStarts, upgradedSessions())
+
+	var out bytes.Buffer
+	if err := Status(ExportOptions{DataDir: s.Dir(), Now: day0.AddDate(0, 0, 8)}, &out); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"2 BUILDS", "0.6.2", "0.6.3", "MORE THAN ONE BUILD"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("the status screen does not mention %q; the operator version line reports "+
+				"whichever build collector-id.json was last written with:\n%s", want, out.String())
+		}
+	}
+}
+
+// TestASingleVersionSoakReadsExactlyAsBefore is the other half of the requirement, and the half
+// that is easy to lose.
+//
+// Almost every soak runs one build. If saying "more than one build produced this" costs a block on
+// every archive that says everything was normal, the block is noise — and a reader who has skimmed
+// past it thirteen times will skim past it on the fourteenth, which is the archive it was written
+// for. Nothing new appears anywhere until there is something to say.
+func TestASingleVersionSoakReadsExactlyAsBefore(t *testing.T) {
+	s := seedCollector(t, 3, true)
+	a := exportToArchive(t, ExportOptions{
+		DataDir: s.Dir(), Salt: exportSalt, Now: day0.AddDate(0, 0, 3),
+	})
+	report := string(a.files["COLLECTION-REPORT.txt"])
+
+	// The header line, byte for byte, with nothing inserted after it.
+	if !strings.Contains(report, "operator version   0.6.1\ncollector started  ") {
+		t.Errorf("the version header is no longer one line followed by `collector started`:\n%s",
+			report)
+	}
+	// The §5 class line ends where it always ended: no attribution suffix when there is nothing to
+	// attribute between.
+	if !regexp.MustCompile(`\n {2}data +\d+ pod\(s\) over \d+ Job\(s\)\n`).MatchString(report) {
+		t.Errorf("the §5 class line grew something after `Job(s)` on a single-build soak:\n%s",
+			moverProfilesSection(t, report))
+	}
+	// The tokens this change can add, and only those. Not the bare word "unattributed": §5 already
+	// uses it for the `unknown` sizing class, and a guard that fails on somebody else's sentence is
+	// a guard that gets deleted rather than read.
+	for _, unwanted := range []string{"BUILDS", "MORE THAN ONE BUILD", "pods ran under"} {
+		if strings.Contains(report, unwanted) {
+			t.Errorf("%q appears in the report of a soak that ran ONE build:\n%s", unwanted, report)
+		}
+	}
+	if a.manifest.OperatorVersionNote != "" {
+		t.Errorf("operatorVersionNote = %q on a single-build archive", a.manifest.OperatorVersionNote)
+	}
+	// The machine-readable half still carries the span, because a reader who wants to check has to
+	// be able to: silence in the prose is not the same as an absent record.
+	if len(a.manifest.OperatorVersions) != 1 {
+		t.Errorf("operatorVersions = %+v, want exactly one span", a.manifest.OperatorVersions)
+	}
+
+	var status bytes.Buffer
+	if err := Status(ExportOptions{DataDir: s.Dir(), Now: day0.AddDate(0, 0, 3)}, &status); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(status.String(), "  operator version     0.6.1\n  metrics URL") {
+		t.Errorf("the --status version line gained something on a single-build soak:\n%s",
+			status.String())
 	}
 }

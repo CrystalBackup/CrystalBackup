@@ -48,7 +48,7 @@ func TestTheLoopActuallyCollects(t *testing.T) {
 	defer srv.Close()
 
 	store := newTestStore(t, 1<<20)
-	sessions, err := OpenSessionLog(store, day0, 15*time.Second)
+	sessions, err := OpenSessionLog(store, day0, 15*time.Second, "test")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,7 +138,7 @@ func TestTheLoopRecordsAScrapeItCouldNotMake(t *testing.T) {
 	defer srv.Close()
 
 	store := newTestStore(t, 1<<20)
-	sessions, err := OpenSessionLog(store, day0, 15*time.Second)
+	sessions, err := OpenSessionLog(store, day0, 15*time.Second, "test")
 	if err != nil {
 		t.Fatal(err)
 	}

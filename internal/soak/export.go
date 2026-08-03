@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path"
 	"path/filepath"
@@ -31,6 +32,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/CrystalBackup/CrystalBackup/internal/metrics"
 	"github.com/CrystalBackup/CrystalBackup/internal/selfcheck"
 )
 
@@ -136,7 +138,7 @@ func Export(opts ExportOptions, w io.Writer, progress io.Writer) error {
 	tw := tar.NewWriter(gz)
 	e := &exporter{
 		opts: opts, now: now, red: red, info: info, uptime: uptime, tw: tw,
-		progress: progress,
+		progress: progress, scrapedVersions: map[string]bool{},
 	}
 	if infoErr != nil {
 		e.problems = append(e.problems, "the collector never recorded its own configuration: "+
@@ -266,6 +268,16 @@ type exporter struct {
 
 	streams  []StreamReport
 	problems []string
+
+	// scrapedVersions is every version label seen on a crystalbackup_build_info point, gathered as
+	// the metrics are redacted rather than by re-reading the stream.
+	//
+	// It is the second, independent account of which build was running: the session log says what
+	// the COLLECTOR was, this says what the OPERATOR said it was, and they are not the same fact.
+	// A soak whose operator image was rolled forward without the collector's has a mixed §5 table
+	// and a session log that swears there was only ever one version — which is precisely the shape
+	// that made this whole gap invisible, so the corroboration has to come from outside the log.
+	scrapedVersions map[string]bool
 
 	// marks is the redacted high-water table, kept so COLLECTION-REPORT.txt can state the
 	// fortnight's ANSWER and not merely grade the stream that holds it.
@@ -433,6 +445,16 @@ func (e *exporter) copyMetricsDay(w io.Writer, day time.Time) (items, okWindows 
 	return items, okWindows, first, last
 }
 
+// buildInfoVersionLabel is crystalbackup_build_info's only label. Spelled out because
+// internal/metrics keeps its own label-name constant unexported and exports the label SET instead,
+// through Catalogue().
+//
+// A bare string that has to match another package's constant is the shape internal/selfcheck's
+// labelKinds warns about — a misspelling does not fail, it passes the value through and reports
+// nothing, forever, in silence. So it is checked against metrics.Catalogue() by a test rather than
+// hoped at: see the guard in TestABuildTheOperatorClaimsAndNoSessionDoesIsAProblem.
+const buildInfoVersionLabel = "version"
+
 // redactMetricLine rewrites one stored point's labels. It returns whether the line was a scrape
 // health record with at least one successful scrape, which is what observedDays counts.
 func (e *exporter) redactMetricLine(raw []byte) (out []byte, at time.Time, health bool, ok bool) {
@@ -451,6 +473,18 @@ func (e *exporter) redactMetricLine(raw []byte) (out []byte, at time.Time, healt
 	var p point
 	if err := json.Unmarshal(raw, &p); err != nil {
 		return nil, time.Time{}, false, false
+	}
+	// The measured system naming itself, taken from a point this function was unmarshalling
+	// anyway. Zero extra I/O and no second pass over the stream — and writeMetrics runs before
+	// writeManifest, so the set is complete by the time anything reads it.
+	//
+	// Read BEFORE the labels are redacted. `version` is not a labelKinds entry today and passes
+	// through verbatim, but a corroboration that only works while that stays true is a
+	// corroboration that stops working without failing.
+	if p.Name == metrics.NameBuildInfo {
+		if v := p.Labels[buildInfoVersionLabel]; v != "" {
+			e.scrapedVersions[v] = true
+		}
 	}
 	p.Labels = e.red.Labels(p.Labels)
 	body, err := json.Marshal(p)
@@ -906,9 +940,32 @@ func (e *exporter) writeManifest() error {
 			"window and send it alongside: which of the eleven rules fired, when and for how long is "+
 			"the one thing this archive cannot tell you."))
 
+	// The two accounts of which build ran, compared before anything is written. A version the
+	// operator reported that no session claims goes in with the export's other problems, where it
+	// is printed under PROBLEMS DURING EXPORT — it is not resolved, and neither side is picked as
+	// the winner, because the whole value of having two independent records is lost the moment one
+	// of them is allowed to overwrite the other.
+	scraped := slices.Sorted(maps.Keys(e.scrapedVersions))
+	for _, v := range unclaimedVersions(e.uptime.Versions, scraped) {
+		e.problems = append(e.problems, fmt.Sprintf(
+			"the operator reported version %q in crystalbackup_build_info and no collector session "+
+				"claims it. The session log is the COLLECTOR binary's build, build_info is the "+
+				"MEASURED operator's, and they come apart exactly when the operator image was changed "+
+				"without the collector's — so the §5 mover table may describe a build this archive "+
+				"cannot name.", v))
+	}
+	// Never null. `drops` taught this package that a null in a document collect.sh reads with jq is
+	// a shape somebody downstream has to remember to defend against.
+	versions := e.uptime.Versions
+	if versions == nil {
+		versions = []VersionSpan{}
+	}
+
 	m := Manifest{
 		Schema:                  ManifestSchema,
 		OperatorVersion:         e.info.OperatorVersion,
+		OperatorVersions:        versions,
+		OperatorVersionNote:     versionNote(e.uptime.Versions, scraped),
 		ExportedAt:              e.now.Format(time.RFC3339),
 		Mode:                    "collector",
 		Redaction:               e.red.Describe(),
@@ -944,12 +1001,22 @@ func (e *exporter) writeManifest() error {
 func renderReport(m Manifest, up Uptime, problems []string, marks *Marks) string {
 	var b strings.Builder
 	_, _ = fmt.Fprintf(&b, "CrystalBackup soak archive\n==========================\n\n")
-	_, _ = fmt.Fprintf(&b, "operator version   %s\n", orDash(m.OperatorVersion))
+	_, _ = fmt.Fprintf(&b, "operator version   %s\n",
+		versionHeadline(m.OperatorVersion, m.OperatorVersions))
+	for _, line := range versionDetailLines(m.OperatorVersions) {
+		_, _ = fmt.Fprintf(&b, "                   %s\n", line)
+	}
 	_, _ = fmt.Fprintf(&b, "collector started  %s\n", orDash(m.CollectorStartedAt))
 	_, _ = fmt.Fprintf(&b, "exported           %s\n", m.ExportedAt)
 	_, _ = fmt.Fprintf(&b, "redaction          %s\n", m.Redaction.Mode)
 	_, _ = fmt.Fprintf(&b, "collector uptime   %.1f%% of the period this archive covers\n\n",
 		m.CollectorUptimeFraction*100)
+	// Printed from the manifest's own field rather than recomputed, so the prose and the JSON
+	// cannot drift apart, and printed only when there is something to say.
+	if m.OperatorVersionNote != "" {
+		b.WriteString(wrap(m.OperatorVersionNote, "  "))
+		b.WriteString("\n")
+	}
 
 	_, _ = fmt.Fprintf(&b, "STREAMS\n-------\n")
 	for _, s := range m.Streams {
@@ -966,7 +1033,7 @@ func renderReport(m Manifest, up Uptime, problems []string, marks *Marks) string
 		}
 	}
 
-	b.WriteString(renderMoverProfiles(marks))
+	b.WriteString(renderMoverProfiles(marks, m.OperatorVersions))
 
 	_, _ = fmt.Fprintf(&b, "\n\nCOLLECTOR UPTIME\n----------------\n")
 	b.WriteString(wrap(up.Note, "  "))
@@ -1001,7 +1068,13 @@ func renderReport(m Manifest, up Uptime, problems []string, marks *Marks) string
 // only had to be non-zero is precisely what hid `data: 0` and `manifests: 0` through a campaign
 // that ran dozens of backups, and a section that silently omitted the empty classes would hide
 // the same failure again in the archive instead of on the status screen.
-func renderMoverProfiles(marks *Marks) string {
+//
+// And it takes the version spans, because this is the section that suffers most from not having
+// them. marks.json persists across collector restarts while the version the archive names does
+// not, so a table built over an upgrade reports one peak for two systems — with nothing on the
+// page to say so. The disclosure goes ABOVE the first number rather than in a footnote: a reader
+// who has already read the figures has already decided what they mean.
+func renderMoverProfiles(marks *Marks, spans []VersionSpan) string {
 	var b strings.Builder
 	_, _ = fmt.Fprintf(&b, "\n\nMOVER RESOURCE PROFILES (the §5 question)\n")
 	b.WriteString("-----------------------------------------\n")
@@ -1009,6 +1082,10 @@ func renderMoverProfiles(marks *Marks) string {
 		b.WriteString(wrap("no high-water table in this archive, so this soak answers nothing "+
 			"about mover sizing. That is a failed collection, not a finding about the cluster.", "  "))
 		return b.String()
+	}
+	if len(spans) > 1 {
+		b.WriteString(wrap(versionNote(spans, nil), "  "))
+		b.WriteString("\n")
 	}
 
 	b.WriteString(wrap("peak memory per sizing class, measured. Compare each against the limit "+
@@ -1019,7 +1096,8 @@ func renderMoverProfiles(marks *Marks) string {
 
 	for _, class := range sortedClasses(*marks) {
 		cm := marks.Classes[class]
-		_, _ = fmt.Fprintf(&b, "\n  %-12s %d pod(s) over %d Job(s)\n", class, cm.Pods, cm.JobsObserved)
+		_, _ = fmt.Fprintf(&b, "\n  %-12s %d pod(s) over %d Job(s)%s\n",
+			class, cm.Pods, cm.JobsObserved, versionAttribution(marks.Pods, class, spans))
 		if cm.Pods == 0 {
 			// The honest zero. It says what was observed and refuses to say why, because the
 			// collector cannot tell an idle workload from its own blindness — and it has been
@@ -1053,6 +1131,108 @@ func renderMoverProfiles(marks *Marks) string {
 		"limit is too LOW, and it needs no metrics-server to be true. Everything else here says "+
 		"how much room was left over.", "  "))
 	return b.String()
+}
+
+// versionHeadline is what the `operator version` line carries, in the report and on the --status
+// screen.
+//
+// One span and it is the scalar, formatted exactly as this line has always been formatted. That is
+// the requirement, not a nicety: a clean archive must not become noisier because a rarer archive
+// needed to say more, or the reader learns to skim the line that matters.
+func versionHeadline(scalar string, spans []VersionSpan) string {
+	if len(spans) <= 1 {
+		return orDash(scalar)
+	}
+	return fmt.Sprintf("%d BUILDS — %s", len(spans), versionListing(spans))
+}
+
+// versionDetailLines are the per-span lines under that headline, and they exist only for a mixed
+// archive. They carry the DATES, which the listing deliberately does not: what a reader needs from
+// a mixed soak is which half of the fortnight each build was measured over, so they can go and look
+// at what else changed that day.
+func versionDetailLines(spans []VersionSpan) []string {
+	if len(spans) <= 1 {
+		return nil
+	}
+	out := make([]string, 0, len(spans))
+	for _, sp := range spans {
+		out = append(out, fmt.Sprintf("%-12s %s .. %s  (%.1f day(s) over %d session(s))",
+			versionWord(sp.Version), sp.From.Format(time.RFC3339), sp.To.Format(time.RFC3339),
+			sp.ObservedSeconds/86400, sp.Sessions))
+	}
+	return out
+}
+
+// versionAttribution says which builds one sizing class's pods ran under, and it is deliberately
+// the dumbest rule that could work: a pod's FirstSeen either falls inside a span's window or it
+// does not.
+//
+// Nothing else is correlated. The metrics stream carries build_info with timestamps, and using
+// those to decide which build a pod ran under would be an inference wearing a measurement's
+// clothes — the same mistake §5 forbids when it insists a mover's class comes off its `--operation`
+// argument and is NEVER guessed. A pod whose FirstSeen lands in no span (inside a gap, or before
+// the first session the log knows about) is `unattributed`: counted, named, and never redistributed
+// over the versions around it, exactly as classUnknown is never redistributed over the classes.
+//
+// Empty for an unmixed archive, so the class line reads as it always has.
+func versionAttribution(pods []PodMark, class string, spans []VersionSpan) string {
+	if len(spans) <= 1 {
+		return ""
+	}
+	counts := map[string]int{}
+	order := []string{}
+	unattributed := 0
+	for _, p := range pods {
+		if p.Class != class {
+			continue
+		}
+		version, ok := versionAt(spans, p.FirstSeen)
+		if !ok {
+			unattributed++
+			continue
+		}
+		word := versionWord(version)
+		if _, seen := counts[word]; !seen {
+			order = append(order, word)
+		}
+		counts[word]++
+	}
+	parts := make([]string, 0, len(order))
+	for _, word := range order {
+		parts = append(parts, fmt.Sprintf("%s ×%d", word, counts[word]))
+	}
+	// Two clauses, not one list. "ran under unattributed" is not a thing that can be true of a
+	// pod, and a bucket that has to be read as a version to parse the sentence is a bucket a
+	// reader will take for one.
+	phrase := ""
+	if len(parts) > 0 {
+		phrase = "pods ran under " + strings.Join(parts, ", ")
+	}
+	if unattributed > 0 {
+		if phrase != "" {
+			phrase += "; "
+		}
+		phrase += fmt.Sprintf("%d unattributed", unattributed)
+	}
+	if phrase == "" {
+		return ""
+	}
+	return "  (" + phrase + ")"
+}
+
+// versionAt is the whole of the attribution rule. A zero FirstSeen attributes to nothing rather
+// than to the first span, because the zero time is inside no window anyone measured and reading it
+// as "the beginning" is how an unattributed pod becomes a confident wrong answer.
+func versionAt(spans []VersionSpan, at time.Time) (string, bool) {
+	if at.IsZero() {
+		return "", false
+	}
+	for _, sp := range spans {
+		if !at.Before(sp.From) && !at.After(sp.To) {
+			return sp.Version, true
+		}
+	}
+	return "", false
 }
 
 func orDash(s string) string {
@@ -1111,7 +1291,11 @@ func Status(opts ExportOptions, out io.Writer) error {
 			opts.DataDir)
 		_, _ = fmt.Fprintf(out, "     Nothing is being collected. Look at the pod before you wait another day.\n\n")
 	} else {
-		_, _ = fmt.Fprintf(out, "  operator version     %s\n", orDash(info.OperatorVersion))
+		_, _ = fmt.Fprintf(out, "  operator version     %s\n",
+			versionHeadline(info.OperatorVersion, uptime.Versions))
+		for _, line := range versionDetailLines(uptime.Versions) {
+			_, _ = fmt.Fprintf(out, "                       %s\n", line)
+		}
 		_, _ = fmt.Fprintf(out, "  metrics URL          %s every %s, downsampled to %s\n",
 			info.MetricsURL, info.MetricsInterval, info.MetricsResolution)
 		_, _ = fmt.Fprintf(out, "  mover sampling       every %s\n", info.MoverSampleInterval)
@@ -1120,6 +1304,16 @@ func Status(opts ExportOptions, out io.Writer) error {
 		_, _ = fmt.Fprintf(out, "  daily self-check     %s\n", enabledWord(info.SelfcheckEnabled,
 			"enabled", "DISABLED (no --redaction-salt-file)"))
 		_, _ = fmt.Fprintf(out, "  footprint cap        %s\n\n", humanBytes(info.MaxBytes))
+	}
+
+	// The same sentence the archive would carry, on the day the upgrade happens rather than at
+	// export. hack/soak/collect.sh captures this screen as its first cluster interaction, so a soak
+	// whose operator was rolled forward mid-run is a thing the admin can still decide about while
+	// there is time to decide it. `nil` for the scraped versions: this screen reads no metrics, and
+	// a corroboration it cannot make is one it must not appear to have made.
+	if note := versionNote(uptime.Versions, nil); note != "" {
+		_, _ = fmt.Fprint(out, wrap(note, "  "))
+		_, _ = fmt.Fprintln(out)
 	}
 
 	_, _ = fmt.Fprintf(out, "  up %.1f%% of the %.1f day(s) since it first started, across %d session(s)\n",

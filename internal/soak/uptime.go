@@ -47,6 +47,35 @@ type Session struct {
 	// judge freshness against the period the RUNNING collector uses, not against a constant that
 	// would be wrong for anyone who changed --mover-sample-interval.
 	BeatPeriod string `json:"beatPeriod,omitempty"`
+	// OperatorVersion is the build that ran THIS session, and it is here for the same reason
+	// BeatPeriod is: it is a property of one process, not of the soak.
+	//
+	// Without it an upgraded soak lies by omission. CollectorInfo.OperatorVersion is rewritten in
+	// full on every collector start, so the archive reports whichever build happened to start
+	// last — a fortnight that ran six days of one version and eight of another comes out as a
+	// single flat version, while highwater/marks.json (which persists across restarts) silently
+	// mixes the two systems into one peak. The gap between the sessions is recorded; the fact
+	// that the measured system CHANGED at that gap was not, anywhere.
+	//
+	// `omitempty` on purpose: an archive written before this field existed has sessions without
+	// it, and those must read as "unknown", never as a version they cannot attest to.
+	OperatorVersion string `json:"operatorVersion,omitempty"`
+}
+
+// VersionSpan is a stretch of the soak during which one build was collecting, derived by
+// collapsing consecutive sessions that carry the same version.
+//
+// Consecutive, not grouped: a soak that went 0.6.2 → 0.6.3 → 0.6.2 (a rollback) produces THREE
+// spans, because merging the two 0.6.2 stretches into one would erase the rollback from the
+// record while leaving its gap in place.
+type VersionSpan struct {
+	// Version is the build, or "" when the sessions predate this field. Rendered as `unknown`
+	// downstream and never dropped — a span nobody can name is still time that was collected.
+	Version         string    `json:"version"`
+	From            time.Time `json:"from"`
+	To              time.Time `json:"to"`
+	ObservedSeconds float64   `json:"observedSeconds"`
+	Sessions        int       `json:"sessions"`
 }
 
 // Gap is a stretch during which nothing was collecting.
@@ -66,7 +95,18 @@ type Uptime struct {
 	ObservedSeconds float64   `json:"observedSeconds"`
 	Fraction        float64   `json:"fraction"`
 	Note            string    `json:"note"`
+	// Versions is which builds produced this archive, in order. One entry is the ordinary case
+	// and says nothing new; more than one is a finding, because every figure derived across the
+	// whole span — the mover high-water table above all — then describes more than one system.
+	Versions []VersionSpan `json:"versions"`
 }
+
+// MixedVersions reports whether more than one build contributed to this archive.
+//
+// Named rather than left as `len(...) > 1` at each call site: four places have to agree about
+// what "mixed" means (the manifest, the report header, the §5 section and the status screen), and
+// a fifth will be added by somebody who does not read the other four.
+func (u Uptime) MixedVersions() bool { return len(u.Versions) > 1 }
 
 // heartbeat is the tiny file --heartbeat-check reads, and it is deliberately NOT the sessions
 // file: the liveness probe runs `/manager soak-collect --heartbeat-check` every five minutes in
@@ -90,13 +130,17 @@ type SessionLog struct {
 // is computed without the dead process having had to do anything on its way out — which is the
 // only way it can work, since the interesting deaths are the ones with no way out: an OOM kill, a
 // node that went away, a SIGKILL after the grace period.
-func OpenSessionLog(store *Store, now time.Time, beatPeriod time.Duration) (*SessionLog, error) {
+// The operatorVersion argument is the build starting this session. It is passed in rather than
+// read here so this file stays free of the metrics package, and so a test can drive two different
+// versions through it without linker tricks.
+func OpenSessionLog(store *Store, now time.Time, beatPeriod time.Duration, operatorVersion string) (*SessionLog, error) {
 	l := &SessionLog{store: store, period: beatPeriod}
 	if err := l.load(); err != nil {
 		return nil, err
 	}
 	l.sessions = append(l.sessions, Session{
 		StartedAt: now.UTC(), LastBeat: now.UTC(), BeatPeriod: beatPeriod.String(),
+		OperatorVersion: operatorVersion,
 	})
 	return l, l.flush(now)
 }
@@ -184,6 +228,24 @@ func computeUptime(sessions []Session, now time.Time) Uptime {
 				u.Gaps = append(u.Gaps, Gap{From: from, To: to, Seconds: to.Sub(from).Seconds()})
 			}
 		}
+		// The version spans, collapsed in the SAME pass over the same already-sorted sessions, so
+		// they cannot disagree with the gaps about ordering. Consecutive-only: see VersionSpan.
+		if n := len(u.Versions); n > 0 && u.Versions[n-1].Version == s.OperatorVersion {
+			sp := &u.Versions[n-1]
+			sp.To = s.LastBeat
+			sp.Sessions++
+			if observed > 0 {
+				sp.ObservedSeconds += observed
+			}
+			continue
+		}
+		span := VersionSpan{
+			Version: s.OperatorVersion, From: s.StartedAt, To: s.LastBeat, Sessions: 1,
+		}
+		if observed > 0 {
+			span.ObservedSeconds = observed
+		}
+		u.Versions = append(u.Versions, span)
 	}
 	// The span ends at NOW and not at the last beat. A collector that died an hour before the
 	// export must have that hour counted against it — measuring the span from the last beat would
