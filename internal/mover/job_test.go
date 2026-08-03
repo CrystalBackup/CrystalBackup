@@ -17,6 +17,7 @@ limitations under the License.
 package mover
 
 import (
+	"maps"
 	"reflect"
 	"testing"
 
@@ -305,11 +306,14 @@ func TestBuildJobDataRequest(t *testing.T) {
 	}
 
 	// --- labels on both Job and pod template --------------------------------------------
-	if !reflect.DeepEqual(job.Labels, req.Labels) {
-		t.Errorf("Job labels = %v, want %v", job.Labels, req.Labels)
+	// The caller's labels, plus the identity label the builder stamps on every mover Job.
+	wantLabels := maps.Clone(req.Labels)
+	wantLabels[LabelAppName] = AppName
+	if !reflect.DeepEqual(job.Labels, wantLabels) {
+		t.Errorf("Job labels = %v, want %v", job.Labels, wantLabels)
 	}
-	if !reflect.DeepEqual(job.Spec.Template.Labels, req.Labels) {
-		t.Errorf("pod template labels = %v, want %v", job.Spec.Template.Labels, req.Labels)
+	if !reflect.DeepEqual(job.Spec.Template.Labels, wantLabels) {
+		t.Errorf("pod template labels = %v, want %v", job.Spec.Template.Labels, wantLabels)
 	}
 }
 
@@ -418,17 +422,91 @@ func TestBuildJobLabelsIndependent(t *testing.T) {
 	}
 }
 
-// TestBuildJobNilLabels confirms a request with no labels yields nil label maps (not empty
-// maps), keeping an empty `labels: {}` out of the serialized object.
+// TestBuildJobNilLabels confirms a request with no labels still yields the identity label, on
+// both the Job and its pod template.
+//
+// This test used to assert the opposite — that no labels in meant nil label maps out. That was
+// the honest reading of the builder at the time and it is exactly what let six of the ten mover
+// creation sites ship Jobs no outside observer could find. The invariant is inverted on purpose:
+// there is no such thing as an unlabelled mover Job any more.
 func TestBuildJobNilLabels(t *testing.T) {
 	req := dataRequest()
 	req.Labels = nil
 	job := BuildJob(req)
-	if job.Labels != nil {
-		t.Errorf("Job labels = %v, want nil", job.Labels)
+
+	want := map[string]string{LabelAppName: AppName}
+	if !maps.Equal(job.Labels, want) {
+		t.Errorf("Job labels = %v, want exactly %v", job.Labels, want)
 	}
-	if job.Spec.Template.Labels != nil {
-		t.Errorf("pod template labels = %v, want nil", job.Spec.Template.Labels)
+	if !maps.Equal(job.Spec.Template.Labels, want) {
+		t.Errorf("pod template labels = %v, want exactly %v", job.Spec.Template.Labels, want)
+	}
+}
+
+// TestEveryOperationBuildsAnIdentifiableJob is the guard for the defect this label was added to
+// close: `app.kubernetes.io/name=crystal-mover` must be on the Job AND its pod template for
+// EVERY operation, so that one label selector really does find the whole mover population.
+//
+// It iterates Operations() rather than a hand-written list, so a new operation is covered the day
+// it is added — the same exhaustive-by-construction shape as TestEveryOperationHasABuiltinProfile.
+// Before the fix this failed for six of the twelve operations: backup, restore, and all four
+// manifest movers. The soak collector selects on this exact label, so those six were reported as
+// NOT_MEASURED — two of the four sizing classes, silently, for four hours of real cluster time.
+func TestEveryOperationBuildsAnIdentifiableJob(t *testing.T) {
+	ops := Operations()
+	if len(ops) < 8 {
+		t.Fatalf("Operations() returned %d operations — too few for this guard to mean anything; "+
+			"it has gone blind", len(ops))
+	}
+
+	for _, op := range ops {
+		t.Run(string(op), func(t *testing.T) {
+			job := BuildJob(JobRequest{
+				Name:       "j",
+				Namespace:  "crystal-backup-system",
+				Operation:  op,
+				ResticArgs: []string{string(op)},
+			})
+
+			if got := job.Labels[LabelAppName]; got != AppName {
+				t.Errorf("Job %s=%q, want %q.\n"+
+					"A mover Job without this label is invisible to `kubectl get jobs -l %s=%s` "+
+					"and to the soak collector, which reports its whole sizing class NOT_MEASURED.",
+					LabelAppName, got, AppName, LabelAppName, AppName)
+			}
+			if got := job.Spec.Template.Labels[LabelAppName]; got != AppName {
+				t.Errorf("pod template %s=%q, want %q.\n"+
+					"The Job carries it but its POD does not, so the peak RSS the mover reports on "+
+					"its own termination message can never be attributed to a mover.",
+					LabelAppName, got, AppName)
+			}
+		})
+	}
+}
+
+// TestBuildJobIdentityLabelCannotBeOverridden pins the other half: a caller passing a different
+// value for the identity label does not win. Stamping last is what makes that true, and a
+// refactor that merged the caller's map last instead would pass every test above while
+// re-opening the hole for any caller that happens to set the key.
+func TestBuildJobIdentityLabelCannotBeOverridden(t *testing.T) {
+	req := dataRequest()
+	req.Labels = map[string]string{
+		LabelAppName:       "crystal-backup", // the OPERATOR pod's value: the plausible mistake
+		"crystalbackup.io": "kept",
+	}
+	job := BuildJob(req)
+
+	if got := job.Labels[LabelAppName]; got != AppName {
+		t.Errorf("caller overrode the identity label: %s=%q, want %q", LabelAppName, got, AppName)
+	}
+	if got := job.Spec.Template.Labels[LabelAppName]; got != AppName {
+		t.Errorf("caller overrode the pod template identity label: %s=%q, want %q",
+			LabelAppName, got, AppName)
+	}
+	// Stamping must not eat the caller's other labels — mapJobToBackup and the orphan reaper
+	// route on them, so dropping them would trade an observability defect for a lifecycle one.
+	if got := job.Labels["crystalbackup.io"]; got != "kept" {
+		t.Errorf("stamping the identity label dropped a caller label: got %q, want %q", got, "kept")
 	}
 }
 

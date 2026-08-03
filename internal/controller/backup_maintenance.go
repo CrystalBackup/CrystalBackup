@@ -110,12 +110,19 @@ func maintenanceResourceName(backupName, op string) string {
 // builders share one definition rather than repeating the string keys. The name value is always
 // crystal-mover, never crystal-backup (the operator pod's own app.kubernetes.io/name, which the
 // crucible's operator-restart tests select on).
+//
+// The name key/value ALIAS mover.LabelAppName/mover.AppName rather than repeating the strings.
+// BuildJob stamps the identity label on every mover Job itself, so these builders no longer have
+// to be right for a Job to be labelled — but they still label the per-Job creds SECRET, which
+// BuildJob does not create, so the definition has to be shared rather than dropped. Two
+// independent spellings of the same label is how the label came to mean different things on
+// different objects in the first place.
 const (
-	labelAppName      = "app.kubernetes.io/name"
+	labelAppName      = mover.LabelAppName
 	labelAppManagedBy = "app.kubernetes.io/managed-by"
 	labelAppComponent = "app.kubernetes.io/component"
 
-	moverAppName   = "crystal-mover"
+	moverAppName   = mover.AppName
 	moverManagedBy = "crystal-backup"
 )
 

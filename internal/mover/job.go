@@ -60,6 +60,33 @@ const (
 // (`--operation <op>`); BuildJob passes it as the first arg, before restic's "--" separator.
 const operationFlag = "--operation"
 
+// LabelAppName / AppName identify a mover Job and its pod: `app.kubernetes.io/name=crystal-mover`
+// on every Job this builder produces, and on its pod template.
+//
+// BuildJob stamps it ITSELF rather than trusting callers to include it in JobRequest.Labels,
+// because trusting callers is exactly what failed. Four of the ten mover creation sites
+// (maintenance, repository init, discovery, external sync) put it in their own label map; the
+// other six — the data movers (backup, restore) and all four manifest movers — never did. The
+// label read as "every mover" and meant "the four that remembered".
+//
+// Nothing in the operator SELECTS on it (the mover-concurrency semaphore counts the per-PVC
+// label, the egress NetworkPolicy matches managed-by, and mapJobToBackup keys off
+// cluster-backup + namespace), so the omission was invisible in-cluster and stayed that way for
+// six milestones. What it broke was every OUTSIDE observer: `kubectl get jobs -l
+// app.kubernetes.io/name=crystal-mover` silently omitted the data movers, and the soak
+// collector — whose whole purpose is measuring what the mover profiles should be — reported
+// classes `data` and `manifests` as NOT_MEASURED across a four-hour run that executed dozens of
+// backups. Two of the four sizing classes, including the only one that touches a user volume.
+//
+// So the identity label belongs to the object's builder, where it cannot be forgotten again.
+// Callers may still pass it; stamping is idempotent. Callers may NOT override it: a mover Job
+// labelled as something other than a mover is never what anyone meant, and silently honouring
+// that is how this defect would come back.
+const (
+	LabelAppName = "app.kubernetes.io/name"
+	AppName      = "crystal-mover"
+)
+
 // Fixed environment variable names restic reads. The AWS credential names are intentionally
 // absent here: they equal SecretKeyAWSAccessKeyID / SecretKeyAWSSecretAccessKey, so moverEnv
 // reuses those constants for both the env var Name and the secretKeyRef Key.
@@ -241,13 +268,13 @@ func BuildJob(req JobRequest) *batchv1.Job {
 			Namespace: req.Namespace,
 			// Independent copies so the Job's labels and the template's labels never alias one
 			// another or the caller's map (a later edit of one must not mutate the others).
-			Labels: copyLabels(req.Labels),
+			Labels: moverLabels(req.Labels),
 		},
 		Spec: batchv1.JobSpec{
 			BackoffLimit:            ptrTo(req.BackoffLimit),
 			TTLSecondsAfterFinished: ttlSeconds(req.TTLSeconds),
 			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{Labels: copyLabels(req.Labels)},
+				ObjectMeta: metav1.ObjectMeta{Labels: moverLabels(req.Labels)},
 				Spec: corev1.PodSpec{
 					RestartPolicy: corev1.RestartPolicyNever,
 					// A data or maintenance mover talks to S3 and the source PVC only; it never
@@ -464,5 +491,18 @@ func copyLabels(in map[string]string) map[string]string {
 	}
 	out := make(map[string]string, len(in))
 	maps.Copy(out, in)
+	return out
+}
+
+// moverLabels is copyLabels plus the identity label, and it is what BuildJob uses for both the
+// Job and its pod template. Unlike copyLabels it never returns nil: a mover Job always carries at
+// least LabelAppName, so "no labels" is not a reachable state.
+//
+// The stamp goes on LAST, so a caller cannot override it — see LabelAppName's comment for why
+// that is deliberate rather than merely convenient.
+func moverLabels(in map[string]string) map[string]string {
+	out := make(map[string]string, len(in)+1)
+	maps.Copy(out, in)
+	out[LabelAppName] = AppName
 	return out
 }
