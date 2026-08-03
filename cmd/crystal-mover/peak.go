@@ -56,7 +56,13 @@ import (
 //   - the peak RSS of the restic process (and of this shim, separately), from ru_maxrss. RSS is
 //     anonymous memory plus mapped file pages and excludes the streamed page cache, which makes
 //     it the figure a memory limit actually has to cover;
-//   - the cgroup peak, labelled as the upper bound it is;
+//   - the cgroup peak, which is what was CHARGED to this cgroup;
+//
+// and the second is NOT an upper bound on the first, however much it looks like one. A file page
+// is charged to whichever cgroup first faulted it in, so a mover whose image pages are already
+// resident on the node maps them without being charged. Measured on the crucible: memory.peak
+// ran 20-22Mi BELOW restic's ru_maxrss on all eight data movers of one campaign. The two count
+// different populations and neither bounds the other;
 //
 // plus the two memory.events counters that say whether the limit was ever pressed at all —
 // which is what lets a reader tell "the cgroup peak is high because of cache" (max == 0) from
@@ -315,8 +321,9 @@ func describeMemory(f memoryFigures) string {
 	fmt.Fprintf(&b, "crystal-mover: peak RSS restic=%s shim=%s (anonymous + mapped, the figure a "+
 		"memory limit must cover)", humanBytes(f.resticPeakRSS), humanBytes(f.shimPeakRSS))
 	if strings.Contains(f.sources, mover.MemorySourceCgroup2) {
-		fmt.Fprintf(&b, "; cgroup peak=%s (INCLUDES reclaimable page cache — an upper bound, not a "+
-			"sizing target); limit hits=%d, cgroup OOM kills=%d",
+		fmt.Fprintf(&b, "; cgroup peak=%s (what was CHARGED to the cgroup, reclaimable page cache "+
+			"included — not a sizing target, and not a ceiling on the RSS above: charged and "+
+			"mapped are different populations); limit hits=%d, cgroup OOM kills=%d",
 			humanBytes(f.cgroupPeak), f.limitHits, f.oomKills)
 	}
 	if f.note != "" {

@@ -314,7 +314,7 @@ that the event path, not the sampler, is what carried them.
 |---|---|---|
 | `peakRSSBytes` | restic's peak resident set (`ru_maxrss`, RUSAGE_CHILDREN) | **the sizing number.** Anonymous + mapped, no page cache — what a memory limit must cover |
 | `shimPeakRSSBytes` | the same for the crystal-mover process | resident at the same time, so a limit covers the SUM |
-| `cgroupPeakBytes` | cgroup v2 `memory.peak` | **an upper bound, not a sizing target.** It is the peak of `memory.current`, which counts reclaimable PAGE CACHE; a backup streams a volume through it, so this can sit an order of magnitude above the RSS peak, and the kernel reclaims that cache long before it OOM-kills anything |
+| `cgroupPeakBytes` | cgroup v2 `memory.peak` | **not a sizing target, and not a ceiling on the RSS peak either.** It is the peak of `memory.current` — everything CHARGED to this cgroup, reclaimable PAGE CACHE included — so a streaming backup can push it an order of magnitude above the RSS peak, and the kernel reclaims that cache long before it OOM-kills anything. It can also sit BELOW the RSS peak: charged and mapped are different populations, and a file page belongs to whichever cgroup first faulted it in, so a mover whose image pages were already resident maps them without being charged. Measured on the crucible, it ran 20–22Mi below restic's `ru_maxrss` on all eight data movers of one campaign |
 | `memoryLimitHits` | `memory.events` `max` | 0 ⇒ the limit was never pressed, so a large cgroup peak is cache the container was merely allowed to keep |
 | `memoryOOMKills` | `memory.events` `oom_kill` | not redundant with the kubelet's `OOMKilled`: when restic is killed and the shim survives to report, Kubernetes records no OOM anywhere |
 

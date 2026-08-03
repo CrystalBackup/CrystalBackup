@@ -118,12 +118,23 @@ type MoverResult struct {
 	// memory.peak): anonymous memory PLUS page cache plus kernel memory, for the whole
 	// container.
 	//
-	// IT IS AN UPPER BOUND, NOT A SIZING TARGET, and it can exceed PeakRSSBytes by an order of
-	// magnitude for exactly the reason this operator exists: a backup streams a volume through
-	// the page cache, every one of those pages is charged to this cgroup, and the cgroup is
-	// free to keep them right up to its limit because they are RECLAIMABLE. Sizing a limit to
-	// this number raises a ceiling that was never the constraint. What it is good for is the
-	// opposite question — it bounds everything the container could possibly have needed.
+	// IT IS NOT A SIZING TARGET, and it can exceed PeakRSSBytes by an order of magnitude for
+	// exactly the reason this operator exists: a backup streams a volume through the page cache,
+	// every one of those pages is charged to this cgroup, and the cgroup is free to keep them
+	// right up to its limit because they are RECLAIMABLE. Sizing a limit to this number raises a
+	// ceiling that was never the constraint.
+	//
+	// NOR IS IT AN UPPER BOUND ON PeakRSSBytes, which is what this comment used to claim. The two
+	// count different populations: memory.peak counts what was CHARGED to this cgroup, and RSS
+	// counts what the process had MAPPED. A file page is charged to whichever cgroup first
+	// faulted it in, so a mover whose image pages were already resident — brought in by an
+	// earlier mover on the same node — maps them without being charged for them.
+	//
+	// Measured on the crucible, and it is the common case rather than a corner: across eight data
+	// movers, memory.peak sat 20-22Mi BELOW restic's ru_maxrss on every single one (75Mi RSS
+	// against 53Mi charged), the gap closing to ~3Mi on manifest movers where anonymous memory —
+	// which is always charged — dominates. Neither figure bounds the other in general. Report
+	// both, name what each counts, and never present one as the ceiling of the other.
 	CgroupPeakBytes int64 `json:"cgroupPeakBytes,omitempty"`
 	// MemoryLimitHits is cgroup v2 memory.events `max`: how many times the cgroup reached its
 	// memory limit and the kernel had to reclaim to stay under it.

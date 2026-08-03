@@ -205,9 +205,15 @@ type PodMark struct {
 	// ReportedShimPeakRSSBytes is the crystal-mover shim's own peak, resident AT THE SAME TIME
 	// (the shim waits while restic runs), so a limit has to cover the sum of the two.
 	ReportedShimPeakRSSBytes int64 `json:"reportedShimPeakRSSBytes,omitempty"`
-	// ReportedCgroupPeakBytes is the peak of the container cgroup's memory.current: anonymous
-	// memory PLUS reclaimable page cache. An upper bound, NOT a sizing target — a backup
-	// streams a volume through the page cache and every one of those pages is charged here.
+	// ReportedCgroupPeakBytes is the peak of the container cgroup's memory.current: everything
+	// CHARGED to this cgroup, anonymous memory plus the reclaimable page cache it faulted in.
+	//
+	// NOT a sizing target — a backup streams a volume through the page cache and every one of
+	// those pages is charged here — and NOT a ceiling on the RSS peak either, which is the
+	// easier mistake because it looks like one. The two count different populations: charged
+	// versus mapped. A file page belongs to whichever cgroup first faulted it in, so a mover
+	// whose image pages were already resident maps them for free. Measured on the crucible, this
+	// figure ran 20-22Mi BELOW restic's RSS on all eight data movers of one campaign.
 	ReportedCgroupPeakBytes int64 `json:"reportedCgroupPeakBytes,omitempty"`
 	// ReportedLimitHits is memory.events `max`: times the cgroup reached its limit and the
 	// kernel reclaimed. Zero means the limit was never pressed, so a large cgroup peak is cache
@@ -909,9 +915,12 @@ func moverReportedReason(cm ClassMarks) string {
 		"with reportedShimPeakRSSBytes, which is resident at the same time",
 		cm.ReportedPods)
 	if cm.ReportedCgroupPeakBytes > 0 {
-		b += ". reportedCgroupPeakBytes is the cgroup's peak memory.current and INCLUDES " +
-			"reclaimable page cache, so for a streaming backup it can sit an order of magnitude " +
-			"above the RSS peak: it is an upper bound, NOT a sizing target"
+		b += ". reportedCgroupPeakBytes is the cgroup's peak memory.current — everything CHARGED " +
+			"to this cgroup, including reclaimable page cache, so for a streaming backup it can " +
+			"sit an order of magnitude above the RSS peak. It is NOT a sizing target, and it is " +
+			"not a ceiling on the RSS peak either: charged and mapped are different populations, " +
+			"and a page already faulted in by an earlier pod on the node is mapped here without " +
+			"being charged here — which is why this figure can also sit BELOW the RSS peak"
 		if cm.ReportedLimitHits == 0 {
 			b += ". reportedLimitHits is 0, so the limit was never reached: whatever the cgroup " +
 				"peak is, it is memory the container was merely ALLOWED to keep"

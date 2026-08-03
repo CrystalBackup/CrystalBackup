@@ -1029,8 +1029,12 @@ func renderMoverProfiles(marks *Marks) string {
 		}
 		_, _ = fmt.Fprintf(&b, "      peak memory   %s\n", classPeakWord(cm))
 		if cm.ReportedCgroupPeakBytes > 0 {
-			_, _ = fmt.Fprintf(&b, "      cgroup peak   %s  (upper bound, NOT a sizing target: it "+
-				"counts reclaimable page cache; %d limit hit(s))\n",
+			// Deliberately NOT called an upper bound. It counts what was CHARGED to the cgroup;
+			// the peak above counts what the process had MAPPED, and a file page is charged to
+			// whichever cgroup first faulted it in. On the crucible this figure sat consistently
+			// BELOW the RSS peak, which would read as a contradiction under the old wording.
+			_, _ = fmt.Fprintf(&b, "      cgroup peak   %s  (what was CHARGED to the cgroup — a "+
+				"different population from the RSS above, and not a ceiling on it; %d limit hit(s))\n",
 				humanBytes(cm.ReportedCgroupPeakBytes), cm.ReportedLimitHits)
 		}
 		_, _ = fmt.Fprintf(&b, "      kills         %d OOM, %d evicted\n", cm.OOMKills, cm.Evictions)
