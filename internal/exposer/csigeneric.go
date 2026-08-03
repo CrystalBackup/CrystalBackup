@@ -21,6 +21,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -38,26 +39,40 @@ type csiGenericExposer struct {
 	// PVC are created (the mover mounts the temp PVC there). Fixed at construction from the
 	// Registry.
 	operatorNamespace string
-	// volumeSnapshotClass is the VolumeSnapshotClass name Registry.For resolved for this
-	// PVC's provisioner. Fixed at construction so Expose never has to re-resolve it.
-	volumeSnapshotClass string
+	// vsClass is the VolumeSnapshotClass OBJECT Registry.For resolved for this PVC's provisioner.
+	// Fixed at construction so Expose never has to re-resolve it — and held whole rather than by
+	// name because Precheck reads its `parameters` (the snapshotter Secret reference).
+	vsClass *unstructured.Unstructured
 }
 
 // newCSIGenericExposer builds a csiGenericExposer preconfigured with the operator namespace and
-// the resolved VolumeSnapshotClass name (see Registry.For — "the returned exposer is
-// preconfigured with the resolved VolumeSnapshotClass name").
-func newCSIGenericExposer(c client.Client, operatorNamespace, volumeSnapshotClass string) *csiGenericExposer {
-	return &csiGenericExposer{client: c, operatorNamespace: operatorNamespace, volumeSnapshotClass: volumeSnapshotClass}
+// the resolved VolumeSnapshotClass (see Registry.For — "the returned exposer is preconfigured
+// with the resolved VolumeSnapshotClass OBJECT").
+func newCSIGenericExposer(c client.Client, operatorNamespace string, vsClass *unstructured.Unstructured) *csiGenericExposer {
+	return &csiGenericExposer{client: c, operatorNamespace: operatorNamespace, vsClass: vsClass}
 }
 
 // Kind implements SnapshotExposer.
 func (e *csiGenericExposer) Kind() string { return KindCSIGeneric }
 
+// Precheck implements SnapshotExposer: verify the resolved class's cluster-side preconditions
+// before anything is created. See Precheck (precheck.go) and the ordering contract on the
+// interface.
+func (e *csiGenericExposer) Precheck(ctx context.Context) error {
+	return Precheck(ctx, e.client, e.vsClass).Err()
+}
+
 // Expose implements SnapshotExposer: create the dynamic VolumeSnapshot and return the Exposure.
 // It does not wait or create the static objects/temp PVC (that is Ready's job) and is safe to
 // retry (the Create tolerates AlreadyExists). See expose.
 func (e *csiGenericExposer) Expose(ctx context.Context, req ExposeRequest) (*Exposure, error) {
-	return expose(ctx, e.client, e.Kind(), req, e.operatorNamespace, e.volumeSnapshotClass)
+	return expose(ctx, e.client, e.Kind(), req, e.operatorNamespace, vsClassName(e.vsClass))
+}
+
+// Progress implements SnapshotExposer: report the origin snapshot's start and whether the CSI
+// stack has acknowledged it at all. See originProgress.
+func (e *csiGenericExposer) Progress(ctx context.Context, ex *Exposure) (SnapshotProgress, bool) {
+	return originProgress(ctx, e.client, ex)
 }
 
 // Ready implements SnapshotExposer: it drives the static re-bind and reports readiness (static

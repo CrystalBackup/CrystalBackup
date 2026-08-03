@@ -255,6 +255,88 @@ func StartedAt(ctx context.Context, c client.Client, ex *Exposure) (time.Time, b
 	return created.Time, true
 }
 
+// SnapshotProgress is what has demonstrably happened to an exposure's ORIGIN VolumeSnapshot, and
+// it exists for one question Ready structurally cannot answer: Ready reports "not yet" in exactly
+// the same way for a snapshot the storage system is busy taking and for a snapshot NOBODY IS
+// LISTENING TO. An unattended snapshot request sits untouched forever, and the backup waits forever
+// in a phase that reads like ordinary progress.
+//
+// Note what this deliberately does NOT include: readyToUse. A snapshot that has been picked up and
+// is genuinely slow (a cold pool, a large image) shows Acknowledged=true long before it shows
+// readyToUse, and it must be given all the time it needs. The distinction being drawn here is
+// "has anything touched this object at all", not "is it done".
+//
+// KNOW WHAT THIS DOES AND DOES NOT CATCH. Both fields Acknowledged reads are written by the
+// cluster-wide external SNAPSHOT-CONTROLLER, which binds a VolumeSnapshotContent within seconds of
+// any request it can see — before the storage system has done any work at all. So an unacknowledged
+// snapshot means nothing is watching this VolumeSnapshotClass: no snapshot-controller running, or a
+// class it will not act on. It does NOT catch the narrower case of a healthy snapshot-controller
+// with a dead per-driver csi-snapshotter sidecar: there the content IS bound and only readyToUse
+// never arrives, which is indistinguishable — from this object alone — from a driver taking its
+// time. Closing that gap needs a second, much longer bound on "bound but never ready", and picking
+// a number for it means picking a maximum time a snapshot may legitimately take on storage we do
+// not own. That is deliberately not attempted here.
+type SnapshotProgress struct {
+	// StartedAt is the origin VolumeSnapshot's creationTimestamp — the same clock StartedAt reads
+	// for the exposure histogram, and for the same reason: it is the only durable record of when
+	// the wait began, so it survives an operator restart with no new CRD field and no new state.
+	StartedAt time.Time
+	// Acknowledged reports whether ANY snapshot-side controller has written to the object's
+	// status: a bound VolumeSnapshotContent name (the external snapshot-controller got there) or a
+	// recorded error (something tried and said why it could not). Either one means the request was
+	// received; neither means it was not.
+	Acknowledged bool
+}
+
+// originProgress reads SnapshotProgress off the origin VolumeSnapshot. Shared by both exposers'
+// Progress methods — the origin snapshot is created identically by both.
+//
+// ok=false when the snapshot cannot be read at all (already cleaned up, RBAC, no snapshot CRDs, an
+// apiserver having a bad second). That is NOT "no progress", and the caller must not treat it as
+// such: this value's whole purpose is to justify failing a volume, and an unreadable object is the
+// one input from which nothing may be concluded. Same rule, same reasoning as StartedAt's ok.
+func originProgress(ctx context.Context, c client.Client, ex *Exposure) (SnapshotProgress, bool) {
+	vs := newUnstructured(volumeSnapshotGVK())
+	if err := c.Get(ctx, client.ObjectKey{Namespace: ex.OriginNamespace, Name: ex.OriginVSName}, vs); err != nil {
+		return SnapshotProgress{}, false
+	}
+	created := vs.GetCreationTimestamp()
+	if created.IsZero() {
+		return SnapshotProgress{}, false
+	}
+
+	boundContent, _, err := unstructured.NestedString(vs.Object, "status", "boundVolumeSnapshotContentName")
+	if err != nil {
+		// The field is there but not a string: the object's status is a shape we do not
+		// understand. Report unknown rather than "not acknowledged" — see the ok=false rule above.
+		return SnapshotProgress{}, false
+	}
+	// status.error is an object (message + time). Its mere PRESENCE is the signal: something in
+	// the CSI stack processed this request and had an opinion, which is the opposite of nobody
+	// listening. The message itself is not read here — a snapshot that errors already surfaces
+	// through the normal not-ready path and its own diagnostics.
+	_, hasError, err := unstructured.NestedMap(vs.Object, "status", "error")
+	if err != nil {
+		return SnapshotProgress{}, false
+	}
+
+	return SnapshotProgress{
+		StartedAt:    created.Time,
+		Acknowledged: boundContent != "" || hasError,
+	}, true
+}
+
+// vsClassName is the name of a resolved VolumeSnapshotClass, tolerating nil so a caller that was
+// handed no class (impossible through Registry.For; possible in a test) gets an empty
+// spec.volumeSnapshotClassName rather than a panic — the API server then rejects the snapshot with
+// a clear message instead of the operator dying.
+func vsClassName(vsc *unstructured.Unstructured) string {
+	if vsc == nil {
+		return ""
+	}
+	return vsc.GetName()
+}
+
 // CutAt reports the instant the STORAGE SYSTEM took the point-in-time copy: the CSI driver's
 // `status.creationTime` on the dynamic VolumeSnapshot. It is the boundary between the two halves
 // of an exposure — waiting for the driver to cut the snapshot, and the re-bind/clone dance that

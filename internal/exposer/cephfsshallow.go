@@ -21,6 +21,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -42,25 +43,41 @@ type cephfsShallowExposer struct {
 	// operatorNamespace is crystal-backup-system: where the static VolumeSnapshot and the temp
 	// PVC are created. Fixed at construction from the Registry.
 	operatorNamespace string
-	// volumeSnapshotClass is the VolumeSnapshotClass name Registry.For resolved for this
-	// PVC's CephFS provisioner. Fixed at construction so Expose never has to re-resolve it.
-	volumeSnapshotClass string
+	// vsClass is the VolumeSnapshotClass OBJECT Registry.For resolved for this PVC's CephFS
+	// provisioner. Fixed at construction so Expose never has to re-resolve it — and held whole
+	// rather than by name because Precheck reads its `parameters` (the snapshotter Secret
+	// reference).
+	vsClass *unstructured.Unstructured
 }
 
 // newCephFSShallowExposer builds a cephfsShallowExposer preconfigured with the operator namespace
-// and the resolved VolumeSnapshotClass name (see Registry.For).
-func newCephFSShallowExposer(c client.Client, operatorNamespace, volumeSnapshotClass string) *cephfsShallowExposer {
-	return &cephfsShallowExposer{client: c, operatorNamespace: operatorNamespace, volumeSnapshotClass: volumeSnapshotClass}
+// and the resolved VolumeSnapshotClass (see Registry.For).
+func newCephFSShallowExposer(c client.Client, operatorNamespace string, vsClass *unstructured.Unstructured) *cephfsShallowExposer {
+	return &cephfsShallowExposer{client: c, operatorNamespace: operatorNamespace, vsClass: vsClass}
 }
 
 // Kind implements SnapshotExposer.
 func (e *cephfsShallowExposer) Kind() string { return KindCephFSShallow }
 
+// Precheck implements SnapshotExposer, identically to csi-generic: the credentials a
+// VolumeSnapshotClass names are a property of the CLASS, not of how its snapshot is later turned
+// into a mountable volume, so both exposers share one implementation. See Precheck (precheck.go).
+func (e *cephfsShallowExposer) Precheck(ctx context.Context) error {
+	return Precheck(ctx, e.client, e.vsClass).Err()
+}
+
 // Expose implements SnapshotExposer: create the dynamic VolumeSnapshot and return the Exposure.
 // Identical to csiGenericExposer.Expose except for Kind — the divergence is Ready's temp PVC. See
 // expose.
 func (e *cephfsShallowExposer) Expose(ctx context.Context, req ExposeRequest) (*Exposure, error) {
-	return expose(ctx, e.client, e.Kind(), req, e.operatorNamespace, e.volumeSnapshotClass)
+	return expose(ctx, e.client, e.Kind(), req, e.operatorNamespace, vsClassName(e.vsClass))
+}
+
+// Progress implements SnapshotExposer: report the origin snapshot's start and whether the CSI
+// stack has acknowledged it at all. Shared with csi-generic — the origin VolumeSnapshot is created
+// identically by both. See originProgress.
+func (e *cephfsShallowExposer) Progress(ctx context.Context, ex *Exposure) (SnapshotProgress, bool) {
+	return originProgress(ctx, e.client, ex)
 }
 
 // Ready implements SnapshotExposer: it drives the same static re-bind as csi-generic and reports

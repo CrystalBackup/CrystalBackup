@@ -36,6 +36,10 @@ import (
 // error so the Backup controller can test errors.Is(err, ErrUnsupported) to distinguish "skip
 // this volume, mark it Skipped/CSISnapshotUnsupported" (ADR 0003) from every other resolution
 // failure (a missing StorageClass, a broken client, ...) that warrants a hard error instead.
+// Its sibling is ErrPrecheckFailed (precheck.go), and the pair is the whole vocabulary of
+// exposure admission: ErrUnsupported means "never, on this storage", ErrPrecheckFailed means "not
+// on this cluster today". They are defined apart because each lives with the code that produces
+// it, and the difference between them is spelled out on ErrPrecheckFailed.
 var ErrUnsupported = errors.New("exposer: storage class has no CSI snapshot support")
 
 // cephfsProvisionerMarker is the substring ADR 0003 pins to recognise a CephFS CSI driver
@@ -89,8 +93,17 @@ func NewRegistry(c client.Client, operatorNamespace string) *Registry {
 //  3. A CephFS provisioner (name contains ".cephfs.csi.") with a match -> cephfsShallowExposer.
 //     Any other provisioner with a match -> csiGenericExposer.
 //
-// The returned exposer is preconfigured with the resolved VolumeSnapshotClass name, so its
-// Expose never has to re-run this resolution.
+// The returned exposer is preconfigured with the resolved VolumeSnapshotClass OBJECT, so its
+// Expose never has to re-run this resolution and its Precheck can read the class's parameters
+// (the snapshotter Secret reference) without a second List.
+//
+// For remains PURE RESOLUTION: it answers "which exposer, if any", and nothing about whether the
+// cluster can serve a snapshot today. That separation is load-bearing beyond taste —
+// hack/gen-preflight-table executes this very function against a fake cluster to generate
+// website/public/preflight.sh, and the script it emits promises administrators that it predicts
+// what the operator will do. Folding the active pre-check in here would make that promise false on
+// any cluster whose snapshotter Secret is missing, in a generated artifact that has no way to say
+// so. The pre-check is therefore a separate, explicit step (SnapshotExposer.Precheck).
 func (r *Registry) For(ctx context.Context, pvc *corev1.PersistentVolumeClaim) (SnapshotExposer, error) {
 	if pvc == nil {
 		return nil, errors.New("exposer: nil PVC")
@@ -106,47 +119,54 @@ func (r *Registry) For(ctx context.Context, pvc *corev1.PersistentVolumeClaim) (
 	}
 	provisioner := sc.Provisioner
 
-	vsClassName, err := r.findVolumeSnapshotClass(ctx, provisioner)
+	vsClass, err := r.findVolumeSnapshotClass(ctx, provisioner)
 	if err != nil {
 		return nil, fmt.Errorf("exposer: list VolumeSnapshotClasses for provisioner %q: %w", provisioner, err)
 	}
-	if vsClassName == "" {
+	if vsClass == nil {
 		return nil, fmt.Errorf("%w: provisioner %q (StorageClass %q) has no matching VolumeSnapshotClass",
 			ErrUnsupported, provisioner, scName)
 	}
 
 	if strings.Contains(provisioner, cephfsProvisionerMarker) {
-		return newCephFSShallowExposer(r.client, r.operatorNamespace, vsClassName), nil
+		return newCephFSShallowExposer(r.client, r.operatorNamespace, vsClass), nil
 	}
-	return newCSIGenericExposer(r.client, r.operatorNamespace, vsClassName), nil
+	return newCSIGenericExposer(r.client, r.operatorNamespace, vsClass), nil
 }
 
-// findVolumeSnapshotClass returns the name of a VolumeSnapshotClass whose "driver" field
-// equals provisioner, or "" if none exists. More than one match is legal (a cluster may
-// define several classes for the same driver, e.g. differing deletionPolicy); this picks the
-// lexicographically smallest name — an arbitrary but DETERMINISTIC tie-break, so the same
-// cluster state always resolves to the same exposer configuration instead of flapping with
-// API list ordering.
-func (r *Registry) findVolumeSnapshotClass(ctx context.Context, provisioner string) (string, error) {
+// findVolumeSnapshotClass returns the VolumeSnapshotClass whose "driver" field equals
+// provisioner, or nil if none exists. More than one match is legal (a cluster may define several
+// classes for the same driver, e.g. differing deletionPolicy); this picks the lexicographically
+// smallest NAME — an arbitrary but DETERMINISTIC tie-break, so the same cluster state always
+// resolves to the same exposer configuration instead of flapping with API list ordering.
+//
+// It returns the OBJECT, not just the name, because the resolved class is read twice downstream
+// for two different reasons: its name goes into the dynamic VolumeSnapshot's
+// spec.volumeSnapshotClassName, and its `parameters` carry the snapshotter Secret reference the
+// pre-check verifies. Re-reading it by name at pre-check time would be a second API round-trip
+// AND a second chance to resolve a different object than the one this tie-break chose.
+func (r *Registry) findVolumeSnapshotClass(ctx context.Context, provisioner string) (*unstructured.Unstructured, error) {
 	list := &unstructured.UnstructuredList{}
 	list.SetGroupVersionKind(volumeSnapshotClassListGVK())
 	if err := r.client.List(ctx, list); err != nil {
-		return "", err
+		return nil, err
 	}
 
-	var candidates []string
+	var candidates []*unstructured.Unstructured
 	for i := range list.Items {
 		driver, _, err := unstructured.NestedString(list.Items[i].Object, "driver")
 		if err != nil {
-			return "", fmt.Errorf("read .driver of VolumeSnapshotClass %s: %w", list.Items[i].GetName(), err)
+			return nil, fmt.Errorf("read .driver of VolumeSnapshotClass %s: %w", list.Items[i].GetName(), err)
 		}
 		if driver == provisioner {
-			candidates = append(candidates, list.Items[i].GetName())
+			candidates = append(candidates, &list.Items[i])
 		}
 	}
 	if len(candidates) == 0 {
-		return "", nil
+		return nil, nil
 	}
-	slices.Sort(candidates)
+	slices.SortFunc(candidates, func(a, b *unstructured.Unstructured) int {
+		return strings.Compare(a.GetName(), b.GetName())
+	})
 	return candidates[0], nil
 }

@@ -19,9 +19,11 @@ package exposer
 import (
 	"context"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -153,10 +155,10 @@ func TestReadyDrivesHandover(t *testing.T) {
 		wantAccessMode corev1.PersistentVolumeAccessMode
 	}{
 		{"csi-generic", func(c client.Client) SnapshotExposer {
-			return newCSIGenericExposer(c, testOperatorNamespace, "ceph-block-snapclass")
+			return newCSIGenericExposer(c, testOperatorNamespace, newVolumeSnapshotClass("ceph-block-snapclass", rbdProvisioner))
 		}, corev1.ReadWriteOnce},
 		{"cephfs-shallow", func(c client.Client) SnapshotExposer {
-			return newCephFSShallowExposer(c, testOperatorNamespace, "cephfs-snapclass")
+			return newCephFSShallowExposer(c, testOperatorNamespace, newVolumeSnapshotClass("cephfs-snapclass", cephfsProvisioner))
 		}, corev1.ReadOnlyMany},
 	}
 
@@ -252,7 +254,7 @@ func TestReadyDrivesHandover(t *testing.T) {
 func TestReadyIsIdempotent(t *testing.T) {
 	ctx := context.Background()
 	c := newHandoverClient(t)
-	e := newCSIGenericExposer(c, testOperatorNamespace, "ceph-block-snapclass")
+	e := newCSIGenericExposer(c, testOperatorNamespace, newVolumeSnapshotClass("ceph-block-snapclass", rbdProvisioner))
 
 	ex, err := e.Expose(ctx, testExposeRequest())
 	if err != nil {
@@ -314,5 +316,121 @@ func TestResolveTempPVCCapacity(t *testing.T) {
 				t.Errorf("resolveTempPVCCapacity = %v, want %v", got.String(), want.String())
 			}
 		})
+	}
+}
+
+// TestOriginProgress covers the other half of delta 9: the signal that tells a caller apart a
+// snapshot that is SLOW from one that nobody is listening to. Ready reports "not yet" identically
+// for both, so this is the only place the distinction exists.
+func TestOriginProgress(t *testing.T) {
+	cases := []struct {
+		name string
+		// mutate plays whatever the CSI stack did (or did not do) to the origin snapshot's status.
+		mutate           func(t *testing.T, c client.Client, ex *Exposure)
+		wantOK           bool
+		wantAcknowledged bool
+	}{
+		{
+			// Freshly created by Expose, untouched: the shape a dead/absent snapshotter leaves
+			// behind forever. This is the ONLY combination that may ever justify failing a volume.
+			name:   "untouched by any snapshotter",
+			mutate: func(*testing.T, client.Client, *Exposure) {},
+			wantOK: true,
+		},
+		{
+			// The external snapshot-controller bound a content: the request was received. Whatever
+			// happens next, this is not abandonment, however long readyToUse takes.
+			name: "bound content — acknowledged, even though it is nowhere near ready",
+			mutate: func(t *testing.T, c client.Client, ex *Exposure) {
+				vs := getUnstructured(t, c, volumeSnapshotGVK(), ex.OriginNamespace, ex.OriginVSName)
+				mustSet(t, vs, originVSCName, "status", "boundVolumeSnapshotContentName")
+				if err := c.Update(context.Background(), vs); err != nil {
+					t.Fatalf("set boundVolumeSnapshotContentName: %v", err)
+				}
+			},
+			wantOK:           true,
+			wantAcknowledged: true,
+		},
+		{
+			// Something tried and said why it could not. That is a diagnosed failure with its own
+			// reporting path — never a stall, and never this deadline's business.
+			name: "recorded error — acknowledged",
+			mutate: func(t *testing.T, c client.Client, ex *Exposure) {
+				vs := getUnstructured(t, c, volumeSnapshotGVK(), ex.OriginNamespace, ex.OriginVSName)
+				mustSet(t, vs, "failed to create snapshot: rpc error", "status", "error", "message")
+				if err := c.Update(context.Background(), vs); err != nil {
+					t.Fatalf("set status.error: %v", err)
+				}
+			},
+			wantOK:           true,
+			wantAcknowledged: true,
+		},
+		{
+			// The snapshot is gone (cleaned up, RBAC, no CRDs). ok=false — and the caller's
+			// contract is that it must conclude NOTHING from this, least of all "no progress".
+			name: "origin snapshot unreadable — unknown, not 'no progress'",
+			mutate: func(t *testing.T, c client.Client, ex *Exposure) {
+				vs := getUnstructured(t, c, volumeSnapshotGVK(), ex.OriginNamespace, ex.OriginVSName)
+				if err := c.Delete(context.Background(), vs); err != nil {
+					t.Fatalf("delete origin VS: %v", err)
+				}
+			},
+		},
+		{
+			// No creationTimestamp means no clock, and a deadline measured from a zero time is
+			// "started in 1970" — i.e. instantly, catastrophically expired. Unknown, not stalled.
+			name: "no creationTimestamp — unknown, never 'expired long ago'",
+			mutate: func(t *testing.T, c client.Client, ex *Exposure) {
+				vs := getUnstructured(t, c, volumeSnapshotGVK(), ex.OriginNamespace, ex.OriginVSName)
+				vs.SetCreationTimestamp(metav1.Time{})
+				if err := c.Update(context.Background(), vs); err != nil {
+					t.Fatalf("clear creationTimestamp: %v", err)
+				}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			c := newHandoverClient(t)
+			e := newCSIGenericExposer(c, testOperatorNamespace, newVolumeSnapshotClass("ceph-block-snapclass", rbdProvisioner))
+
+			ex, err := e.Expose(ctx, testExposeRequest())
+			if err != nil {
+				t.Fatalf("Expose: %v", err)
+			}
+			// The fake client does not populate metadata.creationTimestamp on an unstructured
+			// object the way an API server does, and that field IS the exposure's clock (see
+			// StartedAt / SnapshotProgress). Stamp it here so these cases measure what they claim
+			// to; the "no creationTimestamp" case below then clears it back on purpose.
+			stampOriginCreation(t, c, ex, time.Now().Add(-3*time.Minute))
+			tc.mutate(t, c, ex)
+
+			progress, ok := e.Progress(ctx, ex)
+			if ok != tc.wantOK {
+				t.Fatalf("Progress ok = %v, want %v", ok, tc.wantOK)
+			}
+			if !ok {
+				return
+			}
+			if progress.Acknowledged != tc.wantAcknowledged {
+				t.Errorf("Acknowledged = %v, want %v", progress.Acknowledged, tc.wantAcknowledged)
+			}
+			if progress.StartedAt.IsZero() {
+				t.Error("StartedAt is zero — the deadline has no clock to measure against")
+			}
+		})
+	}
+}
+
+// stampOriginCreation sets the origin VolumeSnapshot's metadata.creationTimestamp, standing in for
+// the API server (which the fake client does not emulate for unstructured objects).
+func stampOriginCreation(t *testing.T, c client.Client, ex *Exposure, at time.Time) {
+	t.Helper()
+	vs := getUnstructured(t, c, volumeSnapshotGVK(), ex.OriginNamespace, ex.OriginVSName)
+	vs.SetCreationTimestamp(metav1.NewTime(at))
+	if err := c.Update(context.Background(), vs); err != nil {
+		t.Fatalf("stamp origin VS creationTimestamp: %v", err)
 	}
 }

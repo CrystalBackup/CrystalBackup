@@ -61,6 +61,13 @@ limitations under the License.
 // A third exposer, rook-rbd-direct, is opt-in/deferred per the ADR (privileged, benchmark-
 // gated) and is intentionally NOT implemented here.
 //
+// # Admission: two questions, asked in this order
+//
+// Registry.For asks the PASSIVE one — "is there a VolumeSnapshotClass for this driver at all?" —
+// and its "no" means Skipped/CSISnapshotUnsupported. Precheck (precheck.go) asks the ACTIVE one —
+// "can this cluster serve a snapshot on that class today?" — and its "no" means Failed. Both run
+// before Expose creates anything, which is what keeps a refusal from leaving objects behind.
+//
 // # The leak-check invariant
 //
 // Every object either exposer creates OR patches is stamped with ExposeRequest.Labels, and
@@ -104,10 +111,39 @@ const (
 // a point-in-time copy without quiescing the workload. Implementations create their objects
 // in Expose, report readiness in Ready, and MUST fully remove them in Cleanup (idempotent) —
 // the leak-check invariant (zero residual VolumeSnapshot/VolumeSnapshotContent/temp PVC).
+//
+// Precheck and Progress are the two verdicts the CALLER needs about an exposure it does not itself
+// hold, and they are on this interface rather than reached around it (as package functions over
+// the caller's own client) for one blunt reason: a controller that reads the live cluster directly
+// for either of them cannot be tested without a live CSI driver, and both exist precisely to catch
+// failure modes that only appear when the CSI stack is broken. Routing them through the same seam
+// as Expose/Ready/Cleanup is what lets envtest drive "the snapshotter is gone" without one.
 type SnapshotExposer interface {
 	Kind() string
+
+	// Precheck verifies the cluster-side preconditions for this exposure and MUST be called
+	// STRICTLY BEFORE Expose. Ordering is load-bearing, not stylistic: Expose creates a real
+	// VolumeSnapshot in a tenant namespace, so a pre-check that runs after it converts every
+	// refusal into leaked snapshot objects — which the crucible's leak-check would then report as
+	// a failure of the pre-check itself.
+	//
+	// nil means "nothing found that would stop this exposure" — which includes preconditions that
+	// could not be evaluated at all (see PrecheckResult and CheckNotCheckable). A non-nil error
+	// wraps ErrPrecheckFailed and carries a *PrecheckError with the individual Checks.
+	Precheck(ctx context.Context) error
+
 	Expose(ctx context.Context, req ExposeRequest) (*Exposure, error)
 	Ready(ctx context.Context, ex *Exposure) (bool, error)
+
+	// Progress reports when the exposure began and whether the CSI stack has acknowledged its
+	// origin VolumeSnapshot at all. It answers the one question Ready cannot: Ready says "not
+	// yet" identically for a snapshot being taken and for a snapshot nobody is listening to.
+	//
+	// ok=false means the origin snapshot could not be READ, which is not the same as "no progress"
+	// and must never be treated as such — a caller that concludes anything from an unreadable
+	// object turns an API blip into a failed backup.
+	Progress(ctx context.Context, ex *Exposure) (SnapshotProgress, bool)
+
 	Cleanup(ctx context.Context, ex *Exposure) error
 }
 

@@ -129,8 +129,8 @@ func TestRegistryForSelectsCSIGenericForRBD(t *testing.T) {
 	if !ok {
 		t.Fatalf("resolved exposer type = %T, want *csiGenericExposer", exp)
 	}
-	if gen.volumeSnapshotClass != "ceph-block-snapclass" {
-		t.Errorf("resolved VolumeSnapshotClass = %q, want %q", gen.volumeSnapshotClass, "ceph-block-snapclass")
+	if vsClassName(gen.vsClass) != "ceph-block-snapclass" {
+		t.Errorf("resolved VolumeSnapshotClass = %q, want %q", vsClassName(gen.vsClass), "ceph-block-snapclass")
 	}
 	if gen.operatorNamespace != testOperatorNamespace {
 		t.Errorf("resolved operatorNamespace = %q, want %q", gen.operatorNamespace, testOperatorNamespace)
@@ -177,8 +177,8 @@ func TestRegistryForSelectsCephFSShallowForCephFS(t *testing.T) {
 	if !ok {
 		t.Fatalf("resolved exposer type = %T, want *cephfsShallowExposer", exp)
 	}
-	if shallow.volumeSnapshotClass != "cephfs-snapclass" {
-		t.Errorf("resolved VolumeSnapshotClass = %q, want %q", shallow.volumeSnapshotClass, "cephfs-snapclass")
+	if vsClassName(shallow.vsClass) != "cephfs-snapclass" {
+		t.Errorf("resolved VolumeSnapshotClass = %q, want %q", vsClassName(shallow.vsClass), "cephfs-snapclass")
 	}
 	if shallow.operatorNamespace != testOperatorNamespace {
 		t.Errorf("resolved operatorNamespace = %q, want %q", shallow.operatorNamespace, testOperatorNamespace)
@@ -272,28 +272,28 @@ func TestFindVolumeSnapshotClassIsDeterministicUnderMultipleMatches(t *testing.T
 		newVolumeSnapshotClass("mmm-other", rbdProvisioner),
 	})
 
-	name, err := (&Registry{client: c}).findVolumeSnapshotClass(context.Background(), rbdProvisioner)
+	got, err := (&Registry{client: c}).findVolumeSnapshotClass(context.Background(), rbdProvisioner)
 	if err != nil {
 		t.Fatalf("findVolumeSnapshotClass: unexpected error: %v", err)
 	}
-	if name != "aaa-delete" {
-		t.Errorf("findVolumeSnapshotClass = %q, want %q (lexicographically smallest)", name, "aaa-delete")
+	if vsClassName(got) != "aaa-delete" {
+		t.Errorf("findVolumeSnapshotClass = %q, want %q (lexicographically smallest)", vsClassName(got), "aaa-delete")
 	}
 }
 
-// TestFindVolumeSnapshotClassNoMatchReturnsEmpty pins the zero-value contract
-// Registry.For relies on to decide ErrUnsupported: no matching class is reported as ("", nil),
+// TestFindVolumeSnapshotClassNoMatchReturnsNil pins the zero-value contract
+// Registry.For relies on to decide ErrUnsupported: no matching class is reported as (nil, nil),
 // never an error.
-func TestFindVolumeSnapshotClassNoMatchReturnsEmpty(t *testing.T) {
+func TestFindVolumeSnapshotClassNoMatchReturnsNil(t *testing.T) {
 	c := newRegistryTestClient(t, nil, []*unstructured.Unstructured{
 		newVolumeSnapshotClass("ceph-block-snapclass", rbdProvisioner),
 	})
 
-	name, err := (&Registry{client: c}).findVolumeSnapshotClass(context.Background(), localPathProvisioner)
+	got, err := (&Registry{client: c}).findVolumeSnapshotClass(context.Background(), localPathProvisioner)
 	if err != nil {
 		t.Fatalf("findVolumeSnapshotClass: unexpected error: %v", err)
 	}
-	if name != "" {
-		t.Errorf("findVolumeSnapshotClass = %q, want \"\" (no VolumeSnapshotClass names this driver)", name)
+	if got != nil {
+		t.Errorf("findVolumeSnapshotClass = %q, want nil (no VolumeSnapshotClass names this driver)", got.GetName())
 	}
 }

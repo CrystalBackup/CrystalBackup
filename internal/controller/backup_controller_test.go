@@ -66,8 +66,8 @@ type stubExposerRegistry struct {
 	client            client.Client
 	operatorNamespace string
 
-	// mu guards the teardown instrumentation below — the manager reconciles on its own
-	// goroutine while specs read these.
+	// mu guards the instrumentation below — the manager reconciles on its own goroutine while
+	// specs read and arm these.
 	mu sync.Mutex
 	// teardowns records every TeardownExposure call as "<originNamespace>/<namePrefix>", so a
 	// spec can assert the terminal re-entry sweep really swept a given volume.
@@ -76,6 +76,26 @@ type stubExposerRegistry struct {
 	// fails that call, letting a spec pin that the sweep withholds its marker (and finalize its
 	// finalizer) until teardown succeeds.
 	failTeardown func(originNamespace, namePrefix string) error
+	// exposed records every Expose call as "<namespace>/<pvc>". It is how a spec proves the
+	// NEGATIVE that delta 9's ordering rests on: a volume the pre-check refused must never have
+	// been exposed at all, and "no VolumeSnapshot exists" is not observable in envtest (no
+	// snapshot CRDs) — but "Expose was never called" is, and it is the stronger statement.
+	exposed []string
+
+	// precheckArmed must be set for this stub to allow ANY exposure. Its ZERO VALUE REFUSES, on
+	// purpose and against convenience: a fake whose default is "pre-check OK" makes every envtest
+	// in this package pass against an implementation that never calls Precheck at all, which is
+	// exactly the class of hole this feature exists to close. Arming it is therefore a deliberate,
+	// one-line act in the suite wiring (suite_test.go), where it is visible.
+	precheckArmed bool
+	// precheckFailures refuses specific volumes, keyed "<namespace>/<pvc>". Per-key rather than a
+	// global switch because the manager reconciles every Backup in the suite concurrently — a
+	// spec that flipped a shared flag would fail its neighbours' volumes.
+	precheckFailures map[string]error
+	// stalled holds volumes (keyed "<namespace>/<pvc>") whose exposure reports NOT ready and whose
+	// origin snapshot was never acknowledged, started at the recorded instant — the shape a dead
+	// snapshotter sidecar leaves behind.
+	stalled map[string]time.Time
 }
 
 var _ ExposerRegistry = (*stubExposerRegistry)(nil)
@@ -85,7 +105,70 @@ func (s *stubExposerRegistry) For(_ context.Context, pvc *corev1.PersistentVolum
 		return nil, fmt.Errorf("stub: storage class %q has no snapshot support: %w",
 			stubUnsupportedStorageClass, exposer.ErrUnsupported)
 	}
-	return &stubExposer{client: s.client, operatorNamespace: s.operatorNamespace}, nil
+	// The exposer carries the PVC's identity so Precheck/Ready/Progress can be armed per volume;
+	// the real Registry.For likewise resolves per PVC.
+	return &stubExposer{
+		client:            s.client,
+		operatorNamespace: s.operatorNamespace,
+		registry:          s,
+		key:               pvc.Namespace + "/" + pvc.Name,
+	}, nil
+}
+
+// precheckVerdict is stubExposer.Precheck's answer. Unarmed => refuse, loudly enough that the
+// failure names the cause rather than looking like a broken cluster.
+func (s *stubExposerRegistry) precheckVerdict(key string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.precheckArmed {
+		return fmt.Errorf("%w: the stub exposer registry was never armed with a pre-check verdict",
+			exposer.ErrPrecheckFailed)
+	}
+	return s.precheckFailures[key]
+}
+
+// failPrecheck arms a pre-check refusal for one volume.
+func (s *stubExposerRegistry) failPrecheck(key string, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.precheckFailures == nil {
+		s.precheckFailures = map[string]error{}
+	}
+	s.precheckFailures[key] = err
+}
+
+// stallSnapshot makes one volume's exposure look abandoned: never ready, never acknowledged,
+// started at startedAt. A spec sets startedAt in the past to cross the controller's deadline
+// without waiting for it.
+func (s *stubExposerRegistry) stallSnapshot(key string, startedAt time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.stalled == nil {
+		s.stalled = map[string]time.Time{}
+	}
+	s.stalled[key] = startedAt
+}
+
+// stallStart reports the armed stall for a volume, if any.
+func (s *stubExposerRegistry) stallStart(key string) (time.Time, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	startedAt, ok := s.stalled[key]
+	return startedAt, ok
+}
+
+// recordExpose notes an Expose call.
+func (s *stubExposerRegistry) recordExpose(key string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.exposed = append(s.exposed, key)
+}
+
+// exposeCalls snapshots the recorded Expose calls.
+func (s *stubExposerRegistry) exposeCalls() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.exposed...)
 }
 
 // TeardownExposure mirrors the real registry's derive-only teardown on the one object the stub
@@ -122,16 +205,48 @@ func (s *stubExposerRegistry) setFailTeardown(f func(originNamespace, namePrefix
 type stubExposer struct {
 	client            client.Client
 	operatorNamespace string
+	// registry is the owning stub, consulted for the per-volume armed verdicts. Nil on the
+	// teardown-only instances TeardownExposure builds (which use Cleanup and nothing else).
+	registry *stubExposerRegistry
+	// key identifies the source volume as "<namespace>/<pvc>".
+	key string
 }
 
 var _ exposer.SnapshotExposer = (*stubExposer)(nil)
 
 func (e *stubExposer) Kind() string { return stubKind }
 
+// Precheck returns whatever the registry was armed with — and REFUSES when it was not armed at
+// all. See stubExposerRegistry.precheckArmed for why the default is the refusing one.
+func (e *stubExposer) Precheck(_ context.Context) error {
+	if e.registry == nil {
+		return fmt.Errorf("%w: stub exposer built without a registry", exposer.ErrPrecheckFailed)
+	}
+	return e.registry.precheckVerdict(e.key)
+}
+
+// Progress reports an armed stall (never acknowledged, started long ago) and otherwise "unknown".
+// Unknown — not "acknowledged" — is the right default here for the same reason the production
+// implementation returns ok=false on an unreadable snapshot: it can never on its own justify
+// failing a volume, so an unarmed spec cannot trip the progress deadline by accident.
+func (e *stubExposer) Progress(_ context.Context, _ *exposer.Exposure) (exposer.SnapshotProgress, bool) {
+	if e.registry == nil {
+		return exposer.SnapshotProgress{}, false
+	}
+	startedAt, ok := e.registry.stallStart(e.key)
+	if !ok {
+		return exposer.SnapshotProgress{}, false
+	}
+	return exposer.SnapshotProgress{StartedAt: startedAt, Acknowledged: false}, true
+}
+
 // Expose creates the temp clone PVC (deterministic name <prefix>-clone, mirroring the real
 // exposer) in the operator namespace so the mover Job has a real PVC to mount, then returns the
 // deterministic Exposure. Idempotent: the Create tolerates AlreadyExists.
 func (e *stubExposer) Expose(ctx context.Context, req exposer.ExposeRequest) (*exposer.Exposure, error) {
+	if e.registry != nil {
+		e.registry.recordExpose(req.Namespace + "/" + req.PVCName)
+	}
 	tempName := req.NamePrefix + "-clone"
 	capacity := req.Capacity
 	if capacity.IsZero() {
@@ -161,7 +276,16 @@ func (e *stubExposer) Expose(ctx context.Context, req exposer.ExposeRequest) (*e
 	}, nil
 }
 
-func (e *stubExposer) Ready(_ context.Context, _ *exposer.Exposure) (bool, error) { return true, nil }
+// Ready is instantly true — except for a volume a spec has explicitly stalled, which stays
+// not-ready forever so the controller's progress deadline is the only thing that can move it.
+func (e *stubExposer) Ready(_ context.Context, _ *exposer.Exposure) (bool, error) {
+	if e.registry != nil {
+		if _, stalled := e.registry.stallStart(e.key); stalled {
+			return false, nil
+		}
+	}
+	return true, nil
+}
 
 // Cleanup deletes the temp clone PVC. envtest enables the StorageObjectInUseProtection admission
 // plugin (which stamps the kubernetes.io/pvc-protection finalizer on every PVC at creation) but
@@ -479,6 +603,93 @@ var _ = Describe("BackupReconciler", func() {
 			g.Expect(string(volumeByPVC(b, okPVC).Phase)).To(Equal("Completed"))
 			g.Expect(string(volumeByPVC(b, skipPVC).Phase)).To(Equal("Skipped"))
 			g.Expect(apimeta.IsStatusConditionTrue(b.Status.Conditions, ConditionReady)).To(BeTrue())
+		}, initTimeout, initPoll).Should(Succeed())
+	})
+
+	It("fails a volume whose snapshotter Secret is missing WITHOUT ever exposing it", func() {
+		const (
+			location = "bk-precheck"
+			ns       = "bk-precheck-ns"
+			run      = "bk-precheck-run"
+			pvcName  = "data-vol"
+		)
+		// Armed BEFORE the Backup exists: the reconciler picks it up within milliseconds, and a
+		// verdict armed after the first pass would be testing the second one.
+		backupExposers.failPrecheck(ns+"/"+pvcName, fmt.Errorf(
+			"%w: VolumeSnapshotClass \"ceph-block\" names snapshotter Secret rook-ceph/rook-csi-rbd-provisioner, which does not exist",
+			exposer.ErrPrecheckFailed))
+
+		seedInitializedRepo(location, "kek-bk-precheck", "s3-bk-precheck")
+		createTenantNamespace(ns)
+		createSourcePVC(ns, pvcName, "ceph-block")
+		createVolumeOnlyParent(run, location, cbv1.PVCSelector{})
+		createChildBackup(ns, run, location)
+
+		By("the volume reaches Failed/SnapshotPrecheckFailed — a fail, not a gate")
+		Eventually(func(g Gomega) {
+			vol := volumeByPVC(getBackupG(g, ns, run), pvcName)
+			g.Expect(vol).NotTo(BeNil())
+			g.Expect(string(vol.Phase)).To(Equal("Failed"))
+			g.Expect(vol.Reason).To(Equal("SnapshotPrecheckFailed"))
+		}, initTimeout, initPoll).Should(Succeed())
+
+		// THE assertion of delta 9's ordering. A pre-check that ran after Expose would leave a live
+		// VolumeSnapshot in the tenant namespace on every refusal — residue the crucible's
+		// leak-check would report as a regression caused by this very feature. envtest has no
+		// snapshot CRDs, so the two observable proxies are used together: the stub's Expose was
+		// never called, and the temp clone PVC it would have created does not exist.
+		By("and nothing was ever exposed for it: no Expose call, no temp clone PVC")
+		Expect(backupExposers.exposeCalls()).NotTo(ContainElement(ns+"/"+pvcName),
+			"the pre-check must run STRICTLY BEFORE Expose — a refusal that exposes first leaks a VolumeSnapshot")
+		Consistently(func(g Gomega) {
+			err := k8sClient.Get(ctx, client.ObjectKey{
+				Namespace: suiteOperatorNamespace, Name: tempCloneNameFor(ns, run, pvcName),
+			}, &corev1.PersistentVolumeClaim{})
+			g.Expect(apierrors.IsNotFound(err)).To(BeTrue(),
+				"a refused volume must leave no exposure object behind (err=%v)", err)
+		}, 2*time.Second, 250*time.Millisecond).Should(Succeed())
+
+		By("and no mover Job was created for a volume that was never snapshotted")
+		Expect(k8sClient.Get(ctx, client.ObjectKey{
+			Namespace: suiteOperatorNamespace, Name: moverJobNameFor(ns, run, pvcName),
+		}, &batchv1.Job{})).To(MatchError(ContainSubstring("not found")))
+	})
+
+	It("fails a volume whose origin snapshot no snapshotter ever picked up, naming the sidecar", func() {
+		const (
+			location = "bk-stall"
+			ns       = "bk-stall-ns"
+			run      = "bk-stall-run"
+			pvcName  = "data-vol"
+		)
+		// The shape a dead / scaled-to-zero snapshotter sidecar leaves: the exposure never becomes
+		// ready and nothing ever touches the origin VolumeSnapshot's status. Started well past
+		// snapshotProgressDeadline so the deadline is crossed on the first Snapshotting pass —
+		// the spec is about the DECISION, not about waiting fifteen real minutes for it.
+		backupExposers.stallSnapshot(ns+"/"+pvcName, time.Now().Add(-2*snapshotProgressDeadline))
+
+		seedInitializedRepo(location, "kek-bk-stall", "s3-bk-stall")
+		createTenantNamespace(ns)
+		createSourcePVC(ns, pvcName, "ceph-block")
+		createVolumeOnlyParent(run, location, cbv1.PVCSelector{})
+		createChildBackup(ns, run, location)
+
+		By("the volume is exposed (the pre-check passed — this failure mode is AFTER admission)")
+		Eventually(func(g Gomega) {
+			g.Expect(backupExposers.exposeCalls()).To(ContainElement(ns + "/" + pvcName))
+		}, initTimeout, initPoll).Should(Succeed())
+
+		By("then the progress deadline fires: Failed/SnapshotProgressDeadlineExceeded, not a permanent wait")
+		Eventually(func(g Gomega) {
+			vol := volumeByPVC(getBackupG(g, ns, run), pvcName)
+			g.Expect(vol).NotTo(BeNil())
+			g.Expect(string(vol.Phase)).To(Equal("Failed"))
+			g.Expect(vol.Reason).To(Equal("SnapshotProgressDeadlineExceeded"))
+		}, initTimeout, initPoll).Should(Succeed())
+
+		By("and its exposure is torn down, exactly as for any other terminal volume")
+		Eventually(func(g Gomega) {
+			g.Expect(backupExposers.teardownCalls()).To(ContainElement(ns + "/" + moverNamePrefix(ns, run, pvcName)))
 		}, initTimeout, initPoll).Should(Succeed())
 	})
 

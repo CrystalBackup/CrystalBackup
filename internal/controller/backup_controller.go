@@ -94,6 +94,61 @@ const (
 // string is a cross-repo contract.
 const backupReasonSkippedUnsupported = "CSISnapshotUnsupported"
 
+// backupReasonPrecheckFailed is the VolumeStatus.reason a volume carries when the exposure
+// pre-check refused it — today: the VolumeSnapshotClass names a snapshotter Secret that does not
+// exist (internal/exposer.Precheck).
+//
+// FAIL, NOT GATE. A gate (hold the volume, requeue, wait for a human) is the wrong shape here for
+// two reasons. First, every check behind this reason is STRUCTURAL: a Secret that is absent stays
+// absent until somebody creates it, and no amount of waiting changes the verdict — so a gate is a
+// backup that never finishes and never alarms, which is the precise failure this pre-check exists
+// to prevent (an un-served VolumeSnapshot hangs the run in Snapshotting, looking like progress).
+// Second, a per-volume Failed is VISIBLE and ALERTABLE: it rolls the Backup up to
+// PartiallyCompleted/Failed, which is a state an operator's dashboards and the shipped alert rules
+// already react to, whereas a gate waits for someone who is not watching.
+//
+// The one exception worth knowing about: a rook-ceph installation that is still converging can
+// fail a FIRST run this way — the VolumeSnapshotClass lands before the CSI Secrets the operator
+// creates. That run reports a real fact about the cluster at that moment, and the next scheduled
+// run passes with no intervention. That is the correct trade: a transiently-red first backup on a
+// half-installed storage cluster, against a silent hang on a permanently broken one.
+//
+// Asserted verbatim by test/crucible/tests/m6_precheck_test.go — a cross-repo contract.
+const backupReasonPrecheckFailed = "SnapshotPrecheckFailed"
+
+// backupReasonSnapshotProgressDeadline is the VolumeStatus.reason a volume carries when its origin
+// VolumeSnapshot sat past snapshotProgressDeadline with nothing having touched it. The reason names
+// the SYMPTOM, not a guess at the cause; the Event carries the diagnosis — the two components that
+// could have picked the request up, most-likely first — plus the elapsed time and the snapshot's
+// identity, so the investigation starts somewhere concrete.
+const backupReasonSnapshotProgressDeadline = "SnapshotProgressDeadlineExceeded"
+
+// snapshotProgressDeadline bounds how long a volume may sit in Snapshotting with its origin
+// VolumeSnapshot completely UNACKNOWLEDGED — no bound VolumeSnapshotContent, no recorded error —
+// before the volume is failed rather than waited on forever.
+//
+// This is the second half of delta 9 and it exists because the pre-check alone is not enough:
+// snapshot machinery that dies AFTER a passing pre-check leaves the backup in exactly the hang the
+// pre-check was built to prevent. It costs no new CRD field and no new state — the clock is the
+// origin VolumeSnapshot's own creationTimestamp, which the exposure histogram already reads
+// (exposer.StartedAt), so it survives an operator restart for free.
+//
+// FIFTEEN MINUTES, and the number is a compromise between two real risks rather than a round one.
+// It must not fire on a genuinely slow first snapshot on a cold pool — but note what the condition
+// actually requires: the object must be UNTOUCHED. The external snapshot-controller binds a
+// VolumeSnapshotContent within seconds of a request it can see, long before the storage system has
+// finished cutting anything, so a slow snapshot shows Acknowledged=true almost immediately and is
+// never a candidate. What 15 minutes buys is headroom over the transients that can legitimately
+// leave the object untouched for a while: a snapshot-controller Deployment rolling out, a leader
+// election after a node drain, a rook-ceph operator mid-reconcile re-creating its CSI sidecars.
+// Those are minutes, not tens of minutes. And it must stay well under the hour-scale window a
+// nightly backup runs in, so the failure is REPORTED BY THAT RUN instead of by the next one.
+//
+// Erring long is the cheap direction: a deadline that is too generous delays a diagnosis, while
+// one that is too tight fails healthy backups — so if this number is ever wrong, it should be
+// wrong this way.
+const snapshotProgressDeadline = 15 * time.Minute
+
 // ExposerRegistry is the seam the Backup controller reaches internal/exposer.Registry through,
 // extracted as an interface so envtest — which has no external snapshot CRDs or CSI driver — can
 // inject a stub. Production wires in *exposer.Registry. Its two methods are the two halves of an
@@ -962,7 +1017,7 @@ func (r *BackupReconciler) advanceVolume(ctx context.Context, backup *cbv1.Backu
 	case status.VolumePhasePending, "":
 		return "", r.advancePending(ctx, backup, vol)
 	case status.VolumePhaseSnapshotting:
-		return "", r.advanceSnapshotting(ctx, backup, vol, rc)
+		return r.advanceSnapshotting(ctx, backup, vol, rc)
 	case status.VolumePhaseUploading:
 		return r.advanceUploading(ctx, backup, vol, rc)
 	default:
@@ -978,6 +1033,12 @@ func (r *BackupReconciler) advanceVolume(ctx context.Context, backup *cbv1.Backu
 // namespace holding one permanently unsnapshottable PVC must not alarm on every run, forever). The
 // skip stays visible per-volume, in status.volumes[].phase + reason. SnapshottingHooks (M4) are
 // skipped in M1: Pending goes straight to Snapshotting.
+//
+// Between resolution and exposure sits the ACTIVE pre-check (exposer.Precheck): a class can exist,
+// name a live driver, and still be unserveable because its snapshotter credentials are absent.
+// That verdict is Failed / SnapshotPrecheckFailed — NOT Skipped — because unlike "this CSI cannot
+// snapshot", it describes a cluster somebody broke and somebody can fix. See
+// backupReasonPrecheckFailed for why it fails rather than gates.
 func (r *BackupReconciler) advancePending(ctx context.Context, backup *cbv1.Backup, vol *cbv1.VolumeStatus) error {
 	var pvc corev1.PersistentVolumeClaim
 	if err := r.Get(ctx, client.ObjectKey{Namespace: backup.Namespace, Name: vol.Pvc}, &pvc); err != nil {
@@ -1001,6 +1062,31 @@ func (r *BackupReconciler) advancePending(ctx context.Context, backup *cbv1.Back
 		return fmt.Errorf("resolve exposer for PVC %s/%s: %w", backup.Namespace, vol.Pvc, err)
 	}
 
+	// The ACTIVE pre-check, and it runs HERE — before Expose, on the same pass, with nothing
+	// created yet. That ordering is the whole safety property: Expose cuts a real VolumeSnapshot in
+	// the tenant namespace, so a pre-check that ran after it would turn every refusal into leaked
+	// snapshot objects the crucible's leak-check would (rightly) report as a regression caused by
+	// this very feature. Registry.For deliberately does NOT fold this in — see its doc.
+	if err := ex.Precheck(ctx); err != nil {
+		if !errors.Is(err, exposer.ErrPrecheckFailed) {
+			// Precheck is total today — every verdict it can reach is a structural refusal — so
+			// this branch is not reachable from the current implementation. It is not padding: it
+			// is the guard that keeps a FUTURE check whose failure is transient (one that should
+			// requeue, not fail the volume) from silently inheriting "fail this volume" simply by
+			// being added.
+			return fmt.Errorf("pre-check exposure for PVC %s/%s: %w", backup.Namespace, vol.Pvc, err)
+		}
+		vol.Phase = status.VolumePhaseFailed
+		vol.Reason = backupReasonPrecheckFailed
+		// Warning, not Normal, and carrying the failing check's own detail verbatim: the reason
+		// string says which gate refused, the Event says what is actually missing (the Secret's
+		// namespace/name and the class that asked for it), which is the difference between an
+		// alert an operator can act on and one they have to go investigate.
+		r.Recorder.Eventf(backup, nil, corev1.EventTypeWarning, "VolumeFailed", "SnapshotPrecheck",
+			"backup of PVC %s cannot start: %v", vol.Pvc, err)
+		return nil
+	}
+
 	if _, err := ex.Expose(ctx, r.exposeRequest(backup, &pvc)); err != nil {
 		return fmt.Errorf("expose PVC %s/%s: %w", backup.Namespace, vol.Pvc, err)
 	}
@@ -1014,17 +1100,35 @@ func (r *BackupReconciler) advancePending(ctx context.Context, backup *cbv1.Back
 // controller re-drive the handover without persisting the Exposure. Once ready it ensures the
 // per-Job creds Secret (DEK + S3 keys) and the mover Job, both tolerating AlreadyExists so a
 // re-reconcile re-adopts rather than duplicates.
-func (r *BackupReconciler) advanceSnapshotting(ctx context.Context, backup *cbv1.Backup, vol *cbv1.VolumeStatus, rc *backupRunContext) error {
+//
+// The not-ready branch is bounded by snapshotProgressDeadline: an exposure whose origin
+// VolumeSnapshot nobody has touched is not slow, it is unattended, and waiting on it forever is
+// how a dead snapshotter sidecar turns into a run that never finishes and never alarms.
+//
+// Like advanceUploading, it returns the PVC name when it JUST made the volume terminal, so
+// Reconcile can tear the exposure down after — never before — the terminal status write.
+func (r *BackupReconciler) advanceSnapshotting(ctx context.Context, backup *cbv1.Backup, vol *cbv1.VolumeStatus, rc *backupRunContext) (string, error) {
 	ex, exposure, err := r.reconstructExposure(ctx, backup, vol.Pvc)
 	if err != nil {
-		return fmt.Errorf("reconstruct exposure for PVC %s/%s: %w", backup.Namespace, vol.Pvc, err)
+		return "", fmt.Errorf("reconstruct exposure for PVC %s/%s: %w", backup.Namespace, vol.Pvc, err)
 	}
 	ready, err := ex.Ready(ctx, exposure)
 	if err != nil {
-		return fmt.Errorf("check exposure readiness for PVC %s/%s: %w", backup.Namespace, vol.Pvc, err)
+		return "", fmt.Errorf("check exposure readiness for PVC %s/%s: %w", backup.Namespace, vol.Pvc, err)
 	}
 	if !ready {
-		return nil // still binding the static re-bind / temp PVC; requeue
+		if r.snapshotStalled(ctx, ex, exposure) {
+			vol.Phase = status.VolumePhaseFailed
+			vol.Reason = backupReasonSnapshotProgressDeadline
+			r.Recorder.Eventf(backup, nil, corev1.EventTypeWarning, "VolumeFailed", "SnapshotProgress",
+				"backup of PVC %s gave up after %s: VolumeSnapshot %s/%s was never picked up — no "+
+					"VolumeSnapshotContent was bound to it and no error was recorded on it, so nothing is "+
+					"watching its VolumeSnapshotClass; check the cluster's CSI snapshot-controller, then the "+
+					"csi-snapshotter sidecar of the driver behind that class",
+				vol.Pvc, snapshotProgressDeadline, exposure.OriginNamespace, exposure.OriginVSName)
+			return vol.Pvc, nil // request teardown once Reconcile has persisted this terminal result
+		}
+		return "", nil // still binding the static re-bind / temp PVC; requeue
 	}
 
 	identity := restic.DataIdentity(rc.clusterID, rc.tenant, backup.Namespace, vol.Pvc, rc.scheduleRef, rc.run)
@@ -1058,13 +1162,13 @@ func (r *BackupReconciler) advanceSnapshotting(ctx context.Context, backup *cbv1
 	// ready) and requeue for a free slot. An already-existing Job means we are re-adopting after a
 	// restart, never blocking — so an in-flight mover is never counted out of its own slot.
 	if blocked, err := r.moverSlotBlocked(ctx, moverName, rc.repoName, rc.maxConcurrentMovers); err != nil {
-		return err
+		return "", err
 	} else if blocked {
-		return nil
+		return "", nil
 	}
 
 	if err := ensureMoverCredsSecret(ctx, r.maintenanceDeps(), moverName, rc.dek, rc.s3CredsSecret, rc.credsNamespace, labels); err != nil {
-		return err
+		return "", err
 	}
 
 	job := mover.BuildJob(mover.JobRequest{
@@ -1098,7 +1202,7 @@ func (r *BackupReconciler) advanceSnapshotting(ctx context.Context, backup *cbv1
 	created := false
 	if err := r.Create(ctx, job); err != nil {
 		if !apierrors.IsAlreadyExists(err) {
-			return fmt.Errorf("create mover Job %s/%s: %w", r.OperatorNamespace, moverName, err)
+			return "", fmt.Errorf("create mover Job %s/%s: %w", r.OperatorNamespace, moverName, err)
 		}
 	} else {
 		created = true
@@ -1116,7 +1220,7 @@ func (r *BackupReconciler) advanceSnapshotting(ctx context.Context, backup *cbv1
 	// re-check cannot miss a concurrently-enqueued unlock.
 	if created && r.Queue != nil && rc.repoName != "" && r.Queue.QuiescenceRequired(rc.repoName) {
 		r.deleteMoverJobAndSecret(ctx, prefix)
-		return nil // stay in Snapshotting; a requeue picks a clean slot once the unlock resolves.
+		return "", nil // stay in Snapshotting; a requeue picks a clean slot once the unlock resolves.
 	}
 
 	// The exposure has done its job: the snapshot is readyToUse, the static VS/VSC re-bind is
@@ -1130,7 +1234,26 @@ func (r *BackupReconciler) advanceSnapshotting(ctx context.Context, backup *cbv1
 	}
 
 	vol.Phase = status.VolumePhaseUploading
-	return nil
+	return "", nil
+}
+
+// snapshotStalled reports whether an exposure that is NOT ready has been abandoned rather than
+// merely delayed: its origin VolumeSnapshot has existed longer than snapshotProgressDeadline and
+// nothing has touched its status — no bound VolumeSnapshotContent, no recorded error. That
+// combination has one realistic cause, and it is the one the Event names: nothing is watching this
+// VolumeSnapshotClass. See exposer.SnapshotProgress for what this catches and, just as important,
+// what it does not (a bound-but-never-ready snapshot is indistinguishable from a slow one).
+//
+// Every "I do not know" answer returns FALSE, deliberately and asymmetrically. An unreadable origin
+// snapshot (deleted, RBAC, an apiserver having a bad second) is not evidence of abandonment, and
+// this predicate's true branch terminates somebody's backup — so the burden of proof sits entirely
+// on the evidence, never on its absence. A pass that cannot tell simply waits for the next one.
+func (r *BackupReconciler) snapshotStalled(ctx context.Context, ex exposer.SnapshotExposer, exposure *exposer.Exposure) bool {
+	progress, ok := ex.Progress(ctx, exposure)
+	if !ok || progress.Acknowledged || progress.StartedAt.IsZero() {
+		return false
+	}
+	return time.Since(progress.StartedAt) > snapshotProgressDeadline
 }
 
 // emitExposureSpans emits the `snapshot` and `expose` spans of spec/05-observability.md §5 for one

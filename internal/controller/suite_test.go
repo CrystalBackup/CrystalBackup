@@ -271,7 +271,15 @@ var _ = BeforeSuite(func() {
 	// Job has something to mount) and reports Ready immediately. envtest has no kubelet, so specs
 	// SIMULATE each mover Job's outcome exactly as the BackupRepository specs do.
 	hookExecutor = &stubHookExecutor{}
-	backupExposers = &stubExposerRegistry{client: mgr.GetClient(), operatorNamespace: suiteOperatorNamespace}
+	backupExposers = &stubExposerRegistry{
+		client:            mgr.GetClient(),
+		operatorNamespace: suiteOperatorNamespace,
+		// The pre-check verdict is armed HERE, explicitly and once, because the stub's default is
+		// to REFUSE. A fake that answered "pre-check OK" by default would let every spec in this
+		// package pass against a controller that never consults the pre-check at all — see
+		// stubExposerRegistry.precheckArmed.
+		precheckArmed: true,
+	}
 	backupStatusFailer = &statusUpdateFailer{}
 	backupReconciler := NewBackupReconciler(
 		// The manager client, with ONE seam added: statusFailingClient lets a spec make a single
