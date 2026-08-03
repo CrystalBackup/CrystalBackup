@@ -213,10 +213,11 @@ func (r *BackupReconciler) startManifestsJob(
 		Profiles:  r.MoverProfiles,
 		// The identity's Path is both what restic records and where the dump writes
 		// (mover.ManifestsRoot + "/" + namespace) — one string, derived once.
-		ResticArgs: resticBackupArgs(id),
-		RepoURL:    rc.repoURL,
-		SecretName: jobName,
-		Labels:     labels,
+		ResticArgs:    resticBackupArgs(id),
+		RepoURL:       rc.repoURL,
+		S3Connections: rc.s3Connections,
+		SecretName:    jobName,
+		Labels:        labels,
 		// The one mover that reaches the API server (I6's sole exception).
 		ServiceAccountName: r.ManifestMoverServiceAccount,
 		ManifestsVolume:    true,

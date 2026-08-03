@@ -80,6 +80,7 @@ type clusterCaptureContext struct {
 	repoURL       string
 	dek           string
 	s3CredsSecret string
+	s3Connections *int32
 	include       []string
 	exclude       []string
 }
@@ -207,10 +208,11 @@ func (r *ClusterBackupReconciler) startClusterManifestsJob(
 		Profiles:  r.MoverProfiles,
 		// The identity's Path (/cluster-manifests) is both what restic records and where the dump
 		// writes — one string, derived once.
-		ResticArgs: resticBackupArgs(id),
-		RepoURL:    cc.repoURL,
-		SecretName: jobName,
-		Labels:     labels,
+		ResticArgs:    resticBackupArgs(id),
+		RepoURL:       cc.repoURL,
+		S3Connections: cc.s3Connections,
+		SecretName:    jobName,
+		Labels:        labels,
 		// The one mover that reaches the API server (I6's sole exception).
 		ServiceAccountName: r.ManifestMoverServiceAccount,
 		ManifestsVolume:    true,

@@ -19,10 +19,13 @@ package mover
 import (
 	"maps"
 	"reflect"
+	"slices"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+
+	"github.com/CrystalBackup/CrystalBackup/internal/restic"
 )
 
 func TestBuildJobTopologySpread(t *testing.T) {
@@ -653,5 +656,110 @@ func TestGoMemLimitAbsentFromEnvWhenUnbounded(t *testing.T) {
 	if !hasEnv(capped.Spec.Template.Spec.Containers[0].Env, "GOMEMLIMIT") {
 		t.Error("GOMEMLIMIT absent with the default table too — this test would pass on a builder " +
 			"that never sets it at all")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// delta 13 — the `-o s3.connections` seam.
+// ---------------------------------------------------------------------------
+
+// TestS3ConnectionsReachesTheArgv is the unit half of "the knob arrives": the location's cap must
+// appear in the argv restic is actually executed with, in the position restic parses it from.
+//
+// It asserts the WHOLE argv rather than merely containing "-o", because the position is the part
+// that can silently rot. `-o` is a global flag; landing after the subcommand's positional
+// arguments (or after a "--") is the difference between a flag restic honours and one it hands to
+// the subcommand as a path to back up.
+func TestS3ConnectionsReachesTheArgv(t *testing.T) {
+	req := dataRequest()
+	req.S3Connections = ptrTo[int32](12)
+	c := BuildJob(req).Spec.Template.Spec.Containers[0]
+
+	wantArgs := []string{"--operation", "backup", "--",
+		"-o", "s3.connections=12",
+		"backup", "/data/team-x/pvc-1", "--host", "prod-eu-1", "--tag", "crystalbackup"}
+	if !reflect.DeepEqual(c.Args, wantArgs) {
+		t.Errorf("args = %v,\n want %v", c.Args, wantArgs)
+	}
+}
+
+// TestNilS3ConnectionsEmitsNoOption pins the default path: a location that tunes nothing must
+// produce the argv this builder produced before `-o` existed. An empty or zero-valued option here
+// would not be cosmetic — it would pin restic's default at whatever the operator guessed it to be,
+// which is precisely what the pointer exists to avoid.
+func TestNilS3ConnectionsEmitsNoOption(t *testing.T) {
+	req := dataRequest() // S3Connections unset
+	c := BuildJob(req).Spec.Template.Spec.Containers[0]
+
+	wantArgs := []string{"--operation", "backup", "--",
+		"backup", "/data/team-x/pvc-1", "--host", "prod-eu-1", "--tag", "crystalbackup"}
+	if !reflect.DeepEqual(c.Args, wantArgs) {
+		t.Errorf("args = %v,\n want %v (an untuned location must carry no -o at all)", c.Args, wantArgs)
+	}
+}
+
+// TestS3ConnectionsIsOmittedForAnRcloneRepository is the guard's own test, and its name says what
+// the guard is for — which is NOT an error from restic.
+//
+// Measured against the pinned engine (restic 0.19.1, build/melange/restic.yaml): restic silently
+// IGNORES an `s3.` option when the repository is on another backend. `restic -o s3.connections=8
+// -r local:/tmp/repo init` exits 0 with no warning, and does not even parse the value —
+// `-o s3.connections=abc` exits 0 too. restic errors only on an unknown key inside a namespace it
+// DOES apply (`-o local.bogus=1` → "Fatal: option local.bogus is not known", exit 1).
+//
+// So nothing breaks if this guard regresses, and that is the reason it needs a test rather than
+// the reason it does not. What breaks is the argv's truthfulness: the external-sync copy Job would
+// advertise a connection cap on a pod that speaks to both its repositories through rclone, on the
+// one Job where an operator chasing sync throughput would most want to believe what they read.
+func TestS3ConnectionsIsOmittedForAnRcloneRepository(t *testing.T) {
+	req := dataRequest()
+	req.Operation = OpSync
+	req.ResticArgs = []string{"copy"}
+	req.RepoURL = RcloneRepoURL(SyncRemoteDest, "secondary", "", "cid-1")
+	req.S3Connections = ptrTo[int32](12)
+
+	c := BuildJob(req).Spec.Template.Spec.Containers[0]
+
+	wantArgs := []string{"--operation", "sync", "--", "copy"}
+	if !reflect.DeepEqual(c.Args, wantArgs) {
+		t.Errorf("args = %v,\n want %v — an rclone repository must carry no s3 backend option",
+			c.Args, wantArgs)
+	}
+	// Not a vacuous pass: the identical request on an s3 URL must still get the option, or this
+	// test would go green on a builder that dropped the feature entirely.
+	req.RepoURL = "s3:https://s3.example.net/bucket/crystal/prod-eu-1"
+	if got := BuildJob(req).Spec.Template.Spec.Containers[0].Args; reflect.DeepEqual(got, wantArgs) {
+		t.Error("the same request on an s3:// repository ALSO omitted the option — the guard is " +
+			"not discriminating, it is simply never emitting")
+	}
+}
+
+// TestS3ConnectionsGuardAgreesWithTheURLBuilder closes the loop the guard depends on: it tests
+// against a URL that restic.RepoURL actually produced, not against a hand-written "s3:" literal.
+//
+// Both sides now name restic.SchemeS3, so this cannot fail by drift — which is the point. It
+// fails if someone changes the repository URL's shape (a scheme rename, an "s3://" spelling)
+// without noticing that the mover's tuning rides on the prefix.
+func TestS3ConnectionsGuardAgreesWithTheURLBuilder(t *testing.T) {
+	for _, tc := range []struct {
+		name                              string
+		endpoint, bucket, prefix, cluster string
+	}{
+		{"https endpoint", "https://s3.example.net", "team-x", "crystal", "prod-eu-1"},
+		{"http endpoint", "http://minio.internal:9000", "team-x", "crystal", "prod-eu-1"},
+		{"bare host", "s3.example.net", "team-x", "", "prod-eu-1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := dataRequest()
+			req.RepoURL = restic.RepoURL(tc.endpoint, tc.bucket, tc.prefix, tc.cluster)
+			req.S3Connections = ptrTo[int32](7)
+
+			args := BuildJob(req).Spec.Template.Spec.Containers[0].Args
+			if !slices.Contains(args, "s3.connections=7") {
+				t.Errorf("RepoURL(%q, …) = %q produced argv %v with no s3 option — the mover's "+
+					"scheme guard no longer recognises what the URL builder emits",
+					tc.endpoint, req.RepoURL, args)
+			}
+		})
 	}
 }

@@ -18,6 +18,7 @@ package utils
 
 import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	cbv1 "github.com/CrystalBackup/CrystalBackup/api/v1alpha1"
@@ -29,6 +30,16 @@ const (
 	myOffsite = "my-offsite"
 )
 
+// SampleConnections is the S3 connection cap every sample location carries, exported so the
+// round-trip test can assert the exact value the API server gave back rather than merely
+// "something non-nil".
+//
+// It is deliberately NOT restic's default of 5: a sample carrying the default would round-trip
+// indistinguishably from a schema that dropped the field and let the value fall back. It is also
+// inside [1,100] — a sample outside the bounds would be rejected at create, which would prove the
+// validation rather than the persistence, and this test needs the latter.
+const SampleConnections int32 = 12
+
 // SampleObjects returns one minimal, schema-valid CR for each of the twelve
 // CrystalBackup kinds. Namespaced kinds land in the given namespace. Shared by
 // the envtest CRD round-trip (test/crd) and the live crucible suite
@@ -38,6 +49,16 @@ func SampleObjects(namespace string) []client.Object {
 		Endpoint:             "https://s3.example.test",
 		Bucket:               "b",
 		CredentialsSecretRef: cbv1.LocalObjectReference{Name: "s3-creds"},
+		// Set on the SHARED spec, so both the cluster and the namespace plane carry it — one
+		// field serving two kinds is the whole reason S3Spec is shared, and a sample that
+		// exercised only one plane would leave the other's CRD unproven.
+		//
+		// It is here rather than only in a test because this is the sole layer that can prove it:
+		// the field is optional and a pointer, so a schema that dropped it would round-trip a nil
+		// back with no error anywhere. test/chart cannot cover it either — `helm template` does
+		// not render crds/. Only a real API server rejecting or silently discarding the value
+		// would show up, and only if a sample actually sets one. See SampleConnections.
+		Connections: ptr.To(SampleConnections),
 	}
 	return []client.Object{
 		&cbv1.ClusterBackupLocation{

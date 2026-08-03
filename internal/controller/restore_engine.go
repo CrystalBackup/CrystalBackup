@@ -140,6 +140,14 @@ type restoreExecContext struct {
 	restoredFromRun string
 	// Repository access, resolved by the owning controller.
 	repoName, repoURL, dek, s3CredsSecret string
+	// s3Connections is the location's spec.s3.connections (nil ⇒ restic's default). A restore is
+	// the read-heavy mirror of a backup against the same shared gateway, so it is capped by the
+	// same location field rather than by a knob of its own.
+	//
+	// The two finalize paths build a context WITHOUT it, as they do without repoURL and dek:
+	// teardown deletes Jobs and exposures and never opens the repository, so there is nothing
+	// there for it to tune.
+	s3Connections *int32
 	// clusterID labels the repository metrics this path emits (the stale-lock counter). Resolved
 	// from the location alongside the repository access above, so a lock reaped by a restore and one
 	// reaped by a backup land on the SAME metric series rather than splitting into two.
@@ -625,6 +633,7 @@ func (e *restoreEngine) adviseVolume(ctx context.Context, rc *restoreExecContext
 				Op:            mover.OpUnlock,
 				ResticArgs:    restic.UnlockArgs(),
 				RepoURL:       rc.repoURL,
+				S3Connections: rc.s3Connections,
 				DEK:           rc.dek,
 				S3CredsSecret: rc.s3CredsSecret,
 				OnDone: func(err error) {
@@ -740,8 +749,9 @@ func (e *restoreEngine) startVolume(ctx context.Context, rc *restoreExecContext,
 		Profiles:  e.MoverProfiles,
 		ResticArgs: restic.RestoreArgs(plan.snapshotID, plan.snapshotPath, target,
 			rc.deleteExtras, plan.include, plan.exclude),
-		RepoURL:    rc.repoURL,
-		SecretName: jobName,
+		RepoURL:       rc.repoURL,
+		S3Connections: rc.s3Connections,
+		SecretName:    jobName,
 		PVC: &mover.PVCMount{
 			ClaimName: ex.StagingPVCName,
 			MountPath: restoreTargetMountPath,

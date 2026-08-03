@@ -266,9 +266,10 @@ func (r *ClusterRestoreReconciler) startClusterRestoreJob(
 		Profiles:  r.Engine.MoverProfiles,
 		ResticArgs: restic.ManifestsRestoreArgs(plan.snapshotID, plan.snapshotPath,
 			mover.ClusterManifestsRestoreDir),
-		RepoURL:    rc.repoURL,
-		SecretName: jobName,
-		Labels:     labels,
+		RepoURL:       rc.repoURL,
+		S3Connections: rc.s3Connections,
+		SecretName:    jobName,
+		Labels:        labels,
 		// The one mover that reaches the API server (I6's sole exception).
 		ServiceAccountName: r.ManifestMoverServiceAccount,
 		ManifestsVolume:    true,

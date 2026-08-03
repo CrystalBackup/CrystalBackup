@@ -269,7 +269,22 @@ func buildSyncJobRequest(deps repoMaintenanceDeps, syncImage, name string, run *
 		Profiles:   deps.MoverProfiles,
 		ResticArgs: restic.SyncArgs(run.Namespaces),
 		// The DESTINATION. See RepoURL's comment for why this is not repo.Status.RepositoryURL.
-		RepoURL:          run.Dest.RepoURL(),
+		RepoURL: run.Dest.RepoURL(),
+		// S3Connections is DELIBERATELY absent, and this is the one mover Job where that is true.
+		//
+		// Both of this Job's repositories are addressed as rclone remotes (RepoURL() renders
+		// `rclone:` on either side, which is why CredentialKeys is overridden to the
+		// RCLONE_CONFIG_* pair just below), so `-o s3.connections` would name a backend that
+		// nothing in this pod is speaking. restic would not complain — it silently ignores an
+		// option whose namespace it never applies — which is exactly why the absence is written
+		// down here rather than left to be noticed: a future reader comparing this Job to the
+		// other nine must be able to tell "considered and excluded" from "forgotten", and the
+		// argv itself gives no such signal. BuildJob's own scheme guard enforces this
+		// independently, so setting the field here would be inert rather than wrong; leaving it
+		// out keeps the request an honest description of the Job.
+		//
+		// Concurrency toward the two object stores IS tunable for this Job — but through rclone's
+		// own knobs, on the rclone remotes, which is a different mechanism and not this field.
 		SecretName:       name,
 		PVC:              nil, // a copy reads and writes repositories, never a volume
 		FromPasswordFile: true,
@@ -487,10 +502,14 @@ func enqueueMirrorForget(q *queue.Manager, deps repoMaintenanceDeps, jobName str
 	dek, credsSecret := run.Dest.Password, run.Dest.Binding.S3.CredentialsSecretRef.Name
 	credsNamespace := run.Dest.Binding.CredsNamespace
 	repoURL := run.Dest.Repo.Status.RepositoryURL
+	// The DESTINATION's cap, not the source's. Unlike the copy beside it, this half is a real
+	// restic op against a real S3 repository (Mirror deletes by snapshot ID on the destination),
+	// so it is tuned by the location it actually talks to.
+	s3Connections := run.Dest.Binding.S3.Connections
 	args := mirrorForgetArgs(snapshotIDs)
 	return q.Enqueue(run.Dest.Repo.Name, queue.OpForget, func(opCtx context.Context) error {
 		return runRepoMaintenance(opCtx, deps, jobName, mover.OpForget, args,
-			repoURL, dek, credsSecret, credsNamespace)
+			repoURL, dek, credsSecret, credsNamespace, s3Connections)
 	})
 }
 

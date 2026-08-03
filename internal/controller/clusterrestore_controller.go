@@ -384,6 +384,7 @@ func (r *ClusterRestoreReconciler) prepare(ctx context.Context, cr *cbv1.Cluster
 		clusterID:       loc.Spec.ClusterID,
 		dek:             dek,
 		s3CredsSecret:   loc.Spec.S3.CredentialsSecretRef.Name,
+		s3Connections:   loc.Spec.S3.Connections,
 	}
 	plans := r.buildPlans(ctx, cr, byPVC)
 	if plans == nil {

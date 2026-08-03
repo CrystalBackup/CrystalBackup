@@ -193,6 +193,7 @@ func (r *BackupReconciler) maybeEnqueueRetentionForget(ctx context.Context, back
 		DEK:            rc.dek,
 		S3CredsSecret:  rc.s3CredsSecret,
 		CredsNamespace: rc.credsNamespace,
+		S3Connections:  rc.s3Connections,
 		// nil when tracing is off, which is what the queue already expects of this field.
 		//
 		// crystalbackup.snapshots_removed, which §5 asks for on this span, is NOT set: the
@@ -232,6 +233,7 @@ func (r *BackupReconciler) enqueueStaleLockUnlock(ctx context.Context, backup *c
 		DEK:            rc.dek,
 		S3CredsSecret:  rc.s3CredsSecret,
 		CredsNamespace: rc.credsNamespace,
+		S3Connections:  rc.s3Connections,
 		OnDone: func(err error) {
 			if err == nil {
 				metrics.RecordLockReaped(rc.repoName, rc.clusterID)
@@ -338,6 +340,11 @@ type repoMaintenanceRequest struct {
 	// cluster-plane repository, the tenant's namespace for a namespace-plane one. Empty means
 	// the operator namespace, which keeps every cluster-plane caller unchanged.
 	CredsNamespace string
+	// S3Connections is the location's spec.s3.connections, forwarded to the maintenance mover.
+	// A prune or a check is the LONGEST S3 conversation this operator ever has with a gateway —
+	// far longer than any one backup — so a repository tuned down to protect a shared RGW that
+	// left its maintenance ops untuned would be tuned exactly where it does not matter.
+	S3Connections *int32
 	// OnDone, when set, is called with the op's result from the QUEUE WORKER goroutine, just after
 	// the op body returns. It exists for the fire-and-forget paths, which drop the Handle and would
 	// otherwise have no way to know an op succeeded — the stale-lock counter must count locks
@@ -358,7 +365,8 @@ type repoMaintenanceRequest struct {
 // M3.1 spent a milestone removing from discovery.
 func submitRepoMaintenance(q *queue.Manager, deps repoMaintenanceDeps, req repoMaintenanceRequest) (*queue.Handle, error) {
 	return q.Enqueue(req.RepoName, req.Kind, func(opCtx context.Context) error {
-		err := runRepoMaintenance(opCtx, deps, req.Name, req.Op, req.ResticArgs, req.RepoURL, req.DEK, req.S3CredsSecret, req.CredsNamespace)
+		err := runRepoMaintenance(opCtx, deps, req.Name, req.Op, req.ResticArgs, req.RepoURL, req.DEK,
+			req.S3CredsSecret, req.CredsNamespace, req.S3Connections)
 		if req.OnDone != nil {
 			req.OnDone(err)
 		}
@@ -385,7 +393,16 @@ func enqueueRepoMaintenance(ctx context.Context, q *queue.Manager, deps repoMain
 // best-effort deletes the Job + Secret before returning — the orphan reaper never touches these
 // (they carry no per-PVC label), so cleanup is this function's own responsibility. It writes no CR
 // status; its error resolves the (dropped) queue Handle and is logged by the worker.
-func runRepoMaintenance(opCtx context.Context, deps repoMaintenanceDeps, name string, op mover.Operation, resticArgs []string, repoURL, dek, s3CredsSecret, credsNamespace string) error {
+//
+// s3Connections is POSITIONAL rather than folded into repoMaintenanceRequest deliberately, even
+// though the request struct exists precisely to shorten this list. Three callers reach this
+// function without ever building a request — the erasure controller's forget+prune pair and the
+// Mirror delete — and a struct field is a thing those callers can omit in silence, which is the
+// entire defect this tunable is being written to avoid. A parameter is a thing the compiler makes
+// them supply. It cannot transpose with the four strings beside it either, being the only *int32.
+func runRepoMaintenance(opCtx context.Context, deps repoMaintenanceDeps, name string, op mover.Operation,
+	resticArgs []string, repoURL, dek, s3CredsSecret, credsNamespace string, s3Connections *int32,
+) error {
 	ctx, cancel := context.WithTimeout(opCtx, maintenanceOpDeadline(op))
 	defer cancel()
 	// LIFO defer order: this runs BEFORE cancel(), so ctx is still live for the delete when the op
@@ -414,18 +431,19 @@ func runRepoMaintenance(opCtx context.Context, deps repoMaintenanceDeps, name st
 		return err
 	}
 	job := mover.BuildJob(mover.JobRequest{
-		Name:         name,
-		Namespace:    deps.OperatorNamespace,
-		Image:        deps.MoverImage,
-		Operation:    op,
-		Profiles:     deps.MoverProfiles,
-		ResticArgs:   resticArgs,
-		RepoURL:      repoURL,
-		SecretName:   name,
-		PVC:          nil,
-		BackoffLimit: maintenanceJobBackoffLimit,
-		TTLSeconds:   maintenanceJobTTLSeconds,
-		Labels:       labels,
+		Name:          name,
+		Namespace:     deps.OperatorNamespace,
+		Image:         deps.MoverImage,
+		Operation:     op,
+		Profiles:      deps.MoverProfiles,
+		ResticArgs:    resticArgs,
+		RepoURL:       repoURL,
+		S3Connections: s3Connections,
+		SecretName:    name,
+		PVC:           nil,
+		BackoffLimit:  maintenanceJobBackoffLimit,
+		TTLSeconds:    maintenanceJobTTLSeconds,
+		Labels:        labels,
 	})
 	// No ownerReference: the Job is in the operator namespace and the triggering CR is in a
 	// tenant namespace (or cluster-scoped), so an ownerRef is illegal/impossible. It is tracked

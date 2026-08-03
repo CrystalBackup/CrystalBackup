@@ -508,6 +508,7 @@ func (r *MaintenanceReconciler) submit(ctx context.Context, repo *cbv1.BackupRep
 		RepoURL:       repo.Status.RepositoryURL,
 		DEK:           dek,
 		S3CredsSecret: loc.Spec.S3.CredentialsSecretRef.Name,
+		S3Connections: loc.Spec.S3.Connections,
 	}
 	if due.op == mover.OpUnlock {
 		// The reap is an EVENT, not a state: nothing in status can reconstruct how many locks were

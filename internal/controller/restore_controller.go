@@ -324,6 +324,7 @@ func (r *RestoreReconciler) prepare(ctx context.Context, restore *cbv1.Restore, 
 		clusterID:       loc.Spec.ClusterID,
 		dek:             dek,
 		s3CredsSecret:   loc.Spec.S3.CredentialsSecretRef.Name,
+		s3Connections:   loc.Spec.S3.Connections,
 	}
 
 	// Mediated resolution (I1, the R2/R14 cornerstone): the snapshots this restore may read

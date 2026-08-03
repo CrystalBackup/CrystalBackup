@@ -276,6 +276,11 @@ type backupRunContext struct {
 	// Secret whose name collides with a platform one would send the tenant's data to whatever
 	// bucket the platform credentials reach.
 	credsNamespace string
+	// s3Connections is the location's spec.s3.connections (nil ⇒ restic's default). It rides on
+	// the run context for the same reason s3CredsSecret does: it is a property of the LOCATION,
+	// resolved once per reconcile, and every mover this run creates — data, manifests, and the
+	// retention forget behind it — must be tuned the same way as the repository they all share.
+	s3Connections *int32
 	// retention is the LOCATION's per-PVC keep policy (R24), read from the resolved
 	// ClusterBackupLocation — not from the run — because one shared repository has one
 	// authoritative policy (adr/0009). A `restic forget` applying it is enqueued once, on the
@@ -868,6 +873,7 @@ func (r *BackupReconciler) resolveRunContext(ctx context.Context, backup *cbv1.B
 		repoURL:             repo.Status.RepositoryURL,
 		dek:                 password,
 		s3CredsSecret:       binding.S3.CredentialsSecretRef.Name,
+		s3Connections:       binding.S3.Connections,
 		credsNamespace:      binding.CredsNamespace,
 		retention:           binding.Retention,
 		mode:                binding.Mode,
@@ -1172,18 +1178,19 @@ func (r *BackupReconciler) advanceSnapshotting(ctx context.Context, backup *cbv1
 	}
 
 	job := mover.BuildJob(mover.JobRequest{
-		Name:         moverName,
-		Namespace:    r.OperatorNamespace,
-		Image:        r.MoverImage,
-		Operation:    mover.OpBackup,
-		Profiles:     r.MoverProfiles,
-		ResticArgs:   resticArgs,
-		RepoURL:      rc.repoURL,
-		SecretName:   moverName,
-		PVC:          &mover.PVCMount{ClaimName: exposure.ExposedPVCName, MountPath: identity.Path},
-		BackoffLimit: rc.backoffLimit,
-		TTLSeconds:   moverJobTTLSeconds,
-		Labels:       labels,
+		Name:          moverName,
+		Namespace:     r.OperatorNamespace,
+		Image:         r.MoverImage,
+		Operation:     mover.OpBackup,
+		Profiles:      r.MoverProfiles,
+		ResticArgs:    resticArgs,
+		RepoURL:       rc.repoURL,
+		S3Connections: rc.s3Connections,
+		SecretName:    moverName,
+		PVC:           &mover.PVCMount{ClaimName: exposure.ExposedPVCName, MountPath: identity.Path},
+		BackoffLimit:  rc.backoffLimit,
+		TTLSeconds:    moverJobTTLSeconds,
+		Labels:        labels,
 		// The W3C handover (spec/05-observability.md §5). The parent it names is the `mover` span
 		// for THIS PVC — a span that does not exist yet and will not until the Job finishes, at
 		// which point advanceUploading emits it with the very id derived here. Both sides compute

@@ -90,8 +90,40 @@ type S3Spec struct {
 	CABundle string `json:"caBundle,omitempty"`
 
 	// forcePathStyle selects path-style addressing (required by most non-AWS gateways).
+	//
+	// It is honoured by every consumer that speaks S3 through an AWS SDK or through rclone —
+	// internal/escrow, internal/repo/s3stat, internal/selfcheck, and the rclone remotes the
+	// external-sync image builds. It is deliberately NOT forwarded to restic, and that is a
+	// decision rather than an omission: restic's S3 backend is minio-go, whose default
+	// bucket-lookup is `auto`, and minio-go's `auto` resolves to VIRTUAL-HOST style only for
+	// Amazon, Google and Aliyun endpoints (s3utils.IsVirtualHostSupported) — every other
+	// endpoint, which is precisely "most non-AWS gateways", already gets PATH style with no
+	// flag at all. Forwarding it as `-o s3.bucket-lookup=path` would therefore set restic to
+	// the value it had already computed, while making the one case it DOES change a wrong one:
+	// a location whose endpoint really is AWS would be forced off virtual-host addressing,
+	// which AWS has deprecated path style for. Verified against the pinned engine
+	// (build/melange/restic.yaml, restic 0.19.1 / minio-go v7).
 	// +optional
 	ForcePathStyle bool `json:"forcePathStyle,omitempty"`
+
+	// connections caps how many concurrent HTTP connections restic opens to this endpoint
+	// (restic's own `-o s3.connections`, forwarded by internal/mover.BuildJob).
+	//
+	// A POINTER, for the reason DiscoverySpec.Enabled is one: nil must stay distinguishable from
+	// a value. restic's own default is 5 (internal/backend/s3.NewConfig), and the operator does
+	// not want to restate it — a nil here emits no `-o` at all, so restic's default remains
+	// restic's to change across an engine bump rather than something this CRD has silently
+	// frozen at whatever 5 meant in 0.19.1.
+	//
+	// The MAXIMUM is the load-bearing half. BackupLocation is TENANT-writable: a namespace can
+	// edit its own location, and every namespace of a cluster points at ONE shared gateway
+	// (adr/0009). Without a ceiling, `connections: 100000` is a tenant-authored denial of
+	// service against every other tenant's backups — not a footgun aimed at themselves. 100 is
+	// well past any real throughput knee and still a bound.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=100
+	Connections *int32 `json:"connections,omitempty"`
 }
 
 // ClusterEncryptionSpec configures the platform key for a ClusterBackupLocation.

@@ -25,8 +25,10 @@ import (
 	"testing"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 
@@ -91,4 +93,78 @@ func TestCRDInstallAndRoundTrip(t *testing.T) {
 	if err := k.Get(ctx, client.ObjectKey{Namespace: ns, Name: "nope"}, &bl); !apierrors.IsNotFound(err) {
 		t.Errorf("expected NotFound for missing BackupLocation, got %v", err)
 	}
+
+	assertS3ConnectionsRoundTrip(t, ctx, k)
+}
+
+// assertS3ConnectionsRoundTrip proves S3Spec.Connections survives a real API server, on BOTH
+// planes, and that its bounds are enforced there rather than only in a Go tag.
+//
+// The loop above cannot cover this: it compares names and UIDs, so a CRD schema that silently
+// discarded an unknown or mis-generated field would still round-trip every sample "successfully".
+// A pointer field makes that failure mode completely quiet — the value simply comes back nil, and
+// every consumer downstream reads that as "the operator did not configure a cap".
+//
+// The MAXIMUM is asserted, not just the happy path, because it is the field's security half:
+// BackupLocation is tenant-writable and every namespace shares one gateway, so the ceiling is
+// what stops `connections: 100000` from being a tenant-authored denial of service against every
+// other tenant. A ceiling that lives only in a marker comment and never reached the installed CRD
+// is not a ceiling.
+func assertS3ConnectionsRoundTrip(t *testing.T, ctx context.Context, k client.Client) {
+	t.Helper()
+
+	// --- the value persists, on both planes -------------------------------------------------
+	var cbl cbv1.ClusterBackupLocation
+	if err := k.Get(ctx, client.ObjectKey{Name: "dr-primary"}, &cbl); err != nil {
+		t.Fatalf("get ClusterBackupLocation back: %v", err)
+	}
+	if got := cbl.Spec.S3.Connections; got == nil || *got != utils.SampleConnections {
+		t.Errorf("ClusterBackupLocation spec.s3.connections = %v, want %d — the field did not "+
+			"survive the API server", fmtConnections(got), utils.SampleConnections)
+	}
+
+	var loc cbv1.BackupLocation
+	if err := k.Get(ctx, client.ObjectKey{Namespace: ns, Name: "my-offsite"}, &loc); err != nil {
+		t.Fatalf("get BackupLocation back: %v", err)
+	}
+	if got := loc.Spec.S3.Connections; got == nil || *got != utils.SampleConnections {
+		t.Errorf("BackupLocation spec.s3.connections = %v, want %d — the tenant-writable plane "+
+			"lost the field", fmtConnections(got), utils.SampleConnections)
+	}
+
+	// --- the bounds are enforced by the installed CRD, not merely by a marker ----------------
+	for _, tc := range []struct {
+		name  string
+		value int32
+	}{
+		{"above the maximum", 101},
+		{"below the minimum", 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bad := loc.DeepCopy()
+			bad.ObjectMeta = metav1.ObjectMeta{Name: "bad-connections", Namespace: ns}
+			bad.Spec.S3.Connections = ptr.To(tc.value)
+			err := k.Create(ctx, bad)
+			if err == nil {
+				_ = k.Delete(ctx, bad)
+				t.Errorf("the API server ACCEPTED spec.s3.connections=%d — a tenant can aim "+
+					"arbitrary concurrency at the shared gateway", tc.value)
+				return
+			}
+			if !apierrors.IsInvalid(err) {
+				t.Errorf("create with connections=%d failed with %v, want an Invalid (schema "+
+					"validation) error — a different failure would pass this test for the wrong "+
+					"reason", tc.value, err)
+			}
+		})
+	}
+}
+
+// fmtConnections renders the optional cap for a failure message, so a nil reads as "nil" rather
+// than as a pointer address the reader has to decode.
+func fmtConnections(v *int32) string {
+	if v == nil {
+		return "nil"
+	}
+	return fmt.Sprintf("%d", *v)
 }

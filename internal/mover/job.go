@@ -17,12 +17,15 @@ limitations under the License.
 package mover
 
 import (
+	"fmt"
 	"maps"
+	"strings"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	"github.com/CrystalBackup/CrystalBackup/internal/restic"
 	"github.com/CrystalBackup/CrystalBackup/internal/tracing"
 )
 
@@ -59,6 +62,24 @@ const (
 // operationFlag is the CLI flag the crystal-mover shim reads to select its operation
 // (`--operation <op>`); BuildJob passes it as the first arg, before restic's "--" separator.
 const operationFlag = "--operation"
+
+// optionFlag is restic's own per-backend tuning flag (`-o key=value`), and optionS3Connections is
+// the single option key this operator sets through it.
+//
+// The key is named ONCE, here, and never restated: it is a wire contract with restic's S3 backend
+// (internal/backend/s3.Config's `option:"connections"` tag), and a second spelling of it somewhere
+// else would not fail — restic silently ignores an option whose namespace it never applies, which
+// is exactly how a typo here becomes a knob that reaches nothing.
+//
+// The flags are emitted BEFORE the restic subcommand (`-o s3.connections=8 backup /data …`), which
+// is where restic documents its global flags and the only position that cannot interact with a
+// subcommand's positional arguments. The shim forwards everything after "--" verbatim and appends
+// `--json` at the END for the operations that need it (cmd/crystal-mover.ensureSummaryJSON), so
+// the leading option flags and the trailing summary flag never contend for the same slot.
+const (
+	optionFlag          = "-o"
+	optionS3Connections = "s3.connections"
+)
 
 // LabelAppName / AppName identify a mover Job and its pod: `app.kubernetes.io/name=crystal-mover`
 // on every Job this builder produces, and on its pod template.
@@ -214,6 +235,25 @@ type JobRequest struct {
 	// The mount path MUST equal the directory the dump writes to, or the dump fails on a
 	// read-only filesystem.
 	ManifestsMountPath string
+	// S3Connections is the location's S3Spec.Connections: how many concurrent HTTP connections
+	// restic may open to the object store. Nil ⇒ no `-o` flag at all ⇒ restic's own default (5).
+	//
+	// It is applied ONLY when RepoURL names restic's S3 backend (restic.SchemeS3), and that guard
+	// lives here rather than at the ten call sites for two reasons. It is the same reason
+	// LabelAppName is stamped by the builder: a rule enforced at every caller is a rule enforced
+	// at the callers who remembered. And it is the only place that can see the deciding fact —
+	// BuildJob holds the repository URL, so it can answer "is this an S3 repository?" without
+	// asking anyone, which keeps the request a description of intent rather than a pre-chewed
+	// argv fragment.
+	//
+	// What the guard buys is HONESTY, not an exit code. Measured against the pinned engine
+	// (restic 0.19.1, build/melange/restic.yaml): restic silently IGNORES an `s3.` option when the
+	// repository is on another backend — exit 0, no warning, and it does not even parse the value.
+	// It errors only on an unknown key inside a namespace it does apply (`option local.bogus is
+	// not known`). So an unguarded `-o s3.connections=N` on the rclone sync repository would not
+	// break anything; it would simply be an argv that advertises a setting with no effect, on the
+	// one Job where an operator debugging throughput would most want to trust what they read.
+	S3Connections *int32
 }
 
 // BuildJob assembles the batchv1.Job for one mover run, exactly per the package's runtime
@@ -228,12 +268,10 @@ func BuildJob(req JobRequest) *batchv1.Job {
 	volumes, mounts := moverVolumes(req, profile)
 
 	container := corev1.Container{
-		Name:    containerName,
-		Image:   req.Image,
-		Command: []string{MoverBinaryPath},
-		// Everything after "--" is restic's own argv, forwarded verbatim by the shim. The
-		// prefix literal has len == cap, so append allocates fresh and never aliases ResticArgs.
-		Args:         append([]string{operationFlag, string(req.Operation), "--"}, req.ResticArgs...),
+		Name:         containerName,
+		Image:        req.Image,
+		Command:      []string{MoverBinaryPath},
+		Args:         moverArgs(req),
 		Env:          moverEnv(req, profile),
 		VolumeMounts: mounts,
 		Resources:    corev1.ResourceRequirements{Requests: profile.Requests, Limits: profile.Limits},
@@ -297,6 +335,35 @@ func BuildJob(req JobRequest) *batchv1.Job {
 			},
 		},
 	}
+}
+
+// moverArgs builds the mover container's argv: the shim's own `--operation <op>`, the "--"
+// separator, then restic's argv — the backend options this request asks for, then the caller's
+// ResticArgs verbatim.
+//
+// The prefix literal has len == cap, so the first append allocates fresh and the result can never
+// alias req.ResticArgs (the caller's slice must stay untouched — several call sites build one and
+// keep using it). That was true of the single append this replaced and it stays true of both.
+func moverArgs(req JobRequest) []string {
+	args := []string{operationFlag, string(req.Operation), "--"}
+	args = append(args, backendOptions(req)...)
+	return append(args, req.ResticArgs...)
+}
+
+// backendOptions renders the `-o key=value` flags for the backend this Job's repository is on.
+// Nil — no flags at all — is the overwhelmingly common answer and must stay byte-identical to the
+// argv this builder produced before any `-o` existed: a location that tunes nothing has no
+// business carrying an empty option into every mover pod.
+//
+// The S3 guard is a prefix test against restic.SchemeS3, the same constant internal/restic.RepoURL
+// builds the URL from, so the producer and this consumer cannot drift. Everything that is NOT that
+// prefix is the rclone sync repository, where an s3 backend option would be a statement about a
+// backend nothing beneath restic is talking to.
+func backendOptions(req JobRequest) []string {
+	if req.S3Connections == nil || !strings.HasPrefix(req.RepoURL, restic.SchemeS3) {
+		return nil
+	}
+	return []string{optionFlag, fmt.Sprintf("%s=%d", optionS3Connections, *req.S3Connections)}
 }
 
 // moverCapabilities returns the capability set added on top of Drop:ALL for one Job, keyed on what

@@ -260,6 +260,7 @@ func (r *ClusterBackupReconciler) resolveClusterCaptureContext(
 		repoURL:       repo.Status.RepositoryURL,
 		dek:           dek,
 		s3CredsSecret: loc.Spec.S3.CredentialsSecretRef.Name,
+		s3Connections: loc.Spec.S3.Connections,
 		include:       cb.Spec.ClusterResources.Include,
 		exclude:       cb.Spec.ClusterResources.Exclude,
 	}, true, nil

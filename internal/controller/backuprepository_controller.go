@@ -547,18 +547,19 @@ func (r *BackupRepositoryReconciler) runInit(opCtx context.Context, owner *cbv1.
 	}
 
 	job := mover.BuildJob(mover.JobRequest{
-		Name:         name,
-		Namespace:    r.OperatorNamespace,
-		Image:        r.MoverImage,
-		Operation:    mover.OpInit,
-		Profiles:     r.MoverProfiles,
-		ResticArgs:   []string{"init"},
-		RepoURL:      repoURL,
-		SecretName:   name,
-		PVC:          nil,
-		BackoffLimit: initJobBackoffLimit,
-		TTLSeconds:   initJobTTLSeconds,
-		Labels:       initJobLabels(),
+		Name:          name,
+		Namespace:     r.OperatorNamespace,
+		Image:         r.MoverImage,
+		Operation:     mover.OpInit,
+		Profiles:      r.MoverProfiles,
+		ResticArgs:    []string{"init"},
+		RepoURL:       repoURL,
+		S3Connections: s3.Connections,
+		SecretName:    name,
+		PVC:           nil,
+		BackoffLimit:  initJobBackoffLimit,
+		TTLSeconds:    initJobTTLSeconds,
+		Labels:        initJobLabels(),
 	})
 	if err := controllerutil.SetControllerReference(owner, job, r.Scheme); err != nil {
 		return fmt.Errorf("set controller reference on init job %s: %w", name, err)

@@ -243,6 +243,16 @@ func ClusterManifestsIdentity(clusterID, schedule, run string) Identity {
 // and https:// must precede http:// only for readability (neither is a prefix of the other).
 var schemes = []string{"https://", "http://"}
 
+// SchemeS3 is the RESTIC_REPOSITORY prefix that marks a repository as restic's S3 backend.
+//
+// Exported, and used by RepoURL itself, so that the ONE producer of this spelling and its
+// consumers share a single constant rather than agreeing by coincidence. The consumer that
+// matters is internal/mover.BuildJob: it injects `-o s3.<option>` only for a repository on this
+// backend, and a mover that guessed the prefix from its own string literal would be one
+// unrelated edit away from either silently dropping the option or attaching S3 tuning to an
+// rclone repository. There is exactly one thing to agree with, so there is exactly one constant.
+const SchemeS3 = "s3:"
+
 // RepoURL builds the restic S3 URL of the ONE shared repository a cluster writes to, at
 // <prefix>/<clusterID>/ under the bucket. Every namespace and tenant of a cluster shares
 // this single repository; tenancy is carried by tags, not by the path (R20, adr/0009), so
@@ -306,7 +316,7 @@ func RepoURL(endpoint, bucket, prefix, clusterID string) string {
 		path = strings.ReplaceAll(path, "//", "/")
 	}
 	path = strings.TrimRight(path, "/")
-	return "s3:" + scheme + path
+	return SchemeS3 + scheme + path
 }
 
 // ForgetArgs builds the argument list for the per-PVC retention `restic forget`. It always

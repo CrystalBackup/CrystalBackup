@@ -181,7 +181,7 @@ func (l *JobSnapshotLister) list(ctx context.Context, repo *cbv1.BackupRepositor
 	if err := l.ensureCredsSecret(ctx, repo, jobName, password, binding); err != nil {
 		return nil, err
 	}
-	if err := l.ensureSnapshotsJob(ctx, repo, jobName, repoURL, resticArgs); err != nil {
+	if err := l.ensureSnapshotsJob(ctx, repo, jobName, repoURL, resticArgs, binding); err != nil {
 		return nil, err
 	}
 
@@ -308,20 +308,27 @@ func (l *JobSnapshotLister) ensureCredsSecret(ctx context.Context, repo *cbv1.Ba
 // events wake that reconciler too — ~2700 no-op reconciles in a 33-minute crucible run
 // (docs/audit-m3.1-throughput.md). A plain owner ref still cascades the GC on repository delete,
 // which is all this Job needs.
-func (l *JobSnapshotLister) ensureSnapshotsJob(ctx context.Context, repo *cbv1.BackupRepository, name, repoURL string, resticArgs []string) error {
+// The binding travels here for one field — its S3 connection cap — for the same reason
+// ensureCredsSecret takes it: the location is the authority on how this repository is reached, and
+// a listing Job that opened it with different tuning than every other Job on the same repository
+// would be the one op whose S3 behaviour nobody configured.
+func (l *JobSnapshotLister) ensureSnapshotsJob(ctx context.Context, repo *cbv1.BackupRepository, name, repoURL string,
+	resticArgs []string, binding *locationBinding,
+) error {
 	job := mover.BuildJob(mover.JobRequest{
-		Name:         name,
-		Namespace:    l.OperatorNamespace,
-		Image:        l.MoverImage,
-		Operation:    mover.OpSnapshots,
-		Profiles:     l.MoverProfiles,
-		ResticArgs:   resticArgs,
-		RepoURL:      repoURL,
-		SecretName:   name,
-		PVC:          nil,
-		BackoffLimit: discoveryJobBackoffLimit,
-		TTLSeconds:   discoveryJobTTLSeconds,
-		Labels:       discoveryJobLabels(),
+		Name:          name,
+		Namespace:     l.OperatorNamespace,
+		Image:         l.MoverImage,
+		Operation:     mover.OpSnapshots,
+		Profiles:      l.MoverProfiles,
+		ResticArgs:    resticArgs,
+		RepoURL:       repoURL,
+		S3Connections: binding.S3.Connections,
+		SecretName:    name,
+		PVC:           nil,
+		BackoffLimit:  discoveryJobBackoffLimit,
+		TTLSeconds:    discoveryJobTTLSeconds,
+		Labels:        discoveryJobLabels(),
 	})
 	if err := controllerutil.SetOwnerReference(repo, job, l.Scheme); err != nil {
 		return fmt.Errorf("set owner reference on discovery job %s: %w", name, err)

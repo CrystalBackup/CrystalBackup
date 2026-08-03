@@ -241,6 +241,10 @@ func (r *ClusterErasureReconciler) drive(ctx context.Context, er *cbv1.ClusterEr
 		}
 		owner := er.DeepCopy()
 		repoURL, credsSecret := repo.Status.RepositoryURL, loc.Spec.S3.CredentialsSecretRef.Name
+		// The erasure prune is the single heaviest S3 conversation in the product — it repacks
+		// every pack a forgotten tenant touched — so it is the last op that should ignore the
+		// location's connection cap.
+		s3Connections := loc.Spec.S3.Connections
 
 		// ONE queued op runs forget THEN prune. They are inseparable: a forget without its prune
 		// leaves the tenant's bytes in the packs, so an erasure that reported Completed between
@@ -248,11 +252,11 @@ func (r *ClusterErasureReconciler) drive(ctx context.Context, er *cbv1.ClusterEr
 		// hold the repository's exclusive lane once instead of racing another op into the gap.
 		handle, enqErr := r.Queue.Enqueue(repo.Name, queue.OpPrune, func(opCtx context.Context) error {
 			if err := runRepoMaintenance(opCtx, deps, erasureResourceName(owner.Name, "forget"),
-				mover.OpForget, forgetArgs, repoURL, dek, credsSecret, ""); err != nil {
+				mover.OpForget, forgetArgs, repoURL, dek, credsSecret, "", s3Connections); err != nil {
 				return fmt.Errorf("erasure forget: %w", err)
 			}
 			if err := runRepoMaintenance(opCtx, deps, erasureResourceName(owner.Name, "prune"),
-				mover.OpPrune, pruneArgs, repoURL, dek, credsSecret, ""); err != nil {
+				mover.OpPrune, pruneArgs, repoURL, dek, credsSecret, "", s3Connections); err != nil {
 				return fmt.Errorf("erasure prune (the snapshots are forgotten; their space is not yet reclaimed): %w", err)
 			}
 			return nil
