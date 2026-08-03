@@ -152,32 +152,53 @@ var _ = Describe("M1 — discovery projects restorable backups", Label("m1"), Or
 		}, 10*time.Minute, 15*time.Second).Should(Succeed())
 
 		By("And each projected Backup has origin=cluster and status.volumes derived from the repository snapshots")
+		// EVENTUALLY, and the previous shape of this block is why.
+		//
+		// The Eventually above gates on the projected Backup EXISTING. status.volumes is a
+		// separate, later write by the same controller — it derives one entry per repository
+		// snapshot — so reading it once, immediately, races the projection. That race was won
+		// often enough to look solid: this spec passed in an unfiltered 82-of-82 campaign and
+		// failed twenty minutes later, on the same cluster and the same commit, with
+		// "projected Backup missing status.volumes entry for pvc data-db-1". Re-read by hand
+		// afterwards, the object had both volumes.
+		//
+		// What made the difference is the repository. By then it held twenty-odd runs, so the
+		// discovery Job's snapshot listing takes longer and status lands later — and a repository
+		// that keeps growing is not an anomaly, it is what a two-week soak produces on purpose.
+		// A gate that gets slower to converge as the cluster gets more realistic must wait for
+		// convergence, not assume it.
+		//
+		// Nothing is weakened: every assertion below is the one that was there, including the
+		// snapshot-ID match. Only WHEN they are evaluated changes.
 		var cdb cbv1.Backup
-		Expect(k8s.Get(ctx, client.ObjectKey{Namespace: "c-db", Name: m1DiscoveryRun}, &cdb)).To(Succeed())
-		Expect(cdb.Labels[apiconst.LabelOrigin]).To(Equal(apiconst.OriginCluster),
-			"projected Backup must be labelled origin=cluster (read-only to users)")
-		Expect(cdb.Labels[apiconst.LabelClusterBackup]).To(Equal(m1DiscoveryRun),
-			"projected Backup must carry the cluster-backup=<run> link label")
-		Expect(cdb.Labels[apiconst.LabelNamespace]).To(Equal("c-db"),
-			"projected Backup must carry the namespace= label")
-		for _, or := range cdb.OwnerReferences {
-			Expect(or.Kind).NotTo(Equal("ClusterBackup"),
-				"the cross-namespace link is by label only — never an ownerReference to the ClusterBackup")
-		}
+		Eventually(func(g Gomega) {
+			g.Expect(k8s.Get(ctx, client.ObjectKey{Namespace: "c-db", Name: m1DiscoveryRun}, &cdb)).To(Succeed())
 
-		// status.volumes is derived from the repository: one Completed volume per
-		// c-db data snapshot, with the snapshot's own restic ID.
-		volByPVC := map[string]cbv1.VolumeStatus{}
-		for _, v := range cdb.Status.Volumes {
-			volByPVC[v.Pvc] = v
-		}
-		for _, s := range dataCDB {
-			pvc, _ := restic.TagValue(s.Tags, restic.TagKeyPVC)
-			v, ok := volByPVC[pvc]
-			Expect(ok).To(BeTrue(), "projected Backup missing status.volumes entry for pvc %s", pvc)
-			Expect(v.SnapshotID).To(Equal(s.ID), "volume %s snapshotID must match its repository snapshot", pvc)
-			Expect(string(v.Phase)).To(Equal("Completed"), "derived volume %s phase", pvc)
-		}
+			g.Expect(cdb.Labels[apiconst.LabelOrigin]).To(Equal(apiconst.OriginCluster),
+				"projected Backup must be labelled origin=cluster (read-only to users)")
+			g.Expect(cdb.Labels[apiconst.LabelClusterBackup]).To(Equal(m1DiscoveryRun),
+				"projected Backup must carry the cluster-backup=<run> link label")
+			g.Expect(cdb.Labels[apiconst.LabelNamespace]).To(Equal("c-db"),
+				"projected Backup must carry the namespace= label")
+			for _, or := range cdb.OwnerReferences {
+				g.Expect(or.Kind).NotTo(Equal("ClusterBackup"),
+					"the cross-namespace link is by label only — never an ownerReference to the ClusterBackup")
+			}
+
+			// status.volumes is derived from the repository: one Completed volume per
+			// c-db data snapshot, with the snapshot's own restic ID.
+			volByPVC := map[string]cbv1.VolumeStatus{}
+			for _, v := range cdb.Status.Volumes {
+				volByPVC[v.Pvc] = v
+			}
+			for _, s := range dataCDB {
+				pvc, _ := restic.TagValue(s.Tags, restic.TagKeyPVC)
+				v, ok := volByPVC[pvc]
+				g.Expect(ok).To(BeTrue(), "projected Backup missing status.volumes entry for pvc %s", pvc)
+				g.Expect(v.SnapshotID).To(Equal(s.ID), "volume %s snapshotID must match its repository snapshot", pvc)
+				g.Expect(string(v.Phase)).To(Equal("Completed"), "derived volume %s phase", pvc)
+			}
+		}, 5*time.Minute, 10*time.Second).Should(Succeed())
 
 		By("And a run whose namespace does not exist on the cluster is NOT projected (it stays available only to ClusterRestore)")
 		Eventually(func() bool {
