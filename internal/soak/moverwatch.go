@@ -121,8 +121,23 @@ func (m *MoverWatch) loop(
 	for ctx.Err() == nil {
 		w, err := open(ctx, m.hw.Namespace, selector)
 		if err != nil {
+			// The message is deliberately STABLE — no attempt counter, no timestamp, nothing that
+			// varies between one failure and the next. Store.RecordError coalesces by message and
+			// keeps a count with a first and last timestamp, so a watch that has been refused
+			// every two seconds for eleven days is ONE record that says so, rather than half a
+			// million identical lines evicting the measurements this collector exists to keep.
+			// Interpolating the attempt number here would make every message unique and defeat
+			// exactly that.
+			//
+			// It names the CONSEQUENCE and not just the error, because a reader finding this in
+			// the archive needs to know what it cost them: the figures fell back to poll quality,
+			// which misses most movers.
 			m.store.RecordError(StreamHighwater,
-				"watch mover "+kind+": "+err.Error(), time.Now().UTC())
+				"watch mover "+kind+" could not be established: "+err.Error()+
+					". The high-water figures fall back to what the poll catches, which misses "+
+					"most movers — they live ten to twenty seconds. Check the collector's RBAC "+
+					"for `watch` on pods and batch/jobs",
+				time.Now().UTC())
 			if !sleepCtx(ctx, m.retryDelay) {
 				return
 			}

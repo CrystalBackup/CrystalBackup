@@ -109,6 +109,20 @@ CONTAINER='collector'
 # output — an identifier that is not checked for is never silently not checked for.
 MIN_IDENT_LEN=3
 
+# The same exclusion, for a reason length cannot express: names that exist on EVERY cluster.
+#
+# These are Kubernetes' own built-in namespaces. Finding one verbatim in the archive tells a
+# reader nothing about this cluster — the user did not choose them and every cluster in the world
+# has them — so a hit is not a leak. And `default` in particular is an ordinary English word that
+# this kit's own prose uses: the self-check's warning about weak salts lists `default` as an
+# example of a guessable namespace name, so a substring grep matched the documentation and
+# reported FAILED on a correctly redacted archive. Every soak would have hit it.
+#
+# A leak check that fails on every run is a leak check nobody reads, and this is the one check
+# standing between a customer's namespace names and a maintainer's inbox. Excluded here, and —
+# like the short ones — NAMED in the output rather than silently dropped.
+UNIVERSAL_IDENTS='default kube-system kube-public kube-node-lease'
+
 # Known-answer test for the token construction, which this script has to reproduce byte for byte
 # to be able to check the archive at all:
 #   HMAC-SHA256(salt, kind || 0x00 || value), first 4 bytes, hex, prefixed "<kind>-"
@@ -312,7 +326,18 @@ export_from_collector() {
 	[ -n "$SINCE" ] && set -- "$@" "--since=$SINCE"
 	[ "$FULL" = yes ] && set -- "$@" --full
 
-	say "${C_DIM}exporting from $_pod…${C_RESET}"
+	# BRACED, and it is not style: writing this expansion UNBRACED with the ellipsis glued
+	# straight onto it breaks the script outright under a non-UTF-8 locale. (Spelled out rather
+	# than shown, so that grepping this tree for the mistake does not match its own explanation.)
+	# The ellipsis is three bytes ≥ 0x80, and a shell whose locale does not mark them as
+	# non-identifier characters reads them as part of the variable name — so `set -u` kills the
+	# run with "_pod<garbage>: unbound variable", three lines before the export, on a cluster
+	# where everything was working. Reproduced on macOS with LANG=fr_FR.
+	#
+	# This is the last step of a fortnight, run once, by someone whose locale is their own. Every
+	# other non-ASCII character in this file sits inside a message with no expansion next to it;
+	# this was the only one touching a variable.
+	say "${C_DIM}exporting from ${_pod}…${C_RESET}"
 	# No -t: a TTY would translate the byte stream and corrupt the gzip. Nothing but the tarball
 	# goes to stdout, by contract; the subcommand's own progress is on stderr.
 	if ! "$KUBECTL" -n "$NS" exec "$_pod" -c "$CONTAINER" -- /manager "$@" \
@@ -486,6 +511,7 @@ unpack_and_read_manifest() {
 leak_check() {
 	_checked=0
 	_skipped=''
+	_universal=''
 	_hits=''
 	while IFS="$TAB" read -r _kind _val; do
 		[ -n "${_val:-}" ] || continue
@@ -493,6 +519,14 @@ leak_check() {
 			_skipped="${_skipped}${_val} "
 			continue
 		fi
+		# Kubernetes' own namespaces: present on every cluster, chosen by nobody, and therefore
+		# not a leak when found. See UNIVERSAL_IDENTS.
+		case " $UNIVERSAL_IDENTS " in
+		*" $_val "*)
+			_universal="${_universal}${_val} "
+			continue
+			;;
+		esac
 		_checked=$((_checked + 1))
 		# Whole-identifier match, and dots escaped: a name is RFC 1123, so `.` is the only
 		# character in it that means something to an ERE.
@@ -506,11 +540,15 @@ leak_check() {
 		record leak-check-short NOT_MADE 0 \
 			"not searched for, being shorter than $MIN_IDENT_LEN characters (they would match ordinary words): $_skipped"
 	fi
+	if [ -n "$_universal" ]; then
+		record leak-check-universal NOT_MADE 0 \
+			"not searched for, being names every Kubernetes cluster has — finding them says nothing about yours, and 'default' is a word this kit's own documentation uses: $_universal"
+	fi
 
 	if [ "$FULL" = yes ]; then
 		record leak-check DISABLED "$_checked" \
 			'--full was requested: identifiers are verbatim on purpose, so there is nothing to leak-check.'
-		unset _checked _skipped _hits _kind _val _re
+		unset _checked _skipped _universal _hits _kind _val _re
 		return
 	fi
 	if [ -n "$_hits" ]; then
@@ -520,7 +558,7 @@ leak_check() {
 		record leak-check OK "$_checked" \
 			"$_checked identifier(s) searched for verbatim; none found. The archive carries no name this cluster uses."
 	fi
-	unset _checked _skipped _hits _kind _val _re
+	unset _checked _skipped _universal _hits _kind _val _re
 }
 
 token_check() {

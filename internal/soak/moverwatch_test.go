@@ -19,6 +19,7 @@ package soak
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -234,13 +235,43 @@ func TestAWatchThatCannotBeOpenedIsRecordedAndRetried(t *testing.T) {
 		podErr: errors.New(`pods is forbidden: cannot watch resource "pods"`),
 		jobErr: errors.New(`jobs.batch is forbidden: cannot watch resource "jobs"`),
 	}
-	_, _ = startWatch(t, w)
+
+	h, _ := startWatch(t, w)
 
 	waitFor(t, func() bool {
 		p, j := w.opens()
-		return p >= 3 && j >= 3
+		return p >= 20 && j >= 20
 	}, "the watch gave up after a failure to open; it must keep retrying, because the grant may "+
 		"be added while the collector is running")
+
+	// AND ~40 failed opens must COALESCE. Store.RecordError keys by message, so a stable sentence
+	// becomes one record with a count; a message carrying an attempt number or a timestamp would
+	// be unique every time and a fortnight of a refused watch would be several hundred thousand
+	// entries evicting the measurements this collector exists to keep. Two records — one per
+	// watched kind — is the whole expected output.
+	errs := h.store.ErrorsFor(StreamHighwater)
+	if len(errs) == 0 {
+		t.Fatal("a watch that cannot be established recorded nothing at all; the collector would " +
+			"silently fall back to polling and the archive would look complete")
+	}
+	if len(errs) > 2 {
+		t.Errorf("%d error records for ~40 failed opens across 2 kinds, want 2. The message is not "+
+			"stable, so Store.RecordError cannot coalesce it and the volume fills with the "+
+			"collector complaining about itself.\nfirst: %s", len(errs), errs[0].Message)
+	}
+	var total int
+	for _, e := range errs {
+		total += e.Count
+	}
+	if total < 20 {
+		t.Errorf("the coalesced records account for only %d failures; the count is what tells a "+
+			"reader this was permanent rather than a blip", total)
+	}
+	// The record has to name the consequence, not just the error: a reader finding this in the
+	// archive needs to know the mover figures are poll-quality.
+	if !strings.Contains(errs[0].Message, "poll") {
+		t.Errorf("the recorded error does not say what the failure COSTS: %q", errs[0].Message)
+	}
 }
 
 // TestNonMoverWorkloadsAreNotMeasuredAsMovers is the counterweight to widening the selector.
