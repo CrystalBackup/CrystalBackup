@@ -29,7 +29,7 @@ class: text-center
 <div class="mt-6 flex gap-2 justify-center">
   <span class="pill">Apache-2.0</span>
   <span class="pill">restic-compatible</span>
-  <span class="pill">v0.6.1 · M0–M6 livrés</span>
+  <span class="pill">v0.6.2 · M0–M6 livrés</span>
 </div>
 
 <p class="tiny muted mt-10">Meetup — 45 min · slides + démo live</p>
@@ -67,7 +67,7 @@ alexis@infrabuilder.com · github.com/CrystalBackup
 <div class="panel accent" style="max-width: 320px">
 <span class="eyebrow">disclaimer honnête</span>
 
-Ce projet est **jeune** (v0.6.1), écrit **avec assistance IA** sous direction humaine,
+Ce projet est **jeune** (v0.6.2), écrit **avec assistance IA** sous direction humaine,
 et testé sur de vrais clusters **parce que** personne ne devrait me croire sur parole.
 
 </div>
@@ -232,7 +232,7 @@ et un RTO en réunions.
 | DR depuis le dépôt seul | <span class="mark-ok">✓</span> | <span class="mark-mid">~</span> | <span class="mark-no">–</span> | <span class="mark-no">–</span> | <span class="mark-mid">~</span> |
 | Relisible avec un outil standard | <span class="mark-ok">✓ restic</span> | <span class="mark-mid">~</span> | <span class="mark-ok">✓</span> | <span class="mark-ok">✓</span> | <span class="mark-no">–</span> |
 
-<p class="tiny muted mt-3">Colonne Crystal Backup = v0.6.1 livrée, chaque ✓ exercé par un rapport d'acceptation publié. Les autres colonnes : à vérifier contre leurs docs — capacités mouvantes, objectifs différents. Ceci n'est <strong>pas</strong> un benchmark.</p>
+<p class="tiny muted mt-3">Colonne Crystal Backup = v0.6.2 livrée, chaque ✓ exercé par un rapport d'acceptation publié. Les autres colonnes : à vérifier contre leurs docs — capacités mouvantes, objectifs différents. Ceci n'est <strong>pas</strong> un benchmark.</p>
 
 <!--
 [06:00 → 07:30]
@@ -726,7 +726,7 @@ spec:
 - `restic forget --tag namespace=team-x` + `prune` : **suppression physique** dans le dépôt partagé
 - Trois granularités : tenant, namespace, PVC
 - Honnêteté : **pas de crypto-shredding par tenant** — « dans un dépôt à clé unique, des DEK par namespace seraient une fiction »
-- Tension assumée : sur une location immutable (Object Lock, M8), l'effacement **attend l'expiry** — WORM vs RGPD, arbitré explicitement
+- Tension assumée : sur une location immutable (Object Lock, M9), l'effacement **attend l'expiry** — WORM vs RGPD, arbitré explicitement
 
 </v-clicks>
 
@@ -1101,7 +1101,7 @@ Le champ `mode: Immutable` est accepté — **il ne donne pas de WORM aujourd'hu
 <v-click>
 
 <div class="panel danger mt-6">
-⚠️ <strong>0.6.1 s'offre au test en conditions réelles, pas à la production.</strong> API <code>v1alpha1</code> — elle bougera encore. Testez sur un cluster dont vous pouvez encaisser la perte, <strong>à côté de</strong> vos backups actuels. Et testez vos restores — c'est la pratique sur laquelle ce projet tourne.
+⚠️ <strong>0.6.2 s'offre au test en conditions réelles, pas à la production.</strong> API <code>v1alpha1</code> — elle bougera encore. Testez sur un cluster dont vous pouvez encaisser la perte, <strong>à côté de</strong> vos backups actuels. Et testez vos restores — c'est la pratique sur laquelle ce projet tourne.
 </div>
 
 </v-click>
@@ -1129,7 +1129,7 @@ class: text-center
 
 ```bash
 helm install crystal-backup oci://ghcr.io/crystalbackup/charts/crystal-backup \
-  --version 0.6.1 -n crystal-backup-system --create-namespace
+  --version 0.6.2 -n crystal-backup-system --create-namespace
 ```
 
 <div class="mt-6 grid grid-cols-3 gap-3 text-left" style="max-width: 760px; margin-inline: auto;">
