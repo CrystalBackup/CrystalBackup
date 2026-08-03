@@ -4,6 +4,119 @@ All notable changes to Crystal Backup. Versioning follows
 [adr/0014](spec/adr/0014-versioning-and-release.md): milestone `Mn` → minor `0.n.z` on
 major 0; `1.0.0` is a deliberate post-M9 API-stability decision.
 
+## 0.6.2 — The instrument, not the measurement (2026-08-03)
+
+This release ships the **soak kit**: everything needed to run M6's two-week soak on a real
+cluster with real data, and to send the result back as one archive. It does not ship the soak's
+findings — that is a fortnight of somebody's calendar, and no release can contain it.
+
+What it deliberately is not: the millions-of-files load test. That still needs infrastructure
+this project does not have, and the mover ceilings it would fit remain conservative by
+admission.
+
+**Validated on real infrastructure: 82 of 82 crucible checks, 0 failed, 0 skipped, in 1h53m17s**
+— the whole suite, M0 through M6, unfiltered, on a live RKE2 + Rook-Ceph cluster with real S3.
+
+### The kit
+
+A resident **collector** — one pod, 200m/384Mi with requests equal to limits, one PVC capped at
+`soak.maxBytes`, cluster-wide **read-only** RBAC — enabled with `soak.enabled=true` and off by
+default. It runs as a subcommand of the operator binary, from the same digest the operator
+Deployment resolves, so there is no second image to keep in step.
+
+It collects continuously rather than daily: operator metrics into windows, hourly CR-status
+snapshots, every Warning event in the cluster (Kubernetes forgets them after an hour), the
+operator's error-level log lines read from the API as they happen, a daily installation
+self-check, and the mover high-water table. `soak-export` writes the whole thing to stdout as
+one tar.gz, every identifier tokenised under an HMAC salt that never travels with it.
+
+**One heartbeat line a day**, in the collector's own log, is the whole health check — because a
+soak nobody can check is a soak you can waste, and the failure mode of the shape before this one
+was discovering on day 14 that day 3 had broken.
+
+### The instrument was broken, and that is most of this release
+
+Its first four-hour run on the crucible reported sizing classes `data` and `manifests` as
+NOT_MEASURED — *"no data mover pod ran while the collector was up"* — alongside a campaign that
+had just executed dozens of backups. The sentence was true about what the collector saw and
+false about the cluster.
+
+Two causes, each sufficient on its own:
+
+- **`mover.BuildJob` stamped no identity label.** It copied the caller's label map verbatim, and
+  six of the ten mover creation sites never included `app.kubernetes.io/name=crystal-mover` —
+  both data movers and all four manifest movers. Nothing in the operator selects on that label,
+  so the omission was invisible in-cluster for six milestones; what it broke was every observer
+  outside it, `kubectl get jobs -l app.kubernetes.io/name=crystal-mover` included.
+- **A mover Job is not there long enough to be polled.** The Backup controller deletes it on the
+  same reconcile pass that reads its result, so `ttlSecondsAfterFinished` is a crash fallback
+  that normally never fires. Measured at 0.25s resolution: the four Jobs of one `ClusterBackup`
+  were visible for **9.6s, 11.0s, 16.3s and 23.7s** against a 15s sample interval.
+
+`BuildJob` now stamps the label itself, last, so no call site can omit or override it — and the
+collector no longer depends on it either, listing on `managed-by` and identifying a mover by the
+`--operation` flag it runs. The exact figures now come from a **watch**, with the poll kept for
+the sampled quantities and as the re-list that repairs a dropped watch.
+
+Three places that let the failure hide are closed too: the heartbeat carries `movers_by_class=`
+with the zeros printed (an aggregate only has to be non-zero — `movers=87` looked healthy while
+two classes sat empty); `--status` prints classes with no pods instead of omitting them; and
+`COLLECTION-REPORT.txt` now states the per-class answer instead of only grading the stream that
+holds it.
+
+### Two more, both found by running the kit rather than reading it
+
+**`collect.sh` died before it exported anything.** An unbraced expansion with an ellipsis glued
+to it: the ellipsis is three bytes above 0x7F, and a shell whose locale does not classify them as
+non-identifier characters reads them as part of the variable name, so `set -u` killed the run
+three lines before the export. Valid syntax — `sh -n` and shellcheck both pass it — and only the
+locale decides, so the author's machine can be fine and the operator's not. A Go test now forbids
+the construct across the kit's scripts.
+
+**The leak check failed on every correctly redacted archive.** It searches every cluster
+identifier verbatim, and `default` is both a namespace name and an ordinary English word — one
+this kit's own prose uses, since the self-check's warning about weak salts lists `default` as an
+example of a guessable namespace. The check was matching its own documentation. Kubernetes'
+built-in namespaces are now excluded, on the grounds that every cluster has them and the user
+chose none of them, and they are NAMED as excluded rather than silently dropped. A check that
+fails every run is a check nobody reads, and this one stands between a customer's namespace names
+and a maintainer's inbox.
+
+### And a claim that was wrong
+
+Every place reporting `cgroupPeakBytes` called it "an upper bound" on the RSS peak. The soak's own
+measurement disproved it: across the eight data movers of one campaign the cgroup peak sat
+**20–22Mi below** restic's `ru_maxrss` on every single pod, the gap narrowing to ~3Mi on manifest
+movers. The reading was right; the label was not. `memory.peak` counts what was **charged** to the
+cgroup, RSS counts what the process had **mapped**, and a file page is charged to whichever cgroup
+first faulted it in — so a mover whose image pages were already resident maps them for free.
+Neither figure bounds the other. Both are still reported, each saying what it counts.
+
+### What §5 now says
+
+Measured on the crucible, all four classes, from the movers' own termination messages:
+
+| class | peak RSS | shipped limit | headroom |
+|---|---|---|---|
+| `data` | 81Mi | 4Gi | ×50 |
+| `manifests` | 105Mi | 2Gi | ×20 |
+| `repo-heavy` | 74Mi | 8Gi | ×110 |
+| `repo-light` | 101Mi | 1Gi | ×10 |
+
+Zero OOM kills, zero evictions, zero limit hits. **On a small repository** — which is the whole
+caveat, and exactly what the two-week soak on real data exists to replace.
+
+### Also
+
+- The crucible leak-check called the soak collector's own PVC a leak. It was a domain-prefix
+  match on `crystalbackup.io/*` in the operator namespace, correct only while nothing permanent
+  lived there; the collector is the first permanent resident. Seven checks burned their full
+  ten-minute budget on a cluster with zero actual residue.
+- The M1 discovery spec asserted on `status.volumes` with a single read, immediately after
+  waiting only for the projected Backup to EXIST. It won that race in an 82-of-82 campaign and
+  lost it twenty minutes later on a repository holding twenty-odd runs — which is precisely what
+  a two-week soak produces on purpose.
+
 ## 0.6.1 — Every mover Job ran unbounded (2026-08-01)
 
 A patch release with one theme: the mover Jobs this operator creates had **no resource

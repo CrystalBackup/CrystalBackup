@@ -384,10 +384,13 @@ decision and the millions-of-files load test, and the VSC ↔ RBD reconciliation
 **Status as of 0.6.1, and the plan to close it (2026-08-02).** Mover resources by operation type
 shipped. What is still open splits three ways, and conflating them is what let it drift:
 
-- **Code — scheduled as `0.6.2`, before M7 opens.** The VSC ↔ RBD reconciliation, trash monitoring
+- **Code — scheduled as `0.6.3`, before M7 opens.** The VSC ↔ RBD reconciliation, trash monitoring
   and the active pre-check before VolumeSnapshot creation (delta 9), and the S3 RGW tuning
   (delta 13). Carrying code from milestone to milestone is the mechanism that produced the
   announced-but-inert features of the M5 lot E; it gets its own patch instead.
+  *(Renumbered from 0.6.2, which went to the soak kit — see the 0.6.2 status below. The
+  re-arbitration of M7–M9 itself took no version: it touched specs, the site and the promotion
+  kit, and a change with no operator behaviour in it is not a release.)*
 - **Measurements — needs real infrastructure.** The millions-of-files load test and the
   restic-vs-rustic revisit ([adr/0001](adr/0001-repository-engine-restic-format.md)) that depends
   on it. This is what would turn the conservative mover ceilings into measured numbers.
@@ -396,6 +399,20 @@ shipped. What is still open splits three ways, and conflating them is what let i
   `crystal-backup-system` is a constraint rather than caution), the two-week soak alongside an
   incumbent, and the pilot rollout. These are the two unmet exit criteria, and they are calendar
   work, not engineering work.
+
+**Status as of 0.6.2 (2026-08-03) — the soak becomes runnable.** "Calendar work, not engineering
+work" was true of the soak only if the instrument existed and worked. It did not: the collector
+shipped in the kit's first form could not see two of the four mover sizing classes at all, and
+reported them as NOT_MEASURED through a four-hour crucible campaign that executed dozens of
+backups. 0.6.2 is that instrument, fixed and verified end to end on real infrastructure — 82 of
+82 crucible checks, unfiltered — plus the first measured answer to §5's mover-sizing question:
+`data` 81Mi against a 4Gi limit, `manifests` 105Mi against 2Gi, `repo-heavy` 74Mi against 8Gi,
+`repo-light` 101Mi against 1Gi, no OOM kills and no evictions. **On the crucible's small
+repository**, which is the caveat the fortnight on real data exists to remove.
+
+So the remaining M6 work is now genuinely calendar: install `soak.enabled=true` on a real
+cluster, leave it a fortnight, run `hack/soak/collect.sh`. The pilot rollout and the PodSecurity
+review are unchanged.
 
 ## M7 — Reach: storage without snapshots, file-level restore, notifications (0.7)
 
