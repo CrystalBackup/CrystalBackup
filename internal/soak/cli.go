@@ -245,11 +245,17 @@ func RunCollect(ctx context.Context, args []string, stderr io.Writer) int {
 		return 1
 	}
 
+	lister := &clusterLister{cs: cs}
+	highWater := NewHighWater(store, lister, *namespace, *moverIvl, *kubeletStat)
+
 	c := &Collector{
 		Store: store, Sessions: sessions, Info: info,
-		Scraper:         scraper,
-		Aggregator:      NewAggregator(*resolution),
-		HighWater:       NewHighWater(store, &clusterLister{cs: cs}, *namespace, *moverIvl, *kubeletStat),
+		Scraper:    scraper,
+		Aggregator: NewAggregator(*resolution),
+		HighWater:  highWater,
+		// The event half. Without it the mover figures would be whatever a 15s poll happened to
+		// catch of Jobs that live ten to twenty seconds — see moverwatch.go.
+		MoverWatch:      NewMoverWatch(highWater, store, lister),
 		Events:          NewEventStream(cs, store),
 		Logs:            NewLogStream(cs, store, *namespace),
 		State:           NewStateStream(reader, store),

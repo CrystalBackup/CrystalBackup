@@ -88,11 +88,25 @@ automountServiceAccountToken: true
 # THE VERBS WERE CHECKED AGAINST THE CODE, not carried over. Three rules that
 # hack/soak/manifests/collector.yaml granted are gone, because nothing reads them:
 #
-#   * `watch` everywhere. Nothing in internal/soak watches. The events stream LISTS on a resync
-#     interval and says why (streams.go: a watch "drops silently on an apiserver rollover … and a
-#     collector that lost its watch on day four would record nothing for ten days while looking
-#     perfectly healthy"); the CR-state stream lists on an interval; the high-water sampler lists;
-#     and the API reader is client.New — uncached, so it opens no informers.
+#   * `watch` EVERYWHERE. It is now granted on exactly two resources — pods and batch/jobs — and
+#     nowhere else. The original reasoning still holds for every stream it still excludes: the
+#     events stream LISTS on a resync interval and says why (streams.go: a watch "drops silently
+#     on an apiserver rollover … and a collector that lost its watch on day four would record
+#     nothing for ten days while looking perfectly healthy"), the CR-state stream lists on an
+#     interval, and the API reader is client.New — uncached, so it opens no informers.
+#
+#     What changed is that for MOVERS the premise was simply false. A mover Job does not sit
+#     around waiting to be listed: the Backup controller deletes it on the same reconcile pass
+#     that reads its result, so ttlSecondsAfterFinished is a crash fallback that normally never
+#     fires. Measured on the crucible at 0.25s resolution, the four Jobs of one ClusterBackup were
+#     visible for 9.6s, 11.0s, 16.3s and 23.7s against a 15s sample interval. The first collector
+#     run reported sizing classes `data` and `manifests` as NOT_MEASURED through a campaign that
+#     ran dozens of backups. Polling is not the conservative choice here, it is the broken one.
+#
+#     The objection that killed `watch` the first time is answered rather than ignored: the poll
+#     is still there, still lists on its interval, and repairs whatever a dropped watch missed —
+#     so a collector whose watch dies on day four degrades to the previous release's behaviour
+#     rather than going silent. See internal/soak/moverwatch.go.
 #   * `storage.k8s.io` storageclasses/volumeattachments. Those are read by the operator
 #     (internal/rexposer, the restore and backup controllers), never by internal/selfcheck or
 #     internal/soak.
@@ -118,16 +132,25 @@ rules:
   - apiGroups: [""]
     resources: ["namespaces", "persistentvolumeclaims", "pods", "events"]
     verbs: ["get", "list"]
+  # WATCH, on pods only. A mover pod exists for the length of one restic invocation and is deleted
+  # with its Job the moment the controller has read its result, so the exact peak RSS it writes
+  # into its own termination message is only ever readable from an event. Scoped to `pods` rather
+  # than folded into the rule above so that widening it later has to be a deliberate edit.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["watch"]
   # The operator's own error-level log lines, read continuously from the API rather than scraped
   # off a node at the end. This is what makes the log stream survive the kubelet's rotation.
   - apiGroups: [""]
     resources: ["pods/log"]
     verbs: ["get"]
   # Mover Jobs: what a mover pod was DOING is on its Job, and without it a peak memory sample is a
-  # number attributed to nothing.
+  # number attributed to nothing. `watch` for the same reason as pods above — the Job carries the
+  # --operation that names the sizing class, and it is deleted just as fast as its pod, so a class
+  # attribution that depended on listing would fall back to `unknown` exactly when it matters.
   - apiGroups: ["batch"]
     resources: ["jobs"]
-    verbs: ["get", "list"]
+    verbs: ["get", "list", "watch"]
   # The self-check's snapshot-leak census.
   - apiGroups: ["snapshot.storage.k8s.io"]
     resources: ["volumesnapshots", "volumesnapshotcontents", "volumesnapshotclasses"]

@@ -123,29 +123,34 @@ func TestHighWaterAttributesByOperationNeverByGuess(t *testing.T) {
 		job       batchv1.Job
 		wantOp    string
 		wantClass string
+		wantMover bool
 	}{
-		{"backup is data", moverJob("j1", mover.OpBackup, time.Time{}, time.Time{}), "backup", "data"},
-		{"prune is repo-heavy", moverJob("j2", mover.OpPrune, time.Time{}, time.Time{}), "prune", "repo-heavy"},
-		{"check is repo-heavy, not the same as prune", moverJob("j3", mover.OpCheck, time.Time{}, time.Time{}), "check", "repo-heavy"},
-		{"forget is repo-light", moverJob("j4", mover.OpForget, time.Time{}, time.Time{}), "forget", "repo-light"},
-		{"manifests backup is manifests", moverJob("j5", mover.OpManifestsBackup, time.Time{}, time.Time{}), "manifests-backup", "manifests"},
+		{"backup is data", moverJob("j1", mover.OpBackup, time.Time{}, time.Time{}), "backup", "data", true},
+		{"prune is repo-heavy", moverJob("j2", mover.OpPrune, time.Time{}, time.Time{}), "prune", "repo-heavy", true},
+		{"check is repo-heavy, not the same as prune", moverJob("j3", mover.OpCheck, time.Time{}, time.Time{}), "check", "repo-heavy", true},
+		{"forget is repo-light", moverJob("j4", mover.OpForget, time.Time{}, time.Time{}), "forget", "repo-light", true},
+		{"manifests backup is manifests", moverJob("j5", mover.OpManifestsBackup, time.Time{}, time.Time{}), "manifests-backup", "manifests", true},
 		{
-			"an operation this build does not know is NOT classed",
+			"an operation this build does not know is NOT classed, but is still a mover",
 			moverJob("j6", mover.Operation("teleport"), time.Time{}, time.Time{}),
-			"teleport", classUnknown,
+			"teleport", classUnknown, true,
 		},
 		{
-			"a Job with no --operation is unknown, not the first class in the map",
+			// The wide managed-by list reaches hook runners and the crucible's restic oracle.
+			// They are not movers, and filing them under `unknown` would put a non-mover's
+			// memory in a table that exists only to size movers.
+			"a Job with no --operation is not a mover at all",
 			batchv1.Job{Spec: batchv1.JobSpec{Template: corev1.PodTemplateSpec{
 				Spec: corev1.PodSpec{Containers: []corev1.Container{{Args: []string{"--", "snapshots"}}}},
 			}}},
-			classUnknown, classUnknown,
+			classUnknown, classUnknown, false,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			op, class := operationOfJob(&tc.job)
-			if op != tc.wantOp || class != tc.wantClass {
-				t.Errorf("operationOfJob = (%q, %q), want (%q, %q)", op, class, tc.wantOp, tc.wantClass)
+			op, class, isMover := operationOfJob(&tc.job)
+			if op != tc.wantOp || class != tc.wantClass || isMover != tc.wantMover {
+				t.Errorf("operationOfJob = (%q, %q, %v), want (%q, %q, %v)",
+					op, class, isMover, tc.wantOp, tc.wantClass, tc.wantMover)
 			}
 		})
 	}
@@ -436,8 +441,24 @@ func TestPodsRanButWereNeverSampledSaysSo(t *testing.T) {
 	if heavy.Pods != 0 {
 		t.Fatalf("repo-heavy pods = %d, want 0", heavy.Pods)
 	}
-	if !strings.Contains(heavy.Memory.Reason, "no repo-heavy mover pod ran") {
-		t.Errorf("a class with no pods at all must say so plainly: %q", heavy.Memory.Reason)
+	// A class with no pods at all still says so — but it no longer claims to know WHY. "No pod
+	// ran" was the sentence the broken collector printed for `data` while backups were running,
+	// and it was the collector that was blind, not the workload. So the zero case states what was
+	// observed and points the reader at the runs the state stream recorded.
+	for _, want := range []string{
+		"no repo-heavy mover pod was OBSERVED",
+		"not a measurement of zero",
+		"state stream",
+	} {
+		if !strings.Contains(heavy.Memory.Reason, want) {
+			t.Errorf("a class with no pods at all is missing %q from its reason:\n%q",
+				want, heavy.Memory.Reason)
+		}
+	}
+	if strings.Contains(heavy.Memory.Reason, "no repo-heavy mover pod ran while") {
+		t.Errorf("the zero case still asserts the workload was idle, which is exactly what the "+
+			"collector could not know when it was blind to two whole classes:\n%q",
+			heavy.Memory.Reason)
 	}
 }
 
@@ -676,5 +697,50 @@ func TestJobNameOfKnowsBothLabelSpellings(t *testing.T) {
 				t.Errorf("jobNameOf = %q, want %q (%s)", got, tc.want, tc.reason)
 			}
 		})
+	}
+}
+
+// TestAnEmptyUnknownBucketIsGoodNews. `unknown` is not a sizing class — it is where a mover whose
+// operation could not be recovered goes — so zero pods there means every mover was attributed,
+// which is the answer you want.
+//
+// The first version of the empty-class wording treated it like the others and printed "check
+// this against what your schedules ran" beside it. That is an alarm on good news, and on a
+// healthy cluster it fires every single day: a reader who learns to ignore the arrow on
+// `unknown` will ignore it on `data`, which is the one it exists for.
+func TestAnEmptyUnknownBucketIsGoodNews(t *testing.T) {
+	store := newTestStore(t, 1<<20)
+	start := day0.Add(time.Hour)
+	f := &fakeLister{
+		jobs:    []batchv1.Job{moverJob("job-backup", mover.OpBackup, start, time.Time{})},
+		pods:    []corev1.Pod{moverPod("job-backup-1", "job-backup", "worker-1", start)},
+		metrics: []podMetric{},
+	}
+	h := NewHighWater(store, f, testNS, 15*time.Second, false)
+	h.Sample(t.Context(), start.Add(15*time.Second))
+
+	unknown := h.Marks(start.Add(time.Minute)).Classes[classUnknown]
+	if unknown.Pods != 0 {
+		t.Fatalf("the fixture put %d pod(s) in the unknown bucket; this test proves nothing",
+			unknown.Pods)
+	}
+	for _, unwanted := range []string{"check", "not a measurement of zero", "blind"} {
+		if strings.Contains(unknown.Memory.Reason, unwanted) {
+			t.Errorf("an empty unknown bucket is reported as a concern (%q appears):\n%q\n"+
+				"Every mover was attributed, which is the healthy answer. An alarm that fires "+
+				"daily on a healthy cluster is an alarm nobody reads on the day it is real.",
+				unwanted, unknown.Memory.Reason)
+		}
+	}
+	if !strings.Contains(unknown.Memory.Reason, "healthy answer") {
+		t.Errorf("an empty unknown bucket does not say it is the healthy answer: %q",
+			unknown.Memory.Reason)
+	}
+
+	// And a REAL sizing class at zero must still carry the nudge — otherwise this test could be
+	// satisfied by softening the wording everywhere, which would undo the fix it belongs to.
+	heavy := h.Marks(start.Add(time.Minute)).Classes["repo-heavy"]
+	if !strings.Contains(heavy.Memory.Reason, "check it against the runs") {
+		t.Errorf("a real sizing class at zero lost its nudge: %q", heavy.Memory.Reason)
 	}
 }

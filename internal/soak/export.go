@@ -266,6 +266,16 @@ type exporter struct {
 
 	streams  []StreamReport
 	problems []string
+
+	// marks is the redacted high-water table, kept so COLLECTION-REPORT.txt can state the
+	// fortnight's ANSWER and not merely grade the stream that holds it.
+	//
+	// The report used to say "highwater OK (130 items)" and stop. The numbers the soak exists to
+	// produce — the peak per sizing class — were in highwater/marks.json and nowhere else, so the
+	// person who receives this archive from someone else's cluster had to parse JSON to read the
+	// result. An archive whose headline finding is only machine-readable is an archive that gets
+	// filed rather than read.
+	marks *Marks
 }
 
 func (e *exporter) note(format string, args ...any) {
@@ -601,6 +611,7 @@ func (e *exporter) writeHighwater() {
 		return
 	}
 	e.addFile("highwater/marks.json", body, marks.UpdatedAt)
+	e.marks = &marks
 	e.note("highwater: %d mover pod(s), %d Job(s)", len(marks.Pods), len(marks.Jobs))
 
 	report := newStreamReport(StreamHighwater, len(marks.Pods),
@@ -923,14 +934,14 @@ func (e *exporter) writeManifest() error {
 		return err
 	}
 	e.addFile("MANIFEST.json", append(body, '\n'), e.now)
-	e.addFile("COLLECTION-REPORT.txt", []byte(renderReport(m, e.uptime, e.problems)), e.now)
+	e.addFile("COLLECTION-REPORT.txt", []byte(renderReport(m, e.uptime, e.problems, e.marks)), e.now)
 	return nil
 }
 
 // renderReport is MANIFEST.json in prose, for the human who opens the tarball rather than
 // running collect.sh. It says the same things in the same order; if the two ever disagree the
 // JSON is the contract and this is the mistake.
-func renderReport(m Manifest, up Uptime, problems []string) string {
+func renderReport(m Manifest, up Uptime, problems []string, marks *Marks) string {
 	var b strings.Builder
 	_, _ = fmt.Fprintf(&b, "CrystalBackup soak archive\n==========================\n\n")
 	_, _ = fmt.Fprintf(&b, "operator version   %s\n", orDash(m.OperatorVersion))
@@ -955,6 +966,8 @@ func renderReport(m Manifest, up Uptime, problems []string) string {
 		}
 	}
 
+	b.WriteString(renderMoverProfiles(marks))
+
 	_, _ = fmt.Fprintf(&b, "\n\nCOLLECTOR UPTIME\n----------------\n")
 	b.WriteString(wrap(up.Note, "  "))
 	for _, g := range up.Gaps {
@@ -973,6 +986,68 @@ func renderReport(m Manifest, up Uptime, problems []string) string {
 	b.WriteString(wrap(m.UnredactedNote, "  "))
 	_, _ = fmt.Fprintf(&b, "\n  Do NOT send the salt file with this archive. With it every token is "+
 		"reversible by dictionary in seconds; without it, by nobody.\n")
+	return b.String()
+}
+
+// renderMoverProfiles is THE ANSWER, in the file a human opens.
+//
+// Everything else in this report grades the collection. This section states the finding the
+// fortnight was spent to obtain: what each mover sizing class actually peaked at, against limits
+// that internal/mover/profiles.go admits are "deliberately generous" ceilings rather than
+// measurements. It lived only in highwater/marks.json, which meant the person receiving this
+// archive from someone else's cluster had to parse JSON to read the result.
+//
+// EVERY class is printed, including the ones at zero. That is not padding — an aggregate that
+// only had to be non-zero is precisely what hid `data: 0` and `manifests: 0` through a campaign
+// that ran dozens of backups, and a section that silently omitted the empty classes would hide
+// the same failure again in the archive instead of on the status screen.
+func renderMoverProfiles(marks *Marks) string {
+	var b strings.Builder
+	_, _ = fmt.Fprintf(&b, "\n\nMOVER RESOURCE PROFILES (the §5 question)\n")
+	b.WriteString("-----------------------------------------\n")
+	if marks == nil || len(marks.Classes) == 0 {
+		b.WriteString(wrap("no high-water table in this archive, so this soak answers nothing "+
+			"about mover sizing. That is a failed collection, not a finding about the cluster.", "  "))
+		return b.String()
+	}
+
+	b.WriteString(wrap("peak memory per sizing class, measured. Compare each against the limit "+
+		"that class ships with (docs/MOVER-RESOURCES.md): the shipped limits are ceilings chosen "+
+		"to stop one runaway mover taking a node down, NOT fitted estimates, and this is the "+
+		"first evidence of where they actually sit.", "  "))
+	b.WriteString("\n")
+
+	for _, class := range sortedClasses(*marks) {
+		cm := marks.Classes[class]
+		_, _ = fmt.Fprintf(&b, "\n  %-12s %d pod(s) over %d Job(s)\n", class, cm.Pods, cm.JobsObserved)
+		if cm.Pods == 0 {
+			// The honest zero. It says what was observed and refuses to say why, because the
+			// collector cannot tell an idle workload from its own blindness — and it has been
+			// blind before.
+			b.WriteString(wrap(cm.Memory.Reason, "      "))
+			continue
+		}
+		_, _ = fmt.Fprintf(&b, "      peak memory   %s\n", classPeakWord(cm))
+		if cm.ReportedCgroupPeakBytes > 0 {
+			_, _ = fmt.Fprintf(&b, "      cgroup peak   %s  (upper bound, NOT a sizing target: it "+
+				"counts reclaimable page cache; %d limit hit(s))\n",
+				humanBytes(cm.ReportedCgroupPeakBytes), cm.ReportedLimitHits)
+		}
+		_, _ = fmt.Fprintf(&b, "      kills         %d OOM, %d evicted\n", cm.OOMKills, cm.Evictions)
+		if cm.Cache.Status == statusOK {
+			_, _ = fmt.Fprintf(&b, "      restic cache  %s high-water over %d sample(s)\n",
+				humanBytes(cm.CacheHighWaterBytes), cm.CacheSamples)
+		}
+		if cm.LongestSeconds > 0 {
+			_, _ = fmt.Fprintf(&b, "      longest       %.0fs (%s)\n",
+				cm.LongestSeconds, orDash(cm.LongestOperation))
+		}
+	}
+
+	b.WriteString("\n")
+	b.WriteString(wrap("An OOM kill or an eviction anywhere above is the one signal that says a "+
+		"limit is too LOW, and it needs no metrics-server to be true. Everything else here says "+
+		"how much room was left over.", "  "))
 	return b.String()
 }
 
@@ -1129,6 +1204,21 @@ func statusLines(dir string, info CollectorInfo) []string {
 		for _, class := range sortedClasses(marks) {
 			cm := marks.Classes[class]
 			if cm.Pods == 0 {
+				// PRINTED, not skipped. This screen used to omit a class with no pods, which is
+				// how `data: 0` and `manifests: 0` went unremarked for four hours on a cluster
+				// running backups continuously — the two classes simply were not on the screen,
+				// and an absent line reads as nothing to see rather than as nothing measured.
+				//
+				// `unknown` is the exception and it points the other way: an empty unattributed
+				// bucket means every mover was matched to a real class, so flagging it would be
+				// an alarm on good news — and a reader who learns to ignore this arrow here will
+				// ignore it on `data`.
+				if class == classUnknown {
+					out = append(out, fmt.Sprintf("  %-18s none unattributed", class))
+					continue
+				}
+				out = append(out, fmt.Sprintf("  %-18s no pod OBSERVED   <-- check this against "+
+					"what your schedules ran", class))
 				continue
 			}
 			out = append(out, fmt.Sprintf("  %-18s %d pod(s), peak %s, %d OOM, %d evicted",

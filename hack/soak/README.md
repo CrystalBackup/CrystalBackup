@@ -162,8 +162,9 @@ A week of history, one line per day:
 
 ```
 INFO soak-heartbeat at=2026-06-04T00:00:00Z day=4 up=100.0% span=3.0d sessions=1 \
-  metrics=3 state=3 events=3 logs=3 selfchecks=3 movers=412 footprint=71Mi/512Mi \
-  degraded=false drops=0 silent=none
+  metrics=3 state=3 events=3 logs=3 selfchecks=3 movers=412 \
+  movers_by_class=data:96,manifests:48,repo-heavy:12,repo-light:256 \
+  footprint=71Mi/512Mi degraded=false drops=0 silent=none
 ```
 
 What to look at, in order:
@@ -173,6 +174,14 @@ What to look at, in order:
   scrape has never worked and the fortnight is being wasted; go and look now, not in eleven days.
   `events=0` and `logs=0` are never named there, because a fortnight with no Warning event and no
   operator error line is a *good* fortnight.
+- **`movers_by_class=`** — read this one against what your schedules actually do, because
+  `silent=` cannot. A class at zero while backups have been running is not an idle workload, it
+  is a blind instrument: that is the exact failure this field was added for, after a run reported
+  `movers=87 silent=none` while `data` and `manifests` sat at zero through dozens of backups.
+  **`data:0` on day 2 with a nightly schedule firing means go and look now.** The classes are the
+  ones in [`docs/MOVER-RESOURCES.md`](../../docs/MOVER-RESOURCES.md); `data` is backup and
+  restore, `manifests` is the Kubernetes-object dumps, `repo-heavy` is prune/check/sync and
+  `repo-light` is the short repository operations.
 - **`up=`** — the fraction of the elapsed span the collector was actually running. Anything below
   ~90% and the archive will be graded THIN.
 - **`footprint=`** — used against the cap. If it is climbing towards the cap far faster than

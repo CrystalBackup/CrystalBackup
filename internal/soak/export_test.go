@@ -26,6 +26,11 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
+
+	"github.com/CrystalBackup/CrystalBackup/internal/mover"
 )
 
 // exportSalt is 32 bytes and is not the known-answer vector, so a test that used the wrong salt
@@ -647,4 +652,56 @@ func tokenFor(t *testing.T, kind, value string) string {
 	t.Helper()
 	mac := hmacSHA256(exportSalt, append(append([]byte(kind), 0), []byte(value)...))
 	return kind + "-" + hex.EncodeToString(mac[:4])
+}
+
+// TestTheArchiveStatesItsOwnAnswer is about who reads this file.
+//
+// The archive comes back from a cluster its recipient does not have access to. Everything else in
+// COLLECTION-REPORT.txt grades the COLLECTION — how many days, which streams, what was dropped —
+// and for six streams that is the right thing to say. For the high-water table it is not: the
+// numbers the fortnight was spent to obtain lived only in highwater/marks.json, so reading the
+// result meant parsing JSON. An archive whose headline finding is machine-readable only is an
+// archive that gets filed.
+//
+// It also pins the harder half: EVERY sizing class is printed, including the empty ones. Omitting
+// a class with no pods is exactly how `data` and `manifests` stayed invisible through a campaign
+// that ran dozens of backups.
+func TestTheArchiveStatesItsOwnAnswer(t *testing.T) {
+	s := seedCollector(t, 2, true)
+	// One repo-light mover with a peak, and nothing at all for the other three classes — the
+	// asymmetric case, where a section that only printed what it had would look complete.
+	at := day0.Add(time.Hour)
+	pod := terminatedWith(moverPod("job-snap-1", "job-snap", "worker-1", at), mover.MoverResult{
+		OK: true, Operation: string(mover.OpSnapshots),
+		PeakRSSBytes: 101 << 20, MemorySource: mover.MemorySourceBoth,
+	})
+	writeMarksFixture(t, s, marksFixture(t,
+		[]batchv1.Job{moverJob("job-snap", mover.OpSnapshots, at, time.Time{})},
+		[]corev1.Pod{pod}, at.Add(15*time.Second)))
+
+	a := exportToArchive(t, ExportOptions{
+		DataDir: s.Dir(), Salt: exportSalt, Now: day0.AddDate(0, 0, 2),
+	})
+	report := string(a.files["COLLECTION-REPORT.txt"])
+
+	if !strings.Contains(report, "MOVER RESOURCE PROFILES") {
+		t.Fatalf("the report does not state the §5 answer at all; the numbers exist only in "+
+			"highwater/marks.json and the recipient has to parse JSON to read the result:\n%s", report)
+	}
+	for _, class := range mover.Classes() {
+		if !strings.Contains(report, class) {
+			t.Errorf("sizing class %q is absent from the report. A class omitted because it had no "+
+				"pods is a class nobody notices is missing — which is how two of them stayed "+
+				"invisible for four hours.", class)
+		}
+	}
+	// And the class that DOES have a figure carries it, with its provenance — otherwise this test
+	// passes against a section that prints four headings and no data.
+	if !strings.Contains(report, "101Mi") {
+		t.Errorf("the measured peak is not in the report:\n%s", report)
+	}
+	if !strings.Contains(report, "mover-reported") {
+		t.Error("the peak appears without naming its source; an exact process peak and the highest " +
+			"sample anyone caught are different quantities and must never read alike")
+	}
 }

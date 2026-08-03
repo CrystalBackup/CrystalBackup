@@ -32,6 +32,7 @@ import (
 	"fmt"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -345,9 +346,53 @@ func TestSoakKubeletStats(t *testing.T) {
 	}
 }
 
+// TestSoakCanWatchMoversOrItMeasuresNothing pins the two grants the §5 measurement rests on.
+//
+// A mover Job is deleted by the Backup controller on the same reconcile pass that reads its
+// result — measured on the crucible, its Jobs were visible for 9.6s to 23.7s against a 15s sample
+// interval — so the exact peak RSS a mover writes into its own termination message is only ever
+// readable from a watch event. Without these verbs the collector silently falls back to polling,
+// which is precisely the configuration that reported sizing classes `data` and `manifests` as
+// NOT_MEASURED through a campaign that ran dozens of backups.
+//
+// It degrades SILENTLY: the poll keeps working, the archive still arrives, and the numbers are
+// just quietly incomplete. That is why this is a test and not a comment — a well-meaning RBAC
+// tightening would otherwise cost a fortnight of somebody's cluster time before anyone noticed.
+func TestSoakCanWatchMoversOrItMeasuresNothing(t *testing.T) {
+	objs := mustRender(t, soakEnabled...)
+	var cr rbacv1.ClusterRole
+	convert(t, find(t, objs, "ClusterRole", "crystal-backup-soak-collector"), &cr)
+
+	for _, want := range []struct{ group, resource string }{
+		{"", "pods"},
+		{"batch", "jobs"},
+	} {
+		granted := false
+		for _, rule := range cr.Rules {
+			if !slices.Contains(rule.APIGroups, want.group) ||
+				!slices.Contains(rule.Resources, want.resource) {
+				continue
+			}
+			if slices.Contains(rule.Verbs, "watch") {
+				granted = true
+			}
+		}
+		if !granted {
+			t.Errorf("the collector cannot watch %q in apiGroup %q.\n"+
+				"Mover Jobs live ~10-20s and are deleted the moment the controller reads their "+
+				"result, so without this verb the whole §5 memory measurement degrades to whatever "+
+				"a 15s poll happens to catch — silently, with a full-looking archive.",
+				want.resource, want.group)
+		}
+	}
+}
+
 // TestSoakRBACIsReadOnly. The collector writes nothing to the cluster — not a Lease, not an Event,
 // not a ConfigMap (hack/soak/SPEC.md §10) — and reads no Secret anywhere. This asserts the shape
 // rather than a copy of the rule list, so a rule added later still has to be a read.
+//
+// `watch` counts as a read, and the collector holds it on pods and batch/jobs — see
+// TestSoakCanWatchMoversOrItMeasuresNothing for why it must.
 func TestSoakRBACIsReadOnly(t *testing.T) {
 	objs := mustRender(t, append(append([]string{}, soakEnabled...), "soak.kubeletStats=true")...)
 	readVerbs := map[string]bool{"get": true, "list": true, "watch": true}

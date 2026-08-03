@@ -19,9 +19,17 @@ package soak
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
+
+	"github.com/CrystalBackup/CrystalBackup/internal/mover"
 )
 
 // beatValue pulls one key= value off the line, the way a reader with `grep` and `cut` would.
@@ -102,6 +110,53 @@ func TestTheHeartbeatSaysEnoughToJudgeASoakWithoutExportingIt(t *testing.T) {
 	}
 	if got := beatValue(t, line, "footprint"); !strings.Contains(got, "/") {
 		t.Errorf("footprint = %s, want used/cap — the cap is what makes the number mean anything", got)
+	}
+}
+
+// TestTheHeartbeatNamesEverySizingClassEvenAtZero is the guard for the failure the aggregate
+// `movers=` count could not show.
+//
+// A four-hour run printed movers=87 and silent=none — healthy by every field on the line — while
+// classes `data` and `manifests` were at zero throughout a campaign that executed dozens of
+// backups. The collector was structurally blind to both, and repo-light alone kept the aggregate
+// comfortably non-zero. So every class from the sizing table is printed, present at zero, which
+// turns that failure into something a reader spots on day one: `data:0` next to a backup schedule
+// that has been firing.
+//
+// Zero must be PRINTED, not omitted. A key that appears only once it is non-zero cannot be
+// grepped for on the day it matters — the same reason silent= always prints "none".
+func TestTheHeartbeatNamesEverySizingClassEvenAtZero(t *testing.T) {
+	store := newTestStore(t, 1<<30)
+	// One repo-light mover and nothing else: the exact shape of the broken run, where a non-zero
+	// total masked two empty classes.
+	at := day0.Add(time.Hour)
+	writeMarksFixture(t, store, marksFixture(t,
+		[]batchv1.Job{moverJob("job-snap", mover.OpSnapshots, at, time.Time{})},
+		[]corev1.Pod{moverPod("job-snap-1", "job-snap", "worker-1", at)},
+		at.Add(15*time.Second)))
+
+	line := collectHeartbeat(store, CollectorInfo{}, day0.AddDate(0, 0, 2)).String()
+	byClass := beatValue(t, line, "movers_by_class")
+
+	for _, class := range mover.Classes() {
+		if !strings.Contains(byClass, class+":") {
+			t.Errorf("sizing class %q is missing from movers_by_class=%s.\n"+
+				"A class that only appears once it is non-zero is a class nobody can notice is "+
+				"empty, which is exactly how `data` stayed at zero for four hours unremarked.",
+				class, byClass)
+		}
+	}
+	if !strings.Contains(byClass, "data:0") {
+		t.Errorf("movers_by_class=%s does not report data:0; an empty class must be stated, "+
+			"not omitted", byClass)
+	}
+	if !strings.Contains(byClass, "repo-light:1") {
+		t.Errorf("movers_by_class=%s lost the pod that WAS observed — this test would otherwise "+
+			"pass against a breakdown that reports zero for everything", byClass)
+	}
+	if strings.Contains(byClass, " ") {
+		t.Errorf("movers_by_class=%s contains a space; the line is parsed one key per awk field",
+			byClass)
 	}
 }
 
@@ -252,5 +307,36 @@ func TestTheLineIsStableBetweenDays(t *testing.T) {
 	b := collectHeartbeat(store, info, day0.AddDate(0, 0, 2)).String()
 	if a != b {
 		t.Errorf("two beats over the same volume differ:\n%s\n%s", a, b)
+	}
+}
+
+// marksFixture builds a Marks through the REAL aggregation — a HighWater fed a fake lister — and
+// not by hand-filling the struct.
+//
+// A hand-built fixture is how the first version of this helper produced a Marks with pods and an
+// empty Classes map, a shape the collector cannot emit. Tests that assert on the report would
+// then be asserting against a file no cluster ever writes. Everything downstream (per-class
+// counts, the report's §5 section, the heartbeat breakdown) reads Classes, so the fixture has to
+// come from the code that fills it.
+func marksFixture(t *testing.T, jobs []batchv1.Job, pods []corev1.Pod, now time.Time) Marks {
+	t.Helper()
+	h := NewHighWater(newTestStore(t, 1<<20),
+		&fakeLister{jobs: jobs, pods: pods, metrics: []podMetric{}},
+		testNS, 15*time.Second, false)
+	h.Sample(t.Context(), now)
+	return h.Marks(now)
+}
+
+// writeMarksFixture lays the table down as marks.json the way the high-water stream does, so the
+// reader under test goes through disk — a field that never survives the round trip is a field
+// that does not exist as far as an archive is concerned.
+func writeMarksFixture(t *testing.T, store *Store, m Marks) {
+	t.Helper()
+	raw, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(store.Dir(), fileMarks), raw, 0o600); err != nil {
+		t.Fatalf("write marks fixture: %v", err)
 	}
 }

@@ -19,8 +19,12 @@ package soak
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
+	"slices"
 	"strings"
 	"time"
+
+	"github.com/CrystalBackup/CrystalBackup/internal/mover"
 )
 
 // ---------------------------------------------------------------------------------------------
@@ -111,11 +115,20 @@ type heartbeatLine struct {
 	Segments   map[string]int
 	Selfchecks int
 	MoverPods  int
-	Footprint  int64
-	MaxBytes   int64
-	Degraded   bool
-	Drops      int
-	Silent     []string
+	// MoverClasses is the per-sizing-class pod count, and it exists because the aggregate above
+	// hid the worst measurement failure this kit has had.
+	//
+	// A four-hour run reported movers=87 — healthy by every signal on this line, `silent=none` —
+	// while classes `data` and `manifests` sat at zero through a campaign that executed dozens of
+	// backups. The collector could not see them at all, and an aggregate that only has to be
+	// non-zero cannot say so: repo-light alone kept the number up. A per-class breakdown makes
+	// `data:0` visible on day one, to a reader doing nothing more than the ten-second check.
+	MoverClasses map[string]int
+	Footprint    int64
+	MaxBytes     int64
+	Degraded     bool
+	Drops        int
+	Silent       []string
 }
 
 // collectHeartbeat reads the volume and says what is there. It never fails: a heartbeat that
@@ -148,6 +161,18 @@ func collectHeartbeat(store *Store, info CollectorInfo, now time.Time) heartbeat
 		var marks Marks
 		if json.Unmarshal(raw, &marks) == nil {
 			h.MoverPods = len(marks.Pods)
+			// Every class from the sizing table, present even at zero. A key that only appears
+			// once it is non-zero is a key nobody can grep for on the day it matters — the same
+			// reason silent= always prints "none".
+			h.MoverClasses = map[string]int{}
+			for _, class := range mover.Classes() {
+				h.MoverClasses[class] = 0
+			}
+			for _, p := range marks.Pods {
+				if _, known := h.MoverClasses[p.Class]; known {
+					h.MoverClasses[p.Class]++
+				}
+			}
 		}
 	}
 	if total, err := store.Footprint(); err == nil {
@@ -195,6 +220,15 @@ func (h heartbeatLine) String() string {
 		fmt.Fprintf(&b, " %s=%d", stream, h.Segments[stream])
 	}
 	fmt.Fprintf(&b, " selfchecks=%d movers=%d", h.Selfchecks, h.MoverPods)
+	// Sorted, so two consecutive days diff cleanly, and comma-separated with no spaces so the
+	// whole line stays one awk field per key.
+	if len(h.MoverClasses) > 0 {
+		parts := make([]string, 0, len(h.MoverClasses))
+		for _, class := range slices.Sorted(maps.Keys(h.MoverClasses)) {
+			parts = append(parts, fmt.Sprintf("%s:%d", class, h.MoverClasses[class]))
+		}
+		fmt.Fprintf(&b, " movers_by_class=%s", strings.Join(parts, ","))
+	}
 	fmt.Fprintf(&b, " footprint=%s/%s", humanBytes(h.Footprint), humanBytes(h.MaxBytes))
 	fmt.Fprintf(&b, " degraded=%t drops=%d", h.Degraded, h.Drops)
 	// silent= is always present, with an explicit "none", because a key that disappears when

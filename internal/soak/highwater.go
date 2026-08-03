@@ -31,6 +31,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/watch"
 
 	"github.com/CrystalBackup/CrystalBackup/internal/mover"
 )
@@ -56,10 +57,32 @@ import (
 //
 // So the mover measures itself. The shim already writes a structured mover.MoverResult to its
 // termination message; it now carries its own peak RSS (exact, from the kernel's per-process
-// accounting), its cgroup peak, and the two memory.events counters. The collector reads them off
-// the terminated pod — an object it was listing anyway, which survives the pod for the Job's
-// ttlSecondsAfterFinished (600s to 3600s), two to three orders of magnitude more forgiving than
-// one scrape interval.
+// accounting), its cgroup peak, and the two memory.events counters.
+//
+// AND THAT WAS STILL NOT ENOUGH — the sentence that used to end this paragraph was wrong, and
+// wrong in the way that costs a measurement rather than a compile. It read: the collector reads
+// the result off the terminated pod, "an object it was listing anyway, which survives the pod for
+// the Job's ttlSecondsAfterFinished (600s to 3600s)". The TTL is a CRASH FALLBACK. In the normal
+// path the Backup controller deletes the mover Job on the same reconcile pass that reads its
+// result, so it never fires. Measured on the crucible at 0.25s resolution, the four Jobs of one
+// ClusterBackup were visible for 9.6s, 11.0s, 16.3s and 23.7s — not 600s. Against a 15s poll that
+// is a coin toss per mover, and it loses most often on the shortest ones.
+//
+// Compounding it, the selector was wrong too: mover.BuildJob stamped no identity label of its
+// own, so six of the ten creation sites — both data movers, all four manifest movers — produced
+// Jobs this collector could not match at all. The result was a four-hour run, alongside a
+// campaign that executed dozens of backups, reporting classes `data` and `manifests` as
+// NOT_MEASURED with the reason "no data mover pod ran while the collector was up". True about
+// what the collector saw. False about the cluster. The instrument lied, quietly, in the exact
+// shape this package spends its comments warning about.
+//
+// Hence THREE sources, with a clean division of labour:
+//
+//	watch (moverwatch.go)  — exact per-mover figures. No visibility window: the event arrives
+//	                         when the kubelet writes the terminated status, however brief the pod.
+//	poll (Sample, here)    — sampled quantities the watch cannot give (metrics.k8s.io, kubelet
+//	                         cache stats), and the periodic re-list that repairs a dropped watch.
+//	mover self-report      — the number itself, exact, from the process that ran.
 //
 // The sampled path stays, for pods long-lived enough to be caught and as a cross-check, but the
 // mover-reported figure is PREFERRED and every figure names its source. The two are not the same
@@ -72,13 +95,45 @@ import (
 // as evidence that prune's 8Gi limit is right when it is evidence about backup's 4Gi.
 const classUnknown = "unknown"
 
-// moverAppLabel selects mover pods and their Jobs. The controllers stamp it on both the Job and
-// its pod template (internal/controller's moverAppName), so one label selector finds the whole
-// population without the collector having to know which controller created what.
+// moverAppLabel selects mover pods and their Jobs. mover.BuildJob stamps it on both the Job and
+// its pod template, for every operation, so one label selector finds the whole population without
+// the collector having to know which controller created what.
+//
+// That sentence was FALSE when this file was written, and the collector believed it for four
+// hours of paid cluster time. The label was not stamped by the builder at all — each of the ten
+// creation sites put it in its own label map, and six of them did not: the two data movers and
+// all four manifest movers. So this selector matched maintenance, init, discovery and sync, and
+// the collector reported classes `data` and `manifests` as NOT_MEASURED through a run that
+// executed dozens of backups. It read as "your workload never ran a backup"; the truth was "the
+// instrument cannot see backups".
+//
+// Two things changed as a result, and BOTH matter — the second is not redundant:
+//
+//  1. mover.BuildJob now stamps the label itself, so no call site can omit it (see
+//     mover.LabelAppName). The keys below ALIAS the mover package's constants rather than
+//     repeating the strings, so this selector cannot drift from what the builder writes.
+//  2. requireOperationArg below means the collector no longer *depends* on the label being
+//     right. A mover is identified by what it runs — the `--operation` flag on the mover binary
+//     — which is a definition, not a decoration.
 const (
-	moverAppLabel = "app.kubernetes.io/name"
-	moverAppValue = "crystal-mover"
+	moverAppLabel = mover.LabelAppName
+	moverAppValue = mover.AppName
 	labelJobName  = "job-name"
+)
+
+// moverManagedByLabel is the second, wider selector. Every mover Job carries managed-by
+// (the egress NetworkPolicy matches on it, so a mover without it cannot reach S3 at all and would
+// never have run), which makes it the one label a mover provably cannot lack.
+//
+// The collector lists on THIS and narrows to real movers by the `--operation` arg, rather than
+// listing on the identity label. The difference is the whole lesson of the defect above: the
+// identity label is now correct, but a measurement instrument that is only correct because
+// something else remembered to be correct is the instrument that quietly reported two empty
+// classes. Listing wider and narrowing on evidence cannot fail that way — and it also catches a
+// mover built by a future path that forgets the label again.
+const (
+	moverManagedByLabel = "app.kubernetes.io/managed-by"
+	moverManagedByValue = "crystal-backup"
 )
 
 // The two container-termination verdicts this stream reads off a pod. Spelled once: a misspelling
@@ -278,6 +333,29 @@ type podLister interface {
 	NodeStats(ctx context.Context, node string) ([]podVolumeStats, error)
 }
 
+// moverEventWatcher is the OTHER half of the sampler's input, and the reason the high-water table
+// can be trusted at all.
+//
+// Polling cannot see a mover. Measured on the crucible at 0.25s resolution, the four Jobs of one
+// ordinary ClusterBackup were visible for 9.6s, 11.0s, 16.3s and 23.7s — the Backup controller
+// deletes each mover Job on the same reconcile pass that reads its result, so the 3600s
+// ttlSecondsAfterFinished is a crash fallback that normally never fires. Against the 15s sample
+// interval that is a coin toss per mover, and the shortest movers — an empty PVC, a tiny
+// namespace — lose it every time.
+//
+// A watch has no such window. The API server delivers the MODIFIED event the instant the kubelet
+// writes the terminated container status (termination message included, which is where the
+// mover's exact peak RSS lives) and the DELETED event carries the object's last state as well. A
+// mover that exists for one second is captured the same as one that runs for an hour.
+//
+// The poll is NOT replaced. It still drives everything a watch cannot give: metrics.k8s.io
+// sampling, kubelet cache stats, and a periodic full re-list that repairs whatever a watch
+// disconnect dropped. Poll for sampled quantities, watch for exact ones.
+type moverEventWatcher interface {
+	WatchPods(ctx context.Context, namespace, selector string) (watch.Interface, error)
+	WatchJobs(ctx context.Context, namespace, selector string) (watch.Interface, error)
+}
+
 type podMetric struct {
 	Name       string
 	MemoryUsed int64
@@ -346,7 +424,10 @@ const kubeletDisabledReason = "--kubelet-stats was not set, so the restic cache 
 // not stop the OOM-kill and eviction counting, which needs nothing but the pod list and is the
 // half of this stream that is always available.
 func (h *HighWater) Sample(ctx context.Context, now time.Time) {
-	selector := moverAppLabel + "=" + moverAppValue
+	// The WIDE selector: every workload the operator manages, narrowed to movers below by the
+	// `--operation` arg rather than by a label. See moverManagedByLabel for why the narrow,
+	// obvious selector is the one that reported two empty sizing classes.
+	selector := moverManagedByLabel + "=" + moverManagedByValue
 
 	jobs, err := h.lister.ListJobs(ctx, h.Namespace, selector)
 	if err != nil {
@@ -426,7 +507,13 @@ func (h *HighWater) observeJobs(jobs *batchv1.JobList) {
 	defer h.mu.Unlock()
 	for i := range jobs.Items {
 		job := &jobs.Items[i]
-		op, class := operationOfJob(job)
+		op, class, isMover := operationOfJob(job)
+		if !isMover {
+			// A crystal-backup Job that runs no mover operation — a hook runner, the crucible's
+			// restic oracle. Not a sizing datum, and filing it under `unknown` would put a
+			// non-mover's memory in a table whose only purpose is sizing movers.
+			continue
+		}
 		h.jobClass[job.Name] = jobIdentity{Operation: op, Class: class}
 		mark, ok := h.jobs[job.Name]
 		if !ok {
@@ -457,7 +544,12 @@ func (h *HighWater) observePods(pods *corev1.PodList, now time.Time) {
 		mark, ok := h.pods[pod.Name]
 		if !ok {
 			job := jobNameOf(pod)
-			ident := h.jobClass[job]
+			ident, known := h.jobClass[job]
+			if !known && pod.Labels[moverAppLabel] != moverAppValue {
+				// Neither its Job nor the pod itself says "mover". The wide list is by
+				// managed-by, so this is a hook or oracle pod, not an unattributed mover.
+				continue
+			}
 			if ident.Class == "" {
 				ident = jobIdentity{Operation: classUnknown, Class: classUnknown}
 			}
@@ -623,7 +715,13 @@ func jobNameOf(pod *corev1.Pod) string {
 // which is a fact about the object and not an inference from it.
 //
 // Anything that does not parse becomes unknown. Never a guess.
-func operationOfJob(job *batchv1.Job) (string, string) {
+// operationOfJob reads a Job's operation off the `--operation` flag its mover container is
+// launched with, and reports whether this Job is a mover at all.
+//
+// The third return is what lets the collector list on the wide managed-by selector and still be
+// precise: a Job with no --operation flag runs no mover, so it is skipped rather than filed under
+// `unknown`. Being a mover is a property of what the Job RUNS, which no label can get wrong.
+func operationOfJob(job *batchv1.Job) (op, class string, isMover bool) {
 	for _, c := range job.Spec.Template.Spec.Containers {
 		for i, arg := range c.Args {
 			if arg != "--operation" || i+1 >= len(c.Args) {
@@ -631,14 +729,14 @@ func operationOfJob(job *batchv1.Job) (string, string) {
 			}
 			op := c.Args[i+1]
 			if class, ok := mover.ClassOf(mover.Operation(op)); ok {
-				return op, class
+				return op, class, true
 			}
 			// A known flag with an operation this build's table does not name: report the
 			// operation (it is real) and refuse to class it.
-			return op, classUnknown
+			return op, classUnknown, true
 		}
 	}
-	return classUnknown, classUnknown
+	return classUnknown, classUnknown, false
 }
 
 func (h *HighWater) setMetricsServer(v MeasuredValue) {
@@ -845,10 +943,34 @@ func moverReportedReason(cm ClassMarks) string {
 // answering for long-lived pods, ZERO samples on every single mover. A shorter
 // --mover-sample-interval cannot fix it — the data is not there to be sampled — which is why the
 // mover reports its own peak (mover.MoverResult) and why this stream prefers that number.
+// A THIRD case hides inside the first, and it is the one that actually happened: pods == 0
+// because the collector could not SEE them. Six of the ten mover creation sites did not stamp the
+// label this stream selected on, and a mover Job is deleted within ~10-20s of finishing, so
+// `data` and `manifests` reported "no data mover pod ran" through a campaign that ran dozens of
+// backups. Both causes are fixed (mover.BuildJob stamps the label; moverwatch.go removes the
+// visibility window), but the zero-pods sentence must no longer claim more than it knows: it
+// tells the reader what to check rather than asserting an idle workload.
 func noPeakReason(class string, pods int) string {
+	// `unknown` is not a sizing class, it is the bucket for a mover whose operation could not be
+	// recovered — so EMPTY IS THE HEALTHY ANSWER, and the nudge below would be exactly backwards.
+	// Printing "check this against what your schedules ran" beside good news is how a reader
+	// learns to ignore the warning that matters.
+	if class == classUnknown {
+		if pods == 0 {
+			return "no unattributed mover — every mover the collector saw was matched to a real " +
+				"sizing class, which is the healthy answer here"
+		}
+		return fmt.Sprintf("%d mover pod(s) could not be attributed to a sizing class. Their "+
+			"peaks are deliberately NOT folded into any class: a `data` peak filed under "+
+			"`repo-heavy` would read as evidence about prune's limit when it is evidence about "+
+			"backup's", pods)
+	}
 	if pods == 0 {
-		return fmt.Sprintf("no %s mover pod ran while the collector was up, so there is no peak to "+
-			"report. This is not a measurement of zero", class)
+		return fmt.Sprintf("no %s mover pod was OBSERVED while the collector was up, so there is "+
+			"no peak to report. This is not a measurement of zero. It usually means no operation "+
+			"of that class ran — but this collector has been blind to a whole class before, so "+
+			"check it against the runs the state stream recorded rather than concluding your "+
+			"workload was idle", class)
 	}
 	return fmt.Sprintf("%d %s mover pod(s) ran and NOT ONE of them was ever sampled: metrics-server "+
 		"only exposes a pod after it has scraped it, on its own cadence (~15s), so a mover that "+

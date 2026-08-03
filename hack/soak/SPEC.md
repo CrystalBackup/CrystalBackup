@@ -36,7 +36,7 @@ crystal-backup soak-export  [flags]     # writes one tar.gz to stdout, or --stat
 | `--metrics-insecure-skip-verify` | `false` | §2. |
 | `--metrics-interval` | `60s` | scrape cadence. |
 | `--metrics-resolution` | `5m` | downsample window. §3. |
-| `--mover-sample-interval` | `15s` | how often mover pods are sampled for the high-water marks. §5. |
+| `--mover-sample-interval` | `15s` | how often mover pods are SAMPLED (metrics.k8s.io, kubelet cache stats). It does not govern whether a mover is seen at all: the exact per-mover figures arrive on a watch, because a mover Job lives ~10-20s and no interval catches that reliably. §5. |
 | `--selfcheck-interval` | `24h` | |
 | `--state-interval` | `1h` | CR snapshots. |
 | `--operator-namespace` | `$POD_NAMESPACE` | same resolution as everywhere else. |
@@ -245,9 +245,10 @@ What to produce, per **operation class** (`data`, `repo-heavy`, `repo-light`, `m
 | restic cache high-water | kubelet `stats/summary`, per-pod volume stats | `--kubelet-stats` only; otherwise NOT MEASURED |
 | longest prune, longest backup, longest check | mover Job start/completion timestamps | wall clock, which is what blocks a window — the duration histogram measures the operator's view of the same thing and both should be in the archive |
 
-Attribution: a mover pod's operation comes from its owning **Job**, which the operator labels.
-Where the operation is not directly recoverable from the labels the controller stamps, derive it
-from the Job and record `unknown` — **never guess a class**, because a `data` peak filed under
+Attribution: a mover pod's operation comes from the `--operation` flag on its owning **Job** —
+what the Job RUNS, never what it is labelled. Labels were the first design and they were wrong in
+a way that cost a four-hour run (see "Why polling cannot answer this" below). Where the operation
+is not recoverable, record `unknown` — **never guess a class**, because a `data` peak filed under
 `repo-heavy` would be read as evidence that prune's 8Gi limit is right when it is evidence about
 backup's 4Gi.
 
@@ -274,6 +275,40 @@ data is not there to be sampled.**
 
 The mover therefore measures itself and reports through the channel that already exists. Its
 `MoverResult` gains, and this stream prefers:
+
+**And that was still not enough.** The measurement above fixed the memory number and left the
+collector unable to find the pod carrying it. Two further defects, both found by running the kit
+against a crucible and reading what it produced rather than trusting that it worked:
+
+1. **The selector matched four creation sites out of ten.** `mover.BuildJob` stamped no identity
+   label of its own — each caller passed its own label map, and only maintenance, repository
+   init, discovery and external sync included `app.kubernetes.io/name=crystal-mover`. The two
+   data movers and all four manifest movers did not. Nothing in the operator selects on that
+   label, so the omission was invisible in-cluster for six milestones; what it broke was every
+   outside observer, this collector included. `BuildJob` now stamps it itself, and the collector
+   no longer depends on it — it lists on `app.kubernetes.io/managed-by` and identifies a mover by
+   the `--operation` flag it runs, which is a definition rather than a decoration.
+
+2. **A mover Job is not there long enough to be listed.** The Backup controller deletes each
+   mover Job on the same reconcile pass that reads its result, so `ttlSecondsAfterFinished` is a
+   crash fallback that normally never fires. Measured on the crucible at 0.25s resolution, the
+   four Jobs of one `ClusterBackup` were visible for **9.6s, 11.0s, 16.3s and 23.7s** against a
+   15s sample interval. Polling here is not a conservative choice, it is a coin toss, and it
+   loses most often on the shortest movers.
+
+   So the exact figures come from a **watch** and the sampled ones stay on the poll. The
+   objection that kept `watch` out of this kit originally — "a collector that lost its watch on
+   day four would record nothing for ten days while looking perfectly healthy" — is answered
+   rather than ignored: the poll still runs on its interval and repairs whatever a dropped watch
+   missed, so the degraded mode is the previous release's behaviour, not silence.
+
+Together those two are why a four-hour run alongside a campaign that executed dozens of backups
+reported classes `data` and `manifests` as NOT MEASURED — *"no data mover pod ran while the
+collector was up"*. The sentence was true about what the collector saw and false about the
+cluster, which is the exact failure this document spends five paragraphs warning about. After the
+fix, one ordinary `ClusterBackup` over two namespaces produced 4 backup movers and 3 manifest
+movers and the collector recorded **7 of 7**, with 3 of the 4 data pods at `samples: 0` — proof
+that the event path, not the sampler, is what carried them.
 
 | field | what it is | what it means |
 |---|---|---|

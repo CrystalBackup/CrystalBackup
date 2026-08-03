@@ -25,6 +25,7 @@ import (
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
 )
 
@@ -44,6 +45,18 @@ func (l *clusterLister) ListPods(ctx context.Context, ns, selector string) (*cor
 
 func (l *clusterLister) ListJobs(ctx context.Context, ns, selector string) (*batchv1.JobList, error) {
 	return l.cs.BatchV1().Jobs(ns).List(ctx, listOptionsFor(selector))
+}
+
+// WatchPods and WatchJobs are the event half (see moverEventWatcher). Same namespace, same
+// selector, same handful of objects as the List above — a watch on a label-selected slice of one
+// namespace is not the cluster-wide informer this package rules out, it is one long-lived HTTP
+// response carrying only mover events.
+func (l *clusterLister) WatchPods(ctx context.Context, ns, selector string) (watch.Interface, error) {
+	return l.cs.CoreV1().Pods(ns).Watch(ctx, listOptionsFor(selector))
+}
+
+func (l *clusterLister) WatchJobs(ctx context.Context, ns, selector string) (watch.Interface, error) {
+	return l.cs.BatchV1().Jobs(ns).Watch(ctx, listOptionsFor(selector))
 }
 
 // podMetricsList is the shape of metrics.k8s.io/v1beta1 PodMetricsList, transcribed rather than

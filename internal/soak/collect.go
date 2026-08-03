@@ -45,6 +45,10 @@ type Collector struct {
 	Scraper    *Scraper
 	Aggregator *Aggregator
 	HighWater  *HighWater
+	// MoverWatch is the one thing here that is NOT on the tick: mover Jobs live ten to twenty
+	// seconds and no tick can be relied on to land inside that. Nil disables it and the loop
+	// degrades to polling only. See moverwatch.go.
+	MoverWatch *MoverWatch
 	Events     *EventStream
 	Logs       *LogStream
 	State      *StateStream
@@ -86,6 +90,14 @@ func (c *Collector) Run(ctx context.Context) error {
 	c.Aggregator.Start(now)
 	c.progress("collecting: metrics every %s into %s windows, movers every %s, CR state every %s",
 		c.MetricsInterval, c.Info.MetricsResolution, c.MoverInterval, c.StateInterval)
+
+	// Started before the first tick, and left to run for the whole session. It shares ctx, so
+	// cancellation ends it with everything else; Run returns once both watches are down.
+	if c.MoverWatch != nil {
+		go c.MoverWatch.Run(ctx)
+		c.progress("watching mover Jobs and pods for events (a mover Job lives ~10-20s, " +
+			"which no poll interval can be relied on to catch)")
+	}
 	// One line NOW, before the first tick. An administrator who has just applied the manifest
 	// gets their confirmation in seconds rather than a day from now, and the day-one check that
 	// hack/soak/README.md asks for has something to look at.
