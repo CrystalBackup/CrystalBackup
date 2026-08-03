@@ -18,7 +18,7 @@ Le chart est publié comme artefact OCI sur GHCR.
 ```bash
 helm install crystal-backup \
   oci://ghcr.io/crystalbackup/charts/crystal-backup \
-  --version 0.6.1 \
+  --version 0.6.2 \
   --namespace crystal-backup-system \
   --create-namespace
 ```

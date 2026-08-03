@@ -119,7 +119,7 @@ spec:
   interval: 1h
   url: oci://ghcr.io/crystalbackup/charts/crystal-backup
   ref:
-    tag: "0.6.1"        # the pin. Bumping this IS the upgrade.
+    tag: "0.6.2"        # the pin. Bumping this IS the upgrade.
 ```
 
 :::note
@@ -150,7 +150,7 @@ Confirmez l'identité contre la release que vous épinglez réellement **avant**
 `OCIRepository` en panne :
 
 ```bash
-cosign verify ghcr.io/crystalbackup/charts/crystal-backup:0.6.1 \
+cosign verify ghcr.io/crystalbackup/charts/crystal-backup:0.6.2 \
   --certificate-oidc-issuer=https://token.actions.githubusercontent.com \
   --certificate-identity-regexp='^https://github.com/CrystalBackup/CrystalBackup/'
 ```
@@ -221,7 +221,7 @@ vendorez les CRDs dans votre repository Git, et appliquez-les depuis une `Kustom
 dont le `HelmRelease` `dependsOn`. Extrayez-les avec :
 
 ```bash
-helm pull oci://ghcr.io/crystalbackup/charts/crystal-backup --version 0.6.1 --untar
+helm pull oci://ghcr.io/crystalbackup/charts/crystal-backup --version 0.6.2 --untar
 ls crystal-backup/crds/
 ```
 

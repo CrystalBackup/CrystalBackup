@@ -156,7 +156,7 @@ spec:
   source:
     repoURL: ghcr.io/crystalbackup/charts
     chart: crystal-backup
-    targetRevision: 0.6.1          # the pin. Bumping this IS the upgrade.
+    targetRevision: 0.6.2          # the pin. Bumping this IS the upgrade.
     helm:
       # Keep the release name fixed. The chart stamps
       # `app.kubernetes.io/instance: <release name>` on every object, and Argo CD
@@ -263,7 +263,7 @@ Twelve is the expected answer. Zero means the CRDs are not in your rendered set,
 apply them yourself before every upgrade:
 
 ```bash
-helm pull oci://ghcr.io/crystalbackup/charts/crystal-backup --version 0.6.1 --untar
+helm pull oci://ghcr.io/crystalbackup/charts/crystal-backup --version 0.6.2 --untar
 kubectl apply -f crystal-backup/crds/
 ```
 

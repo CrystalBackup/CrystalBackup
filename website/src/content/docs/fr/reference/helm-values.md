@@ -9,7 +9,7 @@ Les défauts viennent du `values.yaml` du chart lui-même. Seules les values que
 chances de changer sont annotées ; les autres sont listées par souci d'exhaustivité.
 
 ```bash
-helm show values oci://ghcr.io/crystalbackup/charts/crystal-backup --version 0.6.1
+helm show values oci://ghcr.io/crystalbackup/charts/crystal-backup --version 0.6.2
 ```
 
 ## Namespace et nommage
@@ -115,6 +115,43 @@ Certains CNI acceptent les objets NetworkPolicy et n'appliquent rien — le `kin
 défaut de Kind en fait partie. Leur présence n'est pas en soi la preuve que le confinement
 tient. Vérifiez-le sur votre CNI.
 :::
+
+## Collecteur de soak
+
+Désactivé par défaut. Une fois activé il ajoute **un pod résident** (200m CPU / 384Mi mémoire,
+requests égales aux limits) et **un PVC**, et accorde un ServiceAccount **en lecture seule,
+cluster-wide**, distinct de celui de l'operator. Il existe pour répondre à des questions que la CI
+ne peut pas trancher — ce que devraient être les profils mémoire des movers sur de vraies données,
+ce que quinze jours d'ordonnancement réel produisent — et il se met en route délibérément, se
+laisse tourner deux semaines, puis s'exporte et s'éteint.
+
+Le protocole, et ce qu'il faut vérifier dès le premier jour, sont dans
+[`hack/soak/README.md`](https://github.com/CrystalBackup/CrystalBackup/blob/main/hack/soak/README.md).
+
+| Value | Défaut | Notes |
+|---|---|---|
+| `soak.enabled` | `false` | Rend le Deployment du collecteur, son PVC et sa RBAC. Rien n'est créé tant que c'est `false`. |
+| `soak.saltMethod` | `auto` | `auto` dérive le sel de rédaction de l'UID du namespace de l'operator et ne crée aucun Secret ; `fromSecret` utilise celui que vous avez créé. Les deux produisent des archives aux **garanties de réversibilité différentes** — lisez le bloc `redaction` de l'archive avant de l'envoyer où que ce soit. |
+| `soak.saltSecret` | `""` | Exigé par `saltMethod: fromSecret`, et par lui seul. Régler les deux, ou aucun, est refusé au rendu du template plutôt qu'en CrashLoopBackOff. |
+| `soak.storage` | `1Gi` | La demande du PVC. Si votre StorageClass par défaut est adossée au nœud (local-path), ce PVC **est** du disque de nœud. |
+| `soak.maxBytes` | `512Mi` | Le plafond dur que le collecteur respecte : il fait tourner les données les plus anciennes plutôt que de grossir. Volontairement sous la taille du PVC. |
+| `soak.kubeletStats` | `false` | Lie le ClusterRole `nodes/proxy`, seule source du high-water du cache restic. Le rôle est rendu dans tous les cas, et laissé non lié tant que vous ne réglez pas ceci. |
+| `soak.metricsInterval` | `60s` | Cadence de scrape de l'operator. |
+| `soak.metricsResolution` | `5m` | Fenêtre d'agrégation des scrapes. |
+| `soak.moverSampleInterval` | `15s` | Fréquence d'**échantillonnage** des pods movers (metrics.k8s.io, stats de cache du kubelet). Cela ne décide pas si un mover est vu : les chiffres exacts par mover arrivent par un watch, car un Job mover vit dix à vingt secondes et aucun intervalle de sondage ne l'attrape de façon fiable. |
+| `soak.selfcheckInterval` | `24h` | Le self-check quotidien d'installation. |
+| `soak.stateInterval` | `1h` | Instantanés du statut des CR. |
+
+Vérifiez qu'il collecte **au jour 1 et au jour 2**, pas au jour 14 :
+
+```sh
+kubectl -n crystal-backup-system logs deploy/crystal-backup-soak | grep soak-heartbeat | tail -7
+```
+
+Une ligne par jour. `silent=none` est ce que vous voulez ; `movers_by_class=` doit afficher un
+compte non nul pour chaque classe que vos schedules exercent réellement — une classe à zéro alors
+que des sauvegardes tournent signifie que l'instrument est aveugle, pas que votre charge de
+travail était au repos.
 
 ## Réservé
 

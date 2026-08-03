@@ -362,6 +362,17 @@
       .timeline li.here .ms-id { color: var(--cyan); }
       .timeline li.here .ms-label { color: var(--text); font-weight: 600; }
       .ms-here { font-size: 0.72rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: #041027; background: var(--grad); padding: 4px 10px; border-radius: 999px; }
+      /* `up next` is deliberately quieter than `you are here`: outlined and muted rather than
+         the filled gradient. The filled badge means "this is what you can install today"; a
+         milestone that has not started must not compete with it for the eye, which is exactly
+         what it did while it wore the same marker. */
+      .timeline li.next { border-style: dashed; }
+      .timeline li.next .ms-label { color: var(--muted); }
+      .ms-next {
+        font-size: 0.72rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em;
+        color: var(--muted-2); white-space: nowrap;
+        border: 1px dashed var(--brd); border-radius: 999px; padding: 4px 11px;
+      }
       .ms-done {
         font-size: 0.72rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em;
         color: var(--cyan); white-space: nowrap;

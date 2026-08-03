@@ -7,7 +7,7 @@ sourceHash: 28b7eb61cfdbcad990398c7f7bc2db9f613e3842
 
 ## Où en est le projet
 
-La version courante est **`v0.6.1`**. Les jalons M0 à M6 sont livrés : le moteur de backup,
+La version courante est **`v0.6.2`**. Les jalons M0 à M6 sont livrés : le moteur de backup,
 le disaster recovery du cluster, le restore, les manifests et le DR cluster-scoped, les
 hooks de cohérence, la maintenance et la vérification du repository, le plan namespace, la
 synchronisation externe, le droit à l'effacement, et la couche d'observabilité posée devant
