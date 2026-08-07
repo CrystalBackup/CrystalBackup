@@ -289,8 +289,14 @@ func (r *ClusterBackupLocationReconciler) Reconcile(ctx context.Context, req ctr
 	// question is unresolved, provisioning must wait: a mint now could fork the repository
 	// password away from a recoverable escrow copy.
 	if r.reconcileDEKEscrow(ctx, &loc) {
-		status.SetCondition(&loc.Status.Conditions, ConditionReady, metav1.ConditionFalse, "DEKRecoveryPending",
-			"the bucket escrow may hold a recoverable DEK; repository provisioning waits — see condition DEKEscrowed", loc.Generation)
+		// The reason names the CLASS of problem and defers the specifics to DEKEscrowed, which
+		// now distinguishes seven of them. It used to say "may hold a recoverable DEK; provisioning
+		// waits", which reads as a transient wait — true of EscrowUnreachable, and wrong of a
+		// conflict or a KEK that opens nothing, where nothing improves without an administrator.
+		status.SetCondition(&loc.Status.Conditions, ConditionReady, metav1.ConditionFalse, "DEKEscrowUnresolved",
+			"the wrapped-DEK escrow question is unresolved, so the repository is not provisioned: minting a DEK "+
+				"now could fork it away from a recoverable one. See condition DEKEscrowed for which case this is "+
+				"and whether it clears on its own", loc.Generation)
 		loc.Status.Phase = locationPhaseDegraded
 		if err := r.Status().Update(ctx, &loc); err != nil {
 			return ctrl.Result{}, fmt.Errorf("update status for ClusterBackupLocation %s: %w", loc.Name, err)
