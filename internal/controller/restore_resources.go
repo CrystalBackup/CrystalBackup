@@ -319,6 +319,7 @@ func (r *RestoreReconciler) startResourcesJob(
 		Image:     r.Engine.MoverImage,
 		Operation: mover.OpManifestsRestore,
 		Profiles:  r.Engine.MoverProfiles,
+		Placement: r.Engine.MoverPlacement,
 		ResticArgs: restic.ManifestsRestoreArgs(plan.snapshotID, plan.snapshotPath,
 			mover.ManifestsRestoreDir),
 		RepoURL:       rc.repoURL,

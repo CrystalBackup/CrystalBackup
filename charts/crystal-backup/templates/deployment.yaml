@@ -21,6 +21,10 @@ spec:
         # nothing at all until the next unrelated restart — a knob an admin can read back and that
         # never reached a pod, which is exactly the defect class this milestone is closing.
         checksum/mover-profiles: {{ include (print $.Template.BasePath "/mover-profiles.yaml") . | sha256sum }}
+        # Same argument, and it bites harder: a `helm upgrade` that adds a nodeSelector to
+        # `mover.placement` without restarting the operator leaves every mover scheduling
+        # exactly where it did before, with the new placement visible in `helm get values`.
+        checksum/mover-placement: {{ include (print $.Template.BasePath "/mover-placement.yaml") . | sha256sum }}
         {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -64,6 +68,12 @@ spec:
             # ConfigMap mounted below. The operator holds the DEFAULTS itself — this file carries
             # only what the platform changed — and refuses to start if it cannot make sense of it.
             - --mover-profiles-file=/etc/crystal-backup/mover/profiles.yaml
+            # Where mover Jobs may run (`mover.placement`), rendered into the second ConfigMap
+            # mounted below. Empty — the default — schedules movers anywhere, which is what every
+            # release before 0.6.3 did. The operator refuses to start on a placement it cannot
+            # make sense of, because the failure it would otherwise produce is a mover on a node
+            # that cannot mount the volume, at whatever hour the schedule fires.
+            - --mover-placement-file=/etc/crystal-backup/mover-placement/placement.yaml
             {{- if .Values.rbac.create }}
             # The manifest mover's identity and the ClusterRole the operator binds transiently
             # into a tenant namespace for a capture. Passed rather than derived: these names are
@@ -138,6 +148,9 @@ spec:
             - name: mover-profiles
               mountPath: /etc/crystal-backup/mover
               readOnly: true
+            - name: mover-placement
+              mountPath: /etc/crystal-backup/mover-placement
+              readOnly: true
             {{- if .Values.admission.webhook.enabled }}
             # The chart-generated webhook serving certificate (webhook.yaml). The path is
             # controller-runtime's default CertDir, so no --webhook-cert-path flag is needed.
@@ -151,6 +164,9 @@ spec:
         - name: mover-profiles
           configMap:
             name: {{ include "crystal-backup.fullname" . }}-mover-profiles
+        - name: mover-placement
+          configMap:
+            name: {{ include "crystal-backup.fullname" . }}-mover-placement
         {{- if .Values.admission.webhook.enabled }}
         - name: webhook-certs
           secret:

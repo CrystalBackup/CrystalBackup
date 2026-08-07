@@ -75,9 +75,13 @@ type ClusterBackupReconciler struct {
 	// The names are configured rather than derived — the chart release-prefixes them. An empty
 	// reader role disables the capture, the same way the namespaced half handles an unconfigured
 	// operator.
-	Secrets                          *secrets.ByNameReader
-	MoverImage                       string
-	MoverProfiles                    mover.Profiles
+	Secrets       *secrets.ByNameReader
+	MoverImage    string
+	MoverProfiles mover.Profiles
+	// MoverPlacement is the operator-wide scheduling policy carried by the cluster-manifests
+	// capture Job, so that the one mover with API-server credentials is not also the one mover
+	// running somewhere the administrator did not put the others.
+	MoverPlacement                   mover.Placement
 	ManifestMoverServiceAccount      string
 	ClusterManifestReaderClusterRole string
 	Recorder                         events.EventRecorder
@@ -93,6 +97,7 @@ func NewClusterBackupReconciler(
 	secretsReader *secrets.ByNameReader,
 	moverImage string,
 	moverProfiles mover.Profiles,
+	moverPlacement mover.Placement,
 	manifestMoverSA, clusterManifestReaderRole string,
 	recorder events.EventRecorder,
 ) *ClusterBackupReconciler {
@@ -103,6 +108,7 @@ func NewClusterBackupReconciler(
 		Secrets:                          secretsReader,
 		MoverImage:                       moverImage,
 		MoverProfiles:                    moverProfiles,
+		MoverPlacement:                   moverPlacement,
 		ManifestMoverServiceAccount:      manifestMoverSA,
 		ClusterManifestReaderClusterRole: clusterManifestReaderRole,
 		Recorder:                         recorder,

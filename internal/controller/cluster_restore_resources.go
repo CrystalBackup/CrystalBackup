@@ -264,6 +264,7 @@ func (r *ClusterRestoreReconciler) startClusterRestoreJob(
 		Image:     r.Engine.MoverImage,
 		Operation: mover.OpClusterManifestsRestore,
 		Profiles:  r.Engine.MoverProfiles,
+		Placement: r.Engine.MoverPlacement,
 		ResticArgs: restic.ManifestsRestoreArgs(plan.snapshotID, plan.snapshotPath,
 			mover.ClusterManifestsRestoreDir),
 		RepoURL:       rc.repoURL,

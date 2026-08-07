@@ -258,6 +258,75 @@ If a run reports `PartiallyFailed`:
 kubectl get clusterbackup <run> -o jsonpath='{range .status.failures[*]}{.namespace}{"\t"}{.backup}{"\t"}{.message}{"\n"}{end}'
 ```
 
+## Where the movers run
+
+Mover Jobs schedule anywhere by default, which is the right answer on a cluster whose nodes
+are interchangeable. They are not always interchangeable. A mover **mounts the tenant's
+volume**, so it inherits every constraint the CSI driver puts on the node doing the mounting,
+and those constraints are not uniform: on Rook-Ceph, mapping an RBD *clone* — which is what
+reading from a CSI snapshot is — needs a kernel carrying the clone-child feature bit, so a 5.4
+node answers `rbd: map failed: (22) Invalid argument` while a 5.15 node beside it mounts the
+volume and the backup runs. The ordinary reasons have the same shape: a node pool tainted for
+I/O-heavy work, a zone whose egress to the object store is cheap.
+
+`mover.placement` is a chart value rather than a field on any object on this page, and it is
+where you say so:
+
+```yaml
+mover:
+  placement:
+    nodeSelector:
+      crystalbackup.io/mover: "true"
+    tolerations:
+      - key: dedicated
+        operator: Equal
+        value: backup
+        effect: NoSchedule
+    affinity:
+      nodeAffinity:
+        preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+                - key: node.kubernetes.io/instance-type
+                  operator: In
+                  values: [storage-optimised]
+```
+
+It applies to **every** mover — per-PVC backup and restore, manifest capture, discovery,
+retention, prune, check, unlock, external sync — on both planes. "Backup pods run on the
+backup nodes" is a sentence you can verify with one `kubectl get pods -o wide`; a rule with
+exceptions is one you meet for the first time while debugging. And it is yours alone: there is
+deliberately no per-namespace and no per-schedule override, because which nodes the platform's
+backup pods land on is not a tenant's decision.
+
+**`nodeSelector` is a hard requirement and has no soft form.** Think before pointing it at a
+label only a few nodes carry: it does not make movers *prefer* those nodes, it serialises every
+backup in the cluster through them, and it turns their absence into a cluster with no backups
+at all. When a preference is what you mean, the `affinity.nodeAffinity` block above is the
+field — movers land on the capable nodes while those have room, and elsewhere rather than
+nowhere when they do not.
+
+**One Job is exempt.** A restore into an existing RWO volume is pinned to the node the volume
+is attached to, because that is the only node it can be mounted from. On that Job the
+nodeSelector and the affinity are dropped and only the tolerations are kept: the kubelet
+re-checks both on admission, even for a pod it never scheduled, and would reject the pod
+outright rather than place it better. Dropping them does not make the restore succeed on a node
+that cannot mount the volume — it makes the failure be the real one, from the CSI driver,
+instead of a scheduling error about a pod that was never scheduled.
+
+**A placement the operator cannot make sense of stops it at startup**: an unknown field, an
+invalid label key, a toleration the API server would refuse, an affinity term that matches no
+node. That is deliberate. A placement an administrator reads back in `helm get values` and that
+never reached a pod is a backup running on a node that cannot mount the volume, which is a
+backup that does not exist. Changing the value rolls the operator pod, because the file is read
+once at startup and the deployment carries a checksum of it.
+
+See [Helm values](/CrystalBackup/docs/reference/helm-values/#where-mover-jobs-run) for the
+field-by-field reference, and [the snapshot feasibility
+probe](/CrystalBackup/docs/operations/snapshot-probe/) for establishing whether the
+snapshot → mount → read chain works on this cluster at all.
+
 ## Pausing
 
 ```bash

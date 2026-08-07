@@ -76,11 +76,12 @@ func NewBackupExternalSyncReconciler(
 	c client.Client, scheme *runtime.Scheme, secretsReader *secrets.ByNameReader,
 	userKeys *keys.UserKeyManager, q *queue.Manager, lister FilteredSnapshotLister,
 	operatorNamespace, moverImage, syncImage string, moverProfiles mover.Profiles,
+	moverPlacement mover.Placement,
 	cl clock.PassiveClock, recorder events.EventRecorder,
 ) *BackupExternalSyncReconciler {
 	deps := repoMaintenanceDeps{
 		Client: c, Secrets: secretsReader, OperatorNamespace: operatorNamespace, MoverImage: moverImage,
-		MoverProfiles: moverProfiles,
+		MoverProfiles: moverProfiles, MoverPlacement: moverPlacement,
 	}
 	return &BackupExternalSyncReconciler{
 		Client: c, Scheme: scheme, Secrets: secretsReader, UserKeys: userKeys,

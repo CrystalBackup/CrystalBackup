@@ -197,3 +197,34 @@ func mentionsS3Connections(t *testing.T, file, fnName string) bool {
 	}
 	return false
 }
+
+// TestEveryMoverJobRequestCarriesThePlacement is the third of these guards, and the one with no
+// exemption list at all.
+//
+// The other two tolerate an argued exception: sizing is per-operation, and the sync Job addresses
+// its repositories through rclone so an s3 backend option would name a backend nothing in that pod
+// speaks. Placement admits none. `mover.placement` is documented as applying to EVERY mover — data,
+// manifests, discovery, maintenance and sync alike — and that sentence is either true of all ten
+// call sites or it is a lie in values.yaml. An administrator who excluded a node pool and finds a
+// prune Job on it has been told something false by the chart, not merely under-served by it.
+//
+// Like its siblings this cannot be a compile error, because a struct literal may omit any field
+// and mover.Placement's zero value is a valid, inert placement — a forgotten call site produces a
+// Job that runs, backs data up correctly, and schedules exactly where the administrator said not
+// to. Nothing at runtime would ever say so.
+func TestEveryMoverJobRequestCarriesThePlacement(t *testing.T) {
+	sites := jobRequestSites(t)
+	if len(sites) < 8 {
+		t.Fatalf("found only %d mover.JobRequest literals — the AST walk is not finding them, "+
+			"so this guard is asserting nothing", len(sites))
+	}
+
+	for _, s := range sites {
+		if !hasField(s.lit, "Placement") {
+			t.Errorf("%s:%d: mover.JobRequest in %s() sets no Placement — this Job's pod ignores "+
+				"the platform's mover placement entirely and will schedule anywhere, including on "+
+				"nodes the administrator excluded. There is no exemption list for this field: "+
+				"thread it.", s.file, s.line, s.fn)
+		}
+	}
+}

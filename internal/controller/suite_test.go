@@ -155,6 +155,16 @@ init:
 // suiteMoverProfiles is the parsed form, resolved once in BeforeSuite.
 var suiteMoverProfiles mover.Profiles
 
+// suiteMoverPlacement is deliberately the ZERO placement — no nodeSelector, no tolerations, no
+// affinity — because envtest has no scheduler and no kubelet, so a placement here could only ever
+// be read back out of the object it was written into. What placement has to be true of is proved
+// where it can fail: internal/mover unit tests for the pod spec (including the pinned-Job
+// narrowing), test/chart for the ConfigMap the operator reads, mover_wiring_test.go for every
+// call site having been threaded, and the crucible for a mover that really lands on the node the
+// platform chose. Setting a non-empty value here would only risk perturbing specs that compare
+// whole Job objects, in exchange for an assertion none of them make.
+var suiteMoverPlacement mover.Placement
+
 // The manifest mover identity and grant, as the chart would resolve them. envtest has no
 // kubelet so no Job ever runs, but the RoleBinding IS really created against the API server,
 // which is what exercises the transient-grant path.
@@ -252,6 +262,7 @@ var _ = BeforeSuite(func() {
 		suiteOperatorNamespace,
 		suiteMoverImage,
 		suiteMoverProfiles,
+		suiteMoverPlacement,
 		mgr.GetEventRecorder("backuprepository"),
 	).SetupWithManager(mgr)).To(Succeed())
 
@@ -268,6 +279,7 @@ var _ = BeforeSuite(func() {
 		suiteOperatorNamespace,
 		suiteMoverImage,
 		suiteMoverProfiles,
+		suiteMoverPlacement,
 		mgr.GetEventRecorder("maintenance"),
 		maintenanceClock,
 	).SetupWithManager(mgr)).To(Succeed())
@@ -299,6 +311,7 @@ var _ = BeforeSuite(func() {
 		suiteOperatorNamespace,
 		suiteMoverImage,
 		suiteMoverProfiles,
+		suiteMoverPlacement,
 		suiteManifestMoverSA,
 		suiteManifestReaderRole,
 		mgr.GetEventRecorder("backup"),
@@ -324,6 +337,7 @@ var _ = BeforeSuite(func() {
 		secrets.NewByNameReader(mgr.GetAPIReader()),
 		suiteMoverImage,
 		suiteMoverProfiles,
+		suiteMoverPlacement,
 		suiteManifestMoverSA,
 		suiteClusterManifestReaderRole,
 		mgr.GetEventRecorder("clusterbackup"),
@@ -378,6 +392,7 @@ var _ = BeforeSuite(func() {
 		suiteOperatorNamespace,
 		suiteMoverImage,
 		suiteMoverProfiles,
+		suiteMoverPlacement,
 		mgr.GetEventRecorder("clustererasure"),
 	).SetupWithManager(mgr)).To(Succeed())
 
@@ -395,6 +410,7 @@ var _ = BeforeSuite(func() {
 		suiteMoverImage,
 		suiteSyncImage,
 		suiteMoverProfiles,
+		suiteMoverPlacement,
 		scheduleClock,
 		mgr.GetEventRecorder("clusterbackupexternalsync"),
 	).SetupWithManager(mgr)).To(Succeed())
@@ -409,6 +425,7 @@ var _ = BeforeSuite(func() {
 		suiteMoverImage,
 		suiteSyncImage,
 		suiteMoverProfiles,
+		suiteMoverPlacement,
 		scheduleClock,
 		mgr.GetEventRecorder("backupexternalsync"),
 	).SetupWithManager(mgr)).To(Succeed())
@@ -423,6 +440,7 @@ var _ = BeforeSuite(func() {
 		suiteOperatorNamespace,
 		suiteMoverImage,
 		suiteMoverProfiles,
+		suiteMoverPlacement,
 		suiteManifestMoverSA,
 		suiteManifestWriterRole,
 		mgr.GetEventRecorder("restore"),
@@ -437,6 +455,7 @@ var _ = BeforeSuite(func() {
 		suiteOperatorNamespace,
 		suiteMoverImage,
 		suiteMoverProfiles,
+		suiteMoverPlacement,
 		suiteManifestMoverSA,
 		suiteClusterManifestWriterRole,
 		mgr.GetEventRecorder("clusterrestore"),

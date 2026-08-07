@@ -134,6 +134,7 @@ func main() {
 	var moverImage string
 	var syncImage string
 	var moverProfilesFile string
+	var moverPlacementFile string
 	var manifestMoverSA string
 	var manifestReaderRole string
 	var manifestWriterRole string
@@ -192,6 +193,14 @@ func main() {
 			"A file that does not parse, names an operation that does not exist, or asks for a request above "+
 			"its own limit STOPS THE OPERATOR: an override an admin can read back in `helm get values` and "+
 			"that never reached a pod is the failure this flag exists to make impossible.")
+	flag.StringVar(&moverPlacementFile, "mover-placement-file", "",
+		"Path to the operator-wide mover scheduling policy (nodeSelector, tolerations, affinity) applied "+
+			"to EVERY mover Job — data, manifests, discovery, maintenance and external sync alike. The "+
+			"chart renders `mover.placement` into a ConfigMap and mounts it here. Empty — the normal case "+
+			"— means mover pods schedule anywhere, exactly as they did before this flag existed. A file "+
+			"that does not parse, or that describes a placement the API server would reject, STOPS THE "+
+			"OPERATOR: a placement an admin can read back in `helm get values` and that never reached a "+
+			"pod is a backup running on a node that cannot mount the volume.")
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
@@ -226,11 +235,23 @@ func main() {
 		setupLog.Error(err, "Unable to load the mover sizing profiles", "file", moverProfilesFile)
 		os.Exit(1)
 	}
+	// The mover placement, resolved ONCE for the same two reasons, and with the stakes raised: a
+	// placement the API server would reject must die here, in front of whoever ran `helm upgrade`,
+	// rather than on the first Job creation — and every controller below must schedule its movers
+	// by the same reading of the file, or "backup pods run on the backup nodes" stops being true.
+	moverPlacement, err := mover.LoadPlacementFile(moverPlacementFile)
+	if err != nil {
+		setupLog.Error(err, "Unable to load the mover placement", "file", moverPlacementFile)
+		os.Exit(1)
+	}
 	// Logged in full, at startup, because "which limits is this install actually running with?" is
 	// otherwise a question only a `kubectl get job -o yaml` during a backup can answer.
 	for _, op := range mover.Operations() {
 		setupLog.Info("Mover sizing profile", "operation", string(op), "profile", moverProfiles.For(op).String())
 	}
+	// Logged for the same reason as the sizing table above: otherwise the only way to answer "did
+	// my placement reach the operator?" is to catch a mover Job mid-flight.
+	setupLog.Info("Mover placement", "placement", moverPlacement.String())
 
 	// if the enable-http2 flag is false (the default), http/2 should be disabled
 	// due to its vulnerabilities. More specifically, disabling http/2 will
@@ -430,6 +451,7 @@ func main() {
 		operatorNamespace,
 		moverImage,
 		moverProfiles,
+		moverPlacement,
 		mgr.GetEventRecorder("backuprepository"),
 	).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Unable to create controller", "controller", "BackupRepository")
@@ -446,6 +468,7 @@ func main() {
 		operatorNamespace,
 		moverImage,
 		moverProfiles,
+		moverPlacement,
 		mgr.GetEventRecorder("maintenance"),
 		clock.RealClock{},
 	)
@@ -481,6 +504,7 @@ func main() {
 		operatorNamespace,
 		moverImage,
 		moverProfiles,
+		moverPlacement,
 		manifestMoverSA,
 		manifestReaderRole,
 		mgr.GetEventRecorder("backup"),
@@ -505,6 +529,7 @@ func main() {
 		secrets.NewByNameReader(mgr.GetAPIReader()),
 		moverImage,
 		moverProfiles,
+		moverPlacement,
 		manifestMoverSA,
 		clusterManifestReaderRole,
 		mgr.GetEventRecorder("clusterbackup"),
@@ -553,6 +578,7 @@ func main() {
 		operatorNamespace,
 		moverImage,
 		moverProfiles,
+		moverPlacement,
 	)
 	if err := controller.NewDiscoveryReconciler(
 		mgr.GetClient(),
@@ -579,6 +605,7 @@ func main() {
 		operatorNamespace,
 		moverImage,
 		moverProfiles,
+		moverPlacement,
 		manifestMoverSA,
 		manifestWriterRole,
 		mgr.GetEventRecorder("restore"),
@@ -596,6 +623,7 @@ func main() {
 		operatorNamespace,
 		moverImage,
 		moverProfiles,
+		moverPlacement,
 		manifestMoverSA,
 		clusterManifestWriterRole,
 		mgr.GetEventRecorder("clusterrestore"),
@@ -615,6 +643,7 @@ func main() {
 		operatorNamespace,
 		moverImage,
 		moverProfiles,
+		moverPlacement,
 		mgr.GetEventRecorder("clustererasure"),
 	).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Unable to create controller", "controller", "ClusterErasure")
@@ -634,6 +663,7 @@ func main() {
 		moverImage,
 		syncImage,
 		moverProfiles,
+		moverPlacement,
 		clock.RealClock{},
 		mgr.GetEventRecorder("clusterbackupexternalsync"),
 	).SetupWithManager(mgr); err != nil {
@@ -651,6 +681,7 @@ func main() {
 		moverImage,
 		syncImage,
 		moverProfiles,
+		moverPlacement,
 		clock.RealClock{},
 		mgr.GetEventRecorder("backupexternalsync"),
 	).SetupWithManager(mgr); err != nil {

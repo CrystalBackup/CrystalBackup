@@ -4,7 +4,7 @@ description: Disaster recovery de la plateforme — ClusterBackupLocation, Clust
 sidebar:
   order: 1
 sourceFile: src/content/docs/guides/cluster-plane.md
-sourceHash: 3c6b681ae742fdf2e1088b326a8ea616cec45ab6
+sourceHash: d1f2a0a70fecf337debc134434375c759faa7003
 ---
 
 Le plan cluster appartient à l'équipe plateforme : un repository partagé, une politique de
@@ -266,6 +266,79 @@ Si une exécution rapporte `PartiallyFailed` :
 ```bash
 kubectl get clusterbackup <run> -o jsonpath='{range .status.failures[*]}{.namespace}{"\t"}{.backup}{"\t"}{.message}{"\n"}{end}'
 ```
+
+## Où tournent les movers
+
+Par défaut, un Job de mover se planifie n'importe où, ce qui est la bonne réponse sur un cluster
+dont les nœuds sont interchangeables. Ils ne le sont pas toujours. Un mover **monte le volume du
+tenant** : il hérite donc de toutes les contraintes que le driver CSI impose au nœud qui fait le
+montage, et ces contraintes ne sont pas uniformes. Sur Rook-Ceph, mapper un *clone* RBD — c'est
+exactement ce qu'est la lecture d'un snapshot CSI — exige un noyau portant le feature bit
+clone-child : un nœud en 5.4 répond `rbd: map failed: (22) Invalid argument` là où un nœud en
+5.15 juste à côté monte le volume et la backup passe. Les raisons ordinaires ont la même forme :
+un pool de nœuds tainté pour les travaux gourmands en I/O, une zone dont l'egress vers l'object
+store est bon marché.
+
+`mover.placement` est une value du chart et non un champ d'un objet de cette page, et c'est là
+que cela se dit :
+
+```yaml
+mover:
+  placement:
+    nodeSelector:
+      crystalbackup.io/mover: "true"
+    tolerations:
+      - key: dedicated
+        operator: Equal
+        value: backup
+        effect: NoSchedule
+    affinity:
+      nodeAffinity:
+        preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            preference:
+              matchExpressions:
+                - key: node.kubernetes.io/instance-type
+                  operator: In
+                  values: [storage-optimised]
+```
+
+Elle s'applique à **tous** les movers — backup et restore par PVC, capture des manifests,
+discovery, rétention, prune, check, unlock, sync externe — sur les deux plans. « Les pods de
+backup tournent sur les nœuds de backup » est une phrase que vous vérifiez d'un seul
+`kubectl get pods -o wide` ; une règle à exceptions est une phrase que vous découvrez pour la
+première fois en plein debug. Et elle n'appartient qu'à vous : il n'y a délibérément aucune
+surcharge par namespace ni par schedule, parce que le choix des nœuds sur lesquels atterrissent
+les pods de backup de la plateforme n'est pas une décision de tenant.
+
+**`nodeSelector` est une exigence dure, et il n'en existe pas de forme souple.** Réfléchissez
+avant de le pointer sur un label que seuls quelques nœuds portent : il ne fait pas *préférer*
+ces nœuds aux movers, il sérialise tous les backups du cluster à travers eux, et il transforme
+leur absence en un cluster sans aucune backup. Quand c'est une préférence que vous voulez
+exprimer, le bloc `affinity.nodeAffinity` ci-dessus est le bon champ — les movers atterrissent
+sur les nœuds capables tant que ceux-ci ont de la place, et ailleurs plutôt que nulle part
+quand ils n'en ont plus.
+
+**Un Job fait exception.** Un restore dans un volume RWO existant est épinglé sur le nœud auquel
+le volume est attaché, parce que c'est le seul nœud depuis lequel il peut être monté. Sur ce Job,
+le nodeSelector et l'affinity sont retirés et seules les tolerations sont conservées : la kubelet
+revérifie les deux à l'admission, y compris pour un pod qu'elle n'a jamais planifié, et
+rejetterait le pod purement et simplement au lieu de le placer mieux. Les retirer ne fait pas
+réussir le restore sur un nœud incapable de monter le volume — cela fait que l'échec soit le
+vrai, celui du driver CSI, plutôt qu'une erreur de scheduling à propos d'un pod qui n'a jamais
+été planifié.
+
+**Un placement que l'operator n'arrive pas à interpréter l'arrête au démarrage** : champ inconnu,
+clé de label invalide, toleration que l'API server refuserait, terme d'affinity qui ne matche
+aucun nœud. C'est délibéré. Un placement qu'un administrateur relit dans `helm get values` et qui
+n'a jamais atteint un pod, c'est une backup qui tourne sur un nœud incapable de monter le volume,
+c'est-à-dire une backup qui n'existe pas. Changer la value redémarre le pod de l'operator, parce
+que le fichier est lu une seule fois au démarrage et que le deployment en porte un checksum.
+
+Voir [Values Helm](/CrystalBackup/fr/docs/reference/helm-values/#où-tournent-les-jobs-de-mover)
+pour la référence champ par champ, et [la sonde de faisabilité des
+snapshots](/CrystalBackup/fr/docs/operations/snapshot-probe/) pour établir si la chaîne
+snapshot → montage → lecture fonctionne tout court sur ce cluster.
 
 ## Mettre en pause
 

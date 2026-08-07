@@ -148,7 +148,11 @@ type BackupRepositoryReconciler struct {
 	// MoverProfiles is the resolved per-operation sizing table; init takes the light row.
 	// Nil ⇒ built-in defaults.
 	MoverProfiles mover.Profiles
-	Recorder      events.EventRecorder
+	// MoverPlacement is the operator-wide scheduling policy for mover Jobs. The init Job touches
+	// no volume, but it carries the placement like every other mover: "backup pods run on the
+	// backup nodes" is only verifiable if it has no exceptions (internal/mover.Placement).
+	MoverPlacement mover.Placement
+	Recorder       events.EventRecorder
 
 	// mu guards inflight. inflight tracks the in-flight init Handle per repoKey so the
 	// reconciler is restart-safe (empty map after restart -> re-enqueue -> re-adopt) and never
@@ -170,6 +174,7 @@ func NewBackupRepositoryReconciler(
 	q *queue.Manager,
 	operatorNamespace, moverImage string,
 	moverProfiles mover.Profiles,
+	moverPlacement mover.Placement,
 	recorder events.EventRecorder,
 ) *BackupRepositoryReconciler {
 	return &BackupRepositoryReconciler{
@@ -180,6 +185,7 @@ func NewBackupRepositoryReconciler(
 		OperatorNamespace: operatorNamespace,
 		MoverImage:        moverImage,
 		MoverProfiles:     moverProfiles,
+		MoverPlacement:    moverPlacement,
 		Recorder:          recorder,
 		inflight:          map[string]*queue.Handle{},
 	}
@@ -552,6 +558,7 @@ func (r *BackupRepositoryReconciler) runInit(opCtx context.Context, owner *cbv1.
 		Image:         r.MoverImage,
 		Operation:     mover.OpInit,
 		Profiles:      r.MoverProfiles,
+		Placement:     r.MoverPlacement,
 		ResticArgs:    []string{"init"},
 		RepoURL:       repoURL,
 		S3Connections: s3.Connections,

@@ -218,6 +218,17 @@ type JobRequest struct {
 	// scheduler). Only the restore twin-PV path sets it — an RWO volume attached on exactly
 	// one node must be mounted from that same node (adr/0016 §2); empty everywhere else.
 	NodeName string
+	// Placement is the operator's cluster-wide mover scheduling policy — nodeSelector,
+	// tolerations, affinity — resolved once at startup from --mover-placement-file and handed
+	// to every Job builder, exactly as Profiles is.
+	//
+	// The zero value asks for nothing and is what every unit test and every install that
+	// configures no placement carries; the Job it produces is byte-identical to the one this
+	// builder made before the field existed.
+	//
+	// Its interaction with NodeName above is not a caller's business and is not delegated to
+	// one: see Placement.forJob for what a pinned Job keeps and what it must drop.
+	Placement Placement
 	// ServiceAccountName, when non-empty, runs the pod under that ServiceAccount AND
 	// automounts its token. Empty — the default for every data and maintenance job — keeps
 	// the zero-API posture of I6: the namespace default SA with its token not even mounted.
@@ -266,6 +277,9 @@ func BuildJob(req JobRequest) *batchv1.Job {
 	// come from the same row, so a Job can never be sized as a prune and capped as a backup.
 	profile := req.Profiles.For(req.Operation)
 	volumes, mounts := moverVolumes(req, profile)
+	// One narrowing, used once, but resolved here so the PodSpec literal below stays readable and
+	// so the pinned-Job rule has exactly one implementation (Placement.forJob).
+	nodeSelector, tolerations, affinity := req.Placement.forJob(req.NodeName != "")
 
 	container := corev1.Container{
 		Name:         containerName,
@@ -328,9 +342,15 @@ func BuildJob(req JobRequest) *batchv1.Job {
 					},
 					TopologySpreadConstraints: spreadConstraints(req.SpreadOverLabels),
 					// Empty for every job except a same-node-pinned restore (JobRequest.NodeName).
-					NodeName:   req.NodeName,
-					Containers: []corev1.Container{container},
-					Volumes:    volumes,
+					NodeName: req.NodeName,
+					// The platform's mover placement (JobRequest.Placement). All three are nil on
+					// an install that configures none, and the first and third are nil on a pinned
+					// Job whatever the platform configured — see Placement.forJob.
+					NodeSelector: nodeSelector,
+					Tolerations:  tolerations,
+					Affinity:     affinity,
+					Containers:   []corev1.Container{container},
+					Volumes:      volumes,
 				},
 			},
 		},

@@ -138,7 +138,10 @@ matches every PVC, so put the specific items first. Anything excluded when the m
   your namespace never receives credentials or keys (only restored PVCs).
 - Restoring into a **live, actively-written** volume is discouraged (as with any in-place
   restore tool): quiesce or scale down first for consistent results. An RWO volume attached
-  to one node is handled — the mover is pinned to that node.
+  to one node is handled — the mover is pinned to that node, which is also the one Job exempt
+  from the cluster-wide `mover.placement` (see that value in
+  [charts/crystal-backup/values.yaml](../charts/crystal-backup/values.yaml) and
+  [internal/mover/placement.go](../internal/mover/placement.go)).
 - `volumeMode: Block` PVCs are not restorable (restic restores files); the volume fails
   with reason `RestoreBlockUnsupported`.
 - A many-volume restore is paced: at most **4 mover Jobs per restore** run at once (slots

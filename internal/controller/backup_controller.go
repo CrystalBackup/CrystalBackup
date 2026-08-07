@@ -289,6 +289,11 @@ type BackupReconciler struct {
 	// requests/limits and restic-cache cap every Job this controller builds carries. Nil means
 	// the built-in defaults, which is what envtest runs with.
 	MoverProfiles mover.Profiles
+	// MoverPlacement is the operator-wide scheduling policy (internal/mover.Placement) every Job
+	// this controller builds carries. The data movers here mount the exposed volume, so this is
+	// the field that decides whether the pod lands on a node whose CSI driver can map it; the
+	// same-node restore path pins its Job instead, and mover.Placement narrows itself for that.
+	MoverPlacement mover.Placement
 	// ManifestMoverServiceAccount and ManifestReaderClusterRole name the identity and grant of
 	// the manifest mover. They are CONFIGURED, not derived: the chart release-prefixes every
 	// cluster-scoped object so two installs cannot collide, so the operator must be told the
@@ -355,6 +360,7 @@ func NewBackupReconciler(
 	exposers ExposerRegistry,
 	operatorNamespace, moverImage string,
 	moverProfiles mover.Profiles,
+	moverPlacement mover.Placement,
 	manifestMoverSA, manifestReaderRole string,
 	recorder events.EventRecorder,
 	q *queue.Manager,
@@ -367,6 +373,7 @@ func NewBackupReconciler(
 		OperatorNamespace:           operatorNamespace,
 		MoverImage:                  moverImage,
 		MoverProfiles:               moverProfiles,
+		MoverPlacement:              moverPlacement,
 		ManifestMoverServiceAccount: manifestMoverSA,
 		ManifestReaderClusterRole:   manifestReaderRole,
 		Recorder:                    recorder,
@@ -1325,6 +1332,7 @@ func (r *BackupReconciler) advanceSnapshotting(ctx context.Context, backup *cbv1
 		Image:         r.MoverImage,
 		Operation:     mover.OpBackup,
 		Profiles:      r.MoverProfiles,
+		Placement:     r.MoverPlacement,
 		ResticArgs:    resticArgs,
 		RepoURL:       rc.repoURL,
 		S3Connections: rc.s3Connections,

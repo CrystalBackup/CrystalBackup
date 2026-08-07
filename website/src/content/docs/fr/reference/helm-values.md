@@ -2,7 +2,7 @@
 title: Values Helm
 description: Les values configurables du chart, groupées par ce qu'elles affectent réellement.
 sourceFile: src/content/docs/reference/helm-values.md
-sourceHash: 149d4cc24885048db940042d77a8d07636bd9e81
+sourceHash: b698001ae439fd1c226f3dbb65a72f45bc3b1b1f
 ---
 
 Les défauts viennent du `values.yaml` du chart lui-même. Seules les values que vous avez des
@@ -52,6 +52,28 @@ Crystal Backup est un operator cluster **singleton**. Ne l'installez pas deux fo
 | `podSecurityContext` | non-root `65532`, seccomp `RuntimeDefault` | |
 | `securityContext` | `readOnlyRootFilesystem`, toutes les capabilities retirées | |
 | `livenessProbe`, `readinessProbe` | standard | |
+
+## Où tournent les Jobs de mover
+
+Le bloc ci-dessus place le **pod de l'operator**. Celui-ci place chaque **Job de mover** —
+backup et restore par PVC, capture des manifests, discovery, rétention, prune, check, unlock et
+sync externe, sur les deux plans. Nouveau en 0.6.3 ; vide, le défaut, planifie les movers
+n'importe où, exactement comme toutes les releases précédentes.
+
+| Value | Défaut | Notes |
+|---|---|---|
+| `mover.placement.nodeSelector` | `{}` | Une exigence **dure**, sans forme souple. Pointé sur un label que seuls quelques nœuds portent, il ne fait pas *préférer* ces nœuds aux movers : il sérialise tous les backups du cluster à travers eux, et transforme leur absence en un cluster sans aucun backup. Les deux côtés sont rendus entre guillemets, si bien que `--set mover.placement.nodeSelector.zone=3` reste la chaîne `"3"` plutôt qu'un entier sur lequel l'operator refuse de démarrer. |
+| `mover.placement.tolerations` | `[]` | Pour un pool de nœuds retenu par un taint. La seule des trois values conservée sur un Job **épinglé à un nœud** : un taint `NoExecute` s'applique aux pods en cours d'exécution quel qu'ait été leur placement, et évincerait un restore en pleine copie. |
+| `mover.placement.affinity` | `{}` | Transmise au pod telle quelle. `nodeAffinity.preferredDuringSchedulingIgnoredDuringExecution` est le champ vers lequel se tourner quand c'est une préférence, et non une exigence, que vous voulez exprimer. La node affinity est validée au démarrage ; la pod affinity et l'anti-affinity sont transmises à l'API server, et une règle écrite à la main a toutes les chances d'entrer en conflit avec la répartition souple par hostname que l'operator pose déjà pour le fan-out, plutôt que de s'y ajouter. |
+
+C'est un réglage d'**administrateur** et rien d'autre : il n'y a délibérément aucune surcharge
+par namespace ni par schedule. Un placement que l'operator n'arrive pas à interpréter **l'arrête
+au démarrage** au lieu d'être ignoré, et changer la value redémarre le pod de l'operator — le
+fichier est lu une seule fois au démarrage et le deployment en porte un checksum.
+
+Voir [Où tournent les
+movers](/CrystalBackup/fr/docs/guides/cluster-plane/#où-tournent-les-movers) pour la raison de
+le poser et le seul Job qui y échappe.
 
 ## ServiceAccount et RBAC
 

@@ -483,7 +483,7 @@ func TestSyncReconcilersCarryAMoverImageForMirrorsForget(t *testing.T) {
 	const moverImage, syncImage = "example.com/mover:test", "example.com/sync:test"
 
 	cluster := NewClusterBackupExternalSyncReconciler(
-		nil, nil, nil, nil, nil, "crystal-backup-system", moverImage, syncImage, nil, nil, nil)
+		nil, nil, nil, nil, nil, "crystal-backup-system", moverImage, syncImage, nil, mover.Placement{}, nil, nil)
 	if got := cluster.driver.deps.MoverImage; got != moverImage {
 		t.Errorf("cluster-plane driver mover image = %q, want %q — Mirror's forget Job would have no image", got, moverImage)
 	}
@@ -492,7 +492,7 @@ func TestSyncReconcilersCarryAMoverImageForMirrorsForget(t *testing.T) {
 	}
 
 	namespaced := NewBackupExternalSyncReconciler(
-		nil, nil, nil, nil, nil, nil, "crystal-backup-system", moverImage, syncImage, nil, nil, nil)
+		nil, nil, nil, nil, nil, nil, "crystal-backup-system", moverImage, syncImage, nil, mover.Placement{}, nil, nil)
 	if got := namespaced.driver.deps.MoverImage; got != moverImage {
 		t.Errorf("namespace-plane driver mover image = %q, want %q — Mirror's forget Job would have no image", got, moverImage)
 	}
@@ -537,7 +537,7 @@ func TestNamespacedSyncPauseStartsNothingAndResolvesNothing(t *testing.T) {
 		WithObjects(bs).WithStatusSubresource(&cbv1.BackupExternalSync{}).Build()
 
 	r := NewBackupExternalSyncReconciler(
-		c, scheme, nil, nil, nil, nil, "crystal-backup-system", "mover:test", "sync:test", nil, nil, nil)
+		c, scheme, nil, nil, nil, nil, "crystal-backup-system", "mover:test", "sync:test", nil, mover.Placement{}, nil, nil)
 
 	res, err := r.Reconcile(context.Background(), ctrl.Request{
 		NamespacedName: client.ObjectKey{Namespace: "team-a", Name: "offsite"},

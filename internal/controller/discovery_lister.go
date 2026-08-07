@@ -118,6 +118,10 @@ type JobSnapshotLister struct {
 	// MoverProfiles is the resolved per-operation sizing table; the inventory Job takes the light
 	// row. Nil ⇒ built-in defaults.
 	MoverProfiles mover.Profiles
+	// MoverPlacement is the operator-wide scheduling policy. Discovery mounts nothing, but an
+	// inventory Job stuck Pending because it ignored a node pool's taint is a repository that
+	// reports no snapshots at all — the placement has no opt-outs for that reason.
+	MoverPlacement mover.Placement
 }
 
 // NewJobSnapshotLister builds the production lister. main.go wires the cached client, a clientset
@@ -130,6 +134,7 @@ func NewJobSnapshotLister(
 	scheme *runtime.Scheme,
 	operatorNamespace, moverImage string,
 	moverProfiles mover.Profiles,
+	moverPlacement mover.Placement,
 ) *JobSnapshotLister {
 	return &JobSnapshotLister{
 		Client:            c,
@@ -139,6 +144,7 @@ func NewJobSnapshotLister(
 		OperatorNamespace: operatorNamespace,
 		MoverImage:        moverImage,
 		MoverProfiles:     moverProfiles,
+		MoverPlacement:    moverPlacement,
 	}
 }
 
@@ -321,6 +327,7 @@ func (l *JobSnapshotLister) ensureSnapshotsJob(ctx context.Context, repo *cbv1.B
 		Image:         l.MoverImage,
 		Operation:     mover.OpSnapshots,
 		Profiles:      l.MoverProfiles,
+		Placement:     l.MoverPlacement,
 		ResticArgs:    resticArgs,
 		RepoURL:       repoURL,
 		S3Connections: binding.S3.Connections,

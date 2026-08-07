@@ -214,6 +214,7 @@ func (r *BackupReconciler) maintenanceDeps() repoMaintenanceDeps {
 		OperatorNamespace: r.OperatorNamespace,
 		MoverImage:        r.MoverImage,
 		MoverProfiles:     r.MoverProfiles,
+		MoverPlacement:    r.MoverPlacement,
 	}
 }
 
@@ -319,6 +320,10 @@ type repoMaintenanceDeps struct {
 	// being looked up per op because prune's limits and forget's are DIFFERENT rows of it, and
 	// the op body is one function serving both.
 	MoverProfiles mover.Profiles
+	// MoverPlacement is the operator-wide scheduling policy. Unlike the sizing table it has no
+	// per-op rows, so it travels with the deps only because everything a maintenance Job needs
+	// travels with the deps — every op built here gets the same one.
+	MoverPlacement mover.Placement
 }
 
 // repoMaintenanceRequest fully describes one maintenance op: which repository lane to take
@@ -436,6 +441,7 @@ func runRepoMaintenance(opCtx context.Context, deps repoMaintenanceDeps, name st
 		Image:         deps.MoverImage,
 		Operation:     op,
 		Profiles:      deps.MoverProfiles,
+		Placement:     deps.MoverPlacement,
 		ResticArgs:    resticArgs,
 		RepoURL:       repoURL,
 		S3Connections: s3Connections,

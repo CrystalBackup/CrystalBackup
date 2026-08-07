@@ -51,6 +51,27 @@ Crystal Backup is a **singleton** cluster operator. Do not install it twice.
 | `securityContext` | `readOnlyRootFilesystem`, all capabilities dropped | |
 | `livenessProbe`, `readinessProbe` | standard | |
 
+## Where mover Jobs run
+
+The block above places the **operator pod**. This one places every **mover Job** — per-PVC
+backup and restore, manifest capture, discovery, retention, prune, check, unlock and external
+sync, on both planes. New in 0.6.3; empty, the default, schedules movers anywhere, exactly as
+every release before it did.
+
+| Value | Default | Notes |
+|---|---|---|
+| `mover.placement.nodeSelector` | `{}` | A **hard** requirement with no soft form. Pointed at a label only a few nodes carry it does not make movers *prefer* those nodes: it serialises every backup in the cluster through them, and turns their absence into a cluster with no backups. Both sides are rendered quoted, so `--set mover.placement.nodeSelector.zone=3` stays the string `"3"` rather than an integer the operator refuses to start on. |
+| `mover.placement.tolerations` | `[]` | For a node pool held by a taint. The only one of the three kept on a **node-pinned** Job: a `NoExecute` taint is enforced against running pods however they were placed, and would evict a restore mid-copy. |
+| `mover.placement.affinity` | `{}` | Passed to the pod as written. `nodeAffinity.preferredDuringSchedulingIgnoredDuringExecution` is the field to reach for when a preference, rather than a requirement, is what you mean. Node affinity is validated at startup; pod affinity and anti-affinity are passed through to the API server, and a hand-written one is likely to argue with the soft hostname spread the operator already sets for fan-out rather than add to it. |
+
+It is an **administrator** setting and only that: there is deliberately no per-namespace and
+no per-schedule override. A placement the operator cannot make sense of **stops it at
+startup** rather than being ignored, and changing the value rolls the operator pod — the file
+is read once at startup and the deployment carries a checksum of it.
+
+See [Where the movers run](/CrystalBackup/docs/guides/cluster-plane/#where-the-movers-run) for
+why you would set it and the one Job that is exempt.
+
 ## ServiceAccount and RBAC
 
 | Value | Default | Notes |

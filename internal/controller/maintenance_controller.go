@@ -140,7 +140,11 @@ type MaintenanceReconciler struct {
 	// MoverProfiles is the resolved per-operation sizing table. This controller runs the two
 	// heaviest rows in it — prune and check (internal/mover.classRepoHeavy). Nil ⇒ built-in.
 	MoverProfiles mover.Profiles
-	Recorder      events.EventRecorder
+	// MoverPlacement is the operator-wide scheduling policy. Prune and check are long and
+	// I/O-hungry, which is precisely the reason an administrator confines movers to a node pool
+	// in the first place — so these two are the last ops that should be allowed to escape it.
+	MoverPlacement mover.Placement
+	Recorder       events.EventRecorder
 	// Clock is the only source of "now": clock.RealClock in production, a fake clock in envtest so
 	// a test can step a daily cron without waiting a day.
 	Clock clock.PassiveClock
@@ -160,6 +164,7 @@ func NewMaintenanceReconciler(
 	q *queue.Manager,
 	operatorNamespace, moverImage string,
 	moverProfiles mover.Profiles,
+	moverPlacement mover.Placement,
 	recorder events.EventRecorder,
 	cl clock.PassiveClock,
 ) *MaintenanceReconciler {
@@ -171,6 +176,7 @@ func NewMaintenanceReconciler(
 		OperatorNamespace: operatorNamespace,
 		MoverImage:        moverImage,
 		MoverProfiles:     moverProfiles,
+		MoverPlacement:    moverPlacement,
 		Recorder:          recorder,
 		Clock:             cl,
 		tracker:           newMaintenanceTracker(),
@@ -525,6 +531,7 @@ func (r *MaintenanceReconciler) submit(ctx context.Context, repo *cbv1.BackupRep
 		OperatorNamespace: r.OperatorNamespace,
 		MoverImage:        r.MoverImage,
 		MoverProfiles:     r.MoverProfiles,
+		MoverPlacement:    r.MoverPlacement,
 	}
 
 	started, err := r.tracker.start(repo, due.op, r.Clock.Now(), func() (*queue.Handle, error) {

@@ -131,6 +131,58 @@ mover:
   #       cacheSizeLimit: 60Gi
   profiles: {}
 
+  # -- Where mover Jobs are allowed to run. Empty — the default — means anywhere, which is what
+  # every release before 0.6.3 did and what most clusters should keep.
+  #
+  # This applies to EVERY mover: per-PVC backup and restore, manifest capture, discovery,
+  # retention, prune, check, unlock and external sync. "Backup pods run on the backup nodes" is a
+  # sentence you can verify with one `kubectl get pods -o wide`; a rule with exceptions is one you
+  # meet for the first time while debugging. It is an ADMIN setting only — there is deliberately
+  # no per-namespace and no per-schedule override, because which nodes the platform's backup pods
+  # land on is not a tenant's decision.
+  #
+  # The case it was built for: a mover mounts the tenant's volume, so it inherits every constraint
+  # the CSI driver puts on the node doing the mounting — and those are not uniform. On Rook-Ceph,
+  # mapping an RBD CLONE (which is what restoring from a CSI snapshot is) needs a kernel carrying
+  # the clone-child feature bit; a 5.4 node fails it with `rbd: map failed: (22) Invalid argument`
+  # while a 5.15 node mounts it fine. Ordinary reasons work too: a tainted node pool reserved for
+  # I/O, a zone with cheap egress to the object store.
+  #
+  # `nodeSelector` is a HARD requirement and has no soft form. Think before using it on a cluster
+  # where few nodes match: it does not make movers PREFER those nodes, it serialises every backup
+  # in the cluster through them, and it turns their absence into a cluster with no backups at all.
+  # When a preference is what you mean, use `affinity.nodeAffinity`'s
+  # preferredDuringSchedulingIgnoredDuringExecution — movers land on the capable nodes when those
+  # have room, and elsewhere rather than nowhere when they do not.
+  #
+  # One documented exception: the same-node restore path pins its mover to the node the volume is
+  # attached to (an RWO volume can only be mounted there), so on that Job the nodeSelector and the
+  # affinity are dropped and only the tolerations are kept. Leaving them on would not place the
+  # pod anywhere better — the kubelet re-checks both on admission and would reject it outright.
+  #
+  # A misconfiguration here STOPS THE OPERATOR at startup: an unknown field, an invalid label key,
+  # a toleration the API server would refuse, an affinity term that matches no node. Changing it
+  # rolls the operator pod, because the file is read once at startup.
+  #
+  #   placement:
+  #     nodeSelector:
+  #       crystalbackup.io/mover: "true"
+  #     tolerations:
+  #       - key: dedicated
+  #         operator: Equal
+  #         value: backup
+  #         effect: NoSchedule
+  #     affinity:
+  #       nodeAffinity:
+  #         preferredDuringSchedulingIgnoredDuringExecution:
+  #           - weight: 100
+  #             preference:
+  #               matchExpressions:
+  #                 - key: node.kubernetes.io/instance-type
+  #                   operator: In
+  #                   values: [storage-optimised]
+  placement: {}
+
 # The sync image carries the same crystal-mover shim and the same pinned restic, PLUS rclone
 # (build/apko/sync.yaml, build/melange/sync.yaml). It is a third image rather than an addition to
 # the mover so that rclone's vulnerability surface stays off the backup and restore path; the

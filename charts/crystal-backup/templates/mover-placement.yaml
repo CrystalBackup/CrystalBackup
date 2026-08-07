@@ -1,0 +1,46 @@
+{{/*
+Where mover Jobs are allowed to run, mounted into the operator and read once at startup
+(--mover-placement-file).
+
+A SECOND ConfigMap rather than a second key in -mover-profiles, and the reason is the upgrade
+rather than the taxonomy: folding both settings into one object would have meant renaming that
+object, and a rename makes `helm upgrade` delete and recreate a ConfigMap on every existing
+install to gain nothing an administrator can see. This one is purely additive — no 0.6.2 install
+loses or replaces anything by acquiring it.
+
+Rendered unconditionally, for the same reason -mover-profiles is: an unconditional
+ConfigMap/volume/mount/flag is one shape instead of two, and an empty ConfigMap costs nothing.
+An install that configures no placement renders an empty document, which the operator reads as
+"movers schedule anywhere" — byte-identical Jobs to every release before this one.
+
+nodeSelector is rendered key by key with both sides QUOTED rather than through toYaml, because a
+Kubernetes label value is always a string and neither YAML nor `--set` believes that.
+`--set mover.placement.nodeSelector.disk=true` yields a YAML boolean, `zone: 3` yields an integer,
+and the operator — which unmarshals into map[string]string — would refuse to start on both. The
+refusal is correct behaviour and a rotten first experience for a value that was never ambiguous.
+Tolerations and affinity are structured objects with typed fields, so toYaml is right for them.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "crystal-backup.fullname" . }}-mover-placement
+  namespace: {{ include "crystal-backup.namespace" . }}
+  labels:
+    {{- include "crystal-backup.labels" . | nindent 4 }}
+{{- $placement := .Values.mover.placement | default dict }}
+data:
+  placement.yaml: |
+    {{- with $placement.nodeSelector }}
+    nodeSelector:
+      {{- range $key, $value := . }}
+      {{ $key | quote }}: {{ $value | quote }}
+      {{- end }}
+    {{- end }}
+    {{- with $placement.tolerations }}
+    tolerations:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+    {{- with $placement.affinity }}
+    affinity:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}

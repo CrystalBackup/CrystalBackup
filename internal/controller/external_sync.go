@@ -262,11 +262,17 @@ func buildSyncJobRequest(deps repoMaintenanceDeps, syncImage, name string, run *
 	env = append(env, destEnv...)
 
 	return mover.JobRequest{
-		Name:       name,
-		Namespace:  deps.OperatorNamespace,
-		Image:      syncImage,
-		Operation:  mover.OpSync,
-		Profiles:   deps.MoverProfiles,
+		Name:      name,
+		Namespace: deps.OperatorNamespace,
+		Image:     syncImage,
+		Operation: mover.OpSync,
+		Profiles:  deps.MoverProfiles,
+		// Set, unlike S3Connections a few lines down, and the two absences must not be confused:
+		// that one is excluded because rclone speaks neither of this Job's backends, whereas the
+		// placement is about which NODE the pod runs on, which is the same question for a copy as
+		// for any other mover. An admin who reserved a node pool for backup egress reserved it for
+		// this Job most of all — it is the one that talks to two object stores at once.
+		Placement:  deps.MoverPlacement,
 		ResticArgs: restic.SyncArgs(run.Namespaces),
 		// The DESTINATION. See RepoURL's comment for why this is not repo.Status.RepositoryURL.
 		RepoURL: run.Dest.RepoURL(),

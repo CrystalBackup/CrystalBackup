@@ -253,6 +253,16 @@ serialized against running backups (restic locking) — never inline:
 - Operator-level: `MaxConcurrentReconciles` per controller; a cluster-wide semaphore bounds
   simultaneous mover Jobs (`maxConcurrentMovers`) with a per-node bound via
   `topologySpreadConstraints` + anti-affinity.
+- **Where movers may run at all** is a separate, platform-level decision from how many run at
+  once. `mover.placement` (`--mover-placement-file`, delivered in 0.6.3) applies a `nodeSelector`,
+  `tolerations` and an `affinity` to **every** mover Job — data, manifests, discovery, maintenance
+  and external sync. It is admin-only, with no per-namespace or per-schedule override: a mover
+  mounts the tenant's volume and therefore inherits whatever constraint the CSI driver puts on the
+  node doing the mounting, and that constraint belongs to the platform rather than to the tenant.
+  The empty default schedules movers anywhere. The one exception is the same-node restore of
+  §6, which pins its mover to the node the RWO volume is attached to: there the selector and the
+  affinity are dropped and only the tolerations survive, because the kubelet re-checks both on
+  admission and would reject the pod rather than place it anywhere better.
 - Per-repository: restic locking permits concurrent backup sessions; `prune`, `check`,
   `forget`, init and erasure require exclusivity — serialized by the per-`BackupRepository`
   queue. Many movers writing the one shared cluster repo increase lock-refresh/index churn →

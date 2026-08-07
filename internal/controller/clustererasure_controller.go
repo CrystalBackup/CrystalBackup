@@ -85,7 +85,11 @@ type ClusterErasureReconciler struct {
 	// MoverProfiles is the resolved per-operation sizing table: an erasure's forget takes the
 	// light row, the prune that follows it the heavy one. Nil ⇒ built-in.
 	MoverProfiles mover.Profiles
-	Recorder      events.EventRecorder
+	// MoverPlacement is the operator-wide scheduling policy, applied to both halves of an erasure.
+	// The prune is the heaviest S3 conversation the product has, so a node pool chosen for its
+	// egress is chosen for this op above all others.
+	MoverPlacement mover.Placement
+	Recorder       events.EventRecorder
 
 	mu       sync.Mutex
 	inflight map[string]*queue.Handle
@@ -96,13 +100,15 @@ func NewClusterErasureReconciler(
 	c client.Client, scheme *runtime.Scheme, secretsReader *secrets.ByNameReader,
 	q *queue.Manager, lister FilteredSnapshotLister, operatorNamespace, moverImage string,
 	moverProfiles mover.Profiles,
+	moverPlacement mover.Placement,
 	recorder events.EventRecorder,
 ) *ClusterErasureReconciler {
 	return &ClusterErasureReconciler{
 		Client: c, Scheme: scheme, Secrets: secretsReader, Queue: q, Lister: lister,
 		OperatorNamespace: operatorNamespace, MoverImage: moverImage, MoverProfiles: moverProfiles,
-		Recorder: recorder,
-		inflight: map[string]*queue.Handle{},
+		MoverPlacement: moverPlacement,
+		Recorder:       recorder,
+		inflight:       map[string]*queue.Handle{},
 	}
 }
 
@@ -234,6 +240,7 @@ func (r *ClusterErasureReconciler) drive(ctx context.Context, er *cbv1.ClusterEr
 		deps := repoMaintenanceDeps{
 			Client: r.Client, Secrets: r.Secrets, OperatorNamespace: r.OperatorNamespace,
 			MoverImage: r.MoverImage, MoverProfiles: r.MoverProfiles,
+			MoverPlacement: r.MoverPlacement,
 		}
 		dek, reason, dekErr := resolvePlatformDEK(ctx, r.Client, r.Secrets, r.OperatorNamespace, loc)
 		if dekErr != nil {

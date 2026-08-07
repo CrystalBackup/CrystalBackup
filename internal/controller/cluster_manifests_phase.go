@@ -206,6 +206,7 @@ func (r *ClusterBackupReconciler) startClusterManifestsJob(
 		Image:     r.MoverImage,
 		Operation: mover.OpClusterManifestsBackup,
 		Profiles:  r.MoverProfiles,
+		Placement: r.MoverPlacement,
 		// The identity's Path (/cluster-manifests) is both what restic records and where the dump
 		// writes — one string, derived once.
 		ResticArgs:    resticBackupArgs(id),
