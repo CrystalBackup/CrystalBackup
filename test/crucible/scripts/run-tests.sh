@@ -60,8 +60,14 @@ fi
 # testing a rule the chart does not ship. Hence 180m. The suite's own Eventually deadlines, not
 # this, are what should fail a spec; this only exists so a slow run is not TRUNCATED, which is worse
 # than no run. Override for a long debugging run:
-#   CRUCIBLE_TIMEOUT=4h mise run test
-CRUCIBLE_TIMEOUT="${CRUCIBLE_TIMEOUT:-180m}"
+# 0.6.3 made it 240m, and the arithmetic is worth writing down because the previous campaign hid
+# it: the m6 stall lane was reverting its own fault injection and failing after five minutes, so
+# the 1h53m it contributed to was a run in which that lane did nothing. Working, it waits out a
+# 30-minute mover-start deadline plus a recovery run — call it 50 minutes — and the new placement
+# lane restarts the operator twice around a real backup. 180m would have been the budget for a
+# suite that no longer exists.
+#   CRUCIBLE_TIMEOUT=5h mise run test
+CRUCIBLE_TIMEOUT="${CRUCIBLE_TIMEOUT:-240m}"
 
 # BOTH timeouts, and the Ginkgo one is the load-bearing fix: Ginkgo enforces its OWN suite
 # timeout (default 1h) independently of `go test -timeout`. Passing only the go-test budget let a

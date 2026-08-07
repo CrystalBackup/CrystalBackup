@@ -20,6 +20,7 @@ package crucible
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -100,13 +101,48 @@ const (
 	// the same storage the field report came from, and the one whose node plugin is parked below.
 	m6StallStorageClass = "ceph-block"
 
-	// m6RBDNodePluginNS / m6RBDNodePlugin is the rook-ceph RBD node plugin DaemonSet: the thing
-	// that runs a csi-rbdplugin + driver-registrar on every node, and therefore the thing whose
-	// absence makes a kubelet unable to stage an RBD volume. Its name is rook's convention and is
-	// verified to exist in BeforeAll rather than assumed, so a rook upgrade that renames it fails
-	// with that sentence instead of with a silent no-op fault injection and a green spec.
+	// m6RBDNodePluginNS is where the RBD node plugin DaemonSet lives — the thing that runs a
+	// csi-rbdplugin + driver-registrar on every node, and therefore the thing whose absence makes
+	// a kubelet unable to stage an RBD volume.
+	//
+	// Its NAME is discovered, not declared, for the same reason m6FindSnapshotController discovers
+	// the snapshot-controller's: rook names it after the CSI driver, and the convention has
+	// changed. This spec was written against `csi-rbdplugin` and the first campaign that ran it
+	// found `rook-ceph.rbd.csi.ceph.com-nodeplugin` — a red spec against a correct product, which
+	// is the second-worst outcome after a green one against a broken product. The failure was at
+	// least loud, because BeforeAll verifies the object exists rather than parking a name and
+	// hoping; a silent no-op fault injection would have made this spec pass while testing nothing.
 	m6RBDNodePluginNS = "rook-ceph"
-	m6RBDNodePlugin   = "csi-rbdplugin"
+	// m6RBDNodePluginMatch is the substring that identifies it across rook versions: the RBD
+	// driver's own name is in it either way, and the cephfs plugin — the other DaemonSet in that
+	// namespace — is not matched by it.
+	m6RBDNodePluginMatch = "rbd.csi.ceph.com"
+
+	// m6CSIOperatorDeploy is the ceph-csi-operator's controller-manager, and it has to be stopped
+	// before the DaemonSet below is touched at all.
+	//
+	// rook ≥ 1.17 hands the CSI driver plane to it: the node plugin DaemonSet is OWNED by a
+	// csi.ceph.io/v1 Driver CR, and this Deployment reconciles it on an Owns() watch. Parking the
+	// DaemonSet directly is therefore undone before the next poll — the campaign that first ran
+	// this spec recorded SuccessfulDelete and SuccessfulCreate for all six pods in the SAME
+	// second, and "node plugin daemonset updated successfully" in the csi-operator's log at that
+	// instant. The park did take; it lasted a fraction of a second.
+	//
+	// That is worth stating precisely, because the failure LOOKED like a slow cluster: the spec
+	// timed out waiting for the pods to go away, which reads as "the DaemonSet is draining
+	// slowly" and invites a bigger timeout. No timeout would ever have worked. A reconciler is
+	// not a race you can wait out.
+	//
+	// Setting the Driver CR's own nodePlugin affinity instead — the semantically correct knob —
+	// was rejected: that CR is written by rook-ceph-operator on every CephCluster reconcile, so a
+	// reconcile landing inside this spec's 45-minute window would silently un-inject the fault
+	// and make the spec flaky rather than red. Stopping the reconciler has no such window, and it
+	// is the pattern m6_precheck_test.go already uses on rook-ceph-operator for the same reason.
+	//
+	// Blast radius: this stops RECONCILIATION only. The RBD controller plugin (provisioner and
+	// snapshotter sidecars) keeps running, so the snapshot half of the cascade — cut, clone,
+	// exposure Ready — still works, which is exactly what this spec needs it to do.
+	m6CSIOperatorDeploy = "ceph-csi-controller-manager"
 
 	// m6StallParkLabel is the nodeSelector key the DaemonSet is parked with. A DaemonSet has no
 	// replica count, so "scale it to zero" means "select no node"; this key exists on nothing.
@@ -133,6 +169,12 @@ var _ = Describe("M6 — the mover start deadline", Label("m6", "stall"), Ordere
 	// rather than what this spec assumes was there. rook sets none today; a distro overlay may.
 	var originalNodeSelector map[string]string
 	var captured bool
+	// Resolved in BeforeAll, once, and reused: see m6RBDNodePluginMatch for why it is discovered.
+	var rbdNodePlugin string
+	// The csi-operator's replica count before this spec touched it — captured, never assumed, the
+	// same way m6_precheck_test.go captures rook-ceph-operator's. Restoring "to 1" would be a
+	// guess about someone else's cluster.
+	var csiOperatorReplicas int32
 
 	BeforeAll(func() {
 		m1RequireS3()
@@ -150,7 +192,9 @@ var _ = Describe("M6 — the mover start deadline", Label("m6", "stall"), Ordere
 		startPVCConsumer(m6StallNS, m6StallPVC, m6StallStorageClass)
 
 		By("And the RBD node plugin DaemonSet, whose absence is the fault this spec injects")
-		originalNodeSelector = m6CaptureDaemonSetNodeSelector(m6RBDNodePluginNS, m6RBDNodePlugin)
+		rbdNodePlugin = m6FindRBDNodePlugin()
+		originalNodeSelector = m6CaptureDaemonSetNodeSelector(m6RBDNodePluginNS, rbdNodePlugin)
+		csiOperatorReplicas = m6DeploymentReplicas(m6RookOperatorNS, m6CSIOperatorDeploy)
 		captured = true
 	})
 
@@ -162,16 +206,34 @@ var _ = Describe("M6 — the mover start deadline", Label("m6", "stall"), Ordere
 		// AfterAll for the same trap, where an unguarded restore would have scaled the storage
 		// operator to zero as a cleanup step.
 		if captured {
-			m6RestoreDaemonSetNodeSelector(m6RBDNodePluginNS, m6RBDNodePlugin, originalNodeSelector)
+			m6RestoreDaemonSetNodeSelector(m6RBDNodePluginNS, rbdNodePlugin, originalNodeSelector)
+			// Order matters even here: unpark first, then let the reconciler back in. And it is
+			// guarded on the captured count being non-zero for the reason above — the zero value
+			// of an int32 is a perfectly plausible replica count to restore, and restoring it on
+			// a run where BeforeAll failed would leave the cluster's CSI plane switched off for
+			// every campaign that followed.
+			if csiOperatorReplicas > 0 {
+				m6ScaleDeployment(m6RookOperatorNS, m6CSIOperatorDeploy, csiOperatorReplicas)
+			}
 		}
 		deleteNamespace(m6StallNS)
 	})
 
 	It("fails a volume whose mover pod never started, quoting the kubelet, and leaves nothing behind", func() {
-		By("Given the RBD node plugin is parked — no kubelet can stage an RBD volume any more")
-		m6ParkDaemonSet(m6RBDNodePluginNS, m6RBDNodePlugin)
+		// Before the park, not after: the csi-operator owns the DaemonSet and would put it back
+		// within the second (see m6CSIOperatorDeploy). Registered first so that DeferCleanup's
+		// LIFO order unparks the DaemonSet BEFORE the reconciler is allowed back — the reverse
+		// order would have the operator racing the unpark over the same object.
+		By("Given the ceph-csi operator is stopped — it owns the node plugin and would revert the park")
+		m6ScaleDeployment(m6RookOperatorNS, m6CSIOperatorDeploy, 0)
 		DeferCleanup(func() {
-			m6RestoreDaemonSetNodeSelector(m6RBDNodePluginNS, m6RBDNodePlugin, originalNodeSelector)
+			m6ScaleDeployment(m6RookOperatorNS, m6CSIOperatorDeploy, csiOperatorReplicas)
+		})
+
+		By("And the RBD node plugin is parked — no kubelet can stage an RBD volume any more")
+		m6ParkDaemonSet(m6RBDNodePluginNS, rbdNodePlugin)
+		DeferCleanup(func() {
+			m6RestoreDaemonSetNodeSelector(m6RBDNodePluginNS, rbdNodePlugin, originalNodeSelector)
 		})
 
 		By("When a backup runs over the namespace")
@@ -265,7 +327,11 @@ var _ = Describe("M6 — the mover start deadline", Label("m6", "stall"), Ordere
 		Expect(cb.Status.Phase).To(BeElementOf("Failed", "PartiallyFailed"))
 
 		By("Restoring the RBD node plugin so the teardown of this run's objects can drain")
-		m6RestoreDaemonSetNodeSelector(m6RBDNodePluginNS, m6RBDNodePlugin, originalNodeSelector)
+		m6RestoreDaemonSetNodeSelector(m6RBDNodePluginNS, rbdNodePlugin, originalNodeSelector)
+		// The reconciler goes back after the unpark, never before: it would otherwise rewrite the
+		// DaemonSet from the Driver CR while this spec is still restoring it, and whichever write
+		// landed second would decide the cluster's state for the rest of the campaign.
+		m6ScaleDeployment(m6RookOperatorNS, m6CSIOperatorDeploy, csiOperatorReplicas)
 
 		// A volume failed by a deadline is a terminal volume like any other and goes through the
 		// same teardown. The leak-check is the authority on what residue means; the mover Job and
@@ -292,7 +358,7 @@ var _ = Describe("M6 — the mover start deadline", Label("m6", "stall"), Ordere
 		By("Given every node can stage an RBD volume again")
 		Eventually(func(g Gomega) {
 			var ds appsv1.DaemonSet
-			g.Expect(k8s.Get(ctx, client.ObjectKey{Namespace: m6RBDNodePluginNS, Name: m6RBDNodePlugin}, &ds)).To(Succeed())
+			g.Expect(k8s.Get(ctx, client.ObjectKey{Namespace: m6RBDNodePluginNS, Name: rbdNodePlugin}, &ds)).To(Succeed())
 			g.Expect(ds.Status.NumberReady).To(BeNumerically(">", 0),
 				"the RBD node plugin has no ready pod; the restore in the previous It did not take")
 		}, 10*time.Minute, 10*time.Second).Should(Succeed())
@@ -438,4 +504,34 @@ func m6PrometheusConfigured() bool {
 			fmt.Sprintf("skipping the in-progress-series assertion: %v", err))
 	}
 	return err == nil
+}
+
+// m6FindRBDNodePlugin resolves the RBD node plugin DaemonSet by driver name rather than by a
+// hardcoded object name.
+//
+// rook names it after the CSI driver and the convention has changed: this spec was written
+// against `csi-rbdplugin` and the first campaign to run it met
+// `rook-ceph.rbd.csi.ceph.com-nodeplugin`. Discovering it is the same decision, for the same
+// reason, as m6FindSnapshotController — and the failure below is deliberately a hard one: a
+// spec that could not find the thing whose absence IS its fault injection must not proceed to
+// park nothing and then assert a deadline that would fire for some other reason entirely.
+func m6FindRBDNodePlugin() string {
+	GinkgoHelper()
+	var sets appsv1.DaemonSetList
+	Expect(k8s.List(ctx, &sets, client.InNamespace(m6RBDNodePluginNS))).To(Succeed())
+
+	var names []string
+	for i := range sets.Items {
+		if strings.Contains(sets.Items[i].Name, m6RBDNodePluginMatch) {
+			names = append(names, sets.Items[i].Name)
+		}
+	}
+	Expect(names).NotTo(BeEmpty(),
+		"no DaemonSet in %s matches %q. This spec injects its fault by parking the RBD NODE "+
+			"plugin, and without it there is nothing to park: it would assert a mover-start "+
+			"deadline against a cluster where mounting works, and the only honest outcome is "+
+			"this failure rather than a green.",
+		m6RBDNodePluginNS, m6RBDNodePluginMatch)
+	slices.Sort(names) // deterministic if a distro ships more than one match
+	return names[0]
 }
