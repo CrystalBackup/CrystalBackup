@@ -31,7 +31,7 @@ The chart is published as an OCI artifact on GHCR.
 ```bash
 helm install crystal-backup \
   oci://ghcr.io/crystalbackup/charts/crystal-backup \
-  --version 0.6.2 \
+  --version 0.6.3 \
   --namespace crystal-backup-system
 ```
 
@@ -165,7 +165,7 @@ the chart cannot assume:
 | Value | Default | What off actually means |
 |---|---|---|
 | `metrics.serviceMonitor.enabled` | `false` | Nothing scrapes the operator. Needs the `monitoring.coreos.com` CRDs. |
-| `metrics.rules.enabled` | `false` | **No alert rules exist.** Nothing will tell you a backup stopped running. Same CRD requirement, and the eleven thresholds are platform policy — read them before turning them on. |
+| `metrics.rules.enabled` | `false` | **No alert rules exist.** Nothing will tell you a backup stopped running. Same CRD requirement, and the twelve thresholds are platform policy — read them before turning them on. |
 | `networkPolicy.monitoringNamespace` | `""` | Any pod in the cluster may open a connection to the metrics port. (It is HTTPS with API-server authn/authz, so an unauthorised scrape gets a 403 — but the ingress itself is open.) |
 
 If you run the Prometheus Operator, all three:
@@ -189,8 +189,8 @@ networkPolicy:
 one is a metrics outage that looks exactly like a working install. Read the rules first:
 
 ```bash
-helm show readme oci://ghcr.io/crystalbackup/charts/crystal-backup --version 0.6.2
-helm pull oci://ghcr.io/crystalbackup/charts/crystal-backup --version 0.6.2 --untar
+helm show readme oci://ghcr.io/crystalbackup/charts/crystal-backup --version 0.6.3
+helm pull oci://ghcr.io/crystalbackup/charts/crystal-backup --version 0.6.3 --untar
 less crystal-backup/rules/crystalbackup.rules.yaml
 ```
 
@@ -207,7 +207,7 @@ actually cost, on my data, over two weeks" without a Prometheus anywhere.
 ```bash
 helm upgrade crystal-backup \
   oci://ghcr.io/crystalbackup/charts/crystal-backup \
-  --version 0.6.2 -n crystal-backup-system \
+  --version 0.6.3 -n crystal-backup-system \
   --reuse-values --set soak.enabled=true
 ```
 

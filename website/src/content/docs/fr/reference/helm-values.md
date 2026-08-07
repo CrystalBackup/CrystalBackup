@@ -2,14 +2,14 @@
 title: Values Helm
 description: Les values configurables du chart, groupées par ce qu'elles affectent réellement.
 sourceFile: src/content/docs/reference/helm-values.md
-sourceHash: b698001ae439fd1c226f3dbb65a72f45bc3b1b1f
+sourceHash: b6901644c658db9913065fb45af47e32ec6731cf
 ---
 
 Les défauts viennent du `values.yaml` du chart lui-même. Seules les values que vous avez des
 chances de changer sont annotées ; les autres sont listées par souci d'exhaustivité.
 
 ```bash
-helm show values oci://ghcr.io/crystalbackup/charts/crystal-backup --version 0.6.2
+helm show values oci://ghcr.io/crystalbackup/charts/crystal-backup --version 0.6.3
 ```
 
 ## Namespace et nommage

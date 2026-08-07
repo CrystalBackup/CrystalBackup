@@ -247,7 +247,7 @@ off-peak hours and bound it with `pruneMaxRepackSize`. See
   consequence is worth stating plainly: **a default install ships no alert rules at all.**
   Nothing will tell you a backup stopped running. Without the Prometheus Operator, metrics
   are still served on port 8443 over HTTPS with API-server authn/authz — scrape them however
-  you like, and build the equivalent of the eleven shipped rules yourself.
+  you like, and build the equivalent of the twelve shipped rules yourself.
 - **An existing backup tool.** Coexistence is a design goal, not an afterthought. Add its
   namespace to `admission.deniedNamespaces` so Crystal Backup's tenant-facing resources
   cannot be created there.

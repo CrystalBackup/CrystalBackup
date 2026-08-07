@@ -2,7 +2,7 @@
 title: Prérequis
 description: Ce que votre cluster, votre stockage et votre stockage objet doivent fournir avant d'installer Crystal Backup.
 sourceFile: src/content/docs/start/requirements.md
-sourceHash: 599a83b2c5de293d0e73484131ffe64c70835762
+sourceHash: aa3018d91e2df8b66f09b854ea893faaed1e9527
 ---
 
 ## Vérifiez votre cluster avant d'installer
@@ -261,7 +261,7 @@ exclusive. Donnez-lui des heures creuses et bornez-le avec `pruneMaxRepackSize`.
   d'alerte.** Rien ne vous dira qu'une sauvegarde a cessé de tourner. Sans le Prometheus
   Operator, les métriques sont quand même servies sur le port 8443 en HTTPS avec authn/authz de
   l'API server — scrapez-les comme bon vous semble, et reconstruisez vous-même l'équivalent des
-  onze règles livrées.
+  douze règles livrées.
 - **Un outil de backup existant.** La coexistence est un objectif de conception, pas une
   arrière-pensée. Ajoutez son namespace à `admission.deniedNamespaces` pour que les
   ressources de Crystal Backup destinées aux tenants ne puissent pas y être créées.

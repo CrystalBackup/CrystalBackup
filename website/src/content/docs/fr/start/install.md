@@ -2,7 +2,7 @@
 title: Installer avec Helm
 description: Installation de l'operator Crystal Backup, des CRDs, du RBAC et des policies d'admission.
 sourceFile: src/content/docs/start/install.md
-sourceHash: 469420c17bd25d38b1b85d0a24735f78d7429278
+sourceHash: 7498f2bd232087aee2e7b5a53bf2d7949bf628ca
 ---
 
 Le chart installe l'operator, les douze CRDs, le RBAC cluster-scoped, les policies
@@ -34,7 +34,7 @@ Le chart est publié comme artefact OCI sur GHCR.
 ```bash
 helm install crystal-backup \
   oci://ghcr.io/crystalbackup/charts/crystal-backup \
-  --version 0.6.2 \
+  --version 0.6.3 \
   --namespace crystal-backup-system
 ```
 
@@ -173,7 +173,7 @@ que chacune exige quelque chose que le chart ne peut pas présupposer :
 | Value | Défaut | Ce que « off » veut dire concrètement |
 |---|---|---|
 | `metrics.serviceMonitor.enabled` | `false` | Rien ne scrape l'operator. Exige les CRDs `monitoring.coreos.com`. |
-| `metrics.rules.enabled` | `false` | **Aucune règle d'alerte n'existe.** Rien ne vous dira qu'une sauvegarde a cessé de tourner. Même exigence de CRDs, et les onze seuils relèvent de la politique de la plateforme — lisez-les avant de les activer. |
+| `metrics.rules.enabled` | `false` | **Aucune règle d'alerte n'existe.** Rien ne vous dira qu'une sauvegarde a cessé de tourner. Même exigence de CRDs, et les douze seuils relèvent de la politique de la plateforme — lisez-les avant de les activer. |
 | `networkPolicy.monitoringNamespace` | `""` | N'importe quel pod du cluster peut ouvrir une connexion vers le port des métriques. (C'est du HTTPS avec authn/authz de l'API server, donc un scrape non autorisé prend un 403 — mais l'ingress, lui, est ouvert.) |
 
 Si vous faites tourner le Prometheus Operator, les trois :
@@ -198,8 +198,8 @@ le mauvais donne une panne de métriques qui ressemble exactement à une install
 Lisez les règles d'abord :
 
 ```bash
-helm show readme oci://ghcr.io/crystalbackup/charts/crystal-backup --version 0.6.2
-helm pull oci://ghcr.io/crystalbackup/charts/crystal-backup --version 0.6.2 --untar
+helm show readme oci://ghcr.io/crystalbackup/charts/crystal-backup --version 0.6.3
+helm pull oci://ghcr.io/crystalbackup/charts/crystal-backup --version 0.6.3 --untar
 less crystal-backup/rules/crystalbackup.rules.yaml
 ```
 
@@ -218,7 +218,7 @@ moindre Prometheus.
 ```bash
 helm upgrade crystal-backup \
   oci://ghcr.io/crystalbackup/charts/crystal-backup \
-  --version 0.6.2 -n crystal-backup-system \
+  --version 0.6.3 -n crystal-backup-system \
   --reuse-values --set soak.enabled=true
 ```
 

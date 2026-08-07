@@ -10,7 +10,9 @@ not a caveat added for form.
 
 Milestones M0 through M6 have shipped and are tested — unit and envtest suites, a Kind
 end-to-end suite, and a real-infrastructure suite on provisioned clusters, which for
-`v0.6.0` ran unfiltered: 82 of 82 checks, nothing failed and nothing skipped. But the CRD
+`v0.6.3` ran unfiltered:
+[90 of 90 checks](/CrystalBackup/reports/crucible-m6-3.html), nothing failed and nothing
+skipped. But the CRD
 API is `v1alpha1` and will still move before `1.0.0`, and two of M6's own exit criteria are
 unmet — nobody has run this alongside an incumbent tool for two weeks, and there has been no
 pilot rollout. The honest summary is: **early, but no longer hypothetical.** That is not the

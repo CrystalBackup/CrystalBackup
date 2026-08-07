@@ -2,12 +2,12 @@
 title: État du projet
 description: Ce qui est livré, ce qui ne l'est pas, comment le projet est versionné, et comment il est construit.
 sourceFile: src/content/docs/discover/status.md
-sourceHash: fc59b7eb75500c154e00d2db0dc9406d4e6902d2
+sourceHash: 238a0282c37fb09b713fd0a860b74c4cad71c27d
 ---
 
 ## Où en est le projet
 
-La version courante est **`v0.6.2`**. Les jalons M0 à M6 sont livrés : le moteur de backup,
+La version courante est **`v0.6.3`**. Les jalons M0 à M6 sont livrés : le moteur de backup,
 le disaster recovery du cluster, le restore, les manifests et le DR cluster-scoped, les
 hooks de cohérence, la maintenance et la vérification du repository, le plan namespace, la
 synchronisation externe, le droit à l'effacement, et la couche d'observabilité posée devant
@@ -16,7 +16,7 @@ l'ensemble.
 Trois jalons restent. L'API des CRD est en `v1alpha1` et **changera encore** avant `1.0.0`.
 M6 **était** la passe de durcissement pour la production, et elle est livrée — mais deux de
 ses propres critères de sortie ne sont pas remplis : un soak de deux semaines aux côtés d'un
-outil en place, et un déploiement pilote. C'est pourquoi **0.6.0 est proposée pour être
+outil en place, et un déploiement pilote. C'est pourquoi **0.6.3 est proposée pour être
 testée en conditions réelles, pas pour la production** — une affirmation plus étroite que
 « pas durci », et plus utile. Le résumé honnête est : **précoce, mais ce n'est plus
 hypothétique.** Les chemins livrés sont testés contre de l'infrastructure réelle ; ce n'est
@@ -60,7 +60,7 @@ sont publiés plutôt que résumés.
 |---|---|---|
 | **M6** | livré en `v0.6.0` | Le catalogue complet des métriques, deux dashboards Grafana et onze règles d'alerte observées *en firing* contre un vrai Prometheus, les traces OTel à travers le pipeline, un self-check exportable, et un gate de fidélité du restore qui compare fichier par fichier un restore à sa source. Le réglage des ressources des movers par type d'opération et la revue PodSecurity passent en `0.6.1` ; le soak et le déploiement pilote n'ont pas eu lieu |
 | **M7** | pas commencé | **La portée.** Sauvegarder le stockage incapable de faire des snapshots — aujourd'hui une PVC sur `local-path`, hostPath ou NFS simple est *sautée*, ce qui laisse sans rien la plupart des petites installations k3s/RKE2 — plus la restauration d'un fichier unique dans le volume d'une application qui tourne, et des notifications par webhook générique pour les équipes sans stack Prometheus |
-| **M8** | pas commencé | **La preuve.** Un `RestoreDrill` qui restaure périodiquement votre dernier backup dans un namespace jetable, le compare fichier par fichier et rapporte — la machinerie existe déjà, c'est le propre gate de fidélité du projet, mais c'est un test de CI aujourd'hui, pas quelque chose qui tourne chez vous. Plus les alertes de restauration : aucune des onze règles livrées ne surveille l'échec d'un restore |
+| **M8** | pas commencé | **La preuve.** Un `RestoreDrill` qui restaure périodiquement votre dernier backup dans un namespace jetable, le compare fichier par fichier et rapporte — la machinerie existe déjà, c'est le propre gate de fidélité du projet, mais c'est un test de CI aujourd'hui, pas quelque chose qui tourne chez vous. Plus les alertes de restauration : aucune des douze règles livrées ne surveille l'échec d'un restore |
 | **M9** | pas commencé | Les locations immuables. `spec.mode: Immutable` est accepté par l'API, mais S3 Object Lock, la rotation de repository et l'expiration **ne sont pas implémentés** — cela ne vous donne pas de WORM |
 
 **Deux choses ont quitté cette liste au lieu d'y descendre.** La CLI `crystalctl` et l'UI de

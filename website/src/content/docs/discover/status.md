@@ -5,7 +5,7 @@ description: What has shipped, what has not, how the project is versioned, and h
 
 ## Where the project is
 
-The current release is **`v0.6.2`**. Milestones M0 through M6 have shipped: the core
+The current release is **`v0.6.3`**. Milestones M0 through M6 have shipped: the core
 backup engine, cluster disaster recovery, restore, manifest and cluster-scoped DR,
 consistency hooks, repository maintenance and verification, the namespace plane, external
 sync, the right to erasure, and the observability layer in front of all of it.
@@ -13,7 +13,7 @@ sync, the right to erasure, and the observability layer in front of all of it.
 Three milestones remain. The CRD API is `v1alpha1` and **will still change** before
 `1.0.0`. M6 was the production-hardening pass and it has shipped, but two of its own exit
 criteria have not been met: a two-week soak alongside an incumbent tool, and a pilot
-rollout. That is why **0.6.0 is offered for testing in real conditions, not for
+rollout. That is why **0.6.3 is offered for testing in real conditions, not for
 production** — a narrower claim than "not hardened", and a more useful one. The honest
 summary is: **early, but no longer hypothetical.** The shipped paths
 are tested against real infrastructure; that is not the same as asking you to trust it
@@ -55,7 +55,7 @@ published rather than summarised.
 |---|---|---|
 | **M6** | shipped in `v0.6.0` | The full metrics catalogue, two Grafana dashboards and eleven alert rules watched *firing* against a real Prometheus, OTel traces across the pipeline, an exportable self-check, and a restore-fidelity gate that compares a restore to its source file by file. Mover resource tuning by operation type and the PodSecurity review moved to `0.6.1`; the soak and the pilot rollout have not happened |
 | **M7** | not started | **Reach.** Backing up storage that cannot snapshot — today a PVC on `local-path`, hostPath or plain NFS is *skipped*, which leaves most small k3s/RKE2 installations with nothing — plus restoring a single file into a running application's volume, and notifications over a generic webhook for teams without a Prometheus stack |
-| **M8** | not started | **Proof.** A `RestoreDrill` that restores your latest backup into a scratch namespace on a schedule, compares it file by file and reports — the machinery already exists as the project's own fidelity gate, but it is a CI test today, not something that runs at your site. Plus restore alerting: none of the eleven shipped rules watches a restore failing |
+| **M8** | not started | **Proof.** A `RestoreDrill` that restores your latest backup into a scratch namespace on a schedule, compares it file by file and reports — the machinery already exists as the project's own fidelity gate, but it is a CI test today, not something that runs at your site. Plus restore alerting: none of the twelve shipped rules watches a restore failing |
 | **M9** | not started | Immutable locations. `spec.mode: Immutable` is accepted by the API, but S3 Object Lock, repository rotation and expiry are **not implemented** — it does not give you WORM |
 
 **Two things left this list rather than moving down it.** The `crystalctl` CLI and the browse

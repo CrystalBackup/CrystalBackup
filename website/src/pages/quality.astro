@@ -73,6 +73,16 @@ const reports = [
     covered: 'The first mover sizing this project ever shipped, put in front of real Ceph. Every mover Job had run BestEffort since M1 — no requests, no limits, an unbounded restic cache, no heap cap. The same full suite again on a fresh cluster: <strong>82 of 82, nothing failed and nothing skipped</strong>, on the built-in defaults, with zero evicted pods and zero OOM kills',
     links: [['Crucible 0.6.1', 'crucible-m6-1.html']],
   },
+  {
+    milestone: '0.6.2',
+    covered: 'The soak kit — the instrument for M6’s two-week soak, and mostly a release about the instrument being broken: the collector reported NOT_MEASURED for two of the four mover sizing classes beside a campaign that had run dozens of backups. A third full-suite pass, <strong>82 of 82, nothing failed and nothing skipped</strong>',
+    links: [['Crucible 0.6.2', 'crucible-m6-2.html']],
+  },
+  {
+    milestone: '0.6.3',
+    covered: 'The first campaign installed the way the documentation tells a reader to install. Four defects had blocked a real user’s first hour on their own cluster and none was reachable by any test here — two of them because the crucible’s own deploy script had configured around them before the first campaign ever ran. The suite also grew a lane that had never verified anything: <code>m6/stall</code> shipped red and took three runs to become evidence, and the operator was correct all three times. <strong>90 of 90, nothing failed and nothing skipped</strong>, in 2h43m',
+    links: [['Crucible 0.6.3', 'crucible-m6-3.html']],
+  },
 ];
 
 const gates = [

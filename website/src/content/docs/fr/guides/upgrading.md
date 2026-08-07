@@ -4,7 +4,7 @@ description: Mettre à niveau le chart, le problème des CRD que Helm ne résout
 sidebar:
   order: 10
 sourceFile: src/content/docs/guides/upgrading.md
-sourceHash: 9f8be03e06549602dcefa12e2ffe3a1ce474986f
+sourceHash: 474e89c93ef77bf3968933940e4efea9041a39e8
 ---
 
 ## Ce que signifie un numéro de version ici
@@ -34,14 +34,14 @@ Appliquez les CRD vous-même, avant le chart :
 
 ```bash
 # Pull the chart and take its CRDs. Use the version you are upgrading *to*;
-# 0.6.2 is the current release.
-helm pull oci://ghcr.io/crystalbackup/charts/crystal-backup --version 0.6.2 --untar
+# 0.6.3 is the current release.
+helm pull oci://ghcr.io/crystalbackup/charts/crystal-backup --version 0.6.3 --untar
 kubectl apply -f crystal-backup/crds/
 
 # Then upgrade the operator.
 helm upgrade crystal-backup \
   oci://ghcr.io/crystalbackup/charts/crystal-backup \
-  --version 0.6.2 \
+  --version 0.6.3 \
   --namespace crystal-backup-system
 ```
 
