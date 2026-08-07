@@ -25,6 +25,31 @@
 #   are reported Skipped with reason CSISnapshotUnsupported — visibly, but the backup still ends
 #   Completed. If you never look, you never notice.
 #
+# WHAT IT CANNOT ANSWER, AND WILL NOT PRETEND TO
+#
+#   Half of that question. A VolumeSnapshotClass whose .driver matches your StorageClass proves
+#   snapshot AVAILABILITY: a snapshot can be REQUESTED of that driver, and will very likely be
+#   taken. It does NOT prove snapshot USABILITY — that a volume restored from that snapshot can
+#   be mounted on your nodes and read back. Those are two different questions, and a real
+#   cluster has answered yes to the first and no to the second: snapshots taken cleanly, clones
+#   provisioned cleanly, every mount refused by the node's kernel client with
+#
+#     rbd: map failed: (22) Invalid argument
+#
+#   Nothing in the Kubernetes API showed it. Backups hung for thirty-six hours.
+#
+#   Establishing usability means creating a PVC, writing to it, snapshotting it, restoring it and
+#   mounting the result. This script will not do that: the promise at the top of this file is
+#   worth more than the answer, and it is why you were willing to run this against production.
+#
+#   So every StorageClass that resolves to an exposer is reported here as USABILITY NOT ASSESSED.
+#   It counts as a reservation, never as a pass — an unanswerable question does not become a
+#   green one by being important. The companion below does create those objects, states exactly
+#   which in its own header, and leaves them behind when they fail so the evidence survives:
+#
+#     https://crystalbackup.github.io/CrystalBackup/snapshot-probe.sh
+#     https://crystalbackup.github.io/CrystalBackup/docs/operations/snapshot-probe/
+#
 # USAGE
 #
 #   ./preflight.sh [--json] [--no-rbac-probe] [--no-color] [--help] [--version]
@@ -63,7 +88,12 @@
 # variable here would be a bug in the script, not a fact about the cluster.
 set -u
 
-SCRIPT_VERSION='1.0.0'
+SCRIPT_VERSION='2.0.0'
+
+# The companion that answers the half of the headline question this script deliberately cannot.
+# Named here once, printed wherever the answer is missing.
+CB_PROBE_URL='https://crystalbackup.github.io/CrystalBackup/snapshot-probe.sh'
+CB_PROBE_DOCS='https://crystalbackup.github.io/CrystalBackup/docs/operations/snapshot-probe/'
 
 # >>> BEGIN GENERATED — exposer selection (make preflight-table) >>>
 # Generated from internal/exposer by `make preflight-table` — do not edit by hand.
@@ -136,16 +166,25 @@ setup_color() {
 	C_BOLD=$(printf '\033[1m')
 }
 
-# usage reprints this file's own header. Piped in from a URL there is no file to read ($0 is the
-# shell), so it falls back to the essentials rather than printing nothing at all.
+# usage reprints this file's own header: every line from the second up to the first that is not a
+# comment. This used to be a fixed line range, which is a constant that has to be kept in step
+# with the prose above it — and the prose above it is where this script states what it promises
+# not to do. Piped in from a URL there is no file to read ($0 is the shell), so it falls back to
+# the essentials rather than printing nothing at all.
 usage() {
 	if [ -r "$0" ] && head -n 1 "$0" 2>/dev/null | grep -q '^#!'; then
-		sed -n '2,58p' "$0" | sed -e 's/^# \{0,1\}//' -e 's/^#$//'
+		awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"
 		return
 	fi
 	cat <<'USAGE'
 CrystalBackup preflight — read-only. Creates nothing, changes nothing, writes no file.
 Reports, per StorageClass, which exposer would be chosen and which volumes would be skipped.
+
+It reports snapshot AVAILABILITY. It cannot report snapshot USABILITY — whether a volume
+restored from a snapshot can be mounted and read on your nodes — because answering that
+requires creating objects. Resolvable classes are reported "usability NOT ASSESSED", which is a
+reservation and not a pass. The probe that does answer it:
+  https://crystalbackup.github.io/CrystalBackup/snapshot-probe.sh
 
   preflight.sh [--json] [--no-rbac-probe] [--no-color] [--help] [--version]
 
@@ -207,7 +246,7 @@ record() {
 
 die_unassessed() {
 	if [ "$OUT_JSON" = yes ]; then
-		printf '{"schema":"crystalbackup.preflight/v1","scriptVersion":%s,"verdict":"NOT_ASSESSED","reason":%s,"checks":[],"storageClasses":[]}\n' \
+		printf '{"schema":"crystalbackup.preflight/v2","scriptVersion":%s,"verdict":"NOT_ASSESSED","reason":%s,"usabilityAssessed":false,"checks":[],"storageClasses":[]}\n' \
 			"$(json_str "$SCRIPT_VERSION")" "$(json_str "$1")"
 	else
 		printf '%sNOT ASSESSED%s: %s\n' "$C_FAIL" "$C_RESET" "$1" >&2
@@ -418,6 +457,8 @@ check_storage_classes() {
 
 	_skipped_classes=0
 	_skipped_pvcs=0
+	_resolved_classes=0
+	_resolved_pvcs=0
 	_no_default=yes
 
 	while IFS='	' read -r _name _prov _default; do
@@ -451,19 +492,31 @@ check_storage_classes() {
 			_pvcns=$(count_lines "$(printf '%s\n' "$PVC_ROWS" | awk -F'\t' -v sc="$_name" '$1==sc {print $2}' | LC_ALL=C sort -u)")
 		fi
 
+		# _usability is deliberately never 'ASSESSED'. There is no branch of this script that can
+		# produce that value, because there is no read-only call that establishes it. A column
+		# whose best case is "NOT ASSESSED" reads as an omission until you notice it is the same
+		# in every row — which is exactly the shape of the truth here.
 		case $_verdict in
 		skip)
 			_skipped_classes=$((_skipped_classes + 1))
 			_skipped_pvcs=$((_skipped_pvcs + _pvcn))
+			_usability='NOT_APPLICABLE'
 			_note="no VolumeSnapshotClass has driver '$_prov' — volumes on this class are SKIPPED, reason $CB_SKIP_REASON"
 			;;
 		"$CB_KIND_CEPHFS_SHALLOW")
-			_note="CephFS driver: shallow (backingSnapshot) ReadOnlyMany temp PVC, zero copy"
+			_resolved_classes=$((_resolved_classes + 1))
+			_resolved_pvcs=$((_resolved_pvcs + _pvcn))
+			_usability='NOT_ASSESSED'
+			_note="exposer $_verdict: CephFS shallow (backingSnapshot) ReadOnlyMany temp PVC, zero copy. Snapshot class RESOLVED; whether the restored ReadOnlyMany volume can be mounted and read on your nodes was NOT ASSESSED — see $CB_PROBE_URL"
 			;;
 		"$CB_KIND_CSI_GENERIC")
-			_note="generic CSI path: VolumeSnapshot + ReadWriteOnce temp PVC. Copy-on-write on RBD and most drivers; a driver whose create-from-snapshot is a FULL copy will pay that copy per backup"
+			_resolved_classes=$((_resolved_classes + 1))
+			_resolved_pvcs=$((_resolved_pvcs + _pvcn))
+			_usability='NOT_ASSESSED'
+			_note="exposer $_verdict: VolumeSnapshot + ReadWriteOnce temp PVC. Copy-on-write on RBD and most drivers; a driver whose create-from-snapshot is a FULL copy will pay that copy per backup. Snapshot class RESOLVED; whether the restored volume can be mounted and read on your nodes was NOT ASSESSED — see $CB_PROBE_URL"
 			;;
 		*)
+			_usability='UNDETERMINED'
 			_note="undetermined — VolumeSnapshotClasses could not be listed"
 			;;
 		esac
@@ -471,7 +524,7 @@ check_storage_classes() {
 			_note="$_note; $_ncand classes match this driver, the operator would use '$_chosen'"
 		fi
 
-		SC_ROWS="${SC_ROWS}${_name}${US}${_prov}${US}${_default:-false}${US}${_chosen}${US}${_verdict}${US}${_pvcn}${US}${_pvcns}${US}$(clean "$_note")
+		SC_ROWS="${SC_ROWS}${_name}${US}${_prov}${US}${_default:-false}${US}${_chosen}${US}${_verdict}${US}${_usability}${US}${_pvcn}${US}${_pvcns}${US}$(clean "$_note")
 "
 	done <<EOF
 $_scs
@@ -481,7 +534,8 @@ EOF
 		record storage-classes UNKNOWN "StorageClass coverage" \
 			"VolumeSnapshotClasses could not be listed, so no exposer could be resolved for any StorageClass."
 	elif [ "$_skipped_classes" -eq 0 ]; then
-		record storage-classes PASS "StorageClass coverage" "every StorageClass resolves to an exposer."
+		record storage-classes PASS "StorageClass coverage" \
+			"every StorageClass resolves to a VolumeSnapshotClass and an exposer. That is snapshot AVAILABILITY only; usability is a separate finding below and was not established here."
 	elif [ "$PVC_KNOWN" = yes ] && [ "$_skipped_pvcs" -gt 0 ]; then
 		record storage-classes WARN "StorageClass coverage" \
 			"$_skipped_classes StorageClass(es) cannot be snapshotted, and $_skipped_pvcs existing PVC(s) sit on them. Those volumes' DATA WILL NEVER BE BACKED UP — their manifests will, and the Backup will still report Completed."
@@ -490,13 +544,27 @@ EOF
 			"$_skipped_classes StorageClass(es) cannot be snapshotted. No PVC uses them today; any PVC created on them later is silently data-skipped."
 	fi
 
+	# The headline question — WHICH OF YOUR VOLUMES WILL ACTUALLY BE BACKED UP — has a half this
+	# script cannot reach, and this is where it says so instead of letting the row above stand for
+	# an answer. UNKNOWN, not PASS and not WARN: nothing is wrong, and nothing is established.
+	# There is no code path that turns this into a PASS, by construction.
+	if [ "$_resolved_classes" -gt 0 ]; then
+		_usab_detail="$_resolved_classes StorageClass(es) resolve to a VolumeSnapshotClass"
+		if [ "$PVC_KNOWN" = yes ]; then
+			_usab_detail="$_usab_detail, carrying $_resolved_pvcs existing PVC(s)"
+		fi
+		record storage-usability UNKNOWN "Snapshot USABILITY (not assessed here)" \
+			"$_usab_detail. That proves a snapshot can be REQUESTED. It does not prove the volume restored from it can be MOUNTED on your nodes and READ — a cluster has passed the first and failed the second, with every mount refused by the node ('rbd: map failed: (22) Invalid argument') while the Kubernetes API showed nothing wrong. Establishing it requires creating a PVC, a snapshot, a restored PVC and a pod, which this script does not do. Run the probe, which does and says so: $CB_PROBE_URL (how to read it: $CB_PROBE_DOCS)"
+		unset _usab_detail
+	fi
+
 	if [ "$_no_default" = yes ]; then
 		record default-sc WARN "Default StorageClass" \
 			"no StorageClass is marked default. Restores that do not name a StorageClass explicitly will fail to provision."
 	else
 		record default-sc PASS "Default StorageClass" "set"
 	fi
-	unset _scs _skipped_classes _skipped_pvcs _no_default _name _prov _default _cands _ncand _has _verdict _chosen _pvcn _pvcns _note
+	unset _scs _skipped_classes _skipped_pvcs _resolved_classes _resolved_pvcs _no_default _name _prov _default _cands _ncand _has _verdict _usability _chosen _pvcn _pvcns _note
 }
 
 # A volumeMode: Block PVC is the one case the StorageClass table above reports as covered and is
@@ -723,22 +791,38 @@ EOF
 	if ! printf '%s' "$SC_ROWS" | grep -q '.'; then
 		printf '  %sNo StorageClass verdict could be produced — see the checks above.%s\n' "$C_UNK" "$C_RESET"
 	else
-		printf '  %-22s %-32s %-16s %s\n' 'STORAGECLASS' 'PROVISIONER' 'EXPOSER' 'PVCs'
-		while IFS="$US" read -r _n _p _d _vsc _v _pn _pns _note; do
+		printf '  %-22s %-30s %-16s %-14s %s\n' \
+			'STORAGECLASS' 'PROVISIONER' 'SNAPSHOT CLASS' 'USABILITY' 'PVCs'
+		_any_resolved=no
+		while IFS="$US" read -r _n _p _d _vsc _v _u _pn _pns _note; do
 			[ -n "$_n" ] || continue
+			# Column 3 is the VolumeSnapshotClass the operator would resolve — a name, or the
+			# absence of one. Column 4 is what is known about using it, and its best value is
+			# NOT ASSESSED. Splitting them is the point: the first is a fact this script can
+			# establish, the second is a fact it cannot, and merging them into a single green
+			# token is how this table used to read as an answer to the headline question.
 			case $_v in
-			skip) _c=$C_FAIL; _label='VOLUME SKIPPED' ;;
-			unknown) _c=$C_UNK; _label='UNDETERMINED' ;;
-			*) _c=$C_PASS; _label=$_v ;;
+			skip) _c=$C_FAIL; _label='none' ; _uc=$C_FAIL; _ul='DATA SKIPPED' ;;
+			unknown) _c=$C_UNK; _label='?' ; _uc=$C_UNK; _ul='UNDETERMINED' ;;
+			*) _c=$C_WARN; _label=$_vsc; _uc=$C_UNK; _ul='NOT ASSESSED'; _any_resolved=yes ;;
 			esac
 			_star=''
 			[ "$_d" = true ] && _star=' (default)'
-			printf '  %s%-22s%s %-32s %s%-16s%s %s in %s ns\n' \
-				"$C_BOLD" "$_n$_star" "$C_RESET" "$_p" "$_c" "$_label" "$C_RESET" "$_pn" "$_pns"
+			printf '  %s%-22s%s %-30s %s%-16s%s %s%-14s%s %s in %s ns\n' \
+				"$C_BOLD" "$_n$_star" "$C_RESET" "$_p" \
+				"$_c" "$_label" "$C_RESET" "$_uc" "$_ul" "$C_RESET" "$_pn" "$_pns"
 			printf '      %s%s%s\n' "$C_DIM" "$_note" "$C_RESET"
 		done <<EOF
 $SC_ROWS
 EOF
+		if [ "$_any_resolved" = yes ]; then
+			printf '\n  %sA named SNAPSHOT CLASS means a snapshot of that StorageClass can be REQUESTED.%s\n' "$C_WARN" "$C_RESET"
+			printf '  %sWhether the volume restored from it MOUNTS on your nodes and reads back is a%s\n' "$C_WARN" "$C_RESET"
+			printf '  %sdifferent question, and this read-only script cannot reach it. To answer it:%s\n' "$C_WARN" "$C_RESET"
+			printf '      %s%s\n' "$C_DIM" "$CB_PROBE_URL"
+			printf '      %s%s%s\n' "$C_DIM" "$CB_PROBE_DOCS" "$C_RESET"
+		fi
+		unset _any_resolved _uc _ul
 	fi
 
 	_v=$(verdict_of)
@@ -756,8 +840,16 @@ EOF
 }
 
 report_json() {
-	printf '{"schema":"crystalbackup.preflight/v1"'
+	# Schema v2, and the bump is not cosmetic: in v1 a resolved StorageClass reported
+	# "dataBackedUp": true, which is the same unsupported claim the text report used to make, in
+	# the form a machine acts on. It is now null for every class whose usability was not
+	# assessed — and no class's usability is ever assessed by this script — and false only where
+	# the data is genuinely skipped. There is no input to this script that makes it true.
+	printf '{"schema":"crystalbackup.preflight/v2"'
 	printf ',"scriptVersion":%s' "$(json_str "$SCRIPT_VERSION")"
+	printf ',"usabilityAssessed":false'
+	printf ',"usabilityProbe":{"script":%s,"docs":%s}' \
+		"$(json_str "$CB_PROBE_URL")" "$(json_str "$CB_PROBE_DOCS")"
 	printf ',"jsonEncoder":%s' "$(json_str "$JSON_ENCODER")"
 	printf ',"verdict":%s' "$(json_str "$(verdict_of)")"
 	printf ',"exitCode":%s' "$(exit_code_of)"
@@ -778,16 +870,17 @@ EOF
 
 	printf ',"storageClasses":['
 	_first=1
-	while IFS="$US" read -r _n _p _d _vsc _v _pn _pns _note; do
+	while IFS="$US" read -r _n _p _d _vsc _v _u _pn _pns _note; do
 		[ -n "$_n" ] || continue
 		[ "$_first" = 1 ] || printf ','
 		_first=0
-		_bk=true
+		_bk=null
 		[ "$_v" = skip ] && _bk=false
-		[ "$_v" = unknown ] && _bk=null
-		printf '{"name":%s,"provisioner":%s,"isDefault":%s,"volumeSnapshotClass":%s,"exposer":%s,"dataBackedUp":%s,"skipReason":%s,"pvcCount":%s,"namespaceCount":%s,"note":%s}' \
+		_res=true
+		{ [ "$_v" = skip ] || [ "$_v" = unknown ]; } && _res=false
+		printf '{"name":%s,"provisioner":%s,"isDefault":%s,"volumeSnapshotClass":%s,"exposer":%s,"snapshotClassResolved":%s,"usability":%s,"dataBackedUp":%s,"skipReason":%s,"pvcCount":%s,"namespaceCount":%s,"note":%s}' \
 			"$(json_str "$_n")" "$(json_str "$_p")" "$([ "$_d" = true ] && printf true || printf false)" \
-			"$(json_str "$_vsc")" "$(json_str "$_v")" "$_bk" \
+			"$(json_str "$_vsc")" "$(json_str "$_v")" "$_res" "$(json_str "$_u")" "$_bk" \
 			"$([ "$_v" = skip ] && json_str "$CB_SKIP_REASON" || printf null)" \
 			"$_pn" "$_pns" "$(json_str "$_note")"
 	done <<EOF

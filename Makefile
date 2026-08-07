@@ -699,27 +699,36 @@ observability-docs-verify: ## Fail if the committed Metrics/Alerts reference pag
 ## for. The SHA-256 sidecar is written in the same pass and held by the same guard — a checksum
 ## regenerated separately goes stale one commit after the script, and it fails in the hands of the
 ## one administrator who bothered to verify.
-PREFLIGHT_OUT ?= website/public/preflight.sh website/public/preflight.sh.sha256
+##
+## The same block is spliced into website/public/snapshot-probe.sh, which answers the half of the
+## question preflight refuses to guess at — whether a volume restored from a snapshot can actually
+## be mounted and read. The probe has to pick the SAME VolumeSnapshotClass by the same tie-break
+## and build its restored PVC with the same access mode as the exposer, or it proves nothing about
+## the operator; sharing one generated region is what keeps that true.
+PREFLIGHT_SCRIPTS ?= preflight.sh snapshot-probe.sh
+PREFLIGHT_OUT ?= $(foreach s,$(PREFLIGHT_SCRIPTS),website/public/$(s) website/public/$(s).sha256)
 
 .PHONY: preflight-table
-preflight-table: ## Regenerate the exposer-selection block and checksum of website/public/preflight.sh from internal/exposer.
+preflight-table: ## Regenerate the exposer-selection block and checksums of the published shell scripts from internal/exposer.
 	go run ./hack/gen-preflight-table --root .
 
 .PHONY: preflight-table-verify
-preflight-table-verify: ## Fail if preflight.sh's exposer table or checksum is stale (CI guard).
+preflight-table-verify: ## Fail if a published script's exposer table or checksum is stale (CI guard).
 	@tmp="$$(mktemp -d)"; trap 'rm -rf "$$tmp"' EXIT; \
-	go run ./hack/gen-preflight-table --root . --out "$$tmp/preflight.sh" >/dev/null; \
-	if ! diff -u website/public/preflight.sh "$$tmp/preflight.sh"; then \
-		echo "ERROR: website/public/preflight.sh is out of date with internal/exposer."; \
-		echo "       Run 'make preflight-table' and commit the result."; \
-		exit 1; \
-	fi; \
-	if ! diff -u website/public/preflight.sh.sha256 "$$tmp/preflight.sh.sha256"; then \
-		echo "ERROR: website/public/preflight.sh.sha256 does not match the script it claims to check."; \
-		echo "       Run 'make preflight-table' and commit the result."; \
-		exit 1; \
-	fi; \
-	echo "the preflight script and its checksum are up to date."
+	go run ./hack/gen-preflight-table --root . --out-dir "$$tmp" >/dev/null; \
+	for s in $(PREFLIGHT_SCRIPTS); do \
+		if ! diff -u "website/public/$$s" "$$tmp/$$s"; then \
+			echo "ERROR: website/public/$$s is out of date with internal/exposer."; \
+			echo "       Run 'make preflight-table' and commit the result."; \
+			exit 1; \
+		fi; \
+		if ! diff -u "website/public/$$s.sha256" "$$tmp/$$s.sha256"; then \
+			echo "ERROR: website/public/$$s.sha256 does not match the script it claims to check."; \
+			echo "       Run 'make preflight-table' and commit the result."; \
+			exit 1; \
+		fi; \
+	done; \
+	echo "the published scripts and their checksums are up to date."
 
 ## The website is bilingual (English at the root, French under /fr/), and a translated page
 ## that has silently fallen behind its English source is worse than no translation at all: a

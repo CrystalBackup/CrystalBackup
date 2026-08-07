@@ -100,10 +100,15 @@ jobs:
       # worst-placed drift in the project: it is the one artefact strangers run against their own
       # clusters, and it would keep printing confident verdicts while being wrong.
       #
-      # The published SHA-256 sidecar is checked by the same target. A checksum that no longer
-      # matches the script does not fail quietly — it fails in the hands of the one administrator
+      # The same block is spliced into snapshot-probe.sh, which goes and exercises the exposer
+      # preflight predicts — it must pick the same VolumeSnapshotClass by the same tie-break and
+      # build its restored PVC with the same access mode, or it is testing an object the operator
+      # would never create.
+      #
+      # The published SHA-256 sidecars are checked by the same target. A checksum that no longer
+      # matches its script does not fail quietly — it fails in the hands of the one administrator
       # who followed the documentation and verified before running.
-      - name: Verify the preflight script and its checksum are regenerated
+      - name: Verify the published scripts and their checksums are regenerated
         run: make preflight-table-verify
 
   alert-rules:

@@ -24,37 +24,48 @@ import (
 	"testing"
 )
 
-// The kit's shell scripts are the operator-facing half of this package, and the only half nothing
-// else here can execute. hack/soak/collect.sh is run ONCE, by one person, at the end of a
-// fortnight — so a defect in it does not cost a retry, it costs the retry window.
+// The shell scripts this project hands to somebody else to run are the only artefacts nothing in
+// the Go test suite can execute. hack/soak/collect.sh is run ONCE, by one person, at the end of a
+// fortnight — so a defect in it does not cost a retry, it costs the retry window. The two under
+// website/public/ are worse placed still: they are downloaded from a URL and run by strangers
+// against their own production clusters, and one of them creates objects there.
 //
 // These tests are text-level on purpose. Running collect.sh needs a cluster, which is exactly why
 // its two real defects survived review: both were invisible to reading and obvious the first time
 // anyone ran it.
+//
+// The guard covers website/public as well as hack/soak rather than being duplicated per
+// directory: the hazard below is a property of POSIX shell and of the reader's locale, not of
+// which directory the file sits in, and a second copy of this test is a second thing to remember
+// to point at the next script that ships.
 
-// scriptDir is where the kit's scripts live, relative to this package.
-const scriptDir = "../../hack/soak"
+// scriptDirs are where the shipped shell scripts live, relative to this package.
+var scriptDirs = []string{"../../hack/soak", "../../website/public"}
 
 func kitScripts(t *testing.T) map[string]string {
 	t.Helper()
-	entries, err := os.ReadDir(scriptDir)
-	if err != nil {
-		t.Fatalf("read %s: %v", scriptDir, err)
-	}
 	out := map[string]string{}
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".sh") {
-			continue
-		}
-		path := filepath.Join(scriptDir, e.Name())
-		body, err := os.ReadFile(path) // #nosec G304 -- path is built from a constant dir listing
+	for _, dir := range scriptDirs {
+		entries, err := os.ReadDir(dir)
 		if err != nil {
-			t.Fatalf("read %s: %v", path, err)
+			t.Fatalf("read %s: %v", dir, err)
 		}
-		out[path] = string(body)
-	}
-	if len(out) < 2 {
-		t.Fatalf("found %d script(s) under %s — this guard has gone blind", len(out), scriptDir)
+		found := 0
+		for _, e := range entries {
+			if e.IsDir() || !strings.HasSuffix(e.Name(), ".sh") {
+				continue
+			}
+			path := filepath.Join(dir, e.Name())
+			body, err := os.ReadFile(path) // #nosec G304 -- path is built from a constant dir listing
+			if err != nil {
+				t.Fatalf("read %s: %v", path, err)
+			}
+			out[path] = string(body)
+			found++
+		}
+		if found < 2 {
+			t.Fatalf("found %d script(s) under %s — this guard has gone blind on that directory", found, dir)
+		}
 	}
 	return out
 }

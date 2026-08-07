@@ -14,9 +14,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Command gen-preflight-table writes the exposer-selection block of the preflight script
-// (website/public/preflight.sh) from internal/exposer, and writes the script's SHA-256
-// sidecar.
+// Command gen-preflight-table writes the exposer-selection block of the published shell scripts
+// (website/public/preflight.sh and website/public/snapshot-probe.sh) from internal/exposer, and
+// writes each script's SHA-256 sidecar.
+//
+// # Why two scripts share one generated block
+//
+// They ask the two halves of the same question and must agree on the answer to the first half.
+// preflight.sh reports which exposer would be chosen; snapshot-probe.sh then goes and exercises
+// that exposer's shape — it picks the same VolumeSnapshotClass by the same tie-break, and it
+// builds its restored PVC ReadWriteOnce or ReadOnlyMany according to the same rule, because a
+// probe that mounts an object the operator would never create proves nothing about the operator.
+// One generated region, spliced into both, is what keeps that true.
 //
 // # Why this is generated
 //
@@ -86,6 +95,16 @@ const (
 	exposerPkgDir = "internal/exposer"
 )
 
+// scripts are the published shell scripts that carry the generated region, relative to the
+// repository root. Both are downloaded and run by administrators against their own clusters, and
+// both are checksummed here rather than separately: a sidecar regenerated in its own pass goes
+// stale one commit after the script does, and it fails in the hands of the one person who
+// followed the documentation and verified before running.
+var scripts = []string{
+	filepath.Join("website", "public", "preflight.sh"),
+	filepath.Join("website", "public", "snapshot-probe.sh"),
+}
+
 // knownKinds maps every exposer Kind constant this generator knows how to describe to the
 // verdict token the script prints for it. A Kind* constant in internal/exposer that is absent
 // from this map is a hard error: see checkKindCoverage.
@@ -96,16 +115,16 @@ var knownKinds = map[string]string{
 
 func main() {
 	root := flag.String("root", ".", "repository root")
-	out := flag.String("out", "", "write the script here instead of in place (verify mode)")
+	outDir := flag.String("out-dir", "", "write the scripts and sidecars here instead of in place (verify mode)")
 	flag.Parse()
 
-	if err := run(*root, *out); err != nil {
+	if err := run(*root, *outDir); err != nil {
 		fmt.Fprintf(os.Stderr, "gen-preflight-table: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run(root, out string) error {
+func run(root, outDir string) error {
 	facts, err := extract(filepath.Join(root, exposerPkgDir))
 	if err != nil {
 		return err
@@ -114,7 +133,22 @@ func run(root, out string) error {
 		return err
 	}
 
-	scriptPath := filepath.Join(root, "website", "public", "preflight.sh")
+	if outDir != "" {
+		if err := os.MkdirAll(outDir, 0o755); err != nil {
+			return err
+		}
+	}
+	for _, rel := range scripts {
+		if err := emit(root, outDir, rel, facts); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// emit splices the generated region into one script and writes it plus its sidecar.
+func emit(root, outDir, rel string, facts *facts) error {
+	scriptPath := filepath.Join(root, rel)
 	src, err := os.ReadFile(scriptPath) //nolint:gosec // path is repo-relative and fixed
 	if err != nil {
 		return fmt.Errorf("read %s: %w", scriptPath, err)
@@ -125,12 +159,10 @@ func run(root, out string) error {
 		return fmt.Errorf("%s: %w", scriptPath, err)
 	}
 
+	base := filepath.Base(rel)
 	dest := scriptPath
-	if out != "" {
-		dest = out
-		if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
-			return err
-		}
+	if outDir != "" {
+		dest = filepath.Join(outDir, base)
 	}
 	if err := os.WriteFile(dest, []byte(spliced), 0o755); err != nil { //nolint:gosec // an executable script is the point
 		return fmt.Errorf("write %s: %w", dest, err)
@@ -140,9 +172,13 @@ func run(root, out string) error {
 	// by the same guard. A checksum regenerated separately — or by hand — is a checksum that
 	// goes stale one commit after the script does, and a stale checksum does not fail quietly:
 	// it fails in the hands of the one administrator who bothered to verify.
+	//
+	// The name inside the sidecar is the BASENAME, not the path it was written to, so that
+	// `sha256sum -c` works in the directory the file is published from — which is the only place
+	// anybody will ever run it.
 	sum := sha256.Sum256([]byte(spliced))
 	sidecar := dest + ".sha256"
-	line := fmt.Sprintf("%s  preflight.sh\n", hex.EncodeToString(sum[:]))
+	line := fmt.Sprintf("%s  %s\n", hex.EncodeToString(sum[:]), base)
 	if err := os.WriteFile(sidecar, []byte(line), 0o644); err != nil { //nolint:gosec // published sidecar
 		return fmt.Errorf("write %s: %w", sidecar, err)
 	}
