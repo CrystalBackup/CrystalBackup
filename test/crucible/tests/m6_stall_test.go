@@ -68,9 +68,24 @@ import (
 // demand, so this reproduces its SHAPE, which is what the operator actually
 // keys off: a clone PVC the mover pod cannot mount. The rook-ceph RBD NODE
 // plugin (the DaemonSet that registers the CSI driver with every kubelet) is
-// parked with an impossible nodeSelector. Nothing then answers a NodeStageVolume
-// for rbd.csi.ceph.com, the mover pod sits in ContainerCreating, and the kubelet
-// records the FailedMount Warnings this spec reads back out of the reason.
+// parked with an impossible nodeSelector. The mover pod then sits in
+// ContainerCreating and the cluster records a Warning saying so, which is what
+// this spec reads back out of the reason.
+//
+// The STAGE at which it fails is not the field report's, and the spec must not
+// assume it is. Parking the node plugin also removes the driver-REGISTRAR, so
+// the driver leaves the CSINode object and the attach-detach controller refuses
+// before the kubelet ever reaches MountDevice:
+//
+//	Warning FailedAttachVolume  AttachVolume.Attach failed for volume "pvc-…":
+//	  CSINode crucible-worker-1 does not contain driver rook-ceph.rbd.csi.ceph.com
+//
+// The field report's was FailedMount — there the volume attached and then could
+// not be mapped. Both are the cluster saying why; only the stage differs. The
+// assertions below therefore compare the operator's reason against the Events
+// this cluster actually recorded, rather than against a word. Written the other
+// way, hardcoding FailedMount, this spec asserted how its own fault injection
+// happens to fail and cost a campaign to say so.
 //
 // Parking the NODE plugin and not the provisioner is deliberate and load-bearing:
 // the CONTROLLER-side plugin keeps running, so the VolumeSnapshot is still cut,
@@ -252,9 +267,15 @@ var _ = Describe("M6 — the mover start deadline", Label("m6", "stall"), Ordere
 			moverJob = m6StallMoverJob(g, stalledRun)
 		}, 10*time.Minute, 10*time.Second).Should(Succeed())
 
+		// The pod's NAME is kept, because the assertions further down compare the operator's reason
+		// against the Events the cluster recorded on this exact pod. Reading it once here, while
+		// the pod is demonstrably the wedged one, is what makes that comparison about the right
+		// object even after the Job has been torn down around it.
+		var moverPod string
 		By("And its pod is wedged in ContainerCreating, with the kubelet saying why")
 		Eventually(func(g Gomega) {
 			pod := m6StallMoverPod(g, moverJob)
+			moverPod = pod.Name
 			g.Expect(pod.Status.Phase).To(Equal(corev1.PodPending),
 				"the mover pod started after all — the node plugin was not parked, or something "+
 					"re-created it, and this spec is no longer reproducing the incident")
@@ -296,30 +317,89 @@ var _ = Describe("M6 — the mover start deadline", Label("m6", "stall"), Ordere
 
 		// And THE point of the lot. A reason that said only "MoverStartDeadlineExceeded" would name
 		// our decision and not their cluster, leaving the operator exactly as blind as thirty-six
-		// hours of silence did. FailedMount is the kubelet's own Event reason — the first column
-		// `kubectl describe pod` prints — and its presence here means the two commands finally
-		// agree.
-		By("And the reason CARRIES the kubelet's own account of why the pod could not start")
+		// hours of silence did. So the reason must carry the Event reason the CLUSTER recorded —
+		// the first column `kubectl describe pod` prints — and this asserts that the two commands
+		// agree by reading both, rather than by naming a string.
+		//
+		// It was written the other way and it was wrong. It asserted `FailedMount`, which is the
+		// word from the field report: there the volume attached and then could not be mapped. This
+		// spec injects a different fault. Parking the node plugin removes the driver-REGISTRAR, so
+		// the driver leaves the CSINode object and the attach-detach controller fails before the
+		// kubelet ever reaches MountDevice:
+		//
+		//	Warning FailedAttachVolume  AttachVolume.Attach failed for volume "pvc-…":
+		//	  CSINode crucible-worker-1 does not contain driver rook-ceph.rbd.csi.ceph.com
+		//
+		// Both are the cluster saying why, at different stages, and a spec that hardcodes either
+		// one is asserting how the fault was injected rather than what the operator promised. It
+		// cost a campaign to learn that, and the fix is to compare against the live Events.
+		By("And the reason CARRIES the cluster's own account of why the pod could not start")
 		var failed cbv1.VolumeStatus
 		Eventually(func(g Gomega) {
 			failed = m6PrecheckVolume(g, m6StallNS, stalledRun, m6StallPVC)
-			g.Expect(failed.Reason).To(ContainSubstring("FailedMount"),
+
+			// The colon is the whole claim in one character: bare, the reason is our verdict; with
+			// a detail appended, it is theirs. Asserted separately from the match below so that
+			// "no detail at all" and "a detail that is not the cluster's" fail differently.
+			g.Expect(failed.Reason).To(ContainSubstring(m6StallReason+":"),
 				"reason=%q — it names the deadline and nothing else. `kubectl get backup` has to be "+
 					"as informative as `kubectl describe pod` was, or this whole change converts a "+
 					"silent hang into a silent failure", failed.Reason)
+
+			reasons := m6PodWarningReasons(g, moverPod)
+			// Not a formality. An empty set would make the ContainSubstring below vacuous, and this
+			// spec would then certify the operator against a cluster that recorded nothing.
+			g.Expect(reasons).NotTo(BeEmpty(),
+				"the cluster recorded no Warning Event on mover pod %s, so there is nothing for the "+
+					"reason to have carried and nothing here to compare against", moverPod)
+
+			matched := false
+			for _, r := range reasons {
+				if strings.Contains(failed.Reason, r) {
+					matched = true
+				}
+			}
+			g.Expect(matched).To(BeTrue(),
+				"reason=%q carries a detail, but not one the cluster recorded. `kubectl describe "+
+					"pod %s` says %v, and the two commands have to agree — that agreement IS the "+
+					"deliverable", failed.Reason, moverPod, reasons)
 		}, 2*time.Minute, 10*time.Second).Should(Succeed())
 		Expect(len(failed.Reason)).To(BeNumerically("<=", 200),
 			"a status field must stay bounded; the Event carries the long form")
 
-		By("And the Event names the pod to describe and quotes the kubelet in full")
+		// The Event carries the long form the 200-character status field cannot. Same rule as
+		// above: the cluster's own word is read from the cluster, not named here.
+		By("And the Event names the pod to describe and quotes the cluster in full")
 		Eventually(func(g Gomega) {
 			notes := m6BackupEventNotes(g, m6StallNS, stalledRun, corev1.EventTypeWarning)
 			g.Expect(notes).NotTo(BeEmpty(), "no Warning Event was recorded on the Backup at all")
-			g.Expect(strings.Join(notes, "\n")).To(And(
+			joined := strings.Join(notes, "\n")
+			// The three things the reader needs and cannot get anywhere else: which volume, what
+			// the operator concluded, and the exact command that shows them the rest. The verdict
+			// phrase is the operator's own, taken from backup_progress_deadline_test.go rather than
+			// paraphrased — the first draft of this line looked for "never reached Running" while
+			// the product says "no pod of it EVER reached Running", and a 33-minute lane failed on
+			// the difference between two words that mean the same thing.
+			g.Expect(joined).To(And(
 				ContainSubstring(m6StallPVC),
-				ContainSubstring("never reached Running"),
-				ContainSubstring("FailedMount"),
-			), "the Event must name the PVC, the verdict, and the kubelet's reason")
+				ContainSubstring("no pod of it ever reached Running"),
+				ContainSubstring("kubectl describe pod"),
+				ContainSubstring(moverJob),
+			), "the Event must name the PVC, state the verdict, and hand over the command that "+
+				"shows the reader the rest")
+
+			reasons := m6PodWarningReasons(g, moverPod)
+			g.Expect(reasons).NotTo(BeEmpty(),
+				"the cluster recorded no Warning Event on mover pod %s to compare against", moverPod)
+			matched := false
+			for _, r := range reasons {
+				if strings.Contains(joined, r) {
+					matched = true
+				}
+			}
+			g.Expect(matched).To(BeTrue(),
+				"the Event does not quote any Warning the cluster recorded on pod %s (%v). It reads:\n%s",
+				moverPod, reasons, joined)
 		}, 2*time.Minute, 10*time.Second).Should(Succeed())
 
 		By("And the run reaches a terminal phase rather than hanging")
@@ -489,6 +569,33 @@ func m6PodWarningMessages(g Gomega, podName string) []string {
 			continue
 		}
 		out = append(out, strings.TrimSpace(e.Message))
+	}
+	return out
+}
+
+// m6PodWarningReasons returns the REASON of every Warning Event the cluster recorded about one
+// pod — `FailedAttachVolume`, `FailedMount`, `FailedScheduling`, whatever this cluster's failure
+// stage happens to produce.
+//
+// Reasons rather than messages, and read live rather than named as a constant, because that is
+// the only honest way to state the property under test: the operator promised that
+// `kubectl get backup` would be as informative as `kubectl describe pod`, and the way to check
+// that two commands agree is to run both. A constant here would be this spec asserting how its
+// own fault injection happens to fail — which is what it did, and what cost a campaign.
+func m6PodWarningReasons(g Gomega, podName string) []string {
+	var list corev1.EventList
+	g.Expect(k8s.List(ctx, &list, client.InNamespace(operatorNS),
+		client.MatchingFields{"involvedObject.name": podName})).To(Succeed())
+
+	var out []string
+	for i := range list.Items {
+		e := &list.Items[i]
+		if e.Type != corev1.EventTypeWarning {
+			continue
+		}
+		if reason := strings.TrimSpace(e.Reason); reason != "" && !slices.Contains(out, reason) {
+			out = append(out, reason)
+		}
 	}
 	return out
 }
