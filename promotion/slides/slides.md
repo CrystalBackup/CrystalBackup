@@ -969,8 +969,47 @@ L'écriture de la suite d'acceptation M5 a trouvé **3 features annoncées, docu
 <!--
 [28:30 → 29:30]
 Trois fois la même morale dans une seule release. Publié dans le changelog ET sur le site,
-avec la phrase-pattern. Si vous devez couper une war story pour tenir l'horaire : celle-ci
-se résume en une phrase depuis la slide suivante.
+avec la phrase-pattern. Si vous devez couper une war story pour tenir l'horaire : c'est
+celle-ci — elle se résume en une phrase, et la n°4 qui suit dit la même chose sur le
+harnais plutôt que sur le produit, ce qui est plus rare à entendre.
+-->
+
+---
+
+<span class="eyebrow">war story n°4</span>
+
+# La première heure sur le cluster de quelqu'un d'autre
+
+<div class="warbox mt-5">
+
+Un utilisateur installe la 0.6.2 en suivant la doc. **Quatre défauts dans la première heure**, aucun atteignable par un test de ce dépôt.
+
+<v-clicks>
+
+- **Deux étaient masqués par un seul fichier** : le script de déploiement du crucible, qui posait `namespace.create=false` et `apiServerPort=6443` **avant la première campagne**.
+- Le second portait un commentaire **citant l'erreur de démarrage mot pour mot**.
+- **82 checks verts, trois campagnes** — qui prouvaient qu'un chart que personne n'installe fonctionne.
+
+</v-clicks>
+
+</div>
+
+<v-click>
+
+<div class="pill grad-fill mt-5">Morale : votre banc d'essai peut être ce qui cache le bug.</div>
+
+</v-click>
+
+<!--
+[29:30 → 30:30]
+La plus inconfortable des quatre, et c'est pour ça qu'elle vaut la peine : les trois autres
+sont des bugs de produit, celle-ci est un bug de MÉTHODE. Le harnais avait été configuré
+pour contourner le produit, donc il ne testait plus le produit que les gens installent.
+La règle qui remplace les deux `--set`, à dire à l'oral : soit la doc dit au lecteur de le
+poser, soit c'est un bug dans les défauts.
+Ne nommez pas l'utilisateur et ne décrivez pas son cluster : l'histoire porte sur NOTRE banc
+d'essai, pas sur son infra.
+Si vous êtes en retard : c'est la n°3 qu'on coupe, pas celle-ci.
 -->
 
 ---

@@ -19,8 +19,8 @@ specs ou aux rapports d'acceptation publiés.
 |---|---|---|
 | 0:00 – 8:00 | **Le problème** | Le cluster est sauvegardé, pas ses habitants ; les 3 frustrations tenant ; le trou dans l'existant |
 | 8:00 – 23:30 | **La solution** | Deux plans, la cascade, least-data-movement, le dépôt = source de vérité, réversibilité, isolation, clés, RGPD, coexistence |
-| 23:30 – 31:30 | **La preuve** | Le crucible (~1 € les 2 h), l'oracle restic indépendant, 3 war stories, l'IA assumée |
-| 31:30 – 43:00 | **La démo** | backup → `delete namespace` → restore → checksum → restic upstream → triches refusées |
+| 23:30 – 32:30 | **La preuve** | Le crucible (~1 € les 2 h), l'oracle restic indépendant, 4 war stories, l'IA assumée |
+| 32:30 – 43:00 | **La démo** | backup → `delete namespace` → restore → checksum → restic upstream → triches refusées |
 | 43:00 – 45:00 | **L'atterrissage** | Ce qui n'existe pas encore (M7/M8/M9), CTA sandbox, questions |
 
 Repères de coupe et version 35 min : [slides/README.md](slides/README.md) et
