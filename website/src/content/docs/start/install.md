@@ -258,6 +258,10 @@ and the damage appears afterwards.
 Every command below is bounded with `--timeout` on purpose. An unbounded `kubectl delete`
 in this sequence is a terminal you end up killing, with nothing to show for it.
 
+If what you need is not the sequence but what each of these deletions actually removes — in the
+cluster, in the CSI layer and in the repository — that is a table in
+[Removing Crystal Backup](/CrystalBackup/docs/operations/uninstall/).
+
 **1. Stop what creates new work.**
 
 ```bash

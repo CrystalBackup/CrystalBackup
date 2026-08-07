@@ -2,7 +2,7 @@
 title: Installer avec Helm
 description: Installation de l'operator Crystal Backup, des CRDs, du RBAC et des policies d'admission.
 sourceFile: src/content/docs/start/install.md
-sourceHash: 7498f2bd232087aee2e7b5a53bf2d7949bf628ca
+sourceHash: 24bc9dc6e6bf6d053516424cb5b8518b0a9bdf2d
 ---
 
 Le chart installe l'operator, les douze CRDs, le RBAC cluster-scoped, les policies
@@ -270,6 +270,10 @@ pourra plus jamais être supprimé : son namespace s'arrête en `Terminating`
 Chaque commande ci-dessous est bornée par un `--timeout`, volontairement. Un
 `kubectl delete` non borné dans cette séquence, c'est un terminal que vous finissez par
 tuer, sans rien avoir obtenu.
+
+Si ce qu'il vous faut n'est pas la séquence mais ce que chacune de ces suppressions retire
+réellement — dans le cluster, dans la couche CSI et dans le repository —, c'est un tableau dans
+[Retirer Crystal Backup](/CrystalBackup/fr/docs/operations/uninstall/).
 
 **1. Arrêtez ce qui crée du nouveau travail.**
 

@@ -4,7 +4,7 @@ description: Mettre à niveau le chart, le problème des CRD que Helm ne résout
 sidebar:
   order: 10
 sourceFile: src/content/docs/guides/upgrading.md
-sourceHash: 474e89c93ef77bf3968933940e4efea9041a39e8
+sourceHash: e26516a24ec11d23d9f3f6cccf5cd0c8a49cc4fe
 ---
 
 ## Ce que signifie un numéro de version ici
@@ -47,6 +47,34 @@ helm upgrade crystal-backup \
 
 Un `kubectl apply` sur des CRD est additif et sûr : il ajoute les nouveaux champs et ne
 supprime jamais d'objets stockés.
+
+## 0.6.2 → 0.6.3 sous Argo CD : un objet cesse d'être rendu
+
+Lisez ceci avant de synchroniser, pas après. C'est arrivé sur un vrai cluster.
+
+En `0.6.2`, le chart rendait un objet `Namespace` par défaut (`namespace.create` valait `true`
+par défaut). En `0.6.3`, ce défaut est `false`, et l'objet a simplement disparu du rendu. Sous
+Argo CD avec le prune automatique, **un objet qui cesse d'être rendu est un objet qui est
+supprimé** — c'est ce que veut dire le prune, et il ne distingue pas « l'auteur a retiré ceci »
+de « l'auteur a changé le défaut ». Une synchronisation `0.6.2` → `0.6.3` peut donc supprimer
+`crystal-backup-system` et tout ce qu'il contient, y compris le Secret qui porte votre cluster
+KEK et toutes les DEK wrappées. Rien n'est touché dans le stockage objet, et chaque repository
+que ces clés protègent devient définitivement illisible — un
+[decommission](https://github.com/CrystalBackup/CrystalBackup/blob/main/docs/DECOMMISSION.md#14-the-key-itself)
+exécuté par accident, pendant une montée de patch.
+
+Le remède consiste à sortir le namespace de l'ensemble prunable de l'Application **avant** la
+mise à niveau : arrêtez de le suivre dans l'`Application` de l'operator — une Application à lui
+seul, avec le prune désactivé, ou une exclusion du périmètre de synchronisation. Dès lors que le
+namespace n'est plus quelque chose que cette Application rend, aucun changement de
+`namespace.create` ne peut l'atteindre. Ensuite, mettez à niveau. Le raisonnement, et la forme à
+employer, sont dans
+[Installer avec Argo CD](/CrystalBackup/fr/docs/start/install-argocd/#le-namespace--le-vôtre-pas-celui-du-chart).
+
+Le même danger vaut pour un `HelmRelease` Flux avec le pruning activé, et pour tout autre
+réconciliateur qui traite « n'est plus rendu » comme « à supprimer ». Après la mise à niveau,
+`namespace.create` devrait rester à `false` définitivement : un namespace que Helm possède est un
+namespace qu'un prune ou un `helm uninstall` peut emporter, avec les clés dedans.
 
 ## Avant de mettre à niveau
 

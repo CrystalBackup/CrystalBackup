@@ -45,6 +45,33 @@ helm upgrade crystal-backup \
 `kubectl apply` on CRDs is additive and safe: it adds new fields and never drops stored
 objects.
 
+## 0.6.2 → 0.6.3 under Argo CD: an object stops being rendered
+
+Read this before you sync, not after. It has happened on a real cluster.
+
+In `0.6.2` the chart rendered a `Namespace` object by default (`namespace.create` defaulted to
+`true`). In `0.6.3` that default is `false`, and the object is simply gone from the render. Under
+Argo CD with automated prune, **an object that stops being rendered is an object that gets
+deleted** — that is what prune means, and it does not distinguish between "the author removed
+this" and "the author changed the default". So a `0.6.2` → `0.6.3` sync can delete
+`crystal-backup-system` and everything inside it, including the Secret holding your cluster KEK
+and every wrapped DEK. Nothing in object storage is touched, and every repository those keys
+protect becomes permanently unreadable — a
+[decommission](https://github.com/CrystalBackup/CrystalBackup/blob/main/docs/DECOMMISSION.md#14-the-key-itself)
+executed by accident, during a patch upgrade.
+
+The remedy is to get the namespace out of the Application's prunable set **before** the upgrade:
+stop tracking it in the operator `Application` — a separate Application of its own, with prune
+off, or exclude it from the sync scope. Once the namespace is not something that Application
+renders, no change to `namespace.create` can reach it. Then upgrade. The reasoning, and the
+shape to use, are in
+[Install with Argo CD](/CrystalBackup/docs/start/install-argocd/#the-namespace--yours-not-the-charts).
+
+The same hazard applies to a Flux `HelmRelease` with pruning enabled, and to any other
+reconciler that treats "no longer rendered" as "delete". After the upgrade, `namespace.create`
+should stay `false` permanently: a namespace Helm owns is a namespace a prune or a
+`helm uninstall` can take, with the keys inside it.
+
 ## Before you upgrade
 
 **1 — Let in-flight work finish.** An upgrade restarts the operator, which is safe by
