@@ -51,6 +51,7 @@ on the same tree.
 ```sh
 make test          # unit + envtest (Makefile resolves KUBEBUILDER_ASSETS to an ABSOLUTE path via LOCALBIN — use the target, not a hand-rolled `go test`)
 make lint          # custom golangci-lint over the FULL tree (matches CI). NEVER a package-scoped lint — it has missed findings twice.
+make check-translations  # bilingual site staleness guard (self-tests first). Sat RED on main for four days across 0.6.2 — CI-only, so nobody ran it.
 make e2e           # kind e2e (builds + loads images, deploys, Ginkgo). Heavier; part of the non-reg trio, can run alongside the remote crucible.
 ```
 

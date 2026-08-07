@@ -37,6 +37,28 @@ shape, so the third leg costs one apko file and one melange file.
 Since sync and mover carry the same binary, a change to `cmd/crystal-mover` or `internal/mover`
 invalidates **both** digests. A change to *only* rclone or the sync assembly invalidates just sync.
 
+### melange can skip the rebuild and still exit 0
+
+While preparing 0.6.3 the melange build step was run with its output silenced (`>/dev/null 2>&1`)
+to keep the transcript readable. melange decided the package was already up to date, skipped the
+rebuild, and reused an `.apk` from three days earlier — exit code 0, and no output left to
+contradict it. apko then assembled and pushed an image from that stale package, and the published
+`:dev` digest came out byte-identical to 0.6.2's (`sha256:46706810…`). Nothing failed anywhere in
+the chain. The next step would have been a two-hour, ~€1/h crucible campaign run against the
+*previous* release's operator, and its green report would have been filed as validation of the new
+one. Deleting the stale `.apk` and rebuilding with the output visible produced `sha256:8d470029…`.
+
+Three rules come out of that:
+
+1. **Never silence a build step whose staleness is invisible in its exit code.** melange reports
+   "up to date" as success, so a silenced melange cannot be told apart from a melange that did the
+   work.
+2. **Check the `.apk` mtime after the build, before you push.** It is the cheapest possible proof
+   that the thing you are about to ship was built from the code you just changed.
+3. **An unchanged image digest after a code change is an ALERT, not a convenience.** Two builds of
+   the same source are reproducible and *should* match; a build after an edit that matches is a
+   build that did not happen.
+
 ## Prerequisites (macOS, Apple Silicon / arm64)
 
 1. **Docker via Rancher Desktop.** melange runs its build in a container (`--runner docker`); Rancher
