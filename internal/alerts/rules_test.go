@@ -296,8 +296,8 @@ func TestTableIsWellFormed(t *testing.T) {
 			t.Errorf("%s: no threshold kind declared; lot J cannot evaluate it", r.Name)
 		}
 	}
-	if len(seen) != 11 {
-		t.Errorf("the table has %d rules; spec/05-observability.md §3 specifies 11. If a rule was "+
+	if len(seen) != 12 {
+		t.Errorf("the table has %d rules; spec/05-observability.md §3 specifies 12. If a rule was "+
 			"added or removed, update the spec in the same change.", len(seen))
 	}
 }

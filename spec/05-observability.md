@@ -101,9 +101,27 @@ matching the Prometheus convention for enumerated label values.
 | `crystalbackup_backup_added_bytes_total` | counter | namespace, tenant, schedule, origin, location, cluster | Cumulative bytes uploaded to the repository (S3 egress estimation). |
 | `crystalbackup_backup_failures_total` | counter | namespace, tenant, schedule, origin, location, cluster | `Backup`s ending `Failed` or `PartiallyFailed`. In-process, so the series is **absent** until the first failure and absent again after a restart — see §1, and see the companion below. |
 | `crystalbackup_backup_last_failure_timestamp_seconds` | gauge | namespace, tenant, schedule, origin, location, cluster | Unix time of the last `Backup` that reached `Failed` or `PartiallyFailed`. Derived from the `Backup` objects at scrape time (`status.completionTime`, falling back to `metadata.creationTimestamp` for objects that predate that field and for projections), so it is **absent** until one has failed and is rebuilt intact across an operator restart. The restart-safe half of `CrystalbackupBackupFailed`. |
+| `crystalbackup_backup_in_progress_since_timestamp_seconds` | gauge | namespace, tenant, schedule, origin, location, cluster | Unix time the OLDEST still-unfinished `Backup` of this series was created; **absent** when none is in flight. Derived from the `Backup` objects at scrape time, so it is restart-safe and materialises at its real value rather than at 1 the way a counter child would. Added after the 0.6.2 field report, and it is the only series in this family that describes a run that has NOT ended — see the note below. |
 | `crystalbackup_schedule_active` | gauge | namespace, tenant, schedule, origin, location, cluster | 1 when an unpaused schedule is expected to back up this `(namespace, schedule)`: a namespaced `BackupSchedule` (`origin=namespace`), **or** a `ClusterBackupSchedule` whose namespace selection matches this namespace (`origin=cluster` — the operator resolves the selection and emits one series per matched namespace). **0** when that schedule exists but is paused; **absent** when it does not exist. Drives per-namespace `BackupMissed` across the cluster-plane fan-out. |
 | `crystalbackup_schedule_period_seconds` | gauge | namespace, tenant, schedule, origin, location, cluster | Longest gap between two consecutive activations of the schedule's cron expression. **Absent** when the expression cannot be parsed. Added in M6; it is what lets `BackupMissed` carry a per-schedule deadline instead of a flat 26 h (§8 q3). |
 | `crystalbackup_schedule_created_timestamp_seconds` | gauge | namespace, tenant, schedule, origin, location, cluster | Unix time the schedule object was created — the instant from which backups started being expected. Added in M6; see the note below. |
+
+**The hang, and why it needed a series of its own.** Every other series in this table describes a
+run that ENDED. A backup that never ends is therefore invisible to all of them at once, and the
+0.6.2 field report is what that looks like: a nightly cascade left six data movers whose pods could
+not mount their temp clone PVC in `ContainerCreating` for **thirty-six hours**, and four more
+namespaces sitting in `Snapshotting` beside them. Nothing failed, so nothing incremented;
+`last_success` had not yet gone stale, so `BackupMissed` was correct to stay quiet; and
+`concurrencyPolicy: Forbid` meant no further nightly ran at all — one backup in fifteen days, with a
+green dashboard the whole time. A stall is neither a failure nor a missed schedule, and no
+combination of the two can express it.
+
+`in_progress_since` is state-derived for the same reason `last_failure` is (§1): a stall is a FIRST
+occurrence by definition, and a `CounterVec` child materialises at 1, which `increase()` cannot see.
+It reports the OLDEST unfinished `Backup` of the series, so tonight's fresh run cannot reset the
+clock on last night's wedged one, and it is **absent** rather than 0 when nothing is running, so
+`time() - <series>` is silent on a healthy cluster by construction. Discovery projections are
+excluded: they are materialised views, never executed, and would otherwise sit unfinished forever.
 
 **The never-succeeded hole, and why there are two extra series rather than one.** Until M6 this
 table claimed `last_success` was "initialized to the schedule's creation time on first reconcile,
@@ -403,7 +421,7 @@ if even one of them is still expected to copy, the relationship is still being m
 
 ## 3. Alert rules
 
-**Shipped in M6, and no longer written here.** The eleven rules live in a Go table,
+**Shipped in M6, and no longer written here.** The twelve rules live in a Go table,
 `internal/alerts/rules.go`, from which the chart's `PrometheusRule` body is GENERATED into
 `charts/crystal-backup/rules/crystalbackup.rules.yaml` (`make alert-rules`). Enable it with
 `metrics.rules.enabled=true`; `metrics.rules.labels` sets whatever the Prometheus Operator's
@@ -428,6 +446,7 @@ needs.
 |---|---|---|---|
 | `CrystalbackupBackupMissed` | warning | 15m | An active schedule has gone past **its own** deadline (1.1 × the cron period + 1 h) with no successful `Backup`. Falls back to the schedule's creation time when nothing has ever succeeded, and to a fixed 26 h when the cron expression cannot be parsed. |
 | `CrystalbackupBackupFailed` | warning | — | A `Backup` reached `Failed` or `PartiallyFailed` in the last hour — read from the counter with `increase()`, **or** from `crystalbackup_backup_last_failure_timestamp_seconds` being less than an hour old. The second disjunct is what makes the rule survive an operator restart, which the counter alone does not (§1). |
+| `CrystalbackupBackupStalled` | warning | 30m | A `Backup` has been unfinished for more than **8 h** (`crystalbackup_backup_in_progress_since_timestamp_seconds`). Added after the 0.6.2 field report, and the only rule here whose subject is a run still in flight: every other one waits for something to fail, which is why a 36-hour hang was invisible to the whole table. The bound is loose on purpose — the TIGHT deadlines live in the controller (a mover pod that never reached Running at 30 m, a snapshot acknowledged and never ready at 2 h) and end in a `Failed` volume that `BackupFailed` pages on; this rule catches what those cannot prove, and accepts firing on a genuinely enormous first full to do it. |
 | `CrystalbackupRepositoryCheckFailed` | **critical** | 5m | `restic check` found repository damage. The only critical rule: it is the only one that says the RESTORE PATH is compromised rather than that a backup is late. |
 | `CrystalbackupStaleLocks` | warning | 30m | Stale restic locks persist past the reaper's own cycle. |
 | `CrystalbackupMaintenanceStalled` | warning | 1h | No successful prune for 26 h. Cannot fire on an `Immutable` location, which emits no series (§2.4). |

@@ -123,6 +123,19 @@ var (
 		NameBackupLastFailure,
 		"Unix time of the last Backup that reached Failed or PartiallyFailed for this series.",
 		backupLabels, nil)
+	// The series CrystalbackupBackupStalled reads. It is a TIMESTAMP, not an elapsed count, so the
+	// rule can be `time() - <series> > <bound>` like every other staleness rule here rather than a
+	// number this process has to keep re-deriving — and so the value means the same thing whichever
+	// scrape reads it.
+	//
+	// Emitted for the OLDEST non-terminal Backup of the series, and absent when none is in flight.
+	// Oldest, because a namespace with one wedged run and one healthy run behind it is a namespace
+	// with a wedged run: taking the newest would let each night's fresh Backup reset the clock on
+	// the one that never finished, which is the precise shape of silence this series exists to end.
+	backupInProgressSinceDesc = prometheus.NewDesc(
+		NameBackupInProgressSince,
+		"Unix time the oldest still-unfinished Backup for this series was created; absent when none is in flight.",
+		backupLabels, nil)
 	backupProtectedBytesDesc = prometheus.NewDesc(
 		NameBackupProtectedBytes,
 		"Logical bytes currently protected for the namespace: the newest recorded size of every PVC that has a live restore point.",
@@ -168,6 +181,7 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- backupLastDurationDesc
 	ch <- backupFailuresDesc
 	ch <- backupLastFailureDesc
+	ch <- backupInProgressSinceDesc
 	ch <- backupProtectedBytesDesc
 	ch <- scheduleActiveDesc
 	ch <- schedulePeriodDesc
@@ -356,6 +370,10 @@ type backupSeries struct {
 	lastAdded       float64
 	lastDuration    float64
 	failures        float64
+	// inProgressSinceUnix is the creation time of the OLDEST Backup of this series that has not
+	// reached a terminal phase, or 0 when every one of them has. Zero is unambiguous here: a Unix
+	// creationTimestamp of 0 would be an object created in 1970.
+	inProgressSinceUnix float64
 }
 
 // protectedSeriesKey identifies one crystalbackup_backup_protected_bytes series: the Backup series
@@ -411,6 +429,13 @@ func collectBackups(ch chan<- prometheus.Metric, backups []cbv1.Backup, clusterB
 		// and it is what keeps a fresh install silent.
 		if s.lastFailureUnix > 0 {
 			ch <- prometheus.MustNewConstMetric(backupLastFailureDesc, prometheus.GaugeValue, s.lastFailureUnix, vals...)
+		}
+		// Gated the same way, and the absence carries the same weight: a series with nothing in
+		// flight emits NOTHING here, so `time() - <series> > <bound>` is silent on a healthy cluster
+		// by construction rather than by comparing against a sentinel. Emitting a 0 would put the
+		// epoch on the wire and page every series in the fleet, permanently.
+		if s.inProgressSinceUnix > 0 {
+			ch <- prometheus.MustNewConstMetric(backupInProgressSinceDesc, prometheus.GaugeValue, s.inProgressSinceUnix, vals...)
 		}
 	}
 	for key, volumes := range protected {
@@ -497,6 +522,26 @@ func accumulateBackup(s *backupSeries, b *cbv1.Backup) {
 		}
 		if at > s.lastFailureUnix {
 			s.lastFailureUnix = at
+		}
+	default:
+		// Everything else is a run still in flight: Pending, SnapshottingHooks, Snapshotting,
+		// Uploading, and the empty phase a Backup carries between its creation and its first status
+		// write. The oldest one wins — see backupInProgressSinceDesc for why the newest would be the
+		// wrong answer.
+		//
+		// A discovery projection is excluded. It is a read-only materialised view of snapshots that
+		// already exist (M1 task #21), never a unit of execution, and the Backup controller returns
+		// immediately on one without ever writing a phase — so an unphased projection would sit in
+		// this branch forever and page about a run that was never running.
+		if b.Annotations[apiconst.AnnotationProjected] == apiconst.AnnotationProjectedValue {
+			return
+		}
+		since := float64(b.CreationTimestamp.Unix())
+		if since <= 0 {
+			return
+		}
+		if s.inProgressSinceUnix == 0 || since < s.inProgressSinceUnix {
+			s.inProgressSinceUnix = since
 		}
 	}
 }

@@ -8,7 +8,7 @@ tableOfContents:
 
 <!-- GENERATED FILE — do not edit. Run `make observability-docs` after changing internal/metrics or internal/alerts. -->
 
-11 alert rules ship with the chart. This page is generated from
+12 alert rules ship with the chart. This page is generated from
 `internal/alerts`, so every expression, threshold and annotation below is the one the
 chart actually installs — not a transcription of it.
 
@@ -82,6 +82,7 @@ separately, by `make alert-rules-covered`.
 | --- | --- | --- | --- |
 | [CrystalbackupBackupMissed](#crystalbackupbackupmissed) | warning | `15m` | nothing has happened for 1.1 × the schedule's own period + 1h (falling back to 26h) |
 | [CrystalbackupBackupFailed](#crystalbackupbackupfailed) | warning | none — fires on the first evaluation | the measured value goes above 0 |
+| [CrystalbackupBackupStalled](#crystalbackupbackupstalled) | warning | `30m` | nothing has happened for 8h |
 | [CrystalbackupRepositoryCheckFailed](#crystalbackuprepositorycheckfailed) | **critical** | `5m` | a state gauge reports the bad state (no numeric bound) |
 | [CrystalbackupStaleLocks](#crystalbackupstalelocks) | warning | `30m` | the measured value goes above 0 |
 | [CrystalbackupMaintenanceStalled](#crystalbackupmaintenancestalled) | warning | `1h` | nothing has happened for 26h |
@@ -153,6 +154,22 @@ Two disjuncts, because the counter alone was measured to be SILENT on a real fai
 
 :::caution[The offline self-check answers this one approximately]
 Derived from Backup objects that still exist. The alert's first disjunct reads a COUNTER (increase over 1h), which survives the schedule history limit deleting a failed run; this predicate cannot, and a failure already garbage-collected is not counted here. Its second disjunct is derived from the same objects this predicate reads, so on that half the two agree exactly — including the blind spot they share, which is precisely the deleted run.
+:::
+
+## CrystalbackupBackupStalled
+
+**Severity** warning · **`for`** `30m` · **Threshold** nothing has happened for 8h
+
+> Backup {{ $labels.namespace }}/{{ $labels.schedule }} has been running for over 8h without finishing
+
+**What to do.** A run that never ends is invisible to every other rule here: nothing failed, so BackupFailed is silent, and last_success has not gone stale yet so BackupMissed is too. kubectl get backup -n {{ $labels.namespace }} -o wide shows the per-volume phases; the reason on a volume names the cause, and for one stuck in Uploading, kubectl describe pod on its mover Job in the operator namespace has the kubelet's account.
+
+```promql
+time() - crystalbackup_backup_in_progress_since_timestamp_seconds > 28800
+```
+
+:::note[Why this threshold]
+THE INCIDENT. On 0.6.2 a nightly cascade left six movers whose pods could not mount their temp clone PVC in ContainerCreating for thirty-six hours, and four more namespaces in Snapshotting beside them. Nothing failed, so none of the eleven rules in this table could fire — every one of them watches for a FAILURE. concurrencyPolicy: Forbid then meant no further nightly ran at all: one backup in fifteen days, with a green dashboard. A stall is not a failure and it is not a missed schedule. It needs its own series and its own rule, and `crystalbackup_backup_in_progress_since_timestamp_seconds` is that series. It is STATE-DERIVED, recomputed from the Backup objects on every scrape, and that is load-bearing rather than incidental. The lesson is written out at length under CrystalbackupBackupFailed above: a CounterVec child materialises AT ONE, so a counter cannot page on a first occurrence, and after an operator restart it does not reset — it DISAPPEARS. A stall is a first occurrence by definition, and the operator restarting is one of the things that can cause one, so a counter was never an option here. The series is ABSENT when nothing is in flight, which is what keeps this silent on a healthy cluster rather than merely below a bound — the same absence discipline last_failure follows, and for the same reason: a published 0 would make time()-0 fifty-four years and page the whole fleet forever. It reports the OLDEST unfinished Backup of the series, so tonight's fresh run cannot reset the clock on last night's wedged one. WHY THE BOUND IS SO LOOSE: see backupStalledThreshold. The tight, provable deadlines live in the controller (a mover pod that never reached Running at 30m; a snapshot acknowledged and never ready at 2h) and end in a Failed volume that BackupFailed pages on. This rule catches what those cannot prove, including a Backup gated Pending forever and a mover that is running and wedged, and it accepts firing on a genuinely enormous first full to do it.
 :::
 
 ## CrystalbackupRepositoryCheckFailed

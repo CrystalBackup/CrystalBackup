@@ -72,6 +72,7 @@ const GroupName = "crystalbackup"
 const (
 	ruleBackupMissed              = "CrystalbackupBackupMissed"
 	ruleBackupFailed              = "CrystalbackupBackupFailed"
+	ruleBackupStalled             = "CrystalbackupBackupStalled"
 	ruleRepositoryCheckFailed     = "CrystalbackupRepositoryCheckFailed"
 	ruleStaleLocks                = "CrystalbackupStaleLocks"
 	ruleMaintenanceStalled        = "CrystalbackupMaintenanceStalled"
@@ -270,6 +271,38 @@ var (
 // pausedTooLongExpr for why the second reading is not redundant.
 var schedulePausedTooLongThreshold = Threshold{Kind: ThresholdAge, Age: 7 * 24 * time.Hour}
 
+// backupStalledThreshold: eight hours of a Backup that has not finished.
+//
+// This is the loosest bound in the table and that is on purpose, because it is the only one that
+// has to survive not knowing how big somebody's volume is. Read it against the two TIGHT bounds it
+// backs up, which live in the controller and fail the volume outright:
+//
+//   - moverStartDeadline (30m): a mover pod that never reached Running. Provable — restic has read
+//     nothing — so the operator can be quick and certain.
+//   - snapshotReadyDeadline (2h): a VolumeSnapshot acknowledged and never ready.
+//
+// Both of those end in a Failed volume, which CrystalbackupBackupFailed already pages on. This rule
+// is for the stalls neither can prove, and the list is not short: a Backup gated Pending forever on
+// a BackupRepository that never initialises, a mover pod that IS Running with restic wedged on a
+// dead endpoint, a volume held behind maxConcurrentMovers by a cascade that is itself stuck, a
+// mover Job that vanished (advanceUploading cannot time that one out — there is no clock left to
+// measure), and the case that is hardest to argue against: the deadline code above not running.
+//
+// EIGHT HOURS, and the number is taken from this project's own published model of its workload
+// rather than invented. internal/metrics' durationBuckets — the buckets every duration family in
+// the catalogue shares — top out at 28800 seconds, and the comment there says why: "a first full
+// backup of a multi-terabyte volume over a throttled S3 link lands in the last". A run past eight
+// hours is therefore off the top of the scale we ourselves designed for. That is the honest meaning
+// of this alert, and it is what the operator should read it as: not "this backup is broken", but
+// "this backup is longer than anything we modelled, come and look".
+//
+// It will occasionally fire on a genuine multi-terabyte first full, and that is the direction to
+// err in. The alternative is a bound above every conceivable legitimate run, which is a bound above
+// eight hours, and the incident this rule closes ran for THIRTY-SIX of them with every rule in this
+// table silent. Eight hours also keeps it well inside BackupMissed's 26h deadline, so a stalled
+// nightly is reported the same day rather than by the next night's absence.
+var backupStalledThreshold = Threshold{Kind: ThresholdAge, Age: 8 * time.Hour}
+
 // externalSyncPausedTooLongThreshold: the same week, for the same reason, on the other family.
 //
 // Declared separately rather than shared with the schedule's, following maintenanceStalled and
@@ -356,6 +389,51 @@ func Rules() []Rule {
 			}, "\n"),
 			Expr:      backupFailedExpr(),
 			Predicate: backupFailed,
+		},
+		{
+			Name:     ruleBackupStalled,
+			Severity: SeverityWarning,
+			// 30m, not zero and not an hour. The series is a timestamp read at scrape time, so the
+			// expression is already true continuously once the bound is crossed — the hold is there
+			// to absorb a scrape gap or an operator restart re-listing objects, not to add patience
+			// to a bound that is already eight hours long.
+			For:       30 * time.Minute,
+			Threshold: backupStalledThreshold,
+			Summary: "Backup {{ $labels.namespace }}/{{ $labels.schedule }} has been running for " +
+				"over 8h without finishing",
+			Description: "A run that never ends is invisible to every other rule here: nothing failed, " +
+				"so BackupFailed is silent, and last_success has not gone stale yet so BackupMissed is too. " +
+				"kubectl get backup -n {{ $labels.namespace }} -o wide shows the per-volume phases; the " +
+				"reason on a volume names the cause, and for one stuck in Uploading, kubectl describe pod " +
+				"on its mover Job in the operator namespace has the kubelet's account.",
+			Rationale: strings.Join([]string{
+				"THE INCIDENT. On 0.6.2 a nightly cascade left six movers whose pods could not mount their",
+				"temp clone PVC in ContainerCreating for thirty-six hours, and four more namespaces in",
+				"Snapshotting beside them. Nothing failed, so none of the eleven rules in this table could",
+				"fire — every one of them watches for a FAILURE. concurrencyPolicy: Forbid then meant no",
+				"further nightly ran at all: one backup in fifteen days, with a green dashboard.",
+				"A stall is not a failure and it is not a missed schedule. It needs its own series and its",
+				"own rule, and " + metrics.NameBackupInProgressSince + " is that series.",
+				"It is STATE-DERIVED, recomputed from the Backup objects on every scrape, and that is",
+				"load-bearing rather than incidental. The lesson is written out at length under",
+				"CrystalbackupBackupFailed above: a CounterVec child materialises AT ONE, so a counter",
+				"cannot page on a first occurrence, and after an operator restart it does not reset — it",
+				"DISAPPEARS. A stall is a first occurrence by definition, and the operator restarting is one",
+				"of the things that can cause one, so a counter was never an option here.",
+				"The series is ABSENT when nothing is in flight, which is what keeps this silent on a healthy",
+				"cluster rather than merely below a bound — the same absence discipline last_failure follows,",
+				"and for the same reason: a published 0 would make time()-0 fifty-four years and page the",
+				"whole fleet forever.",
+				"It reports the OLDEST unfinished Backup of the series, so tonight's fresh run cannot reset",
+				"the clock on last night's wedged one.",
+				"WHY THE BOUND IS SO LOOSE: see backupStalledThreshold. The tight, provable deadlines live in",
+				"the controller (a mover pod that never reached Running at 30m; a snapshot acknowledged and",
+				"never ready at 2h) and end in a Failed volume that BackupFailed pages on. This rule catches",
+				"what those cannot prove, including a Backup gated Pending forever and a mover that is",
+				"running and wedged, and it accepts firing on a genuinely enormous first full to do it.",
+			}, "\n"),
+			Expr:      staleTimestampExpr(metrics.NameBackupInProgressSince, backupStalledThreshold.Age),
+			Predicate: backupStalled,
 		},
 		{
 			Name:      ruleRepositoryCheckFailed,

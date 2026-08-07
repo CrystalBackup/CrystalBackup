@@ -103,6 +103,13 @@ var (
 	// to a suite var so the teardown-sweep specs can read its recorded TeardownExposure calls
 	// and arm per-call failures.
 	backupExposers *stubExposerRegistry
+	// backupReconciler is the registered Backup reconciler itself, hoisted to a suite var for ONE
+	// caller: the per-phase deadline specs, which shallow-COPY it and lower MoverStartDeadline on
+	// the copy. envtest cannot backdate a Job's creationTimestamp (the apiserver resets it on every
+	// update), so the only way to reach that decision is to shorten the bound — and doing it on a
+	// copy rather than on this object keeps every other spec running against the production
+	// thirty minutes, which is what stops a shortened deadline from failing their in-flight movers.
+	backupReconciler *BackupReconciler
 	// backupStatusFailer arms the AMBIGUOUS status write for one Backup: the terminal status
 	// Update is performed for real, then reported to the reconciler as a transport error —
 	// exercising terminalPhaseCommitted's committed-despite-error path deterministically.
@@ -281,7 +288,7 @@ var _ = BeforeSuite(func() {
 		precheckArmed: true,
 	}
 	backupStatusFailer = &statusUpdateFailer{}
-	backupReconciler := NewBackupReconciler(
+	backupReconciler = NewBackupReconciler(
 		// The manager client, with ONE seam added: statusFailingClient lets a spec make a single
 		// Backup status Update commit server-side yet error client-side (the ambiguous write).
 		// Disarmed — the default — it is a pure passthrough.

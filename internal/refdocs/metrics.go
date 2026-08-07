@@ -348,7 +348,7 @@ administrator's job, on a real cadence — see
 
 ## See also
 
-- [Alerts](/CrystalBackup/docs/reference/alerts/) — the eleven rules built on these series.
+- [Alerts](/CrystalBackup/docs/reference/alerts/) — the twelve rules built on these series.
 - [Observability](/CrystalBackup/docs/guides/observability/) — scraping, logs, and the conditions
   that say *why*.
 `

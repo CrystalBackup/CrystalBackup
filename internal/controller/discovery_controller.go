@@ -331,7 +331,7 @@ func (r *DiscoveryReconciler) projectGroup(ctx context.Context, repo *cbv1.Backu
 	}
 
 	proj := &cbv1.Backup{
-		TypeMeta: metav1.TypeMeta{APIVersion: cbv1.SchemeGroupVersion.String(), Kind: "Backup"},
+		TypeMeta: metav1.TypeMeta{APIVersion: cbv1.SchemeGroupVersion.String(), Kind: kindBackup},
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: key.Namespace,
 			Name:      key.Run,
@@ -374,7 +374,7 @@ func (r *DiscoveryReconciler) projectGroup(ctx context.Context, repo *cbv1.Backu
 	// phase that went with it. The value applied here is therefore the MERGE of what the repository
 	// shows with what the execution recorded, and the recorded phase is never raised to a better one.
 	statusObj := &cbv1.Backup{
-		TypeMeta:   metav1.TypeMeta{APIVersion: cbv1.SchemeGroupVersion.String(), Kind: "Backup"},
+		TypeMeta:   metav1.TypeMeta{APIVersion: cbv1.SchemeGroupVersion.String(), Kind: kindBackup},
 		ObjectMeta: metav1.ObjectMeta{Namespace: key.Namespace, Name: key.Run},
 		Status: cbv1.BackupStatus{
 			Phase:   projectedPhase(recorded.Phase),

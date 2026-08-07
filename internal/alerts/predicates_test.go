@@ -54,6 +54,7 @@ import (
 var seriesOfRule = map[string]string{
 	ruleBackupMissed:              metrics.NameScheduleActive,
 	ruleBackupFailed:              metrics.NameBackupFailuresTotal,
+	ruleBackupStalled:             metrics.NameBackupInProgressSince,
 	ruleRepositoryCheckFailed:     metrics.NameRepositoryCheckSuccess,
 	ruleStaleLocks:                metrics.NameRepositoryStaleLocks,
 	ruleMaintenanceStalled:        metrics.NameRepositoryLastPrune,
@@ -756,6 +757,10 @@ func breachingCluster(t *testing.T, now time.Time) client.Client {
 		}),
 		// BackupFailed: inside the 1h window.
 		failedBackup("team-a", "run-1", "daily", recent),
+		// BackupStalled: still Uploading ninety days after it was created. Its own schedule label,
+		// so its breach is one series and not entangled with the failed run above — the two rules
+		// describe different halves of the same namespace and must be readable apart.
+		stalledBackup("team-a", "run-wedged", "nightly", old),
 		// RepositoryCheckFailed / MaintenanceStalled / StaleLocks / DiscoveryFailed, all on one
 		// repository: they are independent fields and one object exercises every label path.
 		repo("primary", func(r *cbv1.BackupRepository) {
@@ -893,6 +898,22 @@ func failedBackup(namespace, name, schedule string, at metav1.Time) *cbv1.Backup
 		Type: "Ready", Status: metav1.ConditionFalse, Reason: "Failed",
 		LastTransitionTime: at, Message: "mover failed",
 	}}
+	return b
+}
+
+// stalledBackup is a Backup that started long ago and never reached a terminal phase — the shape
+// CrystalbackupBackupStalled exists for, and the one no other fixture here produces: every other
+// Backup in this file is already finished, one way or the other, which is precisely why a stall was
+// invisible to the whole table before this rule.
+//
+// backupTime is nil and the phase is a running one, so nothing else picks it up: backupFailed skips
+// it on the phase, and the collector's last_success/last_failure gates skip it for want of a
+// terminal timestamp.
+func stalledBackup(namespace, name, schedule string, created metav1.Time) *cbv1.Backup {
+	b := backup(namespace, name, schedule, created)
+	b.CreationTimestamp = created
+	b.Status.Phase = "Uploading"
+	b.Status.BackupTime = nil
 	return b
 }
 

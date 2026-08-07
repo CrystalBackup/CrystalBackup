@@ -465,6 +465,97 @@ func backupFailed(ctx context.Context, r client.Reader, now time.Time) ([]Breach
 	return sorted(out), nil
 }
 
+// backupStalled mirrors `time() - crystalbackup_backup_in_progress_since_timestamp_seconds >
+// <Age>`, and it is the one predicate here that can reproduce its alert EXACTLY — hence no Fidelity
+// entry. The series is derived from the Backup objects at scrape time and this reads the same
+// objects, so there is no counter, no history and no metric-only fact for the two to disagree over.
+//
+// The three shapes it has to get right are the three the collector gets right, and each is a way to
+// be silently wrong:
+//
+//   - TERMINAL phases are not in flight. The list is the four aggregates, and it is spelled as
+//     "these four are done, everything else is running" rather than as a list of running phases,
+//     because the empty phase a Backup carries between its creation and its first status write is
+//     running too — and a new phase added to the API would then default to in-flight, which is the
+//     safe direction for a stall detector.
+//   - A DISCOVERY PROJECTION is excluded. It is a materialised view of snapshots already in the
+//     repository, never executed by anything, and the controller returns from it without writing a
+//     phase — so it would sit unfinished forever and page about a run that never ran.
+//   - The OLDEST unfinished Backup wins per series. Newest would let each night's run reset the
+//     clock on the one that wedged, which is the exact silence this rule exists to break.
+func backupStalled(ctx context.Context, r client.Reader, now time.Time) ([]Breach, error) {
+	t, err := thresholdOf(ruleBackupStalled)
+	if err != nil {
+		return nil, err
+	}
+	var backups cbv1.BackupList
+	if err := r.List(ctx, &backups); err != nil {
+		return nil, fmt.Errorf("list Backups: %w", err)
+	}
+	var namespaces corev1.NamespaceList
+	if err := r.List(ctx, &namespaces); err != nil {
+		return nil, fmt.Errorf("list Namespaces: %w", err)
+	}
+	clusterByLocation, _, err := clusterIdentities(ctx, r)
+	if err != nil {
+		return nil, err
+	}
+	tenants := tenantsByNamespace(namespaces.Items)
+
+	type stall struct {
+		since time.Time
+		name  string
+	}
+	oldest := map[seriesKey]stall{}
+	for i := range backups.Items {
+		b := &backups.Items[i]
+		if terminalBackupPhase(b.Status.Phase) {
+			continue
+		}
+		if b.Annotations[apiconst.AnnotationProjected] == apiconst.AnnotationProjectedValue {
+			continue
+		}
+		key := backupSeriesKeyOf(b, tenants, clusterByLocation)
+		if prev, ok := oldest[key]; ok && !b.CreationTimestamp.Time.Before(prev.since) {
+			continue
+		}
+		oldest[key] = stall{since: b.CreationTimestamp.Time, name: b.Name}
+	}
+
+	var out []Breach
+	for key, s := range oldest {
+		elapsed := now.Sub(s.since)
+		if elapsed <= t.Age {
+			continue
+		}
+		out = append(out, Breach{
+			Labels: map[string]string{
+				labelNamespace: key.namespace, labelTenant: key.tenant, labelSchedule: key.schedule,
+				labelOrigin: key.origin, labelLocation: key.location, labelCluster: key.cluster,
+			},
+			Value: elapsed.Seconds(),
+			Detail: fmt.Sprintf("Backup %s/%s has been unfinished for %s (bound %s)",
+				key.namespace, s.name, elapsed.Truncate(time.Minute), t.Age),
+		})
+	}
+	return sorted(out), nil
+}
+
+// terminalBackupPhase reports whether a Backup phase is one of the four terminal aggregates —
+// the same four the controller's isTerminalBackupPhase names, restated here rather than imported
+// because internal/controller depends on this package's neighbours and the reverse edge would be a
+// cycle. It is a CLOSED list of the finished phases, deliberately, so anything unrecognised counts
+// as still running: for a stall detector, an unknown phase must err towards being noticed.
+func terminalBackupPhase(phase string) bool {
+	switch status.BackupPhase(phase) {
+	case status.BackupPhaseCompleted, status.BackupPhasePartiallyCompleted,
+		status.BackupPhasePartiallyFailed, status.BackupPhaseFailed:
+		return true
+	default:
+		return false
+	}
+}
+
 // failedAt resolves when a failed Backup finished, in the order backupFailed's doc comment sets
 // out: the stamped completion, then the Ready condition's transition, then the object's creation.
 // It always returns something — a failure with no usable timestamp is still a failure, and the

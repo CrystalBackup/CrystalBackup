@@ -44,6 +44,11 @@ import (
 const (
 	// kindBackupLocation is the status.location.kind a namespace-plane repository records.
 	kindBackupLocation = "BackupLocation"
+	// kindBackup is the Backup Kind as a string, for the two places a TypeMeta has to be stamped
+	// by hand (the discovery projection's server-side-apply objects) and for the specs that filter
+	// Events by their regarding.kind. A constant rather than three literals for the reason every
+	// other name in this package is one: a misspelling matches nothing, silently.
+	kindBackup = "Backup"
 
 	// scopeNamespaced is BackupRepository.status.scope for a repository backing a namespaced
 	// BackupLocation.

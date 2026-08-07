@@ -44,19 +44,28 @@ const (
 	// ABSENT rather than reset — and increase() cannot see across a disappearance the way it sees
 	// across a reset. Being state-derived, this one is rebuilt from the Backup objects on the very
 	// first scrape of the new process.
-	NameBackupLastFailure    = "crystalbackup_backup_last_failure_timestamp_seconds"
-	NameBackupLastSize       = "crystalbackup_backup_last_size_bytes"
-	NameBackupLastAdded      = "crystalbackup_backup_last_added_bytes"
-	NameBackupLastDuration   = "crystalbackup_backup_last_duration_seconds"
-	NameBackupFailures       = "crystalbackup_backup_failures"
-	NameBackupDuration       = "crystalbackup_backup_duration_seconds"
-	NameBackupAddedTotal     = "crystalbackup_backup_added_bytes_total"
-	NameBackupFailuresTotal  = "crystalbackup_backup_failures_total"
-	NameScheduleActive       = "crystalbackup_schedule_active"
-	NameSchedulePeriod       = "crystalbackup_schedule_period_seconds"
-	NameScheduleCreated      = "crystalbackup_schedule_created_timestamp_seconds"
-	NameBackupTotal          = "crystalbackup_backup_total"
-	NameBackupProtectedBytes = "crystalbackup_backup_protected_bytes"
+	NameBackupLastFailure = "crystalbackup_backup_last_failure_timestamp_seconds"
+	// NameBackupInProgressSince is the only series in this family that describes a run that has NOT
+	// finished, and it exists because every other one of them is silent about a backup that never
+	// will. A hang is not a failure: nothing increments, nothing times out, last_success simply
+	// stops advancing — and on a nightly schedule that is indistinguishable from "tonight's run is
+	// still going" for the first twenty-five hours. It is derived from the Backup objects at scrape
+	// time (like last_failure and for the same reason), so it is restart-safe and, crucially,
+	// materialises at its REAL value rather than at 1 the way a CounterVec child does — a stall must
+	// be pageable on its first occurrence.
+	NameBackupInProgressSince = "crystalbackup_backup_in_progress_since_timestamp_seconds"
+	NameBackupLastSize        = "crystalbackup_backup_last_size_bytes"
+	NameBackupLastAdded       = "crystalbackup_backup_last_added_bytes"
+	NameBackupLastDuration    = "crystalbackup_backup_last_duration_seconds"
+	NameBackupFailures        = "crystalbackup_backup_failures"
+	NameBackupDuration        = "crystalbackup_backup_duration_seconds"
+	NameBackupAddedTotal      = "crystalbackup_backup_added_bytes_total"
+	NameBackupFailuresTotal   = "crystalbackup_backup_failures_total"
+	NameScheduleActive        = "crystalbackup_schedule_active"
+	NameSchedulePeriod        = "crystalbackup_schedule_period_seconds"
+	NameScheduleCreated       = "crystalbackup_schedule_created_timestamp_seconds"
+	NameBackupTotal           = "crystalbackup_backup_total"
+	NameBackupProtectedBytes  = "crystalbackup_backup_protected_bytes"
 
 	// §2.2 ClusterBackup runs, run-level, no namespace label.
 	NameClusterBackupLastSuccess       = "crystalbackup_clusterbackup_last_success_timestamp_seconds"

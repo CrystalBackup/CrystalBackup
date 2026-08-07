@@ -7,17 +7,18 @@ rules:
 - apiGroups:
   - ""
   resources:
-  - namespaces
+  - events
+  - nodes
   verbs:
-  - create
   - get
   - list
   - watch
 - apiGroups:
   - ""
   resources:
-  - nodes
+  - namespaces
   verbs:
+  - create
   - get
   - list
   - watch

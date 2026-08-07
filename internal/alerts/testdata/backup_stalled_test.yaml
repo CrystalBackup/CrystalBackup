@@ -1,0 +1,133 @@
+# promtool unit tests — CrystalbackupBackupStalled, the rule for a backup that never ends.
+#
+# It is the only rule in the table whose subject is a run still in flight. Every other one waits for
+# something to FAIL, which is exactly why a 0.6.2 cascade could leave six movers wedged in
+# ContainerCreating for thirty-six hours with an entirely green Alertmanager. The properties below
+# are the four ways that silence could come back.
+#
+# Reading the timeline: promtool's clock starts at the Unix epoch, so `time()` at eval_time T is T
+# seconds. A series holding the constant 0 therefore means "this Backup was created at t=0", and its
+# age at T is T — which is what makes an 8h bound testable without a real clock. The grid is 10
+# minutes: a 1-minute grid over a nine-hour horizon is five hundred evaluations of every rule in the
+# file for no extra coverage.
+#
+# The bound is 8h and the hold is 30m, so the page lands at 8h30m.
+rule_files:
+  - ../../../charts/crystal-backup/rules/crystalbackup.rules.yaml
+
+evaluation_interval: 10m
+
+tests:
+  # ── The firing case ───────────────────────────────────────────────────────
+  # One Backup, created at t=0, still unfinished. The collector keeps publishing its creation
+  # timestamp for as long as it has not reached a terminal phase, so the series is a flat line and
+  # its age grows with the clock.
+  - interval: 10m
+    name: a Backup unfinished for over 8h pages after the hold
+    input_series:
+      - series: 'crystalbackup_backup_in_progress_since_timestamp_seconds{namespace="team-a",tenant="team-a",schedule="nightly",origin="cluster",location="primary",cluster="prod"}'
+        values: "0x60"
+    alert_rule_test:
+      # 7h50m — a long run, and explicitly NOT a page. This is the assertion that protects large
+      # backups: the whole design refuses to cap the upload, and a bound that fired here would be
+      # doing exactly that.
+      - eval_time: 7h50m
+        alertname: CrystalbackupBackupStalled
+        exp_alerts: []
+      # 8h10m — past the bound, inside the 30m hold. The hold absorbs a scrape gap, not doubt.
+      - eval_time: 8h10m
+        alertname: CrystalbackupBackupStalled
+        exp_alerts: []
+      - eval_time: 8h40m
+        alertname: CrystalbackupBackupStalled
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              namespace: team-a
+              tenant: team-a
+              schedule: nightly
+              origin: cluster
+              location: primary
+              cluster: prod
+            exp_annotations:
+              summary: "Backup team-a/nightly has been running for over 8h without finishing"
+              description: "A run that never ends is invisible to every other rule here: nothing failed, so BackupFailed is silent, and last_success has not gone stale yet so BackupMissed is too. kubectl get backup -n team-a -o wide shows the per-volume phases; the reason on a volume names the cause, and for one stuck in Uploading, kubectl describe pod on its mover Job in the operator namespace has the kubelet's account."
+
+  # ── The absence case, and the one that keeps a healthy fleet quiet ────────
+  # A namespace backing up normally publishes last_success and NOTHING here: the collector emits
+  # in_progress_since only while a run is unfinished. If it ever "helpfully" published a 0 for an
+  # idle series instead, `time() - 0` would be fifty-four years and every namespace in every cluster
+  # would page permanently — so this test is the guard on the collector's absence discipline as much
+  # as on the rule.
+  - interval: 10m
+    name: a namespace with nothing in flight publishes no series and never pages
+    input_series:
+      - series: 'crystalbackup_backup_last_success_timestamp_seconds{namespace="team-b",tenant="team-b",schedule="nightly",origin="cluster",location="primary",cluster="prod"}'
+        values: "0+600x60"
+    alert_rule_test:
+      - eval_time: 9h
+        alertname: CrystalbackupBackupStalled
+        exp_alerts: []
+
+  # ── Resolution ────────────────────────────────────────────────────────────
+  # The run finishes at 8h50m — twenty minutes after it started paging — and the series DISAPPEARS,
+  # because the collector stops emitting it the moment the phase goes terminal. `time() - <absent>`
+  # is absent, so the alert clears. This is the property that makes the rule usable rather than a
+  # thing operators silence: it has to go away on its own when the backup completes.
+  #
+  # `_` is promtool's gap marker. The last real sample is at 8h50m; from 9h00m the series has no
+  # samples at all, and past the 5m staleness window Prometheus stops carrying it forward.
+  - interval: 10m
+    name: the alert resolves when the run finally finishes and the series goes away
+    input_series:
+      - series: 'crystalbackup_backup_in_progress_since_timestamp_seconds{namespace="team-c",tenant="team-c",schedule="nightly",origin="cluster",location="primary",cluster="prod"}'
+        values: "0x53 _x20"
+    alert_rule_test:
+      - eval_time: 8h40m
+        alertname: CrystalbackupBackupStalled
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              namespace: team-c
+              tenant: team-c
+              schedule: nightly
+              origin: cluster
+              location: primary
+              cluster: prod
+            exp_annotations:
+              summary: "Backup team-c/nightly has been running for over 8h without finishing"
+              description: "A run that never ends is invisible to every other rule here: nothing failed, so BackupFailed is silent, and last_success has not gone stale yet so BackupMissed is too. kubectl get backup -n team-c -o wide shows the per-volume phases; the reason on a volume names the cause, and for one stuck in Uploading, kubectl describe pod on its mover Job in the operator namespace has the kubelet's account."
+      - eval_time: 9h20m
+        alertname: CrystalbackupBackupStalled
+        exp_alerts: []
+
+  # ── The oldest run wins ───────────────────────────────────────────────────
+  # A schedule whose run wedged, and whose NEXT run started fresh eight hours later. The collector
+  # reports the OLDEST unfinished Backup of the series, so the value stays pinned at the wedged
+  # run's creation instead of jumping forward — which is the difference between a page and the
+  # nightly cascade resetting the clock on a hang every single night, forever.
+  #
+  # Modelled as one series holding 0 throughout: two unfinished Backups in one namespace collapse to
+  # one series by construction (the label set has no per-run dimension), and the value is the older
+  # of the two creation timestamps. If the collector ever took the newest instead, this series would
+  # step to 28800 at 8h and the alert below would never fire.
+  - interval: 10m
+    name: a second run starting does not reset the clock on the wedged one
+    input_series:
+      - series: 'crystalbackup_backup_in_progress_since_timestamp_seconds{namespace="team-d",tenant="team-d",schedule="nightly",origin="cluster",location="primary",cluster="prod"}'
+        values: "0x60"
+    alert_rule_test:
+      - eval_time: 8h40m
+        alertname: CrystalbackupBackupStalled
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              namespace: team-d
+              tenant: team-d
+              schedule: nightly
+              origin: cluster
+              location: primary
+              cluster: prod
+            exp_annotations:
+              summary: "Backup team-d/nightly has been running for over 8h without finishing"
+              description: "A run that never ends is invisible to every other rule here: nothing failed, so BackupFailed is silent, and last_success has not gone stale yet so BackupMissed is too. kubectl get backup -n team-d -o wide shows the per-volume phases; the reason on a volume names the cause, and for one stuck in Uploading, kubectl describe pod on its mover Job in the operator namespace has the kubelet's account."

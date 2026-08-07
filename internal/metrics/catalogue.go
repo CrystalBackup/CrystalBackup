@@ -42,19 +42,23 @@ func Catalogue() map[string][]string {
 		// coincidence: BackupFailed `or`s this series against the counter, so an alert instance
 		// has to come out with identical labels whichever disjunct produced it. A label added to
 		// one of the three and not the others would split the alert in two.
-		NameBackupLastFailure:    backupLabels,
-		NameBackupLastSize:       backupLabels,
-		NameBackupLastAdded:      backupLabels,
-		NameBackupLastDuration:   backupLabels,
-		NameBackupFailures:       backupLabels,
-		NameBackupDuration:       backupLabels,
-		NameBackupAddedTotal:     backupLabels,
-		NameBackupFailuresTotal:  backupLabels,
-		NameScheduleActive:       backupLabels,
-		NameSchedulePeriod:       backupLabels,
-		NameScheduleCreated:      backupLabels,
-		NameBackupTotal:          withLabel(backupLabels, resultLabel),
-		NameBackupProtectedBytes: protectedLabels,
+		NameBackupLastFailure: backupLabels,
+		// The same set again, deliberately: CrystalbackupBackupStalled and CrystalbackupBackupFailed
+		// describe the same namespace's run, one before it ends and one after, and an operator has to
+		// be able to follow a single identity from the stall alert to the failure alert.
+		NameBackupInProgressSince: backupLabels,
+		NameBackupLastSize:        backupLabels,
+		NameBackupLastAdded:       backupLabels,
+		NameBackupLastDuration:    backupLabels,
+		NameBackupFailures:        backupLabels,
+		NameBackupDuration:        backupLabels,
+		NameBackupAddedTotal:      backupLabels,
+		NameBackupFailuresTotal:   backupLabels,
+		NameScheduleActive:        backupLabels,
+		NameSchedulePeriod:        backupLabels,
+		NameScheduleCreated:       backupLabels,
+		NameBackupTotal:           withLabel(backupLabels, resultLabel),
+		NameBackupProtectedBytes:  protectedLabels,
 
 		// §2.2 ClusterBackup runs.
 		NameClusterBackupLastSuccess:       clusterBackupLabels,

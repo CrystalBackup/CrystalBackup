@@ -224,6 +224,83 @@ func TestCollectorBackupLastFailure(t *testing.T) {
 	}
 }
 
+// TestCollectorBackupInProgressSince is the collector half of CrystalbackupBackupStalled. The
+// promtool tests prove the RULE fires correctly given the series; only this proves the series is
+// the one the rule was written against, and the three properties below are each a way for the
+// alert to be silently useless:
+//
+//   - the OLDEST unfinished run wins. Take the newest and every nightly cascade resets the clock on
+//     last night's hang, forever — the exact silence the rule exists to break;
+//   - a series with nothing in flight emits NOTHING. Emit a 0 and `time() - 0` is fifty-four years,
+//     which pages every namespace in the fleet permanently and gets the rule deleted by lunchtime;
+//   - a discovery PROJECTION never counts. It is a materialised view of snapshots already in the
+//     repository, never executed by anything, and it carries no phase — so without the exclusion it
+//     would sit "unfinished" forever and page about a run that never ran.
+func TestCollectorBackupInProgressSince(t *testing.T) {
+	loc := &cbv1.ClusterBackupLocation{
+		ObjectMeta: metav1.ObjectMeta{Name: "dr"},
+		Spec:       cbv1.ClusterBackupLocationSpec{ClusterID: "c1"},
+	}
+	wedged := metav1.Date(2026, 7, 17, 2, 0, 0, 0, time.UTC)
+	tonight := metav1.Date(2026, 7, 18, 2, 0, 0, 0, time.UTC)
+
+	seriesLabels := map[string]string{
+		apiconst.LabelOrigin: apiconst.OriginNamespace, apiconst.LabelSchedule: "nightly",
+		apiconst.LabelNamespace: "team-a",
+	}
+	mk := func(name string, phase status.BackupPhase, created metav1.Time) *cbv1.Backup {
+		labels := map[string]string{}
+		for k, v := range seriesLabels {
+			labels[k] = v
+		}
+		labels[apiconst.LabelClusterBackup] = name
+		return &cbv1.Backup{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "team-a", Name: name, Labels: labels, CreationTimestamp: created,
+			},
+			Spec:   cbv1.BackupSpec{LocationRef: cbv1.LocationReference{Name: "dr"}},
+			Status: cbv1.BackupStatus{Phase: string(phase)},
+		}
+	}
+	want := map[string]string{"namespace": "team-a", "tenant": "team-a", "schedule": "nightly", "origin": "namespace", "location": "dr", "cluster": "c1"}
+
+	// Last night's run wedged in Uploading; tonight's has just started. One series, and it must
+	// report the older instant.
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(NewCollector(newFakeClient(t, loc,
+		mk("wedged", status.BackupPhaseUploading, wedged),
+		mk("tonight", status.BackupPhaseSnapshotting, tonight),
+	), testOperatorNamespace))
+	if got, ok := gatherValue(t, reg, "crystalbackup_backup_in_progress_since_timestamp_seconds", want); !ok || got != float64(wedged.Unix()) {
+		t.Fatalf("in_progress_since = %v (found=%v), want the OLDEST unfinished run's creation %d — "+
+			"taking the newest lets tonight's cascade reset the clock on last night's hang",
+			got, ok, wedged.Unix())
+	}
+
+	// Every run finished: no series at all.
+	doneReg := prometheus.NewRegistry()
+	doneReg.MustRegister(NewCollector(newFakeClient(t, loc,
+		mk("done", status.BackupPhaseCompleted, wedged),
+		mk("also-done", status.BackupPhasePartiallyFailed, tonight),
+	), testOperatorNamespace))
+	if got, ok := gatherValue(t, doneReg, "crystalbackup_backup_in_progress_since_timestamp_seconds", want); ok {
+		t.Fatalf("in_progress_since = %v was emitted for a series with nothing in flight; absence is "+
+			"the contract, and anything here pages the whole fleet forever", got)
+	}
+
+	// A projection, which carries no phase and is never executed.
+	projection := mk("projected", "", wedged)
+	projection.Annotations = map[string]string{
+		apiconst.AnnotationProjected: apiconst.AnnotationProjectedValue,
+	}
+	projReg := prometheus.NewRegistry()
+	projReg.MustRegister(NewCollector(newFakeClient(t, loc, projection), testOperatorNamespace))
+	if got, ok := gatherValue(t, projReg, "crystalbackup_backup_in_progress_since_timestamp_seconds", want); ok {
+		t.Fatalf("in_progress_since = %v was emitted for a discovery projection; it is a view of "+
+			"snapshots that already exist, so it is neither running nor stalled", got)
+	}
+}
+
 func TestCollectorBuildInfoAlwaysPresent(t *testing.T) {
 	// With no CRs at all, crystalbackup_build_info must still be emitted, so /metrics always carries
 	// a crystalbackup_ series (the M1 hard-assertion exit criterion).

@@ -92,10 +92,20 @@ type stubExposerRegistry struct {
 	// global switch because the manager reconciles every Backup in the suite concurrently — a
 	// spec that flipped a shared flag would fail its neighbours' volumes.
 	precheckFailures map[string]error
-	// stalled holds volumes (keyed "<namespace>/<pvc>") whose exposure reports NOT ready and whose
-	// origin snapshot was never acknowledged, started at the recorded instant — the shape a dead
-	// snapshotter sidecar leaves behind.
-	stalled map[string]time.Time
+	// stalled holds volumes (keyed "<namespace>/<pvc>") whose exposure reports NOT ready, started
+	// at the recorded instant. The bool is whether the origin snapshot was ACKNOWLEDGED, and it
+	// selects which of the two Snapshotting deadlines the volume is a candidate for — false is a
+	// request nothing ever picked up (15m), true is one the snapshot-controller bound content for
+	// and whose driver never finished (2h). Two different diagnoses, two different reasons, and a
+	// stub with one flag would let a spec assert the wrong one.
+	stalled map[string]stubStall
+}
+
+// stubStall is one armed exposure stall: when the origin snapshot was created, and whether anything
+// acknowledged it.
+type stubStall struct {
+	startedAt    time.Time
+	acknowledged bool
 }
 
 var _ ExposerRegistry = (*stubExposerRegistry)(nil)
@@ -141,20 +151,32 @@ func (s *stubExposerRegistry) failPrecheck(key string, err error) {
 // started at startedAt. A spec sets startedAt in the past to cross the controller's deadline
 // without waiting for it.
 func (s *stubExposerRegistry) stallSnapshot(key string, startedAt time.Time) {
+	s.armStall(key, stubStall{startedAt: startedAt})
+}
+
+// stallSnapshotAcknowledged makes one volume's exposure look picked-up-and-abandoned: never ready,
+// but with a bound VolumeSnapshotContent — the shape a healthy snapshot-controller leaves behind
+// when the driver's own csi-snapshotter sidecar is dead. It is the case exposer.SnapshotProgress
+// documents and declines to judge, and the one snapshotReadyDeadline exists for.
+func (s *stubExposerRegistry) stallSnapshotAcknowledged(key string, startedAt time.Time) {
+	s.armStall(key, stubStall{startedAt: startedAt, acknowledged: true})
+}
+
+func (s *stubExposerRegistry) armStall(key string, stall stubStall) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.stalled == nil {
-		s.stalled = map[string]time.Time{}
+		s.stalled = map[string]stubStall{}
 	}
-	s.stalled[key] = startedAt
+	s.stalled[key] = stall
 }
 
 // stallStart reports the armed stall for a volume, if any.
-func (s *stubExposerRegistry) stallStart(key string) (time.Time, bool) {
+func (s *stubExposerRegistry) stallStart(key string) (stubStall, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	startedAt, ok := s.stalled[key]
-	return startedAt, ok
+	stall, ok := s.stalled[key]
+	return stall, ok
 }
 
 // recordExpose notes an Expose call.
@@ -233,11 +255,11 @@ func (e *stubExposer) Progress(_ context.Context, _ *exposer.Exposure) (exposer.
 	if e.registry == nil {
 		return exposer.SnapshotProgress{}, false
 	}
-	startedAt, ok := e.registry.stallStart(e.key)
+	stall, ok := e.registry.stallStart(e.key)
 	if !ok {
 		return exposer.SnapshotProgress{}, false
 	}
-	return exposer.SnapshotProgress{StartedAt: startedAt, Acknowledged: false}, true
+	return exposer.SnapshotProgress{StartedAt: stall.startedAt, Acknowledged: stall.acknowledged}, true
 }
 
 // Expose creates the temp clone PVC (deterministic name <prefix>-clone, mirroring the real

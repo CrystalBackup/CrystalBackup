@@ -149,6 +149,94 @@ const backupReasonSnapshotProgressDeadline = "SnapshotProgressDeadlineExceeded"
 // wrong this way.
 const snapshotProgressDeadline = 15 * time.Minute
 
+// backupReasonSnapshotReadyDeadline is the VolumeStatus.reason a volume carries when its origin
+// VolumeSnapshot WAS picked up — a VolumeSnapshotContent is bound, or an error was recorded — and
+// then never became readyToUse within snapshotReadyDeadline. It is the other half of
+// backupReasonSnapshotProgressDeadline, and the two are deliberately different strings: one says
+// "nothing is listening to your VolumeSnapshotClass", the other says "something is listening and
+// the copy is not arriving", which send an operator to different components.
+//
+// The reason carries the most recent Warning Event recorded ON THE ORIGIN VOLUMESNAPSHOT, appended
+// after a colon, exactly as MoverEvicted carries the kubelet's own message. That is the whole point
+// of the lot: a reason that says only "timed out" leaves the reader as blind as the 36-hour hang
+// that produced this code did. When no such Event exists the reason is the bare string.
+const backupReasonSnapshotReadyDeadline = "SnapshotReadyDeadlineExceeded"
+
+// snapshotReadyDeadline bounds how long a volume may sit in Snapshotting with an ACKNOWLEDGED
+// origin VolumeSnapshot that never becomes readyToUse.
+//
+// This is the gap internal/exposer's SnapshotProgress documents and deliberately declines to close
+// (see its doc): Acknowledged only proves the cluster-wide snapshot-controller saw the request and
+// bound a VolumeSnapshotContent, which it does within seconds, before the storage system has done
+// any work at all. A dead per-driver csi-snapshotter sidecar leaves exactly that shape — content
+// bound, readyToUse never — and from the object alone it is indistinguishable from a driver taking
+// its time. Closing it therefore means picking a MAXIMUM TIME A SNAPSHOT MAY LEGITIMATELY TAKE ON
+// STORAGE WE DO NOT OWN, which is a guess, and the honest thing to do with a guess is to say so and
+// to err in the survivable direction.
+//
+// TWO HOURS. The number is chosen from the slowest legitimate snapshot this project has evidence
+// of, with room on top:
+//
+//   - A CSI snapshot is usually metadata: ceph-csi and every thin-provisioning driver answer in
+//     seconds regardless of volume size. Those are not what sets this bound.
+//   - What sets it is the drivers that do real work before reporting ready. ceph-csi may FLATTEN a
+//     deep clone chain first (adr/0006 — the same mechanism CrystalbackupPVCSnapshotPileup exists to
+//     warn about), and the cloud-disk drivers hold readyToUse until the provider reports the
+//     snapshot complete, which on a multi-terabyte disk is tens of minutes and occasionally more.
+//   - Two hours is comfortably past all of those and still inside the window a nightly run is
+//     judged in: the failure is reported by THAT run, hours before the next one, rather than
+//     silently rolling into the next night.
+//
+// Err long, always. A deadline that is too generous delays a diagnosis by an hour; one that is too
+// tight fails the biggest, slowest, most valuable volumes in the fleet — the ones whose backup
+// matters most — and it does so on exactly the storage where the operator can least easily prove us
+// wrong. Unlike the mover deadline below, this failure costs a snapshot that was genuinely being
+// worked on, so the burden of proof is set correspondingly high.
+const snapshotReadyDeadline = 2 * time.Hour
+
+// backupReasonMoverStartDeadline is the VolumeStatus.reason a volume carries when its data-mover
+// Job existed for moverStartDeadline without a single one of its pods ever reaching Running.
+//
+// It carries the most recent Warning Event about that pod, appended after a colon — the kubelet's
+// own words, the way MoverEvicted carries them (see podKillReason). In the incident this closes,
+// that string is:
+//
+//	FailedMount: MountVolume.MountDevice failed ... rbd: map failed with error (exit status 22)
+//
+// published by the kubelet 1069 times over 36 hours, starting one minute in, and read by nobody
+// because nothing surfaced it. `kubectl get backup` has to be as informative as `kubectl describe
+// pod` was, or the timeout merely converts a silent hang into a silent failure.
+const backupReasonMoverStartDeadline = "MoverStartDeadlineExceeded"
+
+// moverStartDeadline bounds how long a volume may sit in Uploading with its mover pod never having
+// REACHED RUNNING.
+//
+// READ THE PREDICATE BEFORE THE NUMBER, because the predicate is what makes the number safe. This
+// is NOT a cap on how long a backup may take, and it must never become one: a 500 GB volume
+// legitimately uploads for hours, and failing it on a wall-clock bound would be a far worse defect
+// than the hang this closes. Once the pod is Running, the mover has as long as it likes — nothing
+// here ever looks at it again.
+//
+// What is bounded is the interval before restic has read a single byte. A pod stuck in
+// ContainerCreating or Pending is not slow, it is STUCK: no image, no volume, no scheduling. And
+// because no work has been done, giving up costs nothing — no bytes re-uploaded, no repository
+// lock taken, no snapshot consumed. That asymmetry is what lets this deadline be short where
+// snapshotReadyDeadline must be long.
+//
+// THIRTY MINUTES, sized against the legitimate reasons a pod is slow to start:
+//
+//   - pulling the mover image onto a cold node over a slow or rate-limited registry (minutes);
+//   - the cluster autoscaler provisioning a node for it, which on most clouds is 2–5 minutes and
+//     on a bad day is fifteen;
+//   - the CSI driver attaching and mounting the temp clone PVC — the very step that failed in the
+//     incident, and which on a healthy cluster is seconds.
+//
+// Thirty minutes covers all three happening at once, and still fails the volume inside the first
+// hour of a nightly window instead of on the second morning. If this number is ever wrong it
+// should be wrong LONG, for the same reason every other bound here is: a late failure is
+// recoverable, a premature one is a backup somebody needed.
+const moverStartDeadline = 30 * time.Minute
+
 // ExposerRegistry is the seam the Backup controller reaches internal/exposer.Registry through,
 // extracted as an interface so envtest — which has no external snapshot CRDs or CSI driver — can
 // inject a stub. Production wires in *exposer.Registry. Its two methods are the two halves of an
@@ -220,13 +308,42 @@ type BackupReconciler struct {
 	// nil means "no exec path wired" — which is a hard failure when a run declares hooks, never a
 	// silent downgrade to a crash-consistent snapshot the operator believes is better than that.
 	Hooks hooks.Executor
-	// APIReader reads STRAIGHT from the apiserver, bypassing the cache. Its one caller is the
-	// writeStatus ambiguity check (terminalPhaseCommitted): after a status Update errors
-	// client-side, only an uncached read can tell whether the write nonetheless committed
-	// server-side — the cache may still be serving the pre-write object. Set post-construction
-	// (mgr.GetAPIReader()), like Hooks; nil skips the check, degrading to "treat the error as
-	// not-persisted", which the terminal re-entry sweep then heals on a later pass.
+	// APIReader reads STRAIGHT from the apiserver, bypassing the cache. It has two callers, and
+	// both need the bypass for a different reason:
+	//
+	//   - the writeStatus ambiguity check (terminalPhaseCommitted): after a status Update errors
+	//     client-side, only an uncached read can tell whether the write nonetheless committed
+	//     server-side — the cache may still be serving the pre-write object;
+	//   - the per-phase deadlines' Warning-Event lookup (latestWarningEvent): reading Events through
+	//     the cached client would start an informer over every Event in the cluster, which is the
+	//     largest object stream a cluster has, to serve a handful of field-selected reads.
+	//
+	// Set post-construction (mgr.GetAPIReader()), like Hooks. Nil degrades both: the write check is
+	// skipped (treat the error as not-persisted; the terminal re-entry sweep heals it later) and a
+	// deadline's reason carries no cause detail.
 	APIReader client.Reader
+	// MoverStartDeadline overrides moverStartDeadline. ZERO — what production leaves it — means the
+	// constant, and nothing outside the test suite ever sets it: it is not plumbed to a flag, a
+	// Helm value or a CRD field, deliberately. A per-cluster knob on this bound would be a knob
+	// whose wrong setting silently destroys large backups, and the whole safety of the bound comes
+	// from the predicate (the pod never started) rather than from the number.
+	//
+	// It exists because the alternative is a deadline nothing can test. envtest runs an apiserver
+	// and etcd and nothing else — no kubelet, no Job controller — so the only clock available to a
+	// spec is the mover Job's real creationTimestamp, which the apiserver resets on every update
+	// (rest.objectMetaSystemFieldsUpdate) and therefore cannot be backdated. Without this field the
+	// only way to watch this decision happen is to wait out thirty real minutes, which means in
+	// practice that nobody ever watches it, which is how a timeout ships broken.
+	MoverStartDeadline time.Duration
+}
+
+// effectiveMoverStartDeadline is the bound moverStalled compares against: the injected one when a
+// test set it, the constant otherwise.
+func (r *BackupReconciler) effectiveMoverStartDeadline() time.Duration {
+	if r.MoverStartDeadline > 0 {
+		return r.MoverStartDeadline
+	}
+	return moverStartDeadline
 }
 
 // NewBackupReconciler builds a BackupReconciler. Callers (main.go, the envtest suite) go through
@@ -332,6 +449,14 @@ type backupRunContext struct {
 // +kubebuilder:rbac:groups=snapshot.storage.k8s.io,resources=volumesnapshotclasses,verbs=get;list;watch
 // +kubebuilder:rbac:groups=storage.k8s.io,resources=storageclasses,verbs=get;list;watch
 // +kubebuilder:rbac:groups="";events.k8s.io,resources=events,verbs=create;patch
+//
+// events, READ side. The per-phase deadlines carry the observable cause into
+// status.volumes[].reason — the kubelet's own "FailedMount … rbd: map failed" rather than a bare
+// "timed out" — and an Event is the only place that sentence exists (a pod wedged in
+// ContainerCreating carries nothing useful in its own status). The reads are field-selected by
+// involvedObject.name, through the UNCACHED APIReader, and only on a path that is already failing a
+// volume; see latestWarningEvent for why they must never go through the cache.
+// +kubebuilder:rbac:groups="",resources=events,verbs=get;list;watch
 
 // Reconcile drives one Backup towards a terminal per-namespace result. After deletion-handling
 // and finalizer-ensuring it short-circuits two inert cases (a discovery projection, an
@@ -1107,9 +1232,10 @@ func (r *BackupReconciler) advancePending(ctx context.Context, backup *cbv1.Back
 // per-Job creds Secret (DEK + S3 keys) and the mover Job, both tolerating AlreadyExists so a
 // re-reconcile re-adopts rather than duplicates.
 //
-// The not-ready branch is bounded by snapshotProgressDeadline: an exposure whose origin
-// VolumeSnapshot nobody has touched is not slow, it is unattended, and waiting on it forever is
-// how a dead snapshotter sidecar turns into a run that never finishes and never alarms.
+// The not-ready branch is bounded twice, by two deadlines on one clock: snapshotProgressDeadline
+// for an origin VolumeSnapshot nobody has touched (unattended, not slow), and the much longer
+// snapshotReadyDeadline for one that WAS picked up and never became ready. Waiting on either
+// forever is how a dead snapshotter turns into a run that never finishes and never alarms.
 //
 // Like advanceUploading, it returns the PVC name when it JUST made the volume terminal, so
 // Reconcile can tear the exposure down after — never before — the terminal status write.
@@ -1123,7 +1249,8 @@ func (r *BackupReconciler) advanceSnapshotting(ctx context.Context, backup *cbv1
 		return "", fmt.Errorf("check exposure readiness for PVC %s/%s: %w", backup.Namespace, vol.Pvc, err)
 	}
 	if !ready {
-		if r.snapshotStalled(ctx, ex, exposure) {
+		switch r.snapshotDeadlineExceeded(ctx, ex, exposure) {
+		case backupReasonSnapshotProgressDeadline:
 			vol.Phase = status.VolumePhaseFailed
 			vol.Reason = backupReasonSnapshotProgressDeadline
 			r.Recorder.Eventf(backup, nil, corev1.EventTypeWarning, "VolumeFailed", "SnapshotProgress",
@@ -1132,6 +1259,21 @@ func (r *BackupReconciler) advanceSnapshotting(ctx context.Context, backup *cbv1
 					"watching its VolumeSnapshotClass; check the cluster's CSI snapshot-controller, then the "+
 					"csi-snapshotter sidecar of the driver behind that class",
 				vol.Pvc, snapshotProgressDeadline, exposure.OriginNamespace, exposure.OriginVSName)
+			return vol.Pvc, nil // request teardown once Reconcile has persisted this terminal result
+		case backupReasonSnapshotReadyDeadline:
+			// The snapshot WAS picked up and never finished. Whatever the storage system had to say
+			// about that is on the origin VolumeSnapshot as a Warning Event, and it travels into the
+			// reason so `kubectl get backup` answers the question instead of posing it.
+			detail := r.latestWarningEvent(ctx, exposure.OriginNamespace, exposure.OriginVSName)
+			vol.Phase = status.VolumePhaseFailed
+			vol.Reason = deadlineReason(backupReasonSnapshotReadyDeadline, detail)
+			r.Recorder.Eventf(backup, nil, corev1.EventTypeWarning, "VolumeFailed", "SnapshotReady",
+				"backup of PVC %s gave up after %s: VolumeSnapshot %s/%s was acknowledged (a "+
+					"VolumeSnapshotContent is bound) but never became readyToUse, so the request reached the "+
+					"snapshot-controller and stopped there; check the csi-snapshotter sidecar of the driver "+
+					"behind its VolumeSnapshotClass, and the driver's own logs%s",
+				vol.Pvc, snapshotReadyDeadline, exposure.OriginNamespace, exposure.OriginVSName,
+				eventSuffix(detail))
 			return vol.Pvc, nil // request teardown once Reconcile has persisted this terminal result
 		}
 		return "", nil // still binding the static re-bind / temp PVC; requeue
@@ -1244,23 +1386,43 @@ func (r *BackupReconciler) advanceSnapshotting(ctx context.Context, backup *cbv1
 	return "", nil
 }
 
-// snapshotStalled reports whether an exposure that is NOT ready has been abandoned rather than
-// merely delayed: its origin VolumeSnapshot has existed longer than snapshotProgressDeadline and
-// nothing has touched its status — no bound VolumeSnapshotContent, no recorded error. That
-// combination has one realistic cause, and it is the one the Event names: nothing is watching this
-// VolumeSnapshotClass. See exposer.SnapshotProgress for what this catches and, just as important,
-// what it does not (a bound-but-never-ready snapshot is indistinguishable from a slow one).
+// snapshotDeadlineExceeded classifies an exposure that is NOT ready yet: it returns the
+// VolumeStatus.reason the volume should fail with, or "" while the wait is still legitimate.
 //
-// Every "I do not know" answer returns FALSE, deliberately and asymmetrically. An unreadable origin
-// snapshot (deleted, RBAC, an apiserver having a bad second) is not evidence of abandonment, and
-// this predicate's true branch terminates somebody's backup — so the burden of proof sits entirely
+// Two bounds on ONE clock — the origin VolumeSnapshot's own creationTimestamp, which costs no new
+// CRD field and survives an operator restart for free — and the split between them is entirely
+// about how much evidence of abandonment there is:
+//
+//   - UNACKNOWLEDGED past snapshotProgressDeadline (15m). Nothing has written to the object's
+//     status at all: no bound VolumeSnapshotContent, no recorded error. The external
+//     snapshot-controller binds content within seconds of any request it can see, so this is strong
+//     evidence that nothing is watching the VolumeSnapshotClass. Cheap to be quick about.
+//   - ACKNOWLEDGED past snapshotReadyDeadline (2h). Something did pick it up and readyToUse never
+//     came. This is WEAK evidence — a slow driver looks identical — which is why the bound is eight
+//     times longer and why exposer.SnapshotProgress declines to draw the conclusion itself. It is
+//     drawn here, in the controller, because this is the layer that knows a backup is hanging.
+//
+// The order matters: unacknowledged is checked first, so a snapshot nobody touched is reported as
+// unattended (the actionable diagnosis) at 15 minutes rather than as "not ready" at two hours.
+//
+// Every "I do not know" answer returns "", deliberately and asymmetrically. An unreadable origin
+// snapshot (deleted, RBAC, an apiserver having a bad second) is not evidence of anything, and this
+// function's non-empty branches terminate somebody's backup — so the burden of proof sits entirely
 // on the evidence, never on its absence. A pass that cannot tell simply waits for the next one.
-func (r *BackupReconciler) snapshotStalled(ctx context.Context, ex exposer.SnapshotExposer, exposure *exposer.Exposure) bool {
+func (r *BackupReconciler) snapshotDeadlineExceeded(ctx context.Context, ex exposer.SnapshotExposer, exposure *exposer.Exposure) string {
 	progress, ok := ex.Progress(ctx, exposure)
-	if !ok || progress.Acknowledged || progress.StartedAt.IsZero() {
-		return false
+	if !ok || progress.StartedAt.IsZero() {
+		return ""
 	}
-	return time.Since(progress.StartedAt) > snapshotProgressDeadline
+	elapsed := time.Since(progress.StartedAt)
+	switch {
+	case !progress.Acknowledged && elapsed > snapshotProgressDeadline:
+		return backupReasonSnapshotProgressDeadline
+	case progress.Acknowledged && elapsed > snapshotReadyDeadline:
+		return backupReasonSnapshotReadyDeadline
+	default:
+		return ""
+	}
 }
 
 // emitExposureSpans emits the `snapshot` and `expose` spans of spec/05-observability.md §5 for one
@@ -1379,6 +1541,12 @@ func activeMoverCount(ctx context.Context, c client.Client, operatorNamespace st
 // failing, or an EMPTY termination message (OOMKilled / SIGKILL: the mover died before it could
 // report, which ParseMoverResult surfaces as an error) — Fails the volume with a short,
 // secret-free reason. It returns the PVC name on either terminal outcome to request teardown.
+//
+// A Job that is neither complete nor failed is normally "still running; requeue" — and that used to
+// be unconditional, which is how six movers whose pods could not mount their temp clone PVC sat in
+// ContainerCreating for THIRTY-SIX HOURS while the run reported ordinary progress the whole time.
+// The bound added here is moverStartDeadline, and it is emphatically NOT a bound on the upload: see
+// moverStalled, whose predicate is "the pod never started", never "the mover is slow".
 func (r *BackupReconciler) advanceUploading(ctx context.Context, backup *cbv1.Backup, vol *cbv1.VolumeStatus, rc *backupRunContext) (string, error) {
 	moverName := moverNamePrefix(backup.Namespace, backup.Name, vol.Pvc) + "-mover"
 
@@ -1390,8 +1558,18 @@ func (r *BackupReconciler) advanceUploading(ctx context.Context, backup *cbv1.Ba
 			// a stale reconcile. We deliberately neither re-drive to Snapshotting (which would
 			// RE-CREATE the exposure + Job and, if the Backup is being deleted, leak a clone that
 			// outlives it) NOR mark the volume Failed (which would false-fail on informer lag).
-			// We simply wait and requeue; a genuinely lost Job is caught by the per-phase timeout
-			// (deferred to task #22).
+			// We simply wait and requeue.
+			//
+			// THE PER-PHASE TIMEOUT BELOW DOES NOT COVER THIS BRANCH, and the note that used to
+			// promise it would ("deferred to task #22") was wrong for a structural reason worth
+			// recording rather than re-deferring: every deadline in this controller is measured
+			// against a durable clock that belongs to the object being waited on — the origin
+			// VolumeSnapshot's creationTimestamp, the mover Job's. When the Job is ABSENT there is no
+			// such clock, and the only candidates are the Backup's own creationTimestamp (which says
+			// nothing about this volume) or a new phase-entry timestamp on VolumeStatus (a CRD field,
+			// and a bigger change than this lot). A genuinely lost Job therefore still requeues
+			// forever, and the alert is what catches it — CrystalbackupBackupStalled reads a
+			// state-derived series precisely so it fires on the phases no in-controller clock can see.
 			return "", nil
 		}
 		return "", fmt.Errorf("get mover Job %s/%s: %w", r.OperatorNamespace, moverName, err)
@@ -1400,6 +1578,25 @@ func (r *BackupReconciler) advanceUploading(ctx context.Context, backup *cbv1.Ba
 	complete := job.Status.Succeeded >= 1 || jobConditionTrue(&job, batchv1.JobComplete)
 	failed := jobConditionTrue(&job, batchv1.JobFailed) || job.Status.Failed > rc.backoffLimit
 	if !complete && !failed {
+		// Not finished — but is it running, or merely existing? A mover whose pod never got off the
+		// ground has moved no data, so failing it here costs nothing and ends the hang; a mover whose
+		// pod IS running is left entirely alone, however long it takes.
+		if detail, stalled := r.moverStalled(ctx, &job); stalled {
+			vol.Phase = status.VolumePhaseFailed
+			vol.Reason = deadlineReason(backupReasonMoverStartDeadline, detail)
+			r.Recorder.Eventf(backup, nil, corev1.EventTypeWarning, "VolumeFailed", "MoverStart",
+				"backup of PVC %s gave up after %s: mover Job %s/%s was created but no pod of it ever "+
+					"reached Running, so restic never read a byte — the pod is stuck before start "+
+					"(image pull, scheduling, or mounting the temp clone PVC); `kubectl describe pod -n %s "+
+					"-l %s=%s` has the kubelet's full account%s",
+				vol.Pvc, r.effectiveMoverStartDeadline(), r.OperatorNamespace, moverName, r.OperatorNamespace,
+				batchv1.JobNameLabel, moverName, eventSuffix(detail))
+			// No stale-lock unlock is enqueued, unlike the hard-killed-mover path below: a mover that
+			// never started never ran restic, so it cannot be holding a repository lock. Enqueuing an
+			// `unlock --remove-all` here would take the repository's exclusive lane, and drain every
+			// healthy mover on it, to clear a lock that by construction does not exist.
+			return vol.Pvc, nil // request teardown once Reconcile has persisted this terminal result
+		}
 		return "", nil // still running; requeue
 	}
 
@@ -1871,6 +2068,189 @@ func killDetail(ctx context.Context, c client.Client, operatorNamespace, jobName
 type moverKilledError struct{ reason string }
 
 func (e *moverKilledError) Error() string { return e.reason }
+
+// moverStalled reports whether an in-flight mover Job has failed to START, and returns the
+// observable cause to carry into the volume's reason.
+//
+// The predicate is deliberately narrow and it is the whole safety argument for moverStartDeadline:
+//
+//  1. the Job has existed longer than moverStartDeadline (its own creationTimestamp — durable,
+//     restart-proof, no new state), AND
+//  2. not one of its pods has ever demonstrably run (moverPodEverStarted).
+//
+// Both halves are required. Drop the second and this becomes a wall-clock cap on backups, which
+// would fail every large volume in the fleet — a far worse bug than the hang it closes.
+//
+// Every "I do not know" answer is FALSE, on the same asymmetry snapshotDeadlineExceeded uses: an
+// unreadable pod list is not evidence that nothing started, and the true branch terminates
+// somebody's backup. A pass that cannot tell waits for the next one, five seconds later.
+func (r *BackupReconciler) moverStalled(ctx context.Context, job *batchv1.Job) (string, bool) {
+	if job.CreationTimestamp.IsZero() || time.Since(job.CreationTimestamp.Time) <= r.effectiveMoverStartDeadline() {
+		return "", false
+	}
+	var pods corev1.PodList
+	if err := r.List(ctx, &pods,
+		client.InNamespace(r.OperatorNamespace),
+		client.MatchingLabels{batchv1.JobNameLabel: job.Name}); err != nil {
+		logf.FromContext(ctx).Error(err, "mover start-deadline check could not list the Job's pods; waiting",
+			"job", r.OperatorNamespace+"/"+job.Name)
+		return "", false
+	}
+	if moverPodEverStarted(pods.Items) {
+		return "", false
+	}
+	return r.stalledMoverDetail(ctx, pods.Items, job.Name), true
+}
+
+// moverPodEverStarted reports whether ANY pod of a mover Job has demonstrably begun executing its
+// container. It is the difference between "stuck" and "slow", and therefore the difference between
+// a timeout that closes a 36-hour hang and one that destroys large backups.
+//
+// A pod counts as started on any of:
+//
+//   - a pod phase past Pending. Running is the case this exists for; Succeeded and Failed are
+//     included because a pod that reached a terminal phase is the Job controller's business — its
+//     backoffLimit accounting owns that outcome, and a start-deadline that raced it would report a
+//     crash-looping mover as "never started", which is both wrong and less useful.
+//   - a container that is running, has terminated, or has a previous termination recorded. This
+//     catches the pod whose phase has not been refreshed yet, and the restarting container whose
+//     current state is Waiting but whose LastTerminationState proves it ran.
+//
+// What deliberately does NOT count is pod.status.startTime. The kubelet stamps it when it ACCEPTS
+// the pod, before pulling an image or mounting a volume — a pod wedged in ContainerCreating for
+// thirty-six hours has one, so reading it as a start signal would make this predicate always true
+// and the deadline dead code. The empty slice is likewise NOT started: a Job that is half an hour
+// old with no pod at all (quota rejection, an admission webhook refusing it) is stuck in the same
+// sense and by the same evidence.
+func moverPodEverStarted(pods []corev1.Pod) bool {
+	for i := range pods {
+		pod := &pods[i]
+		switch pod.Status.Phase {
+		case corev1.PodRunning, corev1.PodSucceeded, corev1.PodFailed:
+			return true
+		}
+		for j := range pod.Status.ContainerStatuses {
+			cs := &pod.Status.ContainerStatuses[j]
+			if cs.State.Running != nil || cs.State.Terminated != nil || cs.LastTerminationState.Terminated != nil {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// stalledMoverDetail finds the observable cause of a mover that never started: the most recent
+// Warning Event about its pod, falling back to one about the Job itself when there is no pod (the
+// Job controller records FailedCreate there — a quota denial, a refusing admission webhook).
+//
+// A mover Job runs one pod at a time, so the loop is over a one-element slice in every case anyone
+// will ever see; it takes the first pod that has anything to say rather than the newest event
+// across all of them, because a mover that produced two pods produced them SEQUENTIALLY and the
+// list is small enough that the distinction is not worth a second sort.
+func (r *BackupReconciler) stalledMoverDetail(ctx context.Context, pods []corev1.Pod, jobName string) string {
+	for i := range pods {
+		if msg := r.latestWarningEvent(ctx, r.OperatorNamespace, pods[i].Name); msg != "" {
+			return msg
+		}
+	}
+	return r.latestWarningEvent(ctx, r.OperatorNamespace, jobName)
+}
+
+// latestWarningEvent returns the most recent Warning Event about one object, rendered as
+// "<reason>: <message>" — the two columns `kubectl describe` prints, and the two an operator reads.
+//
+// THIS IS THE POINT OF THE WHOLE DEADLINE. In the incident that produced it the kubelet published
+// the exact cause — an RBD clone the node's krbd could not map — 1069 times over 36 hours, starting
+// one minute in. Every deadline in this file could have been in place and the operator would still
+// have been left with "timed out", which is a fact about us rather than about their cluster. So the
+// cause travels into status.volumes[].reason, the same way podKillReason carries the kubelet's own
+// eviction message verbatim.
+//
+// Read through APIReader — the UNCACHED, straight-to-apiserver reader — and never through the
+// controller's cached client. Listing Events through the cache would make controller-runtime start
+// an informer over every Event in the cluster, which on a busy cluster is the single largest object
+// stream there is; this is a handful of field-selected reads on a path that only executes when a
+// volume is already being failed. A nil APIReader (it is set post-construction, like Hooks)
+// degrades to no detail rather than to a cache subscription: the reason keeps its bare form and the
+// Event still names the pod to describe.
+func (r *BackupReconciler) latestWarningEvent(ctx context.Context, namespace, name string) string {
+	if r.APIReader == nil || name == "" {
+		return ""
+	}
+	var warnings corev1.EventList
+	if err := r.APIReader.List(ctx, &warnings,
+		client.InNamespace(namespace),
+		client.MatchingFields{"involvedObject.name": name}); err != nil {
+		// Decoration on a failure that is already being reported. It must never become a second,
+		// unrelated error about listing Events — the same rule killDetail follows.
+		logf.FromContext(ctx).V(1).Info("could not read Warning Events for the stalled object; "+
+			"the reason will carry no detail", "object", namespace+"/"+name, "error", err.Error())
+		return ""
+	}
+	var newest *corev1.Event
+	var newestAt time.Time
+	for i := range warnings.Items {
+		e := &warnings.Items[i]
+		if e.Type != corev1.EventTypeWarning {
+			continue
+		}
+		at := eventObservedAt(e)
+		if newest == nil || at.After(newestAt) {
+			newest, newestAt = e, at
+		}
+	}
+	if newest == nil {
+		return ""
+	}
+	message := strings.TrimSpace(newest.Message)
+	if reason := strings.TrimSpace(newest.Reason); reason != "" && message != "" {
+		return reason + ": " + message
+	}
+	if message != "" {
+		return message
+	}
+	return strings.TrimSpace(newest.Reason)
+}
+
+// eventObservedAt is when an Event last happened, tolerating the two APIs that write it. A core/v1
+// Event carries lastTimestamp; one written through events.k8s.io/v1 and read back through the core
+// view carries eventTime (and, when aggregated, a series). Preferring the latest of the three and
+// falling back to creation means an aggregated "x1069 over 36h" event sorts by its LAST occurrence
+// rather than its first, which is the one that describes the cluster now.
+func eventObservedAt(e *corev1.Event) time.Time {
+	at := e.LastTimestamp.Time
+	if e.Series != nil && e.Series.LastObservedTime.After(at) {
+		at = e.Series.LastObservedTime.Time
+	}
+	if e.EventTime.After(at) {
+		at = e.EventTime.Time
+	}
+	if at.IsZero() {
+		at = e.CreationTimestamp.Time
+	}
+	return at
+}
+
+// deadlineReason composes a VolumeStatus.reason from a deadline's short name and the observable
+// cause behind it, capped by shortReason so the status field never carries an unbounded blob. With
+// no cause available the bare name is returned unchanged — which is what the crucible and the
+// envtest suite assert verbatim for the reasons that predate this lot.
+func deadlineReason(reason, detail string) string {
+	if detail == "" {
+		return reason
+	}
+	return shortReason(reason + ": " + detail)
+}
+
+// eventSuffix renders the observable cause for the tail of an Event message, or "" when there is
+// none. The Event is not capped the way the reason is: it is the long form, and truncating the
+// kubelet's own sentence is what leaves the reader guessing.
+func eventSuffix(detail string) string {
+	if detail == "" {
+		return ""
+	}
+	return " — the most recent Warning was: " + detail
+}
 
 // deleteMoverJobAndSecret best-effort deletes the mover Job and its creds Secret (both named
 // <prefix>-mover in the operator namespace), tolerating NotFound. Errors are logged, not

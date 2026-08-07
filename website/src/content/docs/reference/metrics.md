@@ -111,6 +111,7 @@ Three series carry the word `failure` and none of them is a spelling of another.
 | `crystalbackup_backup_duration_seconds` | histogram | `namespace` `tenant` `schedule` `origin` `location` `cluster` | End-to-end Backup duration, from creation to terminal phase. |
 | `crystalbackup_backup_failures` | gauge | `namespace` `tenant` `schedule` `origin` `location` `cluster` | Number of Backups currently in a failed terminal phase (Failed or PartiallyFailed) for this series. |
 | `crystalbackup_backup_failures_total` | counter | `namespace` `tenant` `schedule` `origin` `location` `cluster` | Backups that reached Failed or PartiallyFailed. |
+| `crystalbackup_backup_in_progress_since_timestamp_seconds` | gauge | `namespace` `tenant` `schedule` `origin` `location` `cluster` | Unix time the oldest still-unfinished Backup for this series was created; absent when none is in flight. |
 | `crystalbackup_backup_last_added_bytes` | gauge | `namespace` `tenant` `schedule` `origin` `location` `cluster` | Deduplicated bytes added by the last successful Backup (sum of status.volumes[].addedBytes). |
 | `crystalbackup_backup_last_duration_seconds` | gauge | `namespace` `tenant` `schedule` `origin` `location` `cluster` | Wall-clock duration of the last successful Backup (backupTime - creationTimestamp). |
 | `crystalbackup_backup_last_failure_timestamp_seconds` | gauge | `namespace` `tenant` `schedule` `origin` `location` `cluster` | Unix time of the last Backup that reached Failed or PartiallyFailed for this series. |
@@ -255,6 +256,6 @@ administrator's job, on a real cadence — see
 
 ## See also
 
-- [Alerts](/CrystalBackup/docs/reference/alerts/) — the eleven rules built on these series.
+- [Alerts](/CrystalBackup/docs/reference/alerts/) — the twelve rules built on these series.
 - [Observability](/CrystalBackup/docs/guides/observability/) — scraping, logs, and the conditions
   that say *why*.
