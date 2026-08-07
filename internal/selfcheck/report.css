@@ -41,10 +41,16 @@ h1{font-size:38px;line-height:1.1;letter-spacing:-.02em;margin:0 0 12px;}
 .verdict{margin:26px 0;padding:20px 22px;background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--pass);border-radius:12px;box-shadow:var(--shadow);}
 .verdict.degraded{border-left-color:var(--high);}
 .verdict.unhealthy{border-left-color:var(--crit);}
+/* `findings` is a clean rule tally over an installation that is carrying something the rules do not
+ * measure. It takes the INFORMATIONAL blue rather than degraded's amber on purpose: amber and red
+ * mean a rule was breached, and nothing about a leak residual breached a rule. Blue is only there so
+ * that the box is visibly not the plain green a reader skims past. */
+.verdict.findings{border-left-color:var(--med);}
 .verdict .head{display:flex;align-items:center;gap:10px;font-weight:640;font-size:15px;margin-bottom:4px;}
 .verdict .dot{width:9px;height:9px;border-radius:50%;background:var(--pass);display:inline-block;}
 .verdict.degraded .dot{background:var(--high);}
 .verdict.unhealthy .dot{background:var(--crit);}
+.verdict.findings .dot{background:var(--med);}
 .verdict p{margin:8px 0 0;color:var(--muted);font-size:14.5px;}
 h2{font-size:20px;letter-spacing:-.01em;margin:38px 0 6px;}
 h2 .n{font-family:var(--mono);font-size:13px;color:var(--faint);font-weight:400;margin-left:8px;}

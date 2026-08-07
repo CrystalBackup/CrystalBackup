@@ -19,13 +19,19 @@
     <span><b>Redaction</b> {{ .Redaction.Mode }}{{ if eq .Redaction.SaltSource "caller-supplied" }} · caller-supplied salt{{ end }}</span>
   </div>
 
-  <section class="verdict {{ if eq .Verdict.Status "unhealthy" }}unhealthy{{ else if eq .Verdict.Status "degraded" }}degraded{{ end }}">
+  <section class="verdict {{ if eq .Verdict.Status "unhealthy" }}unhealthy{{ else if eq .Verdict.Status "degraded" }}degraded{{ else if eq .Verdict.Status "healthyWithFindings" }}findings{{ end }}">
     <div class="head"><span class="dot"></span>{{ .Verdict.Summary }}</div>
     <p>
       {{ .Verdict.OK }} rule(s) clean · {{ .Verdict.Breached }} breached{{ if has .Verdict.Critical }} ({{ .Verdict.Critical }} critical){{ end }} ·
       {{ .Verdict.NotEvaluated }} not evaluated · {{ .Verdict.Errored }} errored.
       A rule that could not be evaluated is <b>not</b> a passing rule — only Prometheus can answer those, and this report says so rather than showing green.
     </p>
+    {{ if has .Leaks.Totals.Residual }}
+    <p>
+      Those counts are the alert rules only. <b>{{ .Leaks.Totals.Residual }} managed object(s)</b> are also still present past the orphan reaper's grace period —
+      no rule fires on that, so it moves none of the numbers above, and it is the reason this verdict does not read as plainly healthy. See <b>Leak indicators</b> below.
+    </p>
+    {{ end }}
   </section>
 
   {{ if eq .Redaction.Mode "hashed" }}

@@ -24,6 +24,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"html/template"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -575,7 +576,7 @@ func TestNotEvaluatedIsNeverReportedAsOK(t *testing.T) {
 		{Name: "b", Status: StatusNotEvaluated},
 		{Name: "c", Status: StatusError},
 	}
-	v := verdictOf(rules)
+	v := verdictOf(rules, noLeaks)
 	if v.OK != 1 {
 		t.Errorf("OK = %d, want 1: only the evaluated pass counts", v.OK)
 	}
@@ -602,13 +603,135 @@ func TestNotEvaluatedIsNeverReportedAsOK(t *testing.T) {
 // TestCriticalBreachMakesTheVerdictUnhealthy: only a critical rule says the RESTORE PATH is
 // compromised, and only that should be able to produce the strongest word in the report.
 func TestCriticalBreachMakesTheVerdictUnhealthy(t *testing.T) {
-	warn := verdictOf([]RuleResult{{Status: StatusBreached, Severity: "warning"}})
+	warn := verdictOf([]RuleResult{{Status: StatusBreached, Severity: "warning"}}, noLeaks)
 	if warn.Status != "degraded" {
 		t.Errorf("a warning breach gave %q, want degraded", warn.Status)
 	}
-	crit := verdictOf([]RuleResult{{Status: StatusBreached, Severity: "critical"}})
+	crit := verdictOf([]RuleResult{{Status: StatusBreached, Severity: "critical"}}, noLeaks)
 	if crit.Status != "unhealthy" {
 		t.Errorf("a critical breach gave %q, want unhealthy", crit.Status)
+	}
+}
+
+// TestResidualLeaksStopTheVerdictReadingHealthy is the 2026-08-07 defect, pinned.
+//
+// That report said `status: "healthy"` and "No rule breached among the 12 evaluated." over a
+// leakIndicators section carrying seven residual VolumeSnapshots, the oldest 65 hours old. Both
+// halves were true and the top line was the wrong answer to the question being asked, because a
+// reader who sees "healthy" does not scroll to find out what it was a verdict ON.
+func TestResidualLeaksStopTheVerdictReadingHealthy(t *testing.T) {
+	clean := []RuleResult{
+		{Name: "a", Status: StatusOK},
+		{Name: "b", Status: StatusOK},
+	}
+	incident := Leaks{
+		GraceMinutes: 30,
+		Kinds:        []LeakKind{{Kind: "VolumeSnapshot", Total: 9, Residual: 7, OldestAgeHours: 65}},
+		Totals:       LeakSummary{Residual: 7},
+	}
+
+	v := verdictOf(clean, incident)
+	if v.Status == verdictHealthy {
+		t.Error(`status is the bare word "healthy" beside 7 residual objects — this is the exact ` +
+			"report that sent somebody looking for the real state by hand")
+	}
+	if v.Status != verdictFindings {
+		t.Errorf("status = %q, want %q: a residual is a finding, and giving it degraded or unhealthy "+
+			"would claim a rule breach that never happened", v.Status, verdictFindings)
+	}
+	// One sentence, both facts. A reader who reads only the summary must come away knowing the rules
+	// are clean AND that there is residue, with enough of a number to judge it.
+	for _, want := range []string{"No rule breached", "7 managed object(s)", "VolumeSnapshot", "65 h"} {
+		if !strings.Contains(v.Summary, want) {
+			t.Errorf("the summary does not state %q: %q", want, v.Summary)
+		}
+	}
+	if !strings.Contains(v.Summary, "not a breached rule") {
+		t.Errorf("the summary does not say the residue is NOT a breached rule, which is how it ends "+
+			"up quoted into a ticket as an alert that fired: %q", v.Summary)
+	}
+
+	// And with nothing residual, the plain word is still available: a report that could never say
+	// "healthy" would be as useless as one that always did.
+	quiet := verdictOf(clean, noLeaks)
+	if quiet.Status != verdictHealthy {
+		t.Errorf("status = %q with a zero residual, want %q", quiet.Status, verdictHealthy)
+	}
+	if strings.Contains(quiet.Summary, "residual") || strings.Contains(quiet.Summary, "outlived") {
+		t.Errorf("the summary invents a leak clause with nothing to report: %q", quiet.Summary)
+	}
+}
+
+// TestTheRuleTallyIgnoresTheLeakResidual is the other half of the fix, and the one that would break
+// silently. The framing had to change; the ARITHMETIC must not. A residual that added itself to
+// `breached` would put a fired alert in a report the alerting side never sent, and would move the
+// number the operator is reading to decide how bad this is.
+func TestTheRuleTallyIgnoresTheLeakResidual(t *testing.T) {
+	rules := []RuleResult{
+		{Name: "a", Status: StatusOK},
+		{Name: "b", Status: StatusBreached, Severity: "warning"},
+		{Name: "c", Status: StatusNotEvaluated},
+		{Name: "d", Status: StatusError},
+	}
+	leaky := Leaks{
+		GraceMinutes: 30,
+		Kinds: []LeakKind{
+			{Kind: "Job", Total: 4, Residual: 2, OldestAgeHours: 9},
+			{Kind: "VolumeSnapshotContent", Total: 3, Residual: 3, OldestAgeHours: 71},
+		},
+		Totals: LeakSummary{Residual: 5},
+	}
+
+	without := verdictOf(rules, noLeaks)
+	with := verdictOf(rules, leaky)
+	if with.OK != without.OK || with.Breached != without.Breached ||
+		with.Critical != without.Critical || with.NotEvaluated != without.NotEvaluated ||
+		with.Errored != without.Errored {
+		t.Errorf("the residual moved the rule tally: %+v vs %+v", with, without)
+	}
+	// The word stays "degraded": a breached rule is strictly worse news than residue, and the residue
+	// does not get to upgrade or downgrade it.
+	if with.Status != verdictDegraded {
+		t.Errorf("status = %q, want %q — the breach decides the word", with.Status, verdictDegraded)
+	}
+	// It is still stated, because the reader who has just been told about a breach is the one about
+	// to go looking for what else is wrong.
+	for _, want := range []string{"5 managed object(s)", "2 Job", "3 VolumeSnapshotContent", "71 h"} {
+		if !strings.Contains(with.Summary, want) {
+			t.Errorf("a degraded verdict drops the residue from its summary (%q missing): %q",
+				want, with.Summary)
+		}
+	}
+}
+
+// TestTheVerdictOnTheFixtureAccountsForItsResidue runs the same property through the real collector
+// rather than a hand-built Verdict, because the wiring is where this would be lost: Collect has to
+// pass the census it just took to the verdict, and it computes the two in separate passes.
+func TestTheVerdictOnTheFixtureAccountsForItsResidue(t *testing.T) {
+	rep := collectFixture(t, false)
+	if rep.Leaks.Totals.Residual == 0 {
+		t.Fatal("the fixture no longer carries residual objects; this test can no longer see anything")
+	}
+	if rep.Verdict.Status == verdictHealthy {
+		t.Errorf("the fixture reports %q with %d residual object(s)",
+			rep.Verdict.Status, rep.Leaks.Totals.Residual)
+	}
+	if !strings.Contains(rep.Verdict.Summary,
+		fmt.Sprintf("%d managed object(s)", rep.Leaks.Totals.Residual)) {
+		t.Errorf("the summary does not carry the residual count: %q", rep.Verdict.Summary)
+	}
+	// And onto the page, inside the verdict box, so the reader who does not scroll sees it there.
+	page, err := Render(rep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	head, _, ok := strings.Cut(string(page), "<h2>Installation</h2>")
+	if !ok {
+		t.Fatal("the rendered page has no Installation heading to cut at")
+	}
+	if !strings.Contains(head, "past the orphan reaper's grace period") {
+		t.Error("the residue is not mentioned above the fold; it is only in the section a reader " +
+			"who trusts the headline never reaches")
 	}
 }
 
@@ -666,7 +789,10 @@ func TestRoundTripJSONToHTML(t *testing.T) {
 		"CrystalbackupBackupMissed",
 		"Rule verdicts",
 		"Leak indicators",
-		parsed.Verdict.Summary,
+		// ESCAPED, through the same function the renderer uses. The summary is data — it carries an
+		// apostrophe ("the reaper's grace") — and a page that contained it byte-for-byte would be a
+		// page that had not escaped it, which is the bug this assertion would otherwise hide.
+		template.HTMLEscapeString(parsed.Verdict.Summary),
 	} {
 		if !strings.Contains(html, want) {
 			t.Errorf("rendered page is missing %q", want)
@@ -732,6 +858,10 @@ func TestParseRejectsSomethingThatIsNotAReport(t *testing.T) {
 
 // TestReportCommandRendersFromAFileWithNoCluster is the second deliverable's contract, exercised
 // through the actual CLI entry point: no client is built, nothing is read but the file.
+//
+// The connector handed in FAILS THE TEST if it is called. That is the assertion — this mode has to
+// keep working on a maintainer's laptop that has never seen the cluster, and a --from path which
+// merely tolerated a client would break that the day it started building one first.
 func TestReportCommandRendersFromAFileWithNoCluster(t *testing.T) {
 	rep := collectFixture(t, false)
 	body, err := json.MarshalIndent(rep, "", "  ")
@@ -746,7 +876,9 @@ func TestReportCommandRendersFromAFileWithNoCluster(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	if code := RunReport([]string{"--from", in, "--output", out}, &stdout, &stderr); code != 0 {
+	code := runReport(context.Background(), []string{"--from", in, "--output", out},
+		&stdout, &stderr, forbiddenConnector(t))
+	if code != 0 {
 		t.Fatalf("exit %d: %s", code, stderr.String())
 	}
 	page, err := os.ReadFile(out)
@@ -759,14 +891,121 @@ func TestReportCommandRendersFromAFileWithNoCluster(t *testing.T) {
 	assertNoSecrets(t, "rendered file", string(page))
 }
 
-// TestReportCommandRefusesWithoutFrom keeps the usage honest — the flag is the whole command.
-func TestReportCommandRefusesWithoutFrom(t *testing.T) {
+// TestReportWithNoFromCollectsTheSelfCheckItself is the 0.6.4 change, and the incident behind it is
+// worth restating: on 2026-08-07 the only way to see the state of an installation was to run
+// `selfcheck`, capture 17 KB of JSON and read it by hand, because the command that knows how to
+// format that document demanded a file nobody had. Both halves are in one binary with one RBAC.
+func TestReportWithNoFromCollectsTheSelfCheckItself(t *testing.T) {
+	out := filepath.Join(t.TempDir(), "report.html")
 	var stdout, stderr bytes.Buffer
-	if code := RunReport(nil, &stdout, &stderr); code == 0 {
-		t.Error("report with no --from exited 0")
+	code := runReport(context.Background(), []string{"--output", out}, &stdout, &stderr, fixtureConnector(t))
+	if code != 0 {
+		t.Fatalf("exit %d: %s", code, stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "--from") {
-		t.Errorf("the error does not name the missing flag: %q", stderr.String())
+	page, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(page)
+	// A whole report, not a stub: the same page `report --from` produces, because it came through
+	// the same Collect and the same Render.
+	for _, want := range []string{"Installation self-check", "Rule verdicts", "Leak indicators"} {
+		if !strings.Contains(html, want) {
+			t.Errorf("the self-generated page is missing %q", want)
+		}
+	}
+	// Redaction defaults exactly as `selfcheck` does, which is the property that makes this safe to
+	// suggest to somebody who is about to attach the output to an issue.
+	assertNoSecrets(t, "self-generated page", html)
+	if !strings.Contains(html, "Identifiers are redacted") {
+		t.Error("the self-generated page does not state that it is redacted")
+	}
+	if !strings.Contains(stderr.String(), "re-run with --full") {
+		t.Errorf("nothing on the terminal says what was done to the identifiers: %q", stderr.String())
+	}
+
+	// --full reaches the collection through the same flag it does on `selfcheck`; a flag that parsed
+	// and then did nothing would be the worst of the three possible outcomes.
+	full := filepath.Join(t.TempDir(), "full.html")
+	stdout.Reset()
+	stderr.Reset()
+	code = runReport(context.Background(), []string{"--full", "--output", full},
+		&stdout, &stderr, fixtureConnector(t))
+	if code != 0 {
+		t.Fatalf("exit %d: %s", code, stderr.String())
+	}
+	body, err := os.ReadFile(full)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), operatorNS) {
+		t.Errorf("--full produced a page with no verbatim identifier in it: the flag parsed and "+
+			"changed nothing, which is exactly how somebody ends up reading tokens they believe "+
+			"are names (looking for %q)", operatorNS)
+	}
+}
+
+// TestReportWithNoClusterSaysWhichModeItIsIn. This is the one subcommand with a mode that needs a
+// cluster and a mode that pointedly does not, so "no kubeconfig" on its own is a true message and
+// no help at all: the answer is four characters the reader did not type.
+func TestReportWithNoClusterSaysWhichModeItIsIn(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := runReport(context.Background(), nil, &stdout, &stderr,
+		func() (client.Reader, ServerInfo, error) {
+			return nil, nil, fmt.Errorf("no Kubernetes configuration: no kubeconfig and no service account")
+		})
+	if code == 0 {
+		t.Error("report exited 0 having produced nothing")
+	}
+	if stdout.Len() > 0 {
+		t.Errorf("something was written to stdout: %q", stdout.String())
+	}
+	for _, want := range []string{"no Kubernetes configuration", "--from", "COLLECT"} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Errorf("the error does not mention %q, so it does not say which mode failed: %q",
+				want, stderr.String())
+		}
+	}
+}
+
+// TestReportRefusesCollectionFlagsInFromMode. A file handed to --from was collected somewhere else,
+// at another instant, with the redaction whoever ran it chose — so --full cannot do anything to it.
+// Ignoring the flag would print a fully redacted page to somebody who typed --full and believed they
+// were looking at real names, which is worse than either mode failing.
+func TestReportRefusesCollectionFlagsInFromMode(t *testing.T) {
+	dir := t.TempDir()
+	in := filepath.Join(dir, "health.json")
+	body, err := json.Marshal(collectFixture(t, false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(in, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, arg := range []string{"--full", "--operator-namespace=other", "--mover-image=x:1"} {
+		var stdout, stderr bytes.Buffer
+		code := runReport(context.Background(), []string{"--from", in, arg},
+			&stdout, &stderr, forbiddenConnector(t))
+		if code != 2 {
+			t.Errorf("%s alongside --from exited %d, want 2 (usage error)", arg, code)
+		}
+		if stdout.Len() > 0 {
+			t.Errorf("%s alongside --from still produced a page: %q", arg, stdout.String())
+		}
+		if !strings.Contains(stderr.String(), "ALREADY collected") {
+			t.Errorf("the refusal for %s does not explain why the flag cannot apply: %q",
+				arg, stderr.String())
+		}
+	}
+
+	// The namespace default must NOT trip this: it comes from $POD_NAMESPACE, so a `report --from`
+	// run inside the operator pod would otherwise be refused for a flag nobody typed.
+	t.Setenv("POD_NAMESPACE", "crystal-backup-elsewhere")
+	var stdout, stderr bytes.Buffer
+	if code := runReport(context.Background(), []string{"--from", in},
+		&stdout, &stderr, forbiddenConnector(t)); code != 0 {
+		t.Errorf("--from alone exited %d inside a pod namespace: %s", code, stderr.String())
 	}
 }
 
@@ -949,6 +1188,31 @@ const (
 )
 
 func fixtureNow() time.Time { return time.Date(2026, 7, 30, 12, 0, 0, 0, time.UTC) }
+
+// noLeaks is the census of an installation with nothing stranded: the state in which the verdict is
+// allowed to say the bare word "healthy". Named because most verdict tests are about the rules and
+// should not have to construct one.
+var noLeaks = Leaks{GraceMinutes: 30}
+
+// fixtureConnector hands the collecting paths the fixture cluster instead of a real one, which is
+// what lets `report` with no --from be tested at all.
+func fixtureConnector(t *testing.T) clusterConnector {
+	t.Helper()
+	return func() (client.Reader, ServerInfo, error) {
+		return fixtureClient(t), fakeDiscovery{}, nil
+	}
+}
+
+// forbiddenConnector fails the test if a cluster is opened. It is the whole assertion behind
+// `report --from`: that mode has to work on a machine which has never seen the cluster, and the way
+// that property dies is quietly, on the day the file path starts building a client "just in case".
+func forbiddenConnector(t *testing.T) clusterConnector {
+	t.Helper()
+	return func() (client.Reader, ServerInfo, error) {
+		t.Error("a cluster connection was opened on a path that must never need one")
+		return nil, nil, fmt.Errorf("no cluster available")
+	}
+}
 
 func collectFixture(t *testing.T, full bool) *Report {
 	t.Helper()

@@ -39,13 +39,14 @@ var reportCSS string
 //go:embed report.html.tmpl
 var reportTemplate string
 
-// Render turns a report — parsed from JSON, with no cluster anywhere in sight — into one
+// Render turns a report — a *Report and nothing else, with no cluster anywhere in sight — into one
 // self-contained HTML page.
 //
-// The separation is the point of the two subcommands. `selfcheck` needs a cluster and produces
-// JSON; `report` needs a file and produces a page. Someone attaches the JSON to an issue and a
-// maintainer regenerates the page at their desk, which is only possible because nothing in here
-// reaches for a client, a network or a clock.
+// Nothing in here reaches for a client, a network or a clock, and that is what makes the whole
+// workflow possible: someone attaches the JSON to an issue and a maintainer regenerates the page at
+// their desk. It is also why `report` can format a self-check it collected itself moments earlier
+// (see RunReport) without a second renderer — the collecting half hands this function exactly what
+// Parse hands it, so the two modes cannot produce different pages from the same facts.
 func Render(rep *Report) ([]byte, error) {
 	t, err := template.New("report").Funcs(template.FuncMap{
 		"css":        func() template.CSS { return template.CSS(reportCSS) },

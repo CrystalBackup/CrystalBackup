@@ -116,7 +116,9 @@ func Collect(ctx context.Context, opts Options) (*Report, error) {
 	rep.CRDs = c.crds(ctx)
 	rep.Leaks = c.leaks(ctx)
 	rep.Rules = c.rules(ctx)
-	rep.Verdict = verdictOf(rep.Rules)
+	// The leak census is passed to the verdict as well as reported in its own section: the headline
+	// has to account for a residual it is not allowed to call a breach. See verdictOf.
+	rep.Verdict = verdictOf(rep.Rules, rep.Leaks)
 	rep.Redaction = red.Describe()
 	rep.Diagnostics = c.diags
 	return rep, nil
@@ -226,11 +228,17 @@ const (
 	conditionReady = "Ready"
 )
 
-// The three words the headline verdict can take. Named because they appear in the JSON, in the
-// template's class selectors and in the summary sentence, and a fourth spelling would silently
-// style an unhealthy report as a healthy one.
+// The words the headline verdict can take. Named because they appear in the JSON, in the template's
+// class selectors and in the summary sentence, and a fifth spelling would silently style an
+// unhealthy report as a healthy one.
+//
+// verdictFindings is the odd one out and deliberately so. It is NOT a severity between healthy and
+// degraded: degraded and unhealthy mean a rule was breached, and nothing about a leak residual
+// breaches a rule. It exists because the bare word "healthy" was being read as the answer to a
+// question it was never asked — see verdictOf.
 const (
 	verdictHealthy   = "healthy"
+	verdictFindings  = "healthyWithFindings"
 	verdictDegraded  = "degraded"
 	verdictUnhealthy = "unhealthy"
 )
@@ -1016,12 +1024,26 @@ func thresholdView(t alerts.Threshold) ThresholdView {
 	return v
 }
 
-// verdictOf turns the per-rule statuses into the headline.
+// verdictOf turns the per-rule statuses, plus the leak census, into the headline.
 //
 // NotEvaluated is carried INTO the summary sentence, not left in a footnote. An installation where
 // most rules could not be evaluated has not been given a clean bill of health, and the word
 // "healthy" on its own would be exactly the unearned green this report exists to avoid.
-func verdictOf(rules []RuleResult) Verdict {
+//
+// THE LEAK RESIDUAL IS PART OF THE HEADLINE FOR THE SAME REASON, and it took a live incident to see
+// it. On 2026-08-07 this function produced `status: "healthy"` with `summary: "No rule breached
+// among the 12 evaluated."` over a leakIndicators section reporting seven residual VolumeSnapshots,
+// the oldest 65 hours old. Every word of that was true — the verdict is about the rules and says so
+// — and it was the wrong answer to the question the reader was actually asking, because a reader who
+// sees "healthy" at the top does not scroll. That is the defect shape this release has spent itself
+// closing: a status true in its own narrow terms and misleading as an answer.
+//
+// The fix is the FRAMING, not the rules. The tally below is untouched — a residual adds nothing to
+// Breached, Critical or OK, because no alert rule fires on it and inventing one here would put a
+// breach in the report that the alerting side would never send. What changes is that the word
+// "healthy" is no longer available on its own when there is residue, and that the summary states
+// both facts in one sentence instead of leaving the second one four sections down.
+func verdictOf(rules []RuleResult, leaks Leaks) Verdict {
 	v := Verdict{Status: verdictHealthy}
 	for _, r := range rules {
 		switch r.Status {
@@ -1044,20 +1066,62 @@ func verdictOf(rules []RuleResult) Verdict {
 	case v.Breached > 0:
 		v.Status = verdictDegraded
 	}
+	finding := leakClause(leaks)
 	switch v.Status {
 	case verdictUnhealthy:
 		v.Summary = fmt.Sprintf("%d rule(s) breached, %d of them CRITICAL — restore capability is "+
 			"compromised right now.", v.Breached, v.Critical)
 	case verdictDegraded:
 		v.Summary = fmt.Sprintf("%d rule(s) breached, none critical.", v.Breached)
-	default:
-		v.Summary = fmt.Sprintf("No rule breached among the %d evaluated.", v.OK)
+	case verdictHealthy:
+		if finding == "" {
+			v.Summary = fmt.Sprintf("No rule breached among the %d evaluated.", v.OK)
+			break
+		}
+		// One sentence, both facts, and in this order: the rule tally is what the reader came for and
+		// stays first, the residue is what they would otherwise have missed.
+		v.Status = verdictFindings
+		v.Summary = fmt.Sprintf("No rule breached among the %d evaluated, but %s.", v.OK, finding)
+	}
+	// A degraded or unhealthy report keeps its word — a breach is strictly worse news than residue —
+	// but the residue is still stated, because a reader who has just been told about a breach is
+	// exactly the reader about to go looking for what else is wrong.
+	if finding != "" && v.Status != verdictFindings {
+		v.Summary += fmt.Sprintf(" Separately, %s.", finding)
 	}
 	if v.NotEvaluated > 0 || v.Errored > 0 {
 		v.Summary += fmt.Sprintf(" %d rule(s) were NOT evaluated and %d errored — those are not passes.",
 			v.NotEvaluated, v.Errored)
 	}
 	return v
+}
+
+// leakClause states the residue census as a clause a verdict sentence can be built around, or "" when
+// there is nothing to state.
+//
+// It names the counts per kind and the oldest age, because those are the two numbers that decide
+// whether this is worth getting out of bed for: three VolumeSnapshots from an hour ago is a teardown
+// that lost a race, and seven from three days ago is a leak nobody has looked at. And it says what
+// the finding is NOT — a breached rule — in the same breath, so the sentence cannot be quoted into a
+// ticket as an alert that fired.
+func leakClause(l Leaks) string {
+	if l.Totals.Residual == 0 {
+		return ""
+	}
+	perKind := make([]string, 0, len(l.Kinds))
+	oldest := 0
+	for _, k := range l.Kinds {
+		if k.Residual == 0 {
+			continue
+		}
+		perKind = append(perKind, fmt.Sprintf("%d %s", k.Residual, k.Kind))
+		if k.OldestAgeHours > oldest {
+			oldest = k.OldestAgeHours
+		}
+	}
+	return fmt.Sprintf("%d managed object(s) have outlived the orphan reaper's %d-minute grace and are "+
+		"still there (%s; oldest %d h) — a finding from the residue census below, not a breached rule",
+		l.Totals.Residual, l.GraceMinutes, strings.Join(perKind, ", "), oldest)
 }
 
 // --- small helpers --------------------------------------------------------------------------

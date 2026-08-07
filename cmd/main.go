@@ -92,8 +92,13 @@ func main() {
 	// has to read what the collectors read, with the RBAC the operator already holds, and shipping
 	// a second image to do that would mean a second supply chain to sign, scan and get wrong. This
 	// is also NOT the beginning of a `crystalctl` — that is a later milestone with a different
-	// audience (a tenant, from outside the cluster); these two run as the operator, and `report`
-	// runs nowhere near a cluster at all.
+	// audience (a tenant, from outside the cluster); these two run as the operator.
+	//
+	// `report` is the one with two modes, and it is here for the same reason. Given --from it runs
+	// nowhere near a cluster, which is what makes a JSON attached to an issue renderable at a
+	// maintainer's desk. Given no --from it COLLECTS the self-check itself, through the same code
+	// path `selfcheck` uses, because both halves are in this one binary with this one RBAC and a
+	// `report` that needs a file is a `report` nobody can use in the moment they need it.
 	//
 	// The soak pair follows the same rule for the same reason, plus one of its own: `soak-export`
 	// writes its tarball to STDOUT precisely because the operator image is distroless — no shell,
@@ -114,7 +119,7 @@ func main() {
 		case selfcheck.CommandSelfcheck:
 			os.Exit(selfcheck.RunSelfcheck(context.Background(), os.Args[2:], os.Stdout, os.Stderr))
 		case selfcheck.CommandReport:
-			os.Exit(selfcheck.RunReport(os.Args[2:], os.Stdout, os.Stderr))
+			os.Exit(selfcheck.RunReport(context.Background(), os.Args[2:], os.Stdout, os.Stderr))
 		case soak.CommandCollect:
 			os.Exit(soak.RunCollect(context.Background(), os.Args[2:], os.Stderr))
 		case soak.CommandExport:

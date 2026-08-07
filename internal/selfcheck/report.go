@@ -448,14 +448,27 @@ type BreachView struct {
 
 // Verdict is the headline.
 type Verdict struct {
-	// Status is "healthy", "degraded" or "unhealthy". Unhealthy requires a CRITICAL breach — the
-	// only rule severity that says the restore path itself is compromised.
+	// Status is "healthy", "healthyWithFindings", "degraded" or "unhealthy". Degraded and unhealthy
+	// both mean a rule was breached, and unhealthy requires a CRITICAL one — the only rule severity
+	// that says the restore path itself is compromised.
+	//
+	// "healthyWithFindings" is not a fourth severity: it is the same clean rule tally as "healthy",
+	// over an installation that is also carrying something the rules do not measure — today, a
+	// non-zero leakIndicators residual. It exists because "healthy" was being read as a verdict on
+	// the whole installation rather than on the rules, which is what a reader who does not scroll
+	// will always read it as. Anything comparing this field for equality with "healthy" and meaning
+	// "is everything fine" wants to compare against that constant and then read the summary.
 	Status string `json:"status"`
-	// Summary is the sentence a human reads first.
+	// Summary is the sentence a human reads first, and the one place every fact in the headline is
+	// stated together — including the ones no rule covers.
 	Summary string `json:"summary"`
 	// The counts behind it, including NotEvaluated — which is part of the headline on purpose. An
 	// installation where seven of ten rules could not be evaluated has not been given a clean bill
 	// of health, and the number saying so belongs next to the word "healthy".
+	//
+	// These are the RULE tally and nothing else. A leak residual moves none of them: no alert rule
+	// fires on the residue census, and a report that counted one as a breach would claim an alert
+	// that the alerting side would never send.
 	Breached     int `json:"breached"`
 	OK           int `json:"ok"`
 	NotEvaluated int `json:"notEvaluated"`
