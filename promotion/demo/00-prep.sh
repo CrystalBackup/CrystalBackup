@@ -61,10 +61,10 @@ if [[ ! -f "$KEK_DIR/kek.txt" ]]; then
 fi
 # Le Secret ne contient QUE la ligne AGE-SECRET-KEY- : les releases ≤ 0.6.1 rejettent le
 # fichier age-keygen complet, ses lignes de commentaires cassant le parse bech32
-# (« malformed secret key: mixed case »). Corrigé depuis, et 0.6.2 — celle que cette démo
-# installe — embarque le correctif (internal/keys accepte le fichier entier), donc le grep
-# est désormais FACULTATIF ici. Il reste en place parce qu'il est correct partout et que la
-# démo doit pouvoir se rejouer contre une release plus ancienne sans être retouchée.
+# (« malformed secret key: mixed case »). Corrigé à partir de 0.6.2 (internal/keys accepte
+# le fichier entier), donc sur la release que cette démo installe — 0.6.3 — le grep est
+# FACULTATIF. Il reste en place parce qu'il est correct partout et que la démo doit pouvoir
+# se rejouer contre une release plus ancienne sans être retouchée.
 # Le fichier complet reste dans .kek/ : il sert tel quel à `age -d -i` pour la démo.
 kubectl -n crystal-backup-system create secret generic cluster-kek \
   --from-literal=identity="$(grep '^AGE-SECRET-KEY-' "$KEK_DIR/kek.txt")" \

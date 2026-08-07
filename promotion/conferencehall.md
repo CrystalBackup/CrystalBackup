@@ -66,7 +66,7 @@ revendiquée avec l'outil de backup déjà en place.
 sous direction et revue humaines — et c'est précisément pour ça que la vérification est
 brutale : chaque milestone est accepté sur une plateforme réelle jetable
 (RKE2 + Rook-Ceph + Longhorn sur Hetzner), avec un **oracle restic indépendant** (le
-contrôleur ne note pas sa propre copie), et les 82 checks sont publiés — passes, skips
+contrôleur ne note pas sa propre copie), et les 90 checks sont publiés — passes, skips
 **et défauts trouvés**. Le talk assume les war stories : la signature cosign accrochée au
 mauvais manifest pendant quatre releases, le backup qui répond `Completed` sans avoir rien
 écrit, le droit à l'oubli qui n'oubliait rien. Ce qui n'est **pas** livré (CLI, UI,

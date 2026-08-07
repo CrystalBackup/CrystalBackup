@@ -29,7 +29,7 @@ class: text-center
 <div class="mt-6 flex gap-2 justify-center">
   <span class="pill">Apache-2.0</span>
   <span class="pill">restic-compatible</span>
-  <span class="pill">v0.6.2 · M0–M6 livrés</span>
+  <span class="pill">v0.6.3 · M0–M6 livrés</span>
 </div>
 
 <p class="tiny muted mt-10">Meetup — 45 min · slides + démo live</p>
@@ -67,7 +67,7 @@ alexis@infrabuilder.com · github.com/CrystalBackup
 <div class="panel accent" style="max-width: 320px">
 <span class="eyebrow">disclaimer honnête</span>
 
-Ce projet est **jeune** (v0.6.2), écrit **avec assistance IA** sous direction humaine,
+Ce projet est **jeune** (v0.6.3), écrit **avec assistance IA** sous direction humaine,
 et testé sur de vrais clusters **parce que** personne ne devrait me croire sur parole.
 
 </div>
@@ -232,7 +232,7 @@ et un RTO en réunions.
 | DR depuis le dépôt seul | <span class="mark-ok">✓</span> | <span class="mark-mid">~</span> | <span class="mark-no">–</span> | <span class="mark-no">–</span> | <span class="mark-mid">~</span> |
 | Relisible avec un outil standard | <span class="mark-ok">✓ restic</span> | <span class="mark-mid">~</span> | <span class="mark-ok">✓</span> | <span class="mark-ok">✓</span> | <span class="mark-no">–</span> |
 
-<p class="tiny muted mt-3">Colonne Crystal Backup = v0.6.2 livrée, chaque ✓ exercé par un rapport d'acceptation publié. Les autres colonnes : à vérifier contre leurs docs — capacités mouvantes, objectifs différents. Ceci n'est <strong>pas</strong> un benchmark.</p>
+<p class="tiny muted mt-3">Colonne Crystal Backup = v0.6.3 livrée, chaque ✓ exercé par un rapport d'acceptation publié. Les autres colonnes : à vérifier contre leurs docs — capacités mouvantes, objectifs différents. Ceci n'est <strong>pas</strong> un benchmark.</p>
 
 <!--
 [06:00 → 07:30]
@@ -816,7 +816,9 @@ Réponse : ne me croyez pas. Voici comment le projet se teste, et voici ses bugs
 </div>
 
 <div class="panel mt-4">
-📜 Chaque milestone est accepté là-dessus <strong>avant</strong> de sortir. Les rapports sont publiés — les 82 checks, les durées, les skips, <strong>et les défauts trouvés</strong>.
+📜 Chaque milestone est accepté là-dessus <strong>avant</strong> de sortir. Les rapports sont publiés — les 90 checks, les durées, les skips, <strong>et les défauts trouvés</strong>.
+
+<p class="tiny muted mt-2">Dernier : <code>…/reports/crucible-m6-3.html</code> — 90/90, 0 skip, 2 h 43.</p>
 </div>
 
 </v-click>
@@ -1021,7 +1023,7 @@ désactiver — pas de flag, pas de Skip() conditionnel, pas de tolérance régl
 
 <v-click>
 
-<div class="qbig text-center mt-8">20 ADRs publics. 82 checks publiés.<br/><span class="grad">Vous pouvez relire chaque décision.</span></div>
+<div class="qbig text-center mt-8">20 ADRs publics. 90 checks publiés.<br/><span class="grad">Vous pouvez relire chaque décision.</span></div>
 
 </v-click>
 
@@ -1101,7 +1103,7 @@ Le champ `mode: Immutable` est accepté — **il ne donne pas de WORM aujourd'hu
 <v-click>
 
 <div class="panel danger mt-6">
-⚠️ <strong>0.6.2 s'offre au test en conditions réelles, pas à la production.</strong> API <code>v1alpha1</code> — elle bougera encore. Testez sur un cluster dont vous pouvez encaisser la perte, <strong>à côté de</strong> vos backups actuels. Et testez vos restores — c'est la pratique sur laquelle ce projet tourne.
+⚠️ <strong>0.6.3 s'offre au test en conditions réelles, pas à la production.</strong> API <code>v1alpha1</code> — elle bougera encore. Testez sur un cluster dont vous pouvez encaisser la perte, <strong>à côté de</strong> vos backups actuels. Et testez vos restores — c'est la pratique sur laquelle ce projet tourne.
 </div>
 
 </v-click>
@@ -1127,10 +1129,23 @@ class: text-center
 
 # Essayez-le <span class="grad">dans un bac à sable</span>
 
+<div class="text-left" style="max-width: 760px; margin-inline: auto;">
+
 ```bash
+kubectl create namespace crystal-backup-system
+kubectl label namespace crystal-backup-system \
+  pod-security.kubernetes.io/enforce=baseline \
+  pod-security.kubernetes.io/enforce-version=latest \
+  pod-security.kubernetes.io/audit=restricted \
+  pod-security.kubernetes.io/warn=restricted --overwrite
+
 helm install crystal-backup oci://ghcr.io/crystalbackup/charts/crystal-backup \
-  --version 0.6.2 -n crystal-backup-system --create-namespace
+  --version 0.6.3 -n crystal-backup-system
 ```
+
+<p class="tiny muted mt-2">Pas de <code>--create-namespace</code> : le chart ne possède pas ce namespace — la KEK du cluster y vit <strong>avant</strong> l'install, et rien ne doit pouvoir l'emporter. Les labels PSA ne sont pas décoratifs : <code>helm install</code> relit le namespace et <strong>refuse</strong> si le niveau <code>enforce</code> ne colle pas.</p>
+
+</div>
 
 <div class="mt-6 grid grid-cols-3 gap-3 text-left" style="max-width: 760px; margin-inline: auto;">
   <div class="panel tiny"><strong>Docs & quickstart</strong><br/>crystalbackup.github.io/CrystalBackup</div>
@@ -1142,7 +1157,9 @@ helm install crystal-backup oci://ghcr.io/crystalbackup/charts/crystal-backup \
 
 <!--
 [44:00 → 44:30]
-CTA sobre : un helm install, trois liens, une étoile. Insister : SANDBOX. Lire la page
+CTA sobre : le namespace, un helm install, trois liens, une étoile. Insister : SANDBOX.
+Ne pas dérouler les labels PSA à voix haute — juste dire pourquoi le chart ne crée pas le
+namespace (la KEK y est déjà, et un prune GitOps l'emporterait). Lire la page
 « when not to use it » avant de s'emballer — elle est écrite pour être lue.
 -->
 
