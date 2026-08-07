@@ -2,7 +2,7 @@
 title: Quand ne pas le choisir
 description: Les cas que Crystal Backup ne couvre pas, les coûts qu'il impose, et les situations où un autre outil est la meilleure réponse.
 sourceFile: src/content/docs/discover/when-not-to-use.md
-sourceHash: cfcd9a6d3d5944a564bb2935dc42141f54965e4b
+sourceHash: 3c62890ab306d9443f1d4c3eb08eff2ffb5dd3f9
 ---
 
 Lisez ceci avant le démarrage rapide. Chaque point est une limitation réelle de la version

@@ -4,7 +4,7 @@ description: Ce qu'est réellement la frontière du tenant sur chaque plan, ce q
 sidebar:
   order: 3
 sourceFile: src/content/docs/understand/tenancy.md
-sourceHash: 186f4e06a40b8e8f8a8df8a016553ff09faef693
+sourceHash: dda5df785da9bbdb1c49232bd308ef9eb076410a
 ---
 
 Les revendications de multi-tenancy ne coûtent rien. Cette page énonce ce qui est appliqué,

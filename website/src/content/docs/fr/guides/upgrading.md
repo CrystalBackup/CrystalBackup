@@ -4,7 +4,7 @@ description: Mettre à niveau le chart, le problème des CRD que Helm ne résout
 sidebar:
   order: 10
 sourceFile: src/content/docs/guides/upgrading.md
-sourceHash: 92038ae56fba7fd8268940ded1c05b67637baabf
+sourceHash: 9f8be03e06549602dcefa12e2ffe3a1ce474986f
 ---
 
 ## Ce que signifie un numéro de version ici

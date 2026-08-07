@@ -2,7 +2,7 @@
 title: État du projet
 description: Ce qui est livré, ce qui ne l'est pas, comment le projet est versionné, et comment il est construit.
 sourceFile: src/content/docs/discover/status.md
-sourceHash: 28b7eb61cfdbcad990398c7f7bc2db9f613e3842
+sourceHash: fc59b7eb75500c154e00d2db0dc9406d4e6902d2
 ---
 
 ## Où en est le projet

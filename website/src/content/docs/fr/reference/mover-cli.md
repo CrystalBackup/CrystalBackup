@@ -2,7 +2,7 @@
 title: Outils en ligne de commande
 description: L'état de crystalctl, l'entrypoint du container crystal-mover, et comment piloter un repository avec restic upstream aujourd'hui.
 sourceFile: src/content/docs/reference/mover-cli.md
-sourceHash: 28beff6f2b9908a7d7a8867090f5971c4e29a7b0
+sourceHash: b071c2a15c7db00ee39c3f73b2556fb940967fd5
 ---
 
 ## Il n'y a pas de CLI destinée aux utilisateurs dans cette release
