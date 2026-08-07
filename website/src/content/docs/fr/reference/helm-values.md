@@ -2,7 +2,7 @@
 title: Values Helm
 description: Les values configurables du chart, groupées par ce qu'elles affectent réellement.
 sourceFile: src/content/docs/reference/helm-values.md
-sourceHash: 27067be42b630ad4be94c9ec7c76f30361f59fb5
+sourceHash: 149d4cc24885048db940042d77a8d07636bd9e81
 ---
 
 Les défauts viennent du `values.yaml` du chart lui-même. Seules les values que vous avez des
@@ -16,9 +16,9 @@ helm show values oci://ghcr.io/crystalbackup/charts/crystal-backup --version 0.6
 
 | Value | Défaut | Notes |
 |---|---|---|
-| `namespace.create` | `true` | Le chart crée lui-même le namespace de l'operator. |
+| `namespace.create` | `false` | **À off**, parce que le Secret de la cluster KEK entre dans ce namespace avant le chart — il existe donc déjà, et rendre un `Namespace` demande à Helm de l'adopter, ce qu'il refuse (`invalid ownership metadata`). Créez et labellisez le namespace vous-même. `true` est pour un cluster vierge, et donne la propriété à Helm : un prune ou un `helm uninstall` supprime alors le namespace, et les clés avec. |
 | `namespace.name` | `crystal-backup-system` | Chaque credential de la plateforme, la cluster KEK, la clé de plateforme wrappée et chaque Job de mover vivent ici et nulle part ailleurs. |
-| `namespace.podSecurityLabels` | `enforce: baseline`, `audit`/`warn: restricted` | `baseline` plutôt que `restricted` parce que les data movers tournent en `runAsUser: 0` avec `DAC_OVERRIDE` pour préserver la propriété des fichiers au restore. L'assouplissement ne s'applique qu'à ce namespace. |
+| `namespace.podSecurityLabels` | `enforce: baseline`, `audit`/`warn: restricted` | La posture que le namespace **doit** avoir, pas seulement des labels que le chart estampille. `baseline` plutôt que `restricted` parce que les data movers tournent en `runAsUser: 0` avec `DAC_OVERRIDE` pour préserver la propriété des fichiers au restore ; l'assouplissement ne s'applique qu'à ce namespace. Estampillés quand `create: true` ; quand `create: false`, le chart relit le namespace vivant sur `helm install`/`upgrade` et **refuse** un niveau `enforce` divergent, avec la commande `kubectl label` exacte. `restricted`, ou l'absence de clé `enforce`, est refusé au rendu sur tous les chemins. Videz la map pour couper le contrôle. |
 | `fullnameOverride`, `nameOverride` | `""` | Les noms RBAC cluster-scoped dérivent du nom de base. **Gardez-le stable** — un test golden-file épingle le ClusterRole tenant rendu. |
 
 Crystal Backup est un operator cluster **singleton**. Ne l'installez pas deux fois.
@@ -103,11 +103,12 @@ forme de pod ajoutée plus tard démarre sans connectivité plutôt qu'en hérit
 | `networkPolicy.clusterInternalCIDRs` | RFC1918 + link-local + loopback | Les plages que les movers ne doivent **pas** atteindre sur le 443. C'est ce qui empêche un mover compromis de pivoter vers les services internes au cluster. |
 | `networkPolicy.extraMoverEgress` | `[]` | **Un endpoint S3 on-premises sur une adresse privée a besoin d'une entrée ici.** Le défaut est fermé et l'exception est visible. |
 | `networkPolicy.extraOperatorEgress` | `[]` | |
-| `networkPolicy.apiServerCIDRs` | `[]` | Vide autorise le port largement — ça marche, mais ce n'est pas étroit. Posez-y l'adresse de votre API server. |
-| `networkPolicy.apiServerPort` | `443` | |
+| `networkPolicy.apiServerCIDRs` | `[]` | Vide autorise les ports largement — ça marche, mais ce n'est pas étroit. Posez-y l'adresse de votre API server. Réduit **à la fois** la policy du manifest-mover et l'egress de l'operator vers l'API server ; avant 0.6.3, seule la première l'était, ce dont le nom ne disait rien. La règle de stockage objet de l'operator garde son propre `0.0.0.0/0` non réduit. |
+| `networkPolicy.apiServerPorts` | `[443, 6443]` | Un sur-ensemble délibéré. Le Service `kubernetes` écoute sur 443 et kube-proxy fait le DNAT vers le vrai port des Endpoints de l'API server — 6443 sur k3s, RKE2, kubeadm — **avant** que le CNI n'évalue l'egress ; une policy qui ne nomme que 443 ne matche donc rien là-bas et l'operator ne démarre jamais (`dial tcp 10.43.0.1:443: i/o timeout`). Réduisez-le au seul port de votre cluster si vous le souhaitez. |
+| `networkPolicy.apiServerPort` | `null` | **Déprécié.** Un scalaire ici remplace entièrement `apiServerPorts`, ce qui garde à une installation qui l'avait réduit exactement la posture qu'elle demandait. Utilisez `apiServerPorts`. |
 | `networkPolicy.webhookPort` | `9443` | |
 | `networkPolicy.metricsPort` | `8443` | |
-| `networkPolicy.monitoringNamespace` | `""` | Vide autorise n'importe quelle source sur le port des metrics. |
+| `networkPolicy.monitoringNamespace` | `""` | Vide autorise **n'importe quelle source** sur le port des metrics — le seul défaut permissif de ce bloc. L'endpoint est en HTTPS avec authn/authz de l'API server, donc un scrape non autorisé prend un 403, mais l'ingress est ouvert. Pas de défaut parce que le nom est indevinable (`monitoring`, `monitoring-system`, `observability`, `kube-prometheus-stack`) et que le mauvais donne une panne de métriques qui ressemble à une installation qui marche. Posez-le. |
 | `networkPolicy.moverManagedByValue` | `crystal-backup` | Doit correspondre à ce que l'operator estampille sur les pods de mover. |
 
 :::caution[L'application, c'est le travail de votre CNI]

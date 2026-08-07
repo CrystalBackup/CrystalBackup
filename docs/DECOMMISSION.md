@@ -401,8 +401,18 @@ the same chart version picks up the pending deletions, runs the teardown it was 
 and clears the finalizers. Then restart at [§3.2](#32-the-order), in order this time.
 
 ```bash
+# Not --create-namespace: Helm creates the namespace after rendering, so it gets no Pod Security
+# labels, and crystal-backup-system must enforce `baseline` or the first mover is refused at
+# admission. Here that would strand the very deletions you came to unblock.
+kubectl create namespace crystal-backup-system --dry-run=client -o yaml | kubectl apply -f -
+kubectl label namespace crystal-backup-system \
+  pod-security.kubernetes.io/enforce=baseline \
+  pod-security.kubernetes.io/enforce-version=latest \
+  pod-security.kubernetes.io/audit=restricted \
+  pod-security.kubernetes.io/warn=restricted --overwrite
+
 helm install crystal-backup oci://ghcr.io/crystalbackup/charts/crystal-backup \
-  --version <the version you removed> -n crystal-backup-system --create-namespace
+  --version <the version you removed> -n crystal-backup-system
 ```
 
 **Only if you cannot reinstall**, strip the finalizer by hand. This unblocks the namespace and

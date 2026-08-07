@@ -14,9 +14,9 @@ helm show values oci://ghcr.io/crystalbackup/charts/crystal-backup --version 0.6
 
 | Value | Default | Notes |
 |---|---|---|
-| `namespace.create` | `true` | The chart creates the operator namespace itself. |
+| `namespace.create` | `false` | **Off**, because the cluster KEK Secret goes into this namespace before the chart does — so it already exists, and rendering a `Namespace` asks Helm to adopt it, which it refuses (`invalid ownership metadata`). Create and label the namespace yourself. `true` is for a greenfield cluster, and it hands Helm ownership: a prune or a `helm uninstall` then deletes the namespace, and the keys with it. |
 | `namespace.name` | `crystal-backup-system` | Every platform credential, the cluster KEK, the wrapped platform key and every mover Job live here and nowhere else. |
-| `namespace.podSecurityLabels` | `enforce: baseline`, `audit`/`warn: restricted` | `baseline` rather than `restricted` because data movers run `runAsUser: 0` with `DAC_OVERRIDE` to preserve file ownership on restore. The relaxation applies to this namespace only. |
+| `namespace.podSecurityLabels` | `enforce: baseline`, `audit`/`warn: restricted` | The posture the namespace **must** have, not merely labels the chart stamps. `baseline` rather than `restricted` because data movers run `runAsUser: 0` with `DAC_OVERRIDE` to preserve file ownership on restore; the relaxation applies to this namespace only. Stamped when `create: true`; when `create: false` the chart reads the live namespace on `helm install`/`upgrade` and **refuses** a disagreeing `enforce` level with the exact `kubectl label` command. `restricted`, or no `enforce` key, is refused at template time on every path. Empty the map to switch the checking off. |
 | `fullnameOverride`, `nameOverride` | `""` | The cluster-scoped RBAC names derive from the base name. **Keep it stable** — a golden-file test pins the rendered tenant ClusterRole. |
 
 Crystal Backup is a **singleton** cluster operator. Do not install it twice.
@@ -100,11 +100,12 @@ later starts with no connectivity rather than inheriting everything.
 | `networkPolicy.clusterInternalCIDRs` | RFC1918 + link-local + loopback | Ranges movers must **not** reach on 443. This is what stops a compromised mover pivoting to in-cluster services. |
 | `networkPolicy.extraMoverEgress` | `[]` | **An on-premises S3 endpoint on a private address needs an entry here.** The default is closed and the exception is visible. |
 | `networkPolicy.extraOperatorEgress` | `[]` | |
-| `networkPolicy.apiServerCIDRs` | `[]` | Empty allows the port broadly — it works, but is not narrow. Set it to your API server's address. |
-| `networkPolicy.apiServerPort` | `443` | |
+| `networkPolicy.apiServerCIDRs` | `[]` | Empty allows the ports broadly — it works, but is not narrow. Set it to your API server's address. Narrows **both** the manifest-mover policy and the operator's API-server egress; before 0.6.3 it narrowed only the former, which the name gave no hint of. The operator's object-storage rule keeps its own unnarrowed `0.0.0.0/0`. |
+| `networkPolicy.apiServerPorts` | `[443, 6443]` | A deliberate superset. The `kubernetes` Service listens on 443 and kube-proxy DNATs to the API server's real endpoint port — 6443 on k3s, RKE2, kubeadm — **before** the CNI evaluates egress, so a policy naming only 443 matches nothing there and the operator never starts (`dial tcp 10.43.0.1:443: i/o timeout`). Narrow it to the one port your cluster uses if you want to. |
+| `networkPolicy.apiServerPort` | `null` | **Deprecated.** A scalar here replaces `apiServerPorts` entirely, so an install that had narrowed it keeps exactly the posture it asked for. Use `apiServerPorts`. |
 | `networkPolicy.webhookPort` | `9443` | |
 | `networkPolicy.metricsPort` | `8443` | |
-| `networkPolicy.monitoringNamespace` | `""` | Empty allows any source on the metrics port. |
+| `networkPolicy.monitoringNamespace` | `""` | Empty allows **any source** on the metrics port — the one loose default in this block. The endpoint is HTTPS with API-server authn/authz, so an unauthorised scrape gets a 403, but the ingress is open. No default because the name is unguessable (`monitoring`, `monitoring-system`, `observability`, `kube-prometheus-stack`) and the wrong one is a metrics outage that looks like a working install. Set it. |
 | `networkPolicy.moverManagedByValue` | `crystal-backup` | Must match what the operator stamps on mover pods. |
 
 :::caution[Enforcement is your CNI's job]

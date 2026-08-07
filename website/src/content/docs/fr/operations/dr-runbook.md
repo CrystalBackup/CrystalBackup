@@ -4,7 +4,7 @@ description: La checklist pour se remettre d'une perte totale du cluster, et l'e
 sidebar:
   order: 1
 sourceFile: src/content/docs/operations/dr-runbook.md
-sourceHash: 69196da8409a3f1f0fa929b355c7d7ef46d40eeb
+sourceHash: 8d25f083c6898fae1f7a9bf5735738a08cc836d9
 ---
 
 La version narrative, avec les explications, c'est
@@ -69,16 +69,36 @@ kubectl delete namespace dr-drill
 **1 — Reconstruisez un cluster.** Kubernetes ≥ 1.30, un driver CSI avec support des
 snapshots, et les CRDs de l'external-snapshotter.
 
-**2 — Installez l'operator.**
+**2 — Créez et labellisez le namespace, puis installez l'operator.**
+
+Pas de `--create-namespace`. Helm crée le namespace *après* le rendu : il ne porte donc aucun
+label Pod Security — or `crystal-backup-system` doit imposer `baseline`, parce que les data movers
+tournent en uid 0 avec `DAC_OVERRIDE` pour préserver les propriétaires de fichiers à la
+restauration, ce que `restricted` interdit. Un namespace sans labels s'installe proprement, puis
+refuse le premier mover à l'admission. **En pleine restauration de secours, c'est le pire moment
+possible pour le découvrir** — d'où ces deux commandes en tête plutôt qu'en note de bas de page.
 
 ```bash
+kubectl create namespace crystal-backup-system
+
+kubectl label namespace crystal-backup-system \
+  pod-security.kubernetes.io/enforce=baseline \
+  pod-security.kubernetes.io/enforce-version=latest \
+  pod-security.kubernetes.io/audit=restricted \
+  pod-security.kubernetes.io/warn=restricted --overwrite
+
 helm install crystal-backup \
   oci://ghcr.io/crystalbackup/charts/crystal-backup \
   --version 0.6.2 \
-  --namespace crystal-backup-system --create-namespace
+  --namespace crystal-backup-system
 
 kubectl -n crystal-backup-system rollout status deploy/crystal-backup
 ```
+
+L'operator le vérifie lui-même au démarrage et émet un Event `Warning`
+`PodSecurityPostureWrong` sur son propre namespace si la posture est mauvaise : une erreur ici est
+donc visible dans `kubectl -n crystal-backup-system get events` avant toute tentative de
+sauvegarde.
 
 **3 — Restaurez les deux Secrets** depuis le séquestre.
 

@@ -2,7 +2,7 @@
 title: Installer avec Helm
 description: Installation de l'operator Crystal Backup, des CRDs, du RBAC et des policies d'admission.
 sourceFile: src/content/docs/start/install.md
-sourceHash: 71bed39ed6e6bab8132eb2eb0393ca7fbfe6b748
+sourceHash: 469420c17bd25d38b1b85d0a24735f78d7429278
 ---
 
 Le chart installe l'operator, les douze CRDs, le RBAC cluster-scoped, les policies
@@ -13,24 +13,51 @@ partie sur la génération et la mise sous séquestre de la cluster KEK **avant*
 
 ## Installer
 
+Le namespace d'abord — le chart ne le crée pas, et
+[Prérequis](/CrystalBackup/fr/docs/start/requirements/#le-namespace-de-loperator--créez-le-avant-dinstaller)
+explique pourquoi. Si vous l'avez déjà créé pour la cluster KEK, passez directement au
+`helm install` :
+
+```bash
+kubectl create namespace crystal-backup-system
+
+kubectl label namespace crystal-backup-system \
+  pod-security.kubernetes.io/enforce=baseline \
+  pod-security.kubernetes.io/enforce-version=latest \
+  pod-security.kubernetes.io/audit=restricted \
+  pod-security.kubernetes.io/warn=restricted \
+  --overwrite
+```
+
 Le chart est publié comme artefact OCI sur GHCR.
 
 ```bash
 helm install crystal-backup \
   oci://ghcr.io/crystalbackup/charts/crystal-backup \
   --version 0.6.2 \
-  --namespace crystal-backup-system \
-  --create-namespace
+  --namespace crystal-backup-system
 ```
 
-Le chart crée lui-même le namespace par défaut (`namespace.create: true`) ;
-`--create-namespace` est donc une ceinture en plus des bretelles.
+Pas de `--create-namespace`, et pas de `namespace.create: true`. Le chart ne veut
+délibérément pas posséder le namespace : le Secret de la cluster KEK y vit et doit exister
+avant l'operator, donc à l'heure de l'installation le namespace est déjà là — et un chart qui
+rendrait un objet `Namespace` demanderait à Helm de l'adopter, ce que Helm refuse avec
+`invalid ownership metadata; label validation error: missing key "app.kubernetes.io/managed-by"`.
+Ne pas le posséder veut aussi dire qu'aucun prune et aucun `helm uninstall` ne peut emporter
+la KEK avec lui.
+
+Ces labels PSA ne sont pas décoratifs. `helm install` et `helm upgrade` relisent le namespace
+et **refusent d'installer** sur un namespace dont le niveau `enforce` diverge, en affichant la
+commande `kubectl label` exacte — parce que l'alternative, c'est un operator qui démarre, des
+locations qui passent `Ready`, et une première sauvegarde qui échoue des semaines plus tard
+sous la forme d'un pod de mover que plus rien n'admet.
 
 :::caution[Vous installez plutôt depuis Git ?]
 Ne transposez pas la commande ci-dessus en `Application` ou en `HelmRelease` sans aide. Un
 contrôleur GitOps prune, recrée et désinstalle de son propre chef, et les trois sont
-dangereux ici : un prune peut supprimer le namespace qui contient votre cluster KEK, un
-`ClusterBackup` recréé entre en collision avec le run dont il porte le nom, et une
+dangereux ici : un prune peut supprimer le namespace qui contient votre cluster KEK — gardez
+`namespace.create` à son défaut `false` et la release ne peut pas être ce qui le supprime —
+un `ClusterBackup` recréé entre en collision avec le run dont il porte le nom, et une
 désinstallation non ordonnée laisse des namespaces en `Terminating` définitivement. Les
 procédures traitent chacun de ces cas explicitement :
 
@@ -46,9 +73,10 @@ kubectl -n crystal-backup-system rollout status deploy/crystal-backup
 
 ## Ce qui vient d'être installé
 
-**Le namespace `crystal-backup-system`.** Chaque credential de la plateforme, la cluster
-KEK, la clé de plateforme wrappée et chaque Job de mover vivent ici et nulle part ailleurs.
-Crystal Backup est un operator cluster singleton ; ne l'installez pas deux fois.
+**Rien dans `crystal-backup-system` que vous n'ayez déjà.** Le namespace est le vôtre — le
+chart s'installe *dedans* et ne le possède jamais. Chaque credential de la plateforme, la
+cluster KEK, la clé de plateforme wrappée et chaque Job de mover vivent ici et nulle part
+ailleurs. Crystal Backup est un operator cluster singleton ; ne l'installez pas deux fois.
 
 **Douze CRDs**, empaquetés sous le `crds/` du chart. Helm les installe à la première
 installation et — c'est le comportement de Helm, pas un choix de ce chart — **ne les met pas
@@ -131,11 +159,85 @@ networkPolicy:
         - protocol: TCP
           port: 443
 
-# Prometheus Operator present?
+  # Which namespace may open a connection to the metrics port. Empty — the default —
+  # allows any pod in the cluster. See "L'observabilité est opt-in" below.
+  monitoringNamespace: monitoring
+```
+
+## L'observabilité est opt-in, et « off » veut dire aucune alerte
+
+Trois values sont à off par défaut, et une première installation qui les laisse ainsi se prive
+de la moitié de ce produit qui vous dit qu'il a cessé de fonctionner. Elles sont à off parce
+que chacune exige quelque chose que le chart ne peut pas présupposer :
+
+| Value | Défaut | Ce que « off » veut dire concrètement |
+|---|---|---|
+| `metrics.serviceMonitor.enabled` | `false` | Rien ne scrape l'operator. Exige les CRDs `monitoring.coreos.com`. |
+| `metrics.rules.enabled` | `false` | **Aucune règle d'alerte n'existe.** Rien ne vous dira qu'une sauvegarde a cessé de tourner. Même exigence de CRDs, et les onze seuils relèvent de la politique de la plateforme — lisez-les avant de les activer. |
+| `networkPolicy.monitoringNamespace` | `""` | N'importe quel pod du cluster peut ouvrir une connexion vers le port des métriques. (C'est du HTTPS avec authn/authz de l'API server, donc un scrape non autorisé prend un 403 — mais l'ingress, lui, est ouvert.) |
+
+Si vous faites tourner le Prometheus Operator, les trois :
+
+```yaml
 metrics:
   serviceMonitor:
     enabled: true
+  rules:
+    enabled: true
+    # A Prometheus Operator only loads rules matching its `ruleSelector`. An unlabelled
+    # PrometheusRule is installed, valid, and completely ignored.
+    labels:
+      release: kube-prometheus-stack
+networkPolicy:
+  monitoringNamespace: monitoring   # le namespace de votre Prometheus, quel que soit son nom
 ```
+
+`monitoringNamespace` n'a pas de défaut parce que le chart ne peut pas deviner le nom —
+`monitoring`, `monitoring-system`, `observability` et `kube-prometheus-stack` existent tous, et
+le mauvais donne une panne de métriques qui ressemble exactement à une installation qui marche.
+Lisez les règles d'abord :
+
+```bash
+helm show readme oci://ghcr.io/crystalbackup/charts/crystal-backup --version 0.6.2
+helm pull oci://ghcr.io/crystalbackup/charts/crystal-backup --version 0.6.2 --untar
+less crystal-backup/rules/crystalbackup.rules.yaml
+```
+
+Si vous ne faites pas tourner le Prometheus Operator, les métriques sont quand même là sur le
+port 8443 en HTTPS — scrapez-les comme vous voulez. Ce que vous ne pouvez pas faire, c'est ne
+rien faire en supposant que quelque chose surveille. Voir
+[Règles d'alerte](/CrystalBackup/fr/docs/reference/alerts/).
+
+## Le collecteur de soak, si vous évaluez
+
+À off par défaut (`soak.enabled: false`), et il doit y rester sur un cluster que vous vous
+contentez d'exploiter. C'est un kit de **mesure** pour une évaluation de quinze jours : il
+répond à « qu'est-ce que ça a réellement coûté, sur mes données, sur deux semaines » sans le
+moindre Prometheus.
+
+```bash
+helm upgrade crystal-backup \
+  oci://ghcr.io/crystalbackup/charts/crystal-backup \
+  --version 0.6.2 -n crystal-backup-system \
+  --reuse-values --set soak.enabled=true
+```
+
+Ce qu'il coûte, annoncé d'emblée : **un pod** (200m CPU / 384Mi de mémoire, requests égales
+aux limits), **une PVC de 1Gi** dont il n'utilise au plus que `soak.maxBytes`, et un **RBAC
+cluster-wide en lecture seule** tenu pour toute la durée — un ServiceAccount distinct de celui
+de l'operator, si bien que le révoquer, c'est supprimer des bindings et pas éditer ceux de
+l'operator. Il tourne sur la même image que l'operator, donc c'est par construction le build
+que vous évaluez.
+
+Vérifiez au jour un **et** au jour deux qu'il collecte vraiment :
+
+```bash
+kubectl -n crystal-backup-system logs deploy/crystal-backup-soak | grep soak-heartbeat
+```
+
+Une ligne par jour, chacune nommant ce qu'elle a collecté. Un jour sans ligne est un jour sans
+données — et c'est toute la raison de regarder au jour deux plutôt qu'au jour quatorze.
+Protocole complet, y compris l'export et ce que la rédaction promet : `hack/soak/README.md`.
 
 ## Vérifier l'installation
 
@@ -215,10 +317,14 @@ sortie signifie que quelque chose est encore en train de finaliser — enquêtez
 helm uninstall crystal-backup -n crystal-backup-system
 ```
 
-Helm ne supprime **pas** les CRDs, donc vos projections `Backup` survivent. Conservez le
-namespace `crystal-backup-system` sauf si vous entendez aussi détruire la cluster KEK et les
-DEKs wrappées qu'il contient — les supprimer rend définitivement illisible chaque repository
-qu'elles protègent.
+Helm ne supprime **pas** les CRDs, donc vos projections `Backup` survivent. Il ne supprime pas
+non plus le namespace, puisqu'il ne l'a jamais possédé — c'est tout l'intérêt de
+`namespace.create: false`. Conservez `crystal-backup-system` sauf si vous entendez aussi
+détruire la cluster KEK et les DEKs wrappées qu'il contient ; les supprimer rend définitivement
+illisible chaque repository qu'elles protègent.
+
+(Si vous avez installé avec `namespace.create: true`, `helm uninstall` supprime **bel et bien**
+le namespace, et les clés avec. Sortez-en les Secrets d'abord, ou n'utilisez pas cette value.)
 
 **5. Retirez les CRDs, seulement si c'est bien votre intention.** Cela supprime tous les
 objets restants de ces kinds :
@@ -244,7 +350,7 @@ les finalizers. Puis reprenez la séquence ci-dessus, dans l'ordre.
 
 ```bash
 helm install crystal-backup oci://ghcr.io/crystalbackup/charts/crystal-backup \
-  --version <the version you removed> -n crystal-backup-system --create-namespace
+  --version <the version you removed> -n crystal-backup-system
 ```
 
 Seulement si vous ne pouvez pas réinstaller, retirez le finalizer à la main — cela débloque

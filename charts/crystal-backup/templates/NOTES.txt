@@ -21,6 +21,35 @@ RBAC installed (cluster-scoped names are stable):
 
 CRDs: packaged under crds/ (installed by Helm on first install). Regenerate/refresh
       them into the chart with `make chart-crds` before packaging.
+{{- if not .Values.namespace.create }}
+{{- with .Values.namespace.podSecurityLabels }}
+
+Pod Security Admission: this chart did NOT create {{ include "crystal-backup.namespace" $ }} and cannot label it.
+Movers run as uid 0 with DAC_OVERRIDE here, which `restricted` denies — on the first
+backup, not on this command. Confirm the posture:
+
+  kubectl get namespace {{ include "crystal-backup.namespace" $ }} -o jsonpath='{.metadata.labels}' ; echo
+
+If `pod-security.kubernetes.io/enforce` is not `{{ index . "pod-security.kubernetes.io/enforce" }}`, apply it:
+
+  kubectl label namespace {{ include "crystal-backup.namespace" $ }} \
+    {{ range $k, $v := . }}{{ $k }}={{ $v }} \
+    {{ end }}--overwrite
+
+(On `helm install`/`helm upgrade` the chart checks this for you and refuses a namespace
+whose enforce level disagrees. It cannot under `helm template`, so Argo CD gets this
+message and not that check.)
+{{- end }}
+{{- end }}
+{{- if not .Values.metrics.rules.enabled }}
+
+Alert rules: NONE are installed. `metrics.rules.enabled` is off by default because the
+eleven rules need the Prometheus Operator CRDs and their thresholds are platform policy —
+but off means nothing anywhere will tell you a backup stopped running. If you have a
+Prometheus Operator, read `helm show` on rules/crystalbackup.rules.yaml and turn on
+`metrics.serviceMonitor.enabled` and `metrics.rules.enabled`. If you do not, wire the
+metrics on port {{ .Values.metrics.port }} into whatever you do have.
+{{- end }}
 {{- if .Values.soak.enabled }}
 
 Soak collector: ON. It runs the SAME image as the operator above, keeps five streams on a
@@ -30,7 +59,16 @@ is enabled. Redaction salt: --salt-method={{ if eq .Values.soak.saltMethod "from
 Check on day one AND day two that it is really collecting — this is the cheapest defence
 against finding out on day fourteen that nothing was:
 
+  kubectl -n {{ include "crystal-backup.namespace" . }} logs deploy/{{ include "crystal-backup.fullname" . }}-soak | grep soak-heartbeat
   kubectl -n {{ include "crystal-backup.namespace" . }} exec deploy/{{ include "crystal-backup.fullname" . }}-soak -- /manager soak-export --status
 
+One heartbeat line per day, each naming what it collected. A day with no line is a day
+with no data, and it is visible at a glance rather than after an export.
+
 Then collect with hack/soak/collect.sh. The protocol is hack/soak/README.md.
+{{- else }}
+
+Soak collector: OFF, and opt-in (`soak.enabled: true`). It is the fortnight-long
+measurement kit — one pod, one 1Gi PVC, cluster-wide READ-ONLY RBAC, the same image as the
+operator, no Prometheus needed. Turn it on when you want a soak, not as part of an install.
 {{- end }}

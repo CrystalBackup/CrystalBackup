@@ -471,13 +471,16 @@ spec:
       {{- include "crystal-backup.soak.selectorLabels" . | nindent 6 }}
   policyTypes: [Egress]
   egress:
-    # The API server. Both ports, because it is reached on 443 through the in-cluster Service on
-    # most distributions and on 6443 on several others.
+    # The API server, on networkPolicy.apiServerPorts — 443 and 6443 by default, because it is
+    # reached on 443 through the in-cluster Service on some distributions and on 6443 on the rest.
+    # This used to be the literal pair, which was right and was also a second place to fix: an
+    # administrator who narrowed the value for the operator left the collector wide open on a port
+    # they had decided against.
     - ports:
-        - port: 443
+        {{- range splitList "," (include "crystal-backup.apiServerPorts" .) }}
+        - port: {{ . | int }}
           protocol: TCP
-        - port: 6443
-          protocol: TCP
+        {{- end }}
       to:
         - ipBlock:
             cidr: 0.0.0.0/0

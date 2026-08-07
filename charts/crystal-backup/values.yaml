@@ -3,11 +3,19 @@
 # Crystal Backup is a SINGLETON cluster operator. Install it into the
 # crystal-backup-system namespace, where all platform credentials, the cluster
 # KEK and the wrapped platform DEK live and never leave (spec/03-security-and-tenancy.md,
-# invariants I3/I5). Recommended install:
+# invariants I3/I5). Recommended install — the namespace first, because the cluster KEK Secret
+# goes into it before anything else does:
 #
-#   helm install crystal-backup ./charts/crystal-backup -n crystal-backup-system --create-namespace
+#   kubectl create namespace crystal-backup-system
+#   kubectl label namespace crystal-backup-system \
+#     pod-security.kubernetes.io/enforce=baseline \
+#     pod-security.kubernetes.io/enforce-version=latest \
+#     pod-security.kubernetes.io/audit=restricted \
+#     pod-security.kubernetes.io/warn=restricted --overwrite
+#   helm install crystal-backup ./charts/crystal-backup -n crystal-backup-system
 #
-# (the chart also creates the namespace itself by default; see `namespace.create`).
+# The chart does NOT create the namespace by default and does not want to own one that already
+# exists; `namespace.create: true` is there for a greenfield cluster. See `namespace` below.
 #
 # This chart NEVER generates or creates any Secret — not the cluster KEK, not a DEK, not
 # credentials. The cluster KEK is the admin's root of trust: generate it out-of-band (e.g.
@@ -23,14 +31,37 @@ fullnameOverride: ""
 nameOverride: ""
 
 namespace:
-  # -- Create the operator namespace.
-  create: true
+  # -- Create the operator namespace. OFF, because the documented order provisions the cluster KEK
+  # Secret into this namespace BEFORE the chart is installed — so the namespace exists, and a
+  # chart that renders a Namespace object asks Helm to adopt it, which Helm refuses:
+  #
+  #   Namespace "crystal-backup-system" ... exists and cannot be imported into the current
+  #   release: invalid ownership metadata; label validation error: missing key
+  #   "app.kubernetes.io/managed-by"
+  #
+  # That killed the install on the very first command for anyone who followed the documentation.
+  # It also created the hazard install-argocd.md warns about in its own words — "a prune can
+  # delete the namespace holding your cluster KEK" — and the section install-flux.md devotes to
+  # turning this off. Turn it ON only on a greenfield cluster where you want one command to do
+  # everything. templates/namespace.yaml has the full reasoning.
+  create: false
   # -- Operator namespace. Platform credentials, KEK and wrapped DEK live here only.
   name: crystal-backup-system
-  # -- Pod Security Admission labels for the operator namespace. Enforce `baseline`
-  # (not `restricted`): the operator is restricted-compliant, but data movers run
-  # `runAsUser: 0` + DAC_OVERRIDE here (spec/03 §6), which restricted would deny.
+  # -- The Pod Security Admission posture the operator namespace MUST have — not merely the labels
+  # the chart stamps. Enforce `baseline` (not `restricted`): the operator is restricted-compliant,
+  # but data movers run `runAsUser: 0` + DAC_OVERRIDE here (spec/03 §6), which restricted would
+  # deny — on the first backup, as a mover pod that never starts, not at install time.
   # audit/warn stay `restricted` for visibility.
+  #
+  # With `create: true` these are stamped onto the Namespace. With `create: false` the chart
+  # cannot apply them, so it VERIFIES them instead: at template time it looks the namespace up and
+  # refuses to install onto one whose enforce level disagrees, printing the `kubectl label` command
+  # for this exact posture. The lookup is empty under `helm template` (and therefore under Argo CD)
+  # and under `--create-namespace`, so the GitOps pages carry the labelled Namespace inline.
+  #
+  # A posture naming no enforce level, and one naming `restricted`, are both refused at template
+  # time in every mode. Empty the map entirely if you manage this namespace's PSA labels elsewhere
+  # — that is the one way to switch the checking off, and it is deliberately explicit.
   podSecurityLabels:
     pod-security.kubernetes.io/enforce: baseline
     pod-security.kubernetes.io/enforce-version: latest
@@ -341,17 +372,45 @@ networkPolicy:
   extraMoverEgress: []
   # -- Extra egress rules for the operator.
   extraOperatorEgress: []
-  # -- API server address range(s). Empty allows the port broadly, which works but
-  # is not narrow; set it to your API server's address to close the gap.
+  # -- API server address range(s), narrowing BOTH the manifest-mover policy and the operator's
+  # own API-server egress. Empty allows the ports broadly, which works but is not narrow; set it
+  # to your API server's address to close the gap. Until 0.6.2 this narrowed only the
+  # manifest-mover policy while the operator's stayed at 0.0.0.0/0 — an asymmetry the name gave no
+  # hint of. The operator's object-storage rule keeps its own unnarrowed 0.0.0.0/0: a bucket
+  # endpoint is not the API server, and a list of API server addresses must not be read as
+  # covering it.
   apiServerCIDRs: []
-  # -- API server port.
-  apiServerPort: 443
+  # -- The port(s) the API server answers on. A LIST, and the default is a deliberate superset:
+  # the `kubernetes` Service listens on 443 and kube-proxy DNATs to the API server's Endpoints —
+  # 6443 on k3s, RKE2, kubeadm, most of the world — BEFORE the CNI evaluates egress. A policy
+  # naming only 443 therefore matches nothing on those clusters and the operator never starts:
+  #
+  #   Failed to start manager: failed to get server groups:
+  #   Get "https://10.43.0.1:443/api": dial tcp: i/o timeout
+  #
+  # Narrow it to the one port your cluster uses if you want to; the cost of the extra entry, on a
+  # rule whose destination is the API server, is not comparable to an operator that cannot start.
+  apiServerPorts:
+    - 443
+    - 6443
+  # -- DEPRECATED, and null so that it is off. A scalar here REPLACES `apiServerPorts` entirely,
+  # which is what keeps an existing install that narrowed this to one port on exactly the posture
+  # it asked for. New configuration should set `apiServerPorts`.
+  apiServerPort: null
   # -- Operator webhook port (ingress from the API server).
   webhookPort: 9443
   # -- Operator metrics port.
   metricsPort: 8443
-  # -- Namespace allowed to scrape metrics. Empty allows any source on the metrics
-  # port.
+  # -- Namespace allowed to scrape metrics. EMPTY ALLOWS ANY SOURCE on the metrics port — any pod
+  # in the cluster may open a connection to it. What it gets is another matter (the endpoint is
+  # HTTPS with API-server authn/authz, so an unauthorised scrape is a 403), but the ingress itself
+  # is open, and this is the one value in this block whose default is the loose one.
+  #
+  # It is left empty because the closed alternative needs a name this chart cannot guess:
+  # `monitoring`, `monitoring-system`, `observability` and `kube-prometheus-stack` are all real,
+  # and the wrong one is a metrics outage that looks exactly like a working install. Set it — the
+  # install pages say so, and the crucible runs with it set so that the CLOSED configuration is
+  # the one under test.
   monitoringNamespace: ""
 
 # -- The resident soak collector (hack/soak/SPEC.md). One pod, one small PVC, cluster-wide

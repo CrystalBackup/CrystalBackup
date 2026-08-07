@@ -1,11 +1,107 @@
+{{- /*
+The operator namespace — and, more importantly, the Pod Security Admission posture it has to
+carry whether or not this chart is the thing that created it.
+
+WHY `namespace.create` DEFAULTS TO FALSE.
+
+The documented order provisions the cluster KEK Secret into this namespace BEFORE the chart is
+installed (website start/requirements.md), and it has to: the KEK is generated and escrowed out
+of band, and this chart never creates a Secret. So by the time `helm install` runs, the namespace
+already exists — and a chart that renders a Namespace object is asking Helm to adopt it:
+
+  Namespace "crystal-backup-system" ... exists and cannot be imported into the current release:
+  invalid ownership metadata; label validation error: missing key "app.kubernetes.io/managed-by"
+
+Every first-time installer who followed the documented order hit that, on the first command. The
+install did not half-work; it died.
+
+Under a GitOps controller the object is worse than an error. install-argocd.md warns, in its own
+words, that "a prune can delete the namespace holding your cluster KEK" — and that hazard exists
+ONLY because the chart claimed the namespace. install-flux.md's remedy was already a section
+telling the reader to set `namespace.create: false` and manage the namespace themselves. When the
+documentation for two of the three install paths tells you to turn a default off, the default is
+wrong.
+
+`namespace.create: true` remains for the genuinely greenfield case — a cluster where nothing has
+been provisioned yet and you would rather one command did everything. It is then the same object
+it always was.
+
+WHAT THAT COSTS, AND WHAT PAYS FOR IT.
+
+This file was also the only thing that applied `namespace.podSecurityLabels`, and `enforce:
+baseline` is not decoration. Data movers run `runAsUser: 0` with DAC_OVERRIDE in this namespace
+(spec/03 §6) because restoring a volume has to preserve file ownership, and `restricted` denies
+exactly that — not at install time, but weeks later, on the first mover Job, as a pod that never
+starts. Dropping the object without replacing the guarantee would trade one loud failure for a
+quiet one, which is a worse trade than the bug.
+
+So `namespace.podSecurityLabels` stops meaning "labels this chart stamps" and starts meaning "the
+posture this namespace MUST have". It is used three ways:
+
+  1. stamped onto the Namespace object, when the chart creates it;
+  2. CHECKED against the live namespace with `lookup`, when it does not — a missing or unusable
+     enforce level is refused here, at template time, with the exact `kubectl label` command;
+  3. printed by NOTES.txt, for the renders where there is no cluster to look anything up in.
+
+(3) is not a footnote. `lookup` returns nothing under `helm template`, which is how Argo CD
+renders, and nothing under `helm install --create-namespace`, because Helm creates the namespace
+AFTER rendering. So (2) covers the case that actually bit people — a namespace provisioned by hand
+for the KEK, and never labelled — and stays silent on the two where it cannot know. That is why
+both GitOps pages carry the labelled Namespace manifest inline rather than a cross-reference.
+
+The two guards below run in EVERY mode, including `helm template`, because they are about the
+value rather than the cluster: a posture that names no enforce level, and a posture that names one
+the movers cannot run under, are both wrong before anyone has a cluster to apply them to.
+*/ -}}
+{{- $ns := include "crystal-backup.namespace" . -}}
+{{- $psa := .Values.namespace.podSecurityLabels | default dict -}}
+{{- $enforceKey := "pod-security.kubernetes.io/enforce" -}}
+{{- $enforce := index $psa $enforceKey -}}
+
+{{- /*
+The `kubectl label` command for the posture as configured, built from that posture rather than
+written out, so a message can never tell you to apply something other than what the chart wants.
+*/ -}}
+{{- $labelArgs := list -}}
+{{- range $k, $v := $psa -}}
+{{- $labelArgs = append $labelArgs (printf "%s=%s" $k ($v | toString)) -}}
+{{- end -}}
+{{- $labelCmd := printf "kubectl label namespace %s %s --overwrite" $ns (join " " $labelArgs) -}}
+
+{{- if and $psa (not $enforce) }}
+{{- fail (printf "namespace.podSecurityLabels sets %s but no %s, so the namespace would inherit whatever Pod Security Admission level this cluster defaults to. On a cluster defaulting to `restricted` that is not a warning: every data mover Job is denied at admission, weeks after the install, because movers run runAsUser: 0 with DAC_OVERRIDE here to preserve file ownership on restore. Set %s to `baseline`, or empty namespace.podSecurityLabels entirely if you manage this namespace's PSA posture somewhere else." (join ", " (keys $psa | sortAlpha)) $enforceKey $enforceKey) }}
+{{- end }}
+
+{{- if eq ($enforce | toString) "restricted" }}
+{{- fail (printf "namespace.podSecurityLabels sets %s=restricted, which the data movers cannot run under. They run runAsUser: 0 with DAC_OVERRIDE in %s (spec/03 §6) because a restore has to preserve file ownership, and `restricted` denies both. Nothing would fail at install: the operator itself IS restricted-compliant, so you would find out on the first backup, as a mover pod that never starts. `baseline` is the enforce level; audit and warn stay at `restricted` for the visibility." $enforceKey $ns) }}
+{{- end }}
+
 {{- if .Values.namespace.create }}
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: {{ include "crystal-backup.namespace" . }}
+  name: {{ $ns }}
   labels:
     {{- include "crystal-backup.labels" . | nindent 4 }}
-    {{- with .Values.namespace.podSecurityLabels }}
+    {{- with $psa }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
+{{- else }}
+{{- /*
+The chart does not own the namespace, so the only thing it can do about the posture is refuse to
+install onto one that has the wrong one. `lookup` is empty under `helm template` and under
+`--create-namespace`; neither is a failure, and neither is treated as one.
+
+Only the enforce level is checked. audit and warn are advisory — a namespace missing them is worth
+mentioning and not worth blocking an install over — while the enforce level is the one that
+decides whether a mover pod is admitted at all.
+*/ -}}
+{{- $live := lookup "v1" "Namespace" "" $ns -}}
+{{- if and $live $psa }}
+{{- $liveEnforce := dig "metadata" "labels" $enforceKey "" $live }}
+{{- if ne $liveEnforce ($enforce | toString) }}
+{{- $found := ternary (printf "%s=%q" $enforceKey $liveEnforce) (printf "no %s label at all" $enforceKey) (ne $liveEnforce "") }}
+{{- fail (printf "namespace %s exists with %s, and this chart needs %s=%q.\n\nThe chart is not creating the namespace (namespace.create: false, the default — you provisioned it yourself for the cluster KEK), so it cannot label it either. Apply the posture and install again:\n\n  %s\n\nWhy it matters: data movers run runAsUser: 0 with DAC_OVERRIDE in this namespace to preserve file ownership on restore. Under `restricted`, or under a cluster default you did not choose, they are denied at admission — on the first backup, not on this command." $ns $found $enforceKey ($enforce | toString) $labelCmd) }}
+{{- end }}
+{{- end }}
 {{- end }}

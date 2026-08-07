@@ -658,6 +658,21 @@ func main() {
 		os.Exit(1)
 	}
 
+	// The operator namespace's Pod Security posture, checked once from inside the cluster because
+	// that is the only vantage point every install path shares. The chart's own guard cannot see a
+	// namespace under `helm template` (Argo CD, Flux) nor one Helm creates after rendering
+	// (--create-namespace), and both of those produce an unlabelled namespace whose only symptom
+	// is a mover refused by admission, later, during a backup or a restore. See
+	// internal/controller/namespace_posture.go. It never fails startup.
+	if err := mgr.Add(&controller.NamespacePostureCheck{
+		Reader:    mgr.GetAPIReader(),
+		Namespace: operatorNamespace,
+		Recorder:  mgr.GetEventRecorderFor("crystal-backup"),
+	}); err != nil {
+		setupLog.Error(err, "Unable to add the namespace posture check")
+		os.Exit(1)
+	}
+
 	// The orphan reaper is a periodic Runnable (not a reconciler): it sweeps the operator namespace
 	// for leftover native per-PVC exposure objects (temp clone PVCs, mover Jobs, creds Secrets) a
 	// crashed teardown left behind, backstopping the leak-check invariant.

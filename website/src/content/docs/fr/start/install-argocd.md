@@ -2,7 +2,7 @@
 title: Installer avec Argo CD
 description: Gérer Crystal Backup depuis Git avec Argo CD — ce qui va dans Git, ce qui ne doit jamais y aller, et le prune qui détruit vos clés.
 sourceFile: src/content/docs/start/install-argocd.md
-sourceHash: 636ee1678a1b9ac57a21382c8853d834137ea86f
+sourceHash: ef44b1ce4e9ece656baf97ed2869112793e69103
 ---
 
 C'est l'[install Helm](/CrystalBackup/fr/docs/start/install/) pilotée depuis Git. Le chart
@@ -21,12 +21,15 @@ interagissent mal avec cela, et elles sont la raison d'être de cette page plut�
 `Deployment`. En mettre un dans Git conduit un contrôleur à le recréer, et un run recréé est
 un autre run portant le même nom. Voir [Ce qui va dans Git](#ce-qui-va-dans-git).
 
-**2 — Un prune peut détruire vos clés.** Le chart rend le Namespace
-`crystal-backup-system`. Ce namespace contient la cluster KEK et chaque DEK wrappée. Un
-prune d'Argo CD qui retire le Namespace retire les clés avec lui, et chaque repository
-qu'elles protègent devient définitivement illisible — c'est un
+**2 — Un prune peut détruire vos clés.** Le namespace `crystal-backup-system` contient la
+cluster KEK et chaque DEK wrappée. Tout prune qui le retire retire les clés, et chaque
+repository qu'elles protègent devient définitivement illisible — c'est un
 [decommission](https://github.com/CrystalBackup/CrystalBackup/blob/main/docs/DECOMMISSION.md#14-the-key-itself),
-exécuté par accident. Voir [Pourquoi le prune est désactivé](#pourquoi-le-prune-est-désactivé-et-pourquoi-il-ny-a-pas-de-finalizer).
+exécuté par accident. Le chart ne rend plus ce Namespace (`namespace.create` vaut `false` par
+défaut), ce qui le sort entièrement de l'ensemble prunable de l'`Application` de l'operator ;
+mettez-le dans sa propre Application, et gardez-y le prune coupé aussi. Voir
+[Le namespace](#le-namespace--le-vôtre-pas-celui-du-chart) et
+[Pourquoi le prune est désactivé](#pourquoi-le-prune-est-désactivé-et-pourquoi-il-ny-a-pas-de-finalizer).
 
 **3 — Retirer l'operator est une opération ordonnée, et Argo CD ignore l'ordre.** Six kinds
 portent un finalizer que seul l'operator retire. Supprimez l'operator pendant qu'un de ces
@@ -143,6 +146,44 @@ zéro que la pipeline de release remplace, si bien que le pod de l'operator ne p
 jamais. Utilisez toujours le chart OCI publié.
 :::
 
+## Le namespace — le vôtre, pas celui du chart
+
+Le chart ne crée pas `crystal-backup-system` (`namespace.create: false`), et sous Argo CD cela
+vaut davantage que sur le chemin Helm : un objet que le chart ne rend pas est un objet qu'aucun
+prune de l'`Application` de l'operator ne pourra jamais atteindre.
+
+Il doit tout de même exister, et il doit tout de même porter les labels Pod Security Admission
+— les data movers y tournent en uid 0 avec `DAC_OVERRIDE` pour préserver la propriété des
+fichiers au restore, et `restricted` les refuse. Sur `helm install`, le chart relit le namespace
+et refuse un mauvais niveau `enforce` ; Argo CD rend avec `helm template`, qui n'a aucun cluster
+à relire, donc **sous Argo CD ce contrôle n'existe pas**. C'est pourquoi les labels sont écrits
+ici en toutes lettres plutôt que renvoyés à une autre page.
+
+Mettez-le dans sa propre Application, ou dans celle des Secrets, sourcée depuis votre dépôt
+Git — avec le prune coupé :
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: crystal-backup-system
+  annotations:
+    # Belt and braces on top of `prune: false`: never prune this object, whatever the
+    # Application says. It holds the cluster KEK.
+    argocd.argoproj.io/sync-options: Prune=false
+  labels:
+    # `baseline`, not `restricted`: the operator is restricted-compliant, but data movers run
+    # as uid 0 with DAC_OVERRIDE in this namespace to preserve file ownership on restore.
+    # Getting this wrong costs nothing until the first backup, which then never starts.
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+```
+
+Donnez-lui `argocd.argoproj.io/sync-wave: "-10"` pour qu'il arrive avant les Secrets (wave 0)
+et l'operator (wave 10).
+
 ## 2. L'Application de l'operator
 
 ```yaml
@@ -174,16 +215,28 @@ spec:
           deniedNamespaces:
             - "kube-*"
             - crystal-backup-system
+        # Observability is opt-in and off means NO ALERT RULES AT ALL — nothing
+        # would tell you a backup stopped running. Both need the
+        # monitoring.coreos.com CRDs; drop this block if you have no Prometheus
+        # Operator, and wire port 8443 into whatever you do have.
         metrics:
           serviceMonitor:
             enabled: true
+          rules:
+            enabled: true
+            labels:
+              release: kube-prometheus-stack   # your Prometheus's ruleSelector
+        networkPolicy:
+          # Empty — the default — lets any pod in the cluster reach the metrics
+          # port. There is no default because the name is unguessable.
+          monitoringNamespace: monitoring
   syncPolicy:
     automated:
       selfHeal: true
       prune: false                 # deliberate. See below.
     syncOptions:
       - ServerSideApply=true
-      - CreateNamespace=false      # the chart renders the Namespace itself
+      - CreateNamespace=false      # the namespace is a separate Application, above
   ignoreDifferences:
     # The chart mints the admission webhook's CA and serving cert at RENDER time
     # (genCA/genSignedCert, no `lookup`). Argo CD re-renders the chart on every
@@ -239,11 +292,15 @@ aussi un `replace`, opération plus lourde que ce que la situation demande.
 Deux interrupteurs distincts, tous deux « destructeurs » par défaut, tous deux coupés ici.
 
 **`prune: false`** empêche l'auto-sync de supprimer tout ce qui disparaît du chart rendu. Ce
-qu'il protège : le **Namespace** `crystal-backup-system`, que le chart rend et qui contient
-la cluster KEK et chaque DEK wrappée. Supprimer ce namespace détruit ces clés, et un
-repository dont la DEK a disparu ne peut être lu ni par vous, ni par nous, ni par quiconque
-obtient le bucket. Il protège aussi les **CRDs** — voir plus bas — dont la suppression
+qu'il protège, principalement, ce sont les **CRDs** — voir plus bas — dont la suppression
 emporte chaque objet `Backup` du cluster.
+
+Il protégeait aussi une autre chose : le **Namespace** `crystal-backup-system`, que le chart
+rendait. Supprimer ce namespace détruit la cluster KEK et chaque DEK wrappée, et un repository
+dont la DEK a disparu ne peut être lu ni par vous, ni par nous, ni par quiconque obtient le
+bucket. Le chart ne le rend plus, donc cette Application ne peut plus le pruner quoi que vous
+posiez ici — mais le namespace doit bien vivre quelque part, et où que vous le mettiez,
+mettez-y `prune: false` aussi. Un danger déplacé n'est pas un danger supprimé.
 
 **Pas de `resources-finalizer.argocd.argoproj.io`** signifie que supprimer l'Application est
 non cascadant : Argo CD cesse de gérer les objets et les laisse tourner. C'est ce que vous
@@ -437,6 +494,47 @@ Pour en changer un, créez une nouvelle location.
 `paramRef`, si bien qu'elle peut être éditée dans le cluster pour changer la deny-list sans
 toucher à la policy. Sous self-heal, cette édition est annulée à la sync suivante. Changez-la
 plutôt dans les values du chart.
+
+## Le collecteur de soak, si vous évaluez
+
+À off par défaut (`soak.enabled: false`), et il doit y rester sur un cluster que vous vous
+contentez d'exploiter. C'est un kit de **mesure** pour une évaluation de quinze jours, et sous
+Argo CD c'est une value de plus sur l'Application de l'operator :
+
+```yaml
+  source:
+    helm:
+      values: |
+        soak:
+          enabled: true
+```
+
+Ce qu'il coûte : **un pod** (200m CPU / 384Mi de mémoire, requests égales aux limits), **une
+PVC de 1Gi**, et un **RBAC cluster-wide en lecture seule** tenu pour toute la durée — son
+propre ServiceAccount, pas celui de l'operator, si bien que le révoquer, c'est supprimer des
+bindings. Il tourne sur la même image que l'operator, résolue depuis le même digest, donc
+c'est par construction le build que vous évaluez.
+
+Deux spécificités Argo CD. La PVC est `ReadWriteOnce` et le Deployment utilise la stratégie
+`Recreate` : un sync qui roule le collecteur l'affichera `Progressing` pendant que l'ancien pod
+libère le volume — c'est normal, ce n'est pas un sync bloqué. Et remettre la value à off **ne
+supprime rien** tant que `prune: false` est posé : le collecteur continue de tourner et de
+tenir son RBAC. Retirez-le délibérément :
+
+```bash
+kubectl -n crystal-backup-system delete deploy,pvc,sa -l crystalbackup.io/soak=collector
+kubectl delete clusterrole,clusterrolebinding -l crystalbackup.io/soak=collector
+```
+
+Vérifiez au jour un **et** au jour deux qu'il collecte vraiment :
+
+```bash
+kubectl -n crystal-backup-system logs deploy/crystal-backup-soak | grep soak-heartbeat
+```
+
+Une ligne par jour, chacune nommant ce qu'elle a collecté. Un jour sans ligne est un jour sans
+données — d'où le contrôle au jour deux et pas au jour quatorze. Protocole :
+`hack/soak/README.md`.
 
 ## Mise à niveau
 

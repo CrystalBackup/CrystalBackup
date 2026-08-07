@@ -2,7 +2,7 @@
 title: Prérequis
 description: Ce que votre cluster, votre stockage et votre stockage objet doivent fournir avant d'installer Crystal Backup.
 sourceFile: src/content/docs/start/requirements.md
-sourceHash: a1b1a48903f6e68c5ce69699da56ba8301b5517f
+sourceHash: 599a83b2c5de293d0e73484131ffe64c70835762
 ---
 
 ## Vérifiez votre cluster avant d'installer
@@ -78,7 +78,8 @@ d'admission repose sur `ValidatingAdmissionPolicy`, qui a atteint le GA en 1.30.
 Helm déclare `kubeVersion: ">= 1.30.0-0"` et refusera de s'installer en dessous.
 
 Il vous faudra être cluster-admin pour installer : le chart crée des CRDs, du RBAC
-cluster-scoped, des policies d'admission et un namespace.
+cluster-scoped et des policies d'admission. Il ne crée **pas** le namespace de l'operator —
+c'est vous qui le faites, ci-dessous, avant d'installer.
 
 ## Stockage — le chemin snapshot CSI
 
@@ -139,6 +140,50 @@ autorisations étroites. Deux conséquences en découlent :
   mover compromis de pivoter vers les services internes au cluster. Un endpoint S3
   on-premises situé dans ces plages a besoin d'une entrée dans
   `networkPolicy.extraMoverEgress`.
+- **Le port de l'API server est autorisé comme un sur-ensemble, et c'est délibéré.**
+  `networkPolicy.apiServerPorts` vaut `[443, 6443]` par défaut. Le Service `kubernetes`
+  écoute sur 443 et kube-proxy réécrit la destination vers le vrai port des Endpoints de
+  l'API server — 6443 sur k3s, RKE2 et kubeadm — *avant* que le CNI n'évalue l'egress ; une
+  policy qui ne nomme que 443 ne matche donc rien sur ces clusters et l'operator ne démarre
+  jamais (`dial tcp 10.43.0.1:443: i/o timeout`). Réduisez-le au seul port que votre cluster
+  utilise si vous le souhaitez.
+
+## Le namespace de l'operator — créez-le avant d'installer
+
+Le Secret de la cluster KEK va dans `crystal-backup-system`, et il doit y être avant le chart.
+Le namespace passe donc en premier, et **le chart ne le crée pas** (`namespace.create` vaut
+`false` par défaut). Un chart qui rendrait un objet `Namespace` demanderait à Helm d'adopter
+un objet qui existe déjà, ce que Helm refuse :
+
+```
+Namespace "crystal-backup-system" ... exists and cannot be imported into the current
+release: invalid ownership metadata; label validation error: missing key
+"app.kubernetes.io/managed-by"
+```
+
+Créez-le avec sa posture Pod Security Admission d'un seul geste — ces labels comptent, voir
+[Pod Security Admission](#pod-security-admission) plus bas :
+
+```bash
+kubectl create namespace crystal-backup-system
+
+kubectl label namespace crystal-backup-system \
+  pod-security.kubernetes.io/enforce=baseline \
+  pod-security.kubernetes.io/enforce-version=latest \
+  pod-security.kubernetes.io/audit=restricted \
+  pod-security.kubernetes.io/warn=restricted \
+  --overwrite
+```
+
+Sur `helm install` et `helm upgrade`, le chart relit ce namespace et **refuse d'installer**
+sur un namespace dont le niveau `enforce` diverge, en affichant la commande ci-dessus. Il ne
+peut pas le faire sous `helm template`, qui est la façon dont Argo CD rend le chart — les deux
+pages GitOps portent donc le manifeste Namespace labellisé en toutes lettres.
+
+`namespace.create: true` reste disponible pour un cluster vierge où vous préférez qu'une seule
+commande fasse tout. Sur ce chemin, Helm possède le namespace : un prune GitOps ou un
+`helm uninstall` peut alors le supprimer — avec la cluster KEK dedans. Les deux pages GitOps
+disent de le laisser à off pour exactement cette raison.
 
 ## La cluster KEK — provisionnez-la avant d'installer
 
@@ -181,11 +226,18 @@ tenant lui appartient, soit fourni par lui, soit généré dans son propre names
 
 ## Pod Security Admission
 
-Le namespace de l'operator est labellisé `enforce: baseline` (avec `audit` et `warn` à
+Le namespace de l'operator doit être labellisé `enforce: baseline` (avec `audit` et `warn` à
 `restricted`). L'operator lui-même est conforme à `restricted`, mais les data movers
 tournent en `runAsUser: 0` avec `DAC_OVERRIDE` — ils doivent préserver la propriété des
 fichiers au restore — ce que `restricted` refuserait. Cet assouplissement ne s'applique qu'à
 `crystal-backup-system` ; rien ne change dans les namespaces des tenants.
+
+Se tromper là-dessus ne coûte rien à l'installation et tout ensuite : l'operator démarre, les
+locations passent `Ready`, et c'est la **première sauvegarde** qui échoue, sous la forme d'un
+pod de mover qui n'est jamais admis. C'est pourquoi le chart refuse de s'installer sur un
+namespace dont il peut lire le niveau `enforce` et dont il diverge, et pourquoi un
+`namespace.podSecurityLabels` qui nomme `restricted`, ou qui ne nomme aucun niveau `enforce`,
+est refusé au moment du rendu sur tous les chemins d'installation.
 
 ## Dimensionnement
 
@@ -202,9 +254,14 @@ exclusive. Donnez-lui des heures creuses et bornez-le avec `pruneMaxRepackSize`.
 
 ## Optionnel
 
-- **Prometheus Operator** — pour `metrics.serviceMonitor.enabled: true`. Sans lui, les
-  métriques sont quand même servies sur le port 8443 en HTTPS avec authn/authz de
-  l'API server ; scrapez-les comme bon vous semble.
+- **Prometheus Operator** — pour `metrics.serviceMonitor.enabled: true` et
+  `metrics.rules.enabled: true`. Les deux sont à off par défaut parce que les deux rendent des
+  objets `monitoring.coreos.com`, qu'un cluster dépourvu de ces CRDs rejette. La conséquence
+  mérite d'être dite franchement : **une installation par défaut n'embarque aucune règle
+  d'alerte.** Rien ne vous dira qu'une sauvegarde a cessé de tourner. Sans le Prometheus
+  Operator, les métriques sont quand même servies sur le port 8443 en HTTPS avec authn/authz de
+  l'API server — scrapez-les comme bon vous semble, et reconstruisez vous-même l'équivalent des
+  onze règles livrées.
 - **Un outil de backup existant.** La coexistence est un objectif de conception, pas une
   arrière-pensée. Ajoutez son namespace à `admission.deniedNamespaces` pour que les
   ressources de Crystal Backup destinées aux tenants ne puissent pas y être créées.

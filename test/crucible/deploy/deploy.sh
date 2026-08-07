@@ -159,17 +159,31 @@ step "crystal-backup (CRDs + operator chart)"
 mkdir -p "${REPO_ROOT}/charts/crystal-backup/crds"
 rm -f "${REPO_ROOT}/charts/crystal-backup/crds"/*.yaml
 cp "${REPO_ROOT}/config/crd/bases"/*.yaml "${REPO_ROOT}/charts/crystal-backup/crds/"
-# Create the namespace ourselves (with the chart's PSA labels) so helm's release
-# secret has a home, then tell the chart not to create it a second time.
+# The namespace, created and labelled the way the documentation tells a reader to create it —
+# start/requirements.md, verbatim, because the cluster KEK Secret has to land here before the
+# chart is installed and that is what makes the namespace pre-exist. The chart's own default
+# (namespace.create: false) then leaves it alone.
+#
+# THE RULE FOR THIS BLOCK: every `--set` below is either something the documentation tells a user
+# to set, or it is a bug in the defaults. A crucible that configures around the product tests a
+# configuration nobody installs. Two overrides lived here for exactly that reason and were
+# removed in 0.6.3 once the defaults were fixed:
+#
+#   * `namespace.create=false` — now the default. It was set here from the first run, which is
+#     why CI never once saw the ownership error every first-time installer hit.
+#   * `networkPolicy.apiServerPort=6443` — the default is now the list [443, 6443]. The comment
+#     that used to sit here quoted the operator's startup failure verbatim; the workaround had
+#     therefore been understood, written down and shipped in this file for longer than the bug
+#     had been visible to anyone outside it.
 kubectl create namespace crystal-backup-system --dry-run=client -o yaml | kubectl apply -f -
 kubectl label namespace crystal-backup-system \
   pod-security.kubernetes.io/enforce=baseline \
+  pod-security.kubernetes.io/enforce-version=latest \
   pod-security.kubernetes.io/audit=restricted \
   pod-security.kubernetes.io/warn=restricted \
   --overwrite
 helm upgrade --install crystal-backup "${REPO_ROOT}/charts/crystal-backup" \
   --namespace crystal-backup-system \
-  --set namespace.create=false \
   --set image.digest="${OPERATOR_IMAGE_DIGEST}" \
   --set image.tag="${OPERATOR_IMAGE_TAG}" \
   --set mover.image.digest="${MOVER_IMAGE_DIGEST}" \
@@ -178,23 +192,26 @@ helm upgrade --install crystal-backup "${REPO_ROOT}/charts/crystal-backup" \
   --set sync.image.tag="${SYNC_IMAGE_TAG}" \
   --set metrics.serviceMonitor.enabled=true \
   --set metrics.rules.enabled=true \
-  --set networkPolicy.monitoringNamespace=monitoring \
-  --set networkPolicy.apiServerPort=6443
-  # metrics.serviceMonitor / metrics.rules: both default to OFF, so until M6 the crucible ran
-  # against a chart whose observability half was never installed by anything. They are on here
-  # for the same reason the m6 alert specs exist — a PrometheusRule nobody loads is indistinguishable
-  # from one that works.
+  --set networkPolicy.monitoringNamespace=monitoring
+  # The three that remain, and why each is a documented instruction rather than a silent
+  # adjustment. All three are now told to the reader on every install page ("Observability is
+  # opt-in, and off means no alerts"); if that section ever disappears, these become silent
+  # adjustments again and have to come out.
+  #
+  # metrics.serviceMonitor / metrics.rules: both default to OFF because both need the
+  # monitoring.coreos.com CRDs, which the chart cannot assume and cannot install. That default is
+  # defensible and its consequence is not obvious: a default install has NO alert rules at all,
+  # so nothing tells you a backup stopped running. Until M6 the crucible ran against a chart whose
+  # observability half was never installed by anything, which is the same failure one level up —
+  # a PrometheusRule nobody loads is indistinguishable from one that works.
   #
   # monitoringNamespace=monitoring: the operator NetworkPolicy's metrics ingress is unrestricted
-  # while this is empty and namespace-scoped as soon as it is set. Setting it means the crucible
-  # tests the CLOSED configuration, which is the one an operator following the chart's own advice
-  # will run; leaving it empty would have every scrape succeed for the wrong reason.
-  #
-  # apiServerPort=6443: RKE2's kube-apiserver Service (10.43.0.1:443) DNATs to the master
-  # nodes on 6443, and Canal (the crucible CNI) evaluates NetworkPolicy egress POST-DNAT, so
-  # the operator's and manifest-mover's API-server egress must name 6443, not the chart default
-  # 443 (which fits a cluster whose apiserver Endpoints are themselves on 443). Without this the
-  # operator crashes at startup with "dial tcp 10.43.0.1:443: i/o timeout".
+  # while this is empty and namespace-scoped as soon as it is set. The default stays empty because
+  # the closed configuration needs a namespace NAME the chart cannot guess — monitoring,
+  # monitoring-system, observability and kube-prometheus-stack are all real, and the wrong one is
+  # a metrics outage that looks like a working install. Setting it here means the crucible tests
+  # the CLOSED configuration, which is the one an operator following the install page will run;
+  # leaving it empty would have every scrape succeed for the wrong reason.
 
 echo
 echo "Deployed. Storage classes:"

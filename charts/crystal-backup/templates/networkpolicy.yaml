@@ -1,4 +1,5 @@
 {{- if .Values.networkPolicy.create }}
+{{- $apiPorts := splitList "," (include "crystal-backup.apiServerPorts" .) }}
 ################################################################################
 # Network posture for crystal-backup-system (spec/03-security-and-tenancy.md §7).
 #
@@ -98,6 +99,10 @@ spec:
 # selects on crystalbackup.io/mover-role=manifest, which the controller stamps on the manifest
 # Job and on nothing else — a data mover, which holds the repository credentials, is not
 # selected by this policy and so cannot reach the API server at all.
+#
+# Both ports by default (networkPolicy.apiServerPorts). kube-proxy DNATs the `kubernetes` Service
+# from 443 to the API server's Endpoints — 6443 on k3s, RKE2 and kubeadm — BEFORE the CNI
+# evaluates egress, so a rule naming only 443 matches nothing on most clusters.
 ################################################################################
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -113,8 +118,10 @@ spec:
   policyTypes: [Egress]
   egress:
     - ports:
-        - port: {{ .Values.networkPolicy.apiServerPort }}
+        {{- range $apiPorts }}
+        - port: {{ . | int }}
           protocol: TCP
+        {{- end }}
       to:
         {{- if .Values.networkPolicy.apiServerCIDRs }}
         {{- range .Values.networkPolicy.apiServerCIDRs }}
@@ -130,9 +137,30 @@ spec:
         {{- end }}
 ---
 ################################################################################
-# The operator: API server, plus the location endpoints it probes. Ingress on the webhook and
-# metrics ports.
+# The operator: the API server, plus the object-storage endpoints it probes. Ingress on the
+# webhook and metrics ports.
+#
+# THE EGRESS HAS EXACTLY TWO DESTINATIONS, and until 0.6.2 the rendered object did not say so. It
+# listed `port: 443` twice — once from apiServerPort, which defaulted to 443, and once hardcoded
+# for the storage probes — with nothing to tell a reader which entry served which. Kubernetes did
+# not mind. A human auditing the policy could not tell whether one of them was a leftover.
+#
+# So the two destinations are now named, and the shape follows what they actually are:
+#
+#   * with no apiServerCIDRs, both destinations are 0.0.0.0/0 — literally the same allowance, so
+#     it is written ONCE, with the union of the ports and no repeats;
+#   * with apiServerCIDRs set, they are genuinely different destinations and get one rule each.
+#
+# `apiServerCIDRs` now narrows the operator too. It used to narrow only the manifest-mover policy
+# above while this one stayed at 0.0.0.0/0 — an asymmetry the name gave no hint of, and one that
+# quietly made the value worth less than it looked. Object storage keeps its own unnarrowed rule,
+# because an S3 endpoint is not the API server and no CIDR list of API server addresses should be
+# read as covering it.
 ################################################################################
+{{- $operatorPorts := $apiPorts }}
+{{- if not (has "443" $operatorPorts) }}
+{{- $operatorPorts = append $operatorPorts "443" }}
+{{- end }}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -146,16 +174,42 @@ spec:
       {{- include "crystal-backup.selectorLabels" . | nindent 6 }}
   policyTypes: [Ingress, Egress]
   egress:
-    # API server + object-storage endpoints (reachability probes). The operator is trusted
-    # with cluster-wide reads by design, so it is not confined the way a mover is.
+    {{- if .Values.networkPolicy.apiServerCIDRs }}
+    # The Kubernetes API server, narrowed to networkPolicy.apiServerCIDRs.
     - ports:
-        - port: {{ .Values.networkPolicy.apiServerPort }}
+        {{- range $apiPorts }}
+        - port: {{ . | int }}
           protocol: TCP
+        {{- end }}
+      to:
+        {{- range .Values.networkPolicy.apiServerCIDRs }}
+        - ipBlock:
+            cidr: {{ . | quote }}
+        {{- end }}
+    # Object storage on 443: the location reachability probes the operator runs before it hands a
+    # location to a mover. NOT narrowed by apiServerCIDRs — a bucket endpoint is somewhere else
+    # entirely, and it is usually outside the cluster.
+    - ports:
         - port: 443
           protocol: TCP
       to:
         - ipBlock:
             cidr: 0.0.0.0/0
+    {{- else }}
+    # Two destinations, one rule, because with no apiServerCIDRs they are the same allowance:
+    #   * the Kubernetes API server, on networkPolicy.apiServerPorts (443 and 6443 by default);
+    #   * object storage on 443, for the location reachability probes.
+    # The operator is trusted with cluster-wide reads by design, so it is not confined the way a
+    # mover is. Narrow the first destination with networkPolicy.apiServerCIDRs.
+    - ports:
+        {{- range $operatorPorts }}
+        - port: {{ . | int }}
+          protocol: TCP
+        {{- end }}
+      to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+    {{- end }}
     {{- with .Values.networkPolicy.extraOperatorEgress }}
     {{- toYaml . | nindent 4 }}
     {{- end }}

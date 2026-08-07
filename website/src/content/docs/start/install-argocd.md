@@ -19,12 +19,15 @@ and `ClusterErasure` are *executions*, closer to a `Job` than to a `Deployment`.
 in Git makes a controller recreate it, and a recreated run is a different run wearing the same
 name. See [What goes in Git](#what-goes-in-git).
 
-**2 — A prune can destroy your keys.** The chart renders the `crystal-backup-system`
-Namespace. That namespace holds the cluster KEK and every wrapped DEK. An Argo CD prune that
-removes the Namespace removes the keys with it, and every repository they protect becomes
-permanently unreadable — that is a
+**2 — A prune can destroy your keys.** The `crystal-backup-system` namespace holds the cluster
+KEK and every wrapped DEK. Any prune that removes it removes the keys, and every repository
+they protect becomes permanently unreadable — that is a
 [decommission](https://github.com/CrystalBackup/CrystalBackup/blob/main/docs/DECOMMISSION.md#14-the-key-itself),
-executed by accident. See [Why prune is off](#why-prune-is-off-and-there-is-no-finalizer).
+executed by accident. The chart no longer renders that Namespace (`namespace.create` defaults
+to `false`), which removes it from the operator `Application`'s prunable set entirely; put it
+in its own Application, and keep prune off there too. See
+[The namespace](#the-namespace--yours-not-the-charts) and
+[Why prune is off](#why-prune-is-off-and-there-is-no-finalizer).
 
 **3 — Removing the operator is ordered, and Argo CD does not know the order.** Six kinds carry
 a finalizer that only the operator removes. Delete the operator while one of those objects is
@@ -136,6 +139,44 @@ from a Git checkout installs **no CRDs at all**. And `image.digest`, `mover.imag
 operator pod would never pull. Always use the published OCI chart.
 :::
 
+## The namespace — yours, not the chart's
+
+The chart does not create `crystal-backup-system` (`namespace.create: false`), and under Argo
+CD that is worth more than it is on the Helm path: an object the chart does not render is an
+object no prune of the operator `Application` can ever reach.
+
+It still has to exist, and it still has to carry the Pod Security Admission labels — data
+movers run as uid 0 with `DAC_OVERRIDE` in it to preserve file ownership on restore, and
+`restricted` denies them. On `helm install` the chart reads the namespace back and refuses a
+wrong `enforce` level; Argo CD renders with `helm template`, which has no cluster to read, so
+**under Argo CD there is no such check.** That is why the labels are written out here rather
+than cross-referenced.
+
+Put it in its own Application, or in the same one as the Secrets, sourced from your Git
+repository — with prune off:
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: crystal-backup-system
+  annotations:
+    # Belt and braces on top of `prune: false`: never prune this object, whatever the
+    # Application says. It holds the cluster KEK.
+    argocd.argoproj.io/sync-options: Prune=false
+  labels:
+    # `baseline`, not `restricted`: the operator is restricted-compliant, but data movers run
+    # as uid 0 with DAC_OVERRIDE in this namespace to preserve file ownership on restore.
+    # Getting this wrong costs nothing until the first backup, which then never starts.
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+```
+
+Give it `argocd.argoproj.io/sync-wave: "-10"` so it lands before the Secrets (wave 0) and the
+operator (wave 10).
+
 ## 2. The operator Application
 
 ```yaml
@@ -167,16 +208,28 @@ spec:
           deniedNamespaces:
             - "kube-*"
             - crystal-backup-system
+        # Observability is opt-in and off means NO ALERT RULES AT ALL — nothing
+        # would tell you a backup stopped running. Both need the
+        # monitoring.coreos.com CRDs; drop this block if you have no Prometheus
+        # Operator, and wire port 8443 into whatever you do have.
         metrics:
           serviceMonitor:
             enabled: true
+          rules:
+            enabled: true
+            labels:
+              release: kube-prometheus-stack   # your Prometheus's ruleSelector
+        networkPolicy:
+          # Empty — the default — lets any pod in the cluster reach the metrics
+          # port. There is no default because the name is unguessable.
+          monitoringNamespace: monitoring
   syncPolicy:
     automated:
       selfHeal: true
       prune: false                 # deliberate. See below.
     syncOptions:
       - ServerSideApply=true
-      - CreateNamespace=false      # the chart renders the Namespace itself
+      - CreateNamespace=false      # the namespace is a separate Application, above
   ignoreDifferences:
     # The chart mints the admission webhook's CA and serving cert at RENDER time
     # (genCA/genSignedCert, no `lookup`). Argo CD re-renders the chart on every
@@ -229,11 +282,15 @@ than the situation calls for.
 Two separate switches, both defaulting to "destructive", both turned off here.
 
 **`prune: false`** stops auto-sync from deleting anything that disappears from the rendered
-chart. What it protects: the `crystal-backup-system` **Namespace**, which the chart renders and
-which holds the cluster KEK and every wrapped DEK. Deleting that namespace destroys those keys,
-and a repository whose DEK is gone cannot be read by you, by us, or by anyone who obtains the
-bucket. It also protects the **CRDs** — see below — whose deletion takes every `Backup` object
-in the cluster with it.
+chart. What it protects, chiefly, is the **CRDs** — see below — whose deletion takes every
+`Backup` object in the cluster with it.
+
+It used to protect one more thing: the `crystal-backup-system` **Namespace**, which the chart
+rendered. Deleting that namespace destroys the cluster KEK and every wrapped DEK, and a
+repository whose DEK is gone cannot be read by you, by us, or by anyone who obtains the bucket.
+The chart no longer renders it, so this Application cannot prune it however you set this — but
+the namespace still has to live somewhere, and wherever you put it, put `prune: false` there
+too. A hazard moved is not a hazard removed.
 
 **No `resources-finalizer.argocd.argoproj.io`** means deleting the Application is
 non-cascading: Argo CD stops managing the objects and leaves them running. That is what you
@@ -421,6 +478,45 @@ new location.
 `paramRef`, so it can be edited in the cluster to change the deny-list without touching the
 policy. Under self-heal, that edit is reverted on the next sync. Change it in the chart values
 instead.
+
+## The soak collector, if you are evaluating
+
+Off by default (`soak.enabled: false`) and it should stay off on a cluster you are simply
+running. It is a **measurement** kit for a fortnight-long evaluation, and under Argo CD it is
+one more value on the operator Application:
+
+```yaml
+  source:
+    helm:
+      values: |
+        soak:
+          enabled: true
+```
+
+What it costs: **one pod** (200m CPU / 384Mi memory, requests equal to limits), **one 1Gi
+PVC**, and **cluster-wide read-only RBAC** held for the duration — its own ServiceAccount, not
+the operator's, so revoking it is deleting bindings. It runs the same image as the operator,
+resolved from the same digest, so it is by construction the build you are evaluating.
+
+Two Argo CD specifics. The PVC is `ReadWriteOnce` and the Deployment uses the `Recreate`
+strategy, so a sync that rolls the collector will show it `Progressing` while the old pod
+releases the volume — that is normal and not a stuck sync. And turning the value back off
+**deletes nothing** while `prune: false` is set: the collector keeps running and holding its
+RBAC. Remove it deliberately:
+
+```bash
+kubectl -n crystal-backup-system delete deploy,pvc,sa -l crystalbackup.io/soak=collector
+kubectl delete clusterrole,clusterrolebinding -l crystalbackup.io/soak=collector
+```
+
+Check on day one **and** day two that it is really collecting:
+
+```bash
+kubectl -n crystal-backup-system logs deploy/crystal-backup-soak | grep soak-heartbeat
+```
+
+One line per day, each naming what it collected. A day with no line is a day with no data —
+which is why you look on day two and not on day fourteen. Protocol: `hack/soak/README.md`.
 
 ## Upgrading
 

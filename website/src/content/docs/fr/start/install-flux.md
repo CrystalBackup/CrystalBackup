@@ -2,7 +2,7 @@
 title: Installer avec Flux
 description: Gérer Crystal Backup depuis Git avec Flux — la mise à jour des CRDs qu'il faut demander, le prune qui détruit vos clés, et ce qui ne doit jamais être réconcilié.
 sourceFile: src/content/docs/start/install-flux.md
-sourceHash: 17628f4dc2f3b9d74ed8c1b7b829433b6dd21bcb
+sourceHash: cb31ac222f2184cafc2830ea4357e31f93994f7e
 ---
 
 C'est l'[install Helm](/CrystalBackup/fr/docs/start/install/) pilotée depuis Git. Le chart
@@ -21,12 +21,13 @@ qu'un « pointez un `HelmRelease` sur le chart » en une ligne.
 `Deployment`. En réconcilier un revient à le recréer, et un run recréé est un autre run
 portant le même nom. Voir [Ce qui va dans Git](#ce-qui-va-dans-git).
 
-**2 — Retirer un `HelmRelease` déclenche `helm uninstall`.** Ce qui supprime le Namespace
-`crystal-backup-system` que le chart rend, lequel contient la cluster KEK et chaque DEK
-wrappée. Chaque repository qu'elles protègent devient définitivement illisible — un
+**2 — Retirer un `HelmRelease` déclenche `helm uninstall`.** Le namespace
+`crystal-backup-system` contient la cluster KEK et chaque DEK wrappée, et chaque repository
+qu'elles protègent devient définitivement illisible s'il disparaît — un
 [decommission](https://github.com/CrystalBackup/CrystalBackup/blob/main/docs/DECOMMISSION.md#14-the-key-itself)
-exécuté par accident, et cela commence par quelqu'un qui supprime un fichier de Git. Voir
-[Protéger le namespace](#protéger-le-namespace).
+exécuté par accident, qui commence par quelqu'un qui supprime un fichier de Git. Le chart ne
+rend plus ce Namespace, donc `helm uninstall` ne le supprime plus ; le reste du problème
+d'ordonnancement est inchangé. Voir [Protéger le namespace](#protéger-le-namespace).
 
 **3 — Retirer l'operator est une opération ordonnée, et Flux ignore l'ordre.** Six kinds
 portent un finalizer que seul l'operator retire. Supprimez l'operator pendant qu'un de ces
@@ -196,10 +197,27 @@ spec:
       deniedNamespaces:
         - "kube-*"
         - crystal-backup-system
+    # Observability is opt-in, and off means NO ALERT RULES AT ALL — nothing would tell
+    # you a backup stopped running. Both values need the monitoring.coreos.com CRDs, which
+    # is why they are off by default; drop this block if you have no Prometheus Operator
+    # and wire port 8443 into whatever you do have.
     metrics:
       serviceMonitor:
         enabled: true
+      rules:
+        enabled: true
+        labels:
+          release: kube-prometheus-stack     # your Prometheus's ruleSelector
+    networkPolicy:
+      # Empty — the default — lets any pod in the cluster reach the metrics port. There is
+      # no default because `monitoring`, `monitoring-system`, `observability` and
+      # `kube-prometheus-stack` are all real names and the wrong one is a silent outage.
+      monitoringNamespace: monitoring
 ```
+
+Si votre Prometheus Operator vit dans un autre dépôt de gestion du cluster, ajoutez sa
+`Kustomization` au `dependsOn` de ce `HelmRelease` — un `HelmRelease` qui rend un
+`ServiceMonitor` avant que la CRD n'existe fait échouer l'installation, pas seulement cet objet.
 
 `CreateReplace` crée les CRDs manquantes et remplace celles qui existent. Il n'en supprime
 jamais aucune, ce qui est la propriété qui compte ici : supprimer les douze CRDs supprime
@@ -274,17 +292,16 @@ contrôle, alors faites-en une décision plutôt qu'un contournement.
 
 ## Protéger le namespace
 
-Le chart rend le Namespace `crystal-backup-system` (`namespace.create: true`). Ce qui veut
-dire que `helm uninstall` le supprime — et avec lui le Secret `cluster-kek` et chaque DEK
-wrappée qu'il contient. Sous Flux, `helm uninstall` est ce qui se produit quand le
-`HelmRelease` est retiré de Git et que la `Kustomization` parente le prune. Un fichier
-supprimé devient un repository illisible.
+Cette section commençait par vous dire de poser `namespace.create: false`. **C'est désormais
+le défaut du chart** — la release ne rend pas le Namespace `crystal-backup-system` et
+`helm uninstall` ne le supprime donc pas. Le namespace doit tout de même venir de quelque part,
+et l'endroit où vous le mettez décide si un fichier supprimé peut encore devenir un repository
+illisible.
 
 Deux garde-fous, et vous voulez les deux :
 
-**Sortez le Namespace de la release.** Posez `namespace.create: false` et gérez-le depuis
-une `Kustomization` avec le pruning désactivé, pour que rien dans le chemin de livraison ne
-puisse le retirer :
+**Gérez le Namespace depuis une `Kustomization` avec le pruning désactivé**, pour que rien dans
+le chemin de livraison ne puisse le retirer :
 
 ```yaml
 apiVersion: v1
@@ -294,19 +311,32 @@ metadata:
   annotations:
     kustomize.toolkit.fluxcd.io/prune: disabled
   labels:
-    # The chart's own defaults. `baseline`, not `restricted`: the operator is
-    # restricted-compliant, but data movers run as uid 0 with DAC_OVERRIDE in this
-    # namespace to preserve file ownership on restore, which restricted would deny.
+    # Required, and the chart cannot apply them: it does not own this object. `baseline`,
+    # not `restricted` — the operator is restricted-compliant, but data movers run as uid 0
+    # with DAC_OVERRIDE in this namespace to preserve file ownership on restore, which
+    # restricted would deny. Nothing fails at install if these are wrong; the FIRST BACKUP
+    # fails, as a mover pod that never gets admitted.
     pod-security.kubernetes.io/enforce: baseline
     pod-security.kubernetes.io/enforce-version: latest
     pod-security.kubernetes.io/audit: restricted
     pod-security.kubernetes.io/warn: restricted
 ```
 
+Flux fait tourner de vraies opérations Helm : contrairement à Argo CD, vous bénéficiez donc
+ici du contrôle du chart lui-même — il relit le namespace à l'install et à l'upgrade, et refuse
+un niveau `enforce` divergent en affichant la commande `kubectl label`. Les labels ci-dessus
+sont ce qui fait passer ce contrôle, pas quelque chose qu'il dupliquerait.
+
 **Ne prunez pas la `Kustomization` de l'operator.** Posez `prune: false` sur la
 `Kustomization` qui porte le `HelmRelease`. Retirer l'operator est une
 [procédure ordonnée](#le-retirer), et une désinstallation automatique la fait dans le
 mauvais ordre par définition.
+
+:::caution[Ne posez pas `namespace.create: true` pour économiser un fichier]
+Cela redonnerait à la release la propriété du namespace, et alors un `HelmRelease` pruné
+devient un `helm uninstall` qui supprime la cluster KEK. La `Kustomization` séparée, c'est
+trois lignes de YAML contre une classe de panne sans récupération possible.
+:::
 
 ## 3. Secrets
 
@@ -488,6 +518,41 @@ La chaîne de `dependsOn` ci-dessus vous épargne simplement le bruit.
 `paramRef`, si bien qu'elle peut être éditée dans le cluster pour changer la deny-list sans
 toucher à la policy. Avec la détection de dérive activée, cette édition est annulée.
 Changez-la plutôt dans les values du `HelmRelease`.
+
+## Le collecteur de soak, si vous évaluez
+
+À off par défaut (`soak.enabled: false`), et il doit y rester sur un cluster que vous vous
+contentez d'exploiter. C'est un kit de **mesure** pour une évaluation de quinze jours, et sous
+Flux c'est une value de plus sur le `HelmRelease` :
+
+```yaml
+spec:
+  values:
+    soak:
+      enabled: true
+```
+
+Ce qu'il coûte : **un pod** (200m CPU / 384Mi de mémoire, requests égales aux limits), **une
+PVC de 1Gi**, et un **RBAC cluster-wide en lecture seule** tenu pour toute la durée — son
+propre ServiceAccount, pas celui de l'operator, si bien que le révoquer, c'est supprimer des
+bindings. Il tourne sur la même image que l'operator, résolue depuis le même digest, donc
+c'est par construction le build que vous évaluez.
+
+Deux spécificités Flux. Remettre la value à `false` lors d'un vrai upgrade Helm **supprime
+bien** les objets, contrairement à un Argo CD sans prune : le helm-controller exécute un
+véritable `helm upgrade` et l'ensemble rendu rétrécit. Et la PVC du collecteur est
+`ReadWriteOnce` avec une stratégie `Recreate` : un upgrade qui le roule montre un moment
+d'indisponibilité pendant que l'ancien pod libère le volume — n'y lisez pas une release échouée.
+
+Vérifiez au jour un **et** au jour deux qu'il collecte vraiment :
+
+```bash
+kubectl -n crystal-backup-system logs deploy/crystal-backup-soak | grep soak-heartbeat
+```
+
+Une ligne par jour, chacune nommant ce qu'elle a collecté. Un jour sans ligne est un jour sans
+données — d'où le contrôle au jour deux et pas au jour quatorze. Protocole :
+`hack/soak/README.md`.
 
 ## Mise à niveau
 

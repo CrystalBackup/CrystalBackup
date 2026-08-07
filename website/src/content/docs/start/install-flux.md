@@ -18,12 +18,13 @@ and `ClusterErasure` are *executions*, closer to a `Job` than to a `Deployment`.
 means recreating it, and a recreated run is a different run wearing the same name. See
 [What goes in Git](#what-goes-in-git).
 
-**2 — Removing a `HelmRelease` runs `helm uninstall`.** That deletes the
-`crystal-backup-system` Namespace the chart renders, which holds the cluster KEK and every
-wrapped DEK. Every repository they protect becomes permanently unreadable — a
+**2 — Removing a `HelmRelease` runs `helm uninstall`.** The `crystal-backup-system` namespace
+holds the cluster KEK and every wrapped DEK, and every repository they protect becomes
+permanently unreadable if it goes — a
 [decommission](https://github.com/CrystalBackup/CrystalBackup/blob/main/docs/DECOMMISSION.md#14-the-key-itself)
-executed by accident, and it starts with someone deleting a file from Git. See
-[Protecting the namespace](#protecting-the-namespace).
+executed by accident, starting with someone deleting a file from Git. The chart no longer
+renders that Namespace, so `helm uninstall` no longer deletes it; the rest of the ordering
+problem is unchanged. See [Protecting the namespace](#protecting-the-namespace).
 
 **3 — Removing the operator is ordered, and Flux does not know the order.** Six kinds carry a
 finalizer that only the operator removes. Delete the operator while one of those objects is
@@ -186,10 +187,27 @@ spec:
       deniedNamespaces:
         - "kube-*"
         - crystal-backup-system
+    # Observability is opt-in, and off means NO ALERT RULES AT ALL — nothing would tell
+    # you a backup stopped running. Both values need the monitoring.coreos.com CRDs, which
+    # is why they are off by default; drop this block if you have no Prometheus Operator
+    # and wire port 8443 into whatever you do have.
     metrics:
       serviceMonitor:
         enabled: true
+      rules:
+        enabled: true
+        labels:
+          release: kube-prometheus-stack     # your Prometheus's ruleSelector
+    networkPolicy:
+      # Empty — the default — lets any pod in the cluster reach the metrics port. There is
+      # no default because `monitoring`, `monitoring-system`, `observability` and
+      # `kube-prometheus-stack` are all real names and the wrong one is a silent outage.
+      monitoringNamespace: monitoring
 ```
+
+If your Prometheus Operator lives in another cluster-management repository, add its
+`Kustomization` to this `HelmRelease`'s `dependsOn` — a `HelmRelease` that renders a
+`ServiceMonitor` before the CRD exists fails the install, not just that object.
 
 `CreateReplace` creates missing CRDs and replaces existing ones. It never deletes one, which is
 the property that matters here: deleting the twelve CRDs deletes every `Backup`,
@@ -261,15 +279,16 @@ decision rather than a workaround.
 
 ## Protecting the namespace
 
-The chart renders the `crystal-backup-system` Namespace (`namespace.create: true`). That means
-`helm uninstall` deletes it — and with it the `cluster-kek` Secret and every wrapped DEK inside.
-Under Flux, `helm uninstall` is what happens when the `HelmRelease` is removed from Git and the
-parent `Kustomization` prunes it. A deleted file becomes an unreadable repository.
+This section used to open by telling you to set `namespace.create: false`. **That is now the
+chart's default** — the release does not render the `crystal-backup-system` Namespace and
+`helm uninstall` therefore does not delete it. The namespace has to come from somewhere all the
+same, and where you put it decides whether a deleted file can still become an unreadable
+repository.
 
 Two guards, and you want both:
 
-**Take the Namespace out of the release.** Set `namespace.create: false` and manage it from a
-`Kustomization` with pruning disabled, so nothing in the delivery path can remove it:
+**Manage the Namespace from a `Kustomization` with pruning disabled**, so nothing in the
+delivery path can remove it:
 
 ```yaml
 apiVersion: v1
@@ -279,19 +298,32 @@ metadata:
   annotations:
     kustomize.toolkit.fluxcd.io/prune: disabled
   labels:
-    # The chart's own defaults. `baseline`, not `restricted`: the operator is
-    # restricted-compliant, but data movers run as uid 0 with DAC_OVERRIDE in this
-    # namespace to preserve file ownership on restore, which restricted would deny.
+    # Required, and the chart cannot apply them: it does not own this object. `baseline`,
+    # not `restricted` — the operator is restricted-compliant, but data movers run as uid 0
+    # with DAC_OVERRIDE in this namespace to preserve file ownership on restore, which
+    # restricted would deny. Nothing fails at install if these are wrong; the FIRST BACKUP
+    # fails, as a mover pod that never gets admitted.
     pod-security.kubernetes.io/enforce: baseline
     pod-security.kubernetes.io/enforce-version: latest
     pod-security.kubernetes.io/audit: restricted
     pod-security.kubernetes.io/warn: restricted
 ```
 
+Flux's helm-controller runs real Helm operations, so unlike Argo CD you do get the chart's own
+check here: it reads the namespace back at install and upgrade, and refuses an `enforce` level
+that disagrees, printing the `kubectl label` command. The labels above are what makes that
+check pass rather than something it duplicates.
+
 **Do not prune the operator's own `Kustomization`.** Set `prune: false` on the `Kustomization`
 that carries the `HelmRelease`. Removing the operator is an
 [ordered procedure](#removing-it), and an automatic uninstall does it in the wrong order by
 definition.
+
+:::caution[Do not set `namespace.create: true` to save a file]
+It would give the release ownership of the namespace again, and then a pruned `HelmRelease` is
+a `helm uninstall` that deletes the cluster KEK. The separate `Kustomization` is three lines of
+YAML against a class of failure with no recovery.
+:::
 
 ## 3. Secrets
 
@@ -466,6 +498,39 @@ so it goes `Ready` once the Secret lands. The `dependsOn` chain above just spare
 the `ValidatingAdmissionPolicy` reads through a `paramRef`, so it can be edited in the cluster to
 change the deny-list without touching the policy. With drift detection on, that edit is reverted.
 Change it in the `HelmRelease` values instead.
+
+## The soak collector, if you are evaluating
+
+Off by default (`soak.enabled: false`) and it should stay off on a cluster you are simply
+running. It is a **measurement** kit for a fortnight-long evaluation, and under Flux it is one
+more value on the `HelmRelease`:
+
+```yaml
+spec:
+  values:
+    soak:
+      enabled: true
+```
+
+What it costs: **one pod** (200m CPU / 384Mi memory, requests equal to limits), **one 1Gi
+PVC**, and **cluster-wide read-only RBAC** held for the duration — its own ServiceAccount, not
+the operator's, so revoking it is deleting bindings. It runs the same image as the operator,
+resolved from the same digest, so it is by construction the build you are evaluating.
+
+Two Flux specifics. Setting the value back to `false` on a real Helm upgrade **does** remove
+the objects, unlike a pruneless Argo CD — helm-controller runs a genuine `helm upgrade` and
+the rendered set shrinks. And the collector's PVC is `ReadWriteOnce` with a `Recreate`
+strategy, so an upgrade that rolls it shows a moment of unavailability while the old pod
+releases the volume; do not read that as a failed release.
+
+Check on day one **and** day two that it is really collecting:
+
+```bash
+kubectl -n crystal-backup-system logs deploy/crystal-backup-soak | grep soak-heartbeat
+```
+
+One line per day, each naming what it collected. A day with no line is a day with no data —
+which is why you look on day two and not on day fourteen. Protocol: `hack/soak/README.md`.
 
 ## Upgrading
 

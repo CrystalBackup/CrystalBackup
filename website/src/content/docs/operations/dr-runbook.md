@@ -64,16 +64,35 @@ kubectl delete namespace dr-drill
 **1 — Rebuild a cluster.** Kubernetes ≥ 1.30, a CSI driver with snapshot support, and the
 external-snapshotter CRDs.
 
-**2 — Install the operator.**
+**2 — Create and label the namespace, then install the operator.**
+
+Not `--create-namespace`. Helm creates the namespace *after* rendering, so it carries no Pod
+Security labels — and `crystal-backup-system` must enforce `baseline`, because data movers run as
+uid 0 with `DAC_OVERRIDE` to preserve file ownership on restore, which `restricted` denies. An
+unlabelled namespace installs cleanly and then refuses the first mover at admission. **During a
+disaster recovery that is the worst possible moment to find out**, which is why these two commands
+come first here rather than being a footnote.
 
 ```bash
+kubectl create namespace crystal-backup-system
+
+kubectl label namespace crystal-backup-system \
+  pod-security.kubernetes.io/enforce=baseline \
+  pod-security.kubernetes.io/enforce-version=latest \
+  pod-security.kubernetes.io/audit=restricted \
+  pod-security.kubernetes.io/warn=restricted --overwrite
+
 helm install crystal-backup \
   oci://ghcr.io/crystalbackup/charts/crystal-backup \
   --version 0.6.2 \
-  --namespace crystal-backup-system --create-namespace
+  --namespace crystal-backup-system
 
 kubectl -n crystal-backup-system rollout status deploy/crystal-backup
 ```
+
+The operator checks this itself on startup and emits a `PodSecurityPostureWrong` Warning Event on
+its own namespace if the posture is wrong, so a mistake here is visible in
+`kubectl -n crystal-backup-system get events` before any backup is attempted.
 
 **3 — Restore the two Secrets** from escrow.
 

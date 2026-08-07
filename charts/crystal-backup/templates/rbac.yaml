@@ -149,6 +149,28 @@ rules:
   - apiGroups: ["", "events.k8s.io"]
     resources: ["events"]
     verbs: ["create", "patch"]
+  # And READ them, in the core group only, which is the half this chart was missing.
+  #
+  # A per-phase deadline that fails a stalled volume is worth very little without the reason it
+  # stalled, and the reason is already published — by the kubelet, as a Warning Event on the mover
+  # pod. The incident this closes ran 1069 identical FailedMount events over 36 hours, each naming
+  # `rbd: map failed: (22) Invalid argument`, while `kubectl get backup` said nothing at all.
+  # backup_controller's latestWarningEvent copies that message into status.volumes[].reason, the
+  # way MoverEvicted already copies the kubelet's eviction message.
+  #
+  # Without this rule the deadline still fires and still fails the volume — silently, with a bare
+  # `MoverStartDeadlineExceeded` and no cause. That is a WORSE outcome than the bug it replaces,
+  # because it looks like a working feature. config/rbac/role.yaml has carried the grant since the
+  # deadline landed; the chart is the copy an actual install uses, and the two are not generated
+  # from one source.
+  #
+  # Core group only: the kubelet writes to v1 Events, and the operator reads through an uncached
+  # APIReader. Listing Events through the cached client would open an informer over the largest
+  # object stream a cluster has, which is the one thing a backup operator must not do to a cluster
+  # it is meant to protect.
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

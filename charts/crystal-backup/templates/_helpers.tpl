@@ -117,6 +117,48 @@ either — a hardcoded cluster-scoped name is a collision waiting for the second
 {{- end -}}
 
 {{/*
+The port(s) the Kubernetes API server answers on, as a comma-separated string. Consumers split
+it and cast each element with `int` — a NetworkPolicy port given as a STRING is a named port, so
+the cast is not cosmetic.
+
+WHY THIS IS A LIST. It was a scalar defaulting to 443, and that default made the operator unable
+to start on k3s, RKE2, kubeadm — most of the world:
+
+  Failed to start manager: failed to get server groups: Get "https://10.43.0.1:443/api":
+  dial tcp: i/o timeout
+
+The `kubernetes` Service listens on 443 and DNATs to the API server's Endpoints, which on those
+distributions are on 6443. kube-proxy rewrites the destination port BEFORE the CNI evaluates
+egress, so a policy naming 443 never matches the packet that actually leaves the pod. There is no
+way for the chart to know which of the two it will be, and guessing wrong costs an operator that
+never starts — so the default is the SUPERSET and narrowing it is the deliberate act. The security
+cost of one extra outbound TCP port, on a policy whose destination is already the API server, is
+not comparable.
+
+The crucible knew this before the chart did: test/crucible/deploy/deploy.sh carried
+`--set networkPolicy.apiServerPort=6443` with a comment quoting that error verbatim, which is why
+CI never saw the bug. The override is gone; the campaign now installs what a user installs.
+
+`networkPolicy.apiServerPort` (scalar) is still accepted and REPLACES the list when set, so an
+install that narrowed it to one port keeps exactly the posture it asked for.
+*/}}
+{{- define "crystal-backup.apiServerPorts" -}}
+{{- $ports := .Values.networkPolicy.apiServerPorts | default list -}}
+{{- with .Values.networkPolicy.apiServerPort -}}
+{{- $ports = list . -}}
+{{- end -}}
+{{- $out := list -}}
+{{- range $ports -}}
+{{- $out = append $out (. | toString) -}}
+{{- end -}}
+{{- $out = uniq $out -}}
+{{- if not $out -}}
+{{- fail "networkPolicy.apiServerPorts is empty, so nothing in crystal-backup-system could reach the API server: the operator would fail its first discovery call with \"dial tcp: i/o timeout\" and the manifest mover would never capture a manifest. The default is [443, 6443] — 443 for a cluster whose apiserver Endpoints are themselves on 443, 6443 for k3s/RKE2/kubeadm, where kube-proxy DNATs the kubernetes Service to 6443 before the CNI evaluates egress. Narrow it to the port your cluster actually uses, or leave the default." -}}
+{{- end -}}
+{{- join "," $out -}}
+{{- end -}}
+
+{{/*
 Fully-resolved operator image reference. Prefers the immutable digest pin; falls
 back to a tag (default: appVersion) only when no digest is configured.
 */}}
