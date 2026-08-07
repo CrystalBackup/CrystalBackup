@@ -347,9 +347,32 @@ crucible lanes, all with zero residual snapshot objects
       **Still open**: the load test on millions-of-files volumes and the restic-vs-rustic revisit
       ([adr/0001](adr/0001-repository-engine-restic-format.md)) — it needs real infrastructure and
       is what would turn these conservative ceilings into measured numbers; delta 7.
-- [ ] VSC ↔ RBD-image reconciliation + trash monitoring + active pre-check before VS creation
-      (VolumeSnapshotClass resolved, secret present, snapshotter sidecar reachable) — delta 9;
-      S3 RGW tuning (`s3.connections`, wave test vs `rgw_max_concurrent_requests`) — delta 13.
+- [x] Active pre-check before VS creation (VolumeSnapshotClass resolved, secret present) —
+      delta 9; S3 RGW tuning (`s3.connections`, wave test vs `rgw_max_concurrent_requests`) —
+      delta 13. **Both delivered in 0.6.3**, and the bullet is closed rather than carried because
+      the two halves that are missing from it are a DECISION, not a remainder:
+      - **Delivered.** The snapshotter Secret named by the VolumeSnapshotClass parameters is
+        checked before Expose — missing → the volume fails `SnapshotPrecheckFailed` with the
+        Secret named in the Event; CSI-templated (`${volumesnapshotcontent.name}`) → the verdict
+        is `NOT_CHECKABLE` with the reason, never "pass". A progress deadline bounds a snapshot
+        nobody acknowledged (15m) and, from 0.6.3, one acknowledged and never ready (2h).
+        `spec.s3.connections` reaches restic as `-o s3.connections=N`, bounded by a CRD `Maximum`
+        because `BackupLocation` is tenant-writable against one shared gateway (adr/0009).
+      - **Decided against: "snapshotter sidecar reachable", VSC ↔ RBD-image reconciliation and
+        trash monitoring.** All three need `rbd trash ls` / `rbd snap ls` or an equivalent
+        Ceph-side read, and [adr/0003](adr/0003-snapshot-exposure-csi-generic-first.md) accepts as
+        a consequence of its whole design that there are **no Ceph credentials anywhere in the
+        backup system**. Acquiring them to close a monitoring gap would trade the design's central
+        property for an observation, and adr/0003's own risk table already assigns that ground to
+        a platform alert on ceph-mgr. This is therefore not deferred work and should not be
+        re-opened as a task; re-opening it means re-opening adr/0003. The reasoning is written into
+        `internal/exposer/precheck.go` so it is read by whoever next reaches for it.
+      **Still open, and it is the residue of the pre-check rather than of this bullet**: a healthy
+      snapshot-controller with a dead per-driver sidecar binds a VolumeSnapshotContent within
+      seconds and never sets `readyToUse`, which from the object alone is indistinguishable from a
+      slow driver. The 2h deadline ends the hang; it does not diagnose it. Diagnosing it needs
+      either the Ceph reads above or a maximum legitimate snapshot duration on storage we do not
+      own, and neither is attempted.
 - [x] **Restore-fidelity gate** (the beta bar for `0.6`, not a 1.0/GA claim): e2e restore +
       checksum comparison to a Rook-Ceph PVC while restic#5543 stays open (delta 14).
       **Executable as the `m6` crucible label** (`mise run test m6`) — the exit criterion is a
@@ -413,6 +436,77 @@ repository**, which is the caveat the fortnight on real data exists to remove.
 So the remaining M6 work is now genuinely calendar: install `soak.enabled=true` on a real
 cluster, leave it a fortnight, run `hack/soak/collect.sh`. The pilot rollout and the PodSecurity
 review are unchanged.
+
+**Status as of 0.6.3 (2026-08-07) — the crucible was testing a chart nobody installs.** The code
+scheduled here for `0.6.3` shipped: delta 9's API side and delta 13. But that is not what the
+release is about. **Four defects blocked one user's first hour with 0.6.2** on their own RKE2 +
+Rook-Ceph cluster, and not one of the four was reachable by any test in this repository. Two of
+them were hidden by a single file: `test/crucible/deploy/deploy.sh` set `namespace.create=false`,
+so the campaign never met the Helm ownership error that killed the documented install order on its
+first command, and it set `networkPolicy.apiServerPort=6443` with a comment quoting the operator's
+startup failure verbatim — the workaround had been understood, written down and shipped here for
+longer than the bug had been visible to anyone outside. The third is a documentation gap the
+crucible had no reason to notice: the soak, 0.6.2's headline, appeared in none of the six install
+pages, so no reader following the documentation could reach it at all.
+
+Both overrides are removed and the rule that replaces them is written into that file: every
+`--set` is either something the documentation tells a user to set, or it is a bug in the defaults.
+`test/chart/install_test.go` holds the DEFAULT render, which nothing in this repository had ever
+looked at. This is the same failure mode as the M5 lot E's announced-but-inert features and as
+0.6.2's collector reporting NOT_MEASURED beside a campaign that ran dozens of backups: **the
+instrument agreeing with itself.** Three rounds, three different shapes of it.
+
+The fourth is not a chart bug and is the one worth keeping. A nightly cascade whose mover
+pods could not map an RBD clone left a backup unfinished for **thirty-six hours**; nothing failed,
+so none of the eleven alert rules could fire, and `concurrencyPolicy: Forbid` then meant one
+backup in fifteen days behind a green dashboard. The per-phase timeout had been marked "deferred
+to task #22" since M1. It now exists in two forms with predicates that make their numbers safe (a
+mover pod that never reached Running at 30m; a snapshot acknowledged and never ready at 2h), the
+kubelet's own Warning travels into `status.volumes[].reason`, and a twelfth rule
+`CrystalbackupBackupStalled` reads a state-derived series so it covers the phases no in-controller
+clock can see. A mover Job that has *vanished* still requeues forever — there is no durable clock
+left to measure it against — and the alert is what covers that.
+
+`preflight.sh` would have reported that user's cluster READY, because a resolvable
+VolumeSnapshotClass proves snapshot **availability** and not **usability**. It now reports every
+resolvable class as USABILITY NOT ASSESSED, counted as a reservation with no code path to a pass,
+and `website/public/snapshot-probe.sh` answers the other half by actually snapshotting, restoring
+and mounting per StorageClass.
+
+**And the fifth, which the incident exposed rather than caused.** Diagnosing that user's cluster
+established the fact with a control — an identical pod on a 5.15 node mounted the RBD clone, on a
+5.4 node it failed `rbd: map failed: (22)` — and then established that the operator had no way to
+act on it. Nothing in the product could say *where* a mover may run: the chart's `nodeSelector` is
+the operator pod's, and `mover.JobRequest` carried only `NodeName`, set by the same-node restore
+path alone. The advice available was "upgrade every kernel first", which is not advice anybody can
+act on this afternoon. `mover.placement` (nodeSelector, tolerations, affinity, applied to **every**
+mover Job, admin-only) closes that, and the case generalises well beyond one kernel bug — a tainted
+pool reserved for I/O, a zone with cheap egress. Its sharp edge is documented where the decision is
+made: a `nodeSelector` few nodes match does not make movers *prefer* those nodes, it serialises
+every backup in the cluster through them.
+
+**One more instrument found agreeing with itself, in the campaign for this very release.** The new
+`m6/stall` spec injects its fault by parking the RBD node plugin DaemonSet, and it timed out at
+300s waiting for the pods to go away. The failure read like a slow cluster and invited a bigger
+timeout. It was not: rook ≥ 1.17 hands the CSI driver plane to a ceph-csi-operator that OWNS that
+DaemonSet, and the park was reverted in the same second it was applied — six `SuccessfulDelete` and
+six `SuccessfulCreate` events with the same timestamp, and "node plugin daemonset updated
+successfully" in the reconciler's log between them. No timeout would ever have worked. **A
+reconciler is not a race you can wait out**, and a fault injection that is silently undone is the
+same defect class as a green campaign against a chart nobody installs. The spec now stops the
+reconciler before it touches the object, which is the pattern `m6_precheck_test.go` already used on
+`rook-ceph-operator` for the same reason.
+
+**Validated: 90 of 90 crucible checks, 0 failed, 0 skipped, in 2h43m24s** — the whole suite
+unfiltered on a six-node RKE2 v1.35.7 + Rook-Ceph cluster with real S3, against the operator digest
+this release ships. Eight checks more than 0.6.2, and the eight are the point: the `m6/stall` and
+`m6/placement` lanes are new, and the first of them took three runs to become evidence rather than
+decoration.
+
+The two unmet exit criteria are unchanged: the two-week soak and the pilot rollout. The
+PodSecurity review has moved from "answer known, review not done" to partly executed — the posture
+`crystal-backup-system` must carry is now enforced by the chart in three places and checked by the
+operator at startup — but the review as a document is still not written.
 
 ## M7 — Reach: storage without snapshots, file-level restore, notifications (0.7)
 
@@ -516,7 +610,10 @@ backup.
       [adr/0005](adr/0005-immutability-mode.md)).
 - [ ] **Erasure-on-immutable**: `ClusterErasure` stays `Blocked` until object-lock expiry, then
       completes; lifecycle of residual object versions left by retried uploads on versioned
-      buckets (delta 13).
+      buckets (**delta 15** — *renumbered in 0.6.3. This carried `delta 13`, which M6 §
+      "S3 RGW tuning" also carries. Two unrelated lessons under one tag is a tag that resolves to
+      the wrong issue; `delta 13` now means the RGW tuning only, and 15 was the next free number
+      after the restore-fidelity gate's 14.*).
 - [ ] e2e with **Ceph RGW Object Lock**: erasure blocked then completing; rotation retiring an
       expired repo.
 

@@ -4,6 +4,349 @@ All notable changes to Crystal Backup. Versioning follows
 [adr/0014](spec/adr/0014-versioning-and-release.md): milestone `Mn` → minor `0.n.z` on
 major 0; `1.0.0` is a deliberate post-M9 API-stability decision.
 
+## 0.6.3 — The first hour on somebody else's cluster (2026-08-07)
+
+**Four defects blocked one user's first hour with 0.6.2** on their own RKE2 + Rook-Ceph cluster.
+Not one of the four was reachable by any test in this repository, and two of them were hidden by
+one file. `test/crucible/deploy/deploy.sh` set `namespace.create=false` and
+`networkPolicy.apiServerPort=6443` before the first crucible run ever happened — the second with
+a comment quoting the operator's startup failure verbatim, so the workaround had been understood,
+written down and shipped here for longer than the bug had been visible to anyone outside. The
+third was a documentation gap the campaign had no reason to notice; the fourth is a real hole in
+the product and is the one worth keeping.
+
+Eighty-two green checks, three campaigns in a row, and for two of the four they were proving that
+a chart nobody installs works.
+
+Both overrides are gone. The rule that replaces them is written into that file: **every `--set`
+in the crucible's install is either something the documentation tells a user to set, or it is a
+bug in the defaults.** Three remain, and each is now told to the reader on every install page.
+
+That is the through-line, and most of this release is it. There is a fifth defect the incident
+exposed rather than caused: once the RBD failure was pinned to a kernel feature bit present on one
+of their nine nodes, it turned out **nothing in this product could say where a mover may run**, so
+the only available advice was "upgrade every kernel first". `mover.placement` is the answer to
+that. The rest is delta 9's API side, delta 13, and one CI gate that had been red on `main` for
+four days without anybody noticing.
+
+**Validated on real infrastructure: 90 of 90 crucible checks, 0 failed, 0 skipped, in 2h43m24s**
+— the whole suite, M0 through M6, unfiltered, on a live six-node RKE2 v1.35.7 + Rook-Ceph cluster
+with real S3, against the exact operator digest this release ships. Report:
+[crucible-m6.3](https://crystalbackup.github.io/CrystalBackup/reports/crucible-m6-3.html).
+
+Eight checks more than 0.6.2's 82, and fifty minutes longer, for one reason worth stating: **the
+suite grew a lane that had never verified anything.** `m6/stall` shipped red and took three runs to
+become evidence. First it was reverting its own fault injection inside the same second (see below).
+Then, twice, it compared the operator's output against strings nobody emits — `FailedMount`, which
+is the word from the field report but not the one *this* injection produces, and "never reached
+Running" against a product that says "no pod of it ever reached Running". The operator was correct
+on all three occasions. A spec written against an imagined message tests its author's imagination,
+which is the same family as a campaign run against a chart nobody installs; the assertions now read
+the Events the cluster actually recorded and compare against those.
+
+**Breaking-ish, and deliberately so: `namespace.create` now defaults to `false`.** An existing
+install that relied on the chart owning the namespace must set `namespace.create: true`
+explicitly. `networkPolicy.apiServerPort` (scalar) is still accepted and still *replaces*
+`networkPolicy.apiServerPorts` when set, so an install that had narrowed it to one port keeps
+exactly the posture it asked for.
+
+### A backup waited thirty-six hours and nothing gave up
+
+Six mover pods sat in `ContainerCreating` because an RBD clone could not be mapped:
+
+```
+rbd: map failed: (22) Invalid argument
+```
+
+Their kernel, their clone format — not a defect in this operator. What *is* a defect in this
+operator is everything that happened next, which is nothing. The kubelet published that Warning
+**1069 times over thirty-six hours**, starting one minute in, and nothing read it. Four more
+namespaces sat in `Snapshotting` beside them. `concurrencyPolicy: Forbid` then meant no further
+nightly run fired at all: **one backup in fifteen days**, with a green dashboard the whole time.
+
+No rule could fire, and that was structural rather than bad luck. All eleven rules in the table
+watch for a **failure**. Nothing failed. A stall is not a failure and it is not a missed
+schedule, and there was no series in the catalogue that described one.
+
+The per-phase timeout that would have ended it had been marked "deferred to task #22" in
+`advanceUploading` since M1.
+
+Three things ship instead of that note:
+
+- **Two deadlines in the controller, each with a predicate that makes its number safe.**
+  `moverStartDeadline` is **30 minutes** and it is emphatically not a cap on how long a backup
+  may take — the predicate is *the mover Job has existed that long and not one of its pods has
+  ever demonstrably run*. A pod stuck before start has moved no bytes, taken no repository lock
+  and consumed no snapshot, so giving up costs nothing; once the pod is Running nothing looks at
+  it again, however long it takes. `snapshotReadyDeadline` is **2 hours** and is the opposite
+  trade: a snapshot that was acknowledged and never became ready *was* being worked on, a slow
+  driver looks identical to a dead one from the object alone, so the burden of proof is set high
+  and the bound is eight times the existing 15-minute unacknowledged one. Both are measured
+  against a durable clock the waited-on object already carries — the Job's `creationTimestamp`,
+  the origin VolumeSnapshot's — so neither adds a CRD field and both survive an operator restart.
+  Every "I do not know" answer waits rather than fails.
+- **The kubelet's own words in `status.volumes[].reason`.** The most recent Warning Event on the
+  pod, or on the origin VolumeSnapshot, appended after a colon, the way `MoverEvicted` already
+  carried them. A reason that says only "timed out" leaves the reader exactly as blind as the
+  thirty-six hours did. The Events are read field-selected through the uncached `APIReader` and
+  only on a path already failing a volume — going through the cache would start an informer over
+  the largest object stream a cluster has to serve a handful of reads.
+- **`CrystalbackupBackupStalled`**, the twelfth rule, on a new series
+  `crystalbackup_backup_in_progress_since_timestamp_seconds`. State-derived from the Backup
+  objects at scrape time, absent when nothing is in flight, and reporting the **oldest**
+  unfinished Backup of the series so tonight's fresh run cannot reset the clock on last night's
+  wedged one. A counter was never an option: a `CounterVec` child materialises at one, so it
+  cannot page on a first occurrence, and a stall is a first occurrence by definition.
+
+The alert bound is **eight hours**, which is the loosest in the table and is taken from this
+project's own published model rather than invented: `internal/metrics`' shared `durationBuckets`
+top out at 28800 seconds, on the stated grounds that "a first full backup of a multi-terabyte
+volume over a throttled S3 link lands in the last". Past that, a run is off the top of the scale
+we designed for. It will occasionally fire on a genuine multi-terabyte first full. That is the
+direction to err in, and the alternative — a bound above every conceivable legitimate run — is a
+bound above the thirty-six hours this closes.
+
+**What none of it catches**, stated because the gap is real: a mover Job that has *vanished*
+still requeues forever. Every deadline here is measured against a clock belonging to the object
+being waited on, and when the Job is absent there is no such clock. The candidates were the
+Backup's own `creationTimestamp`, which says nothing about one volume, and a phase-entry
+timestamp on `VolumeStatus`, which is a CRD field and a bigger change than this. The alert is
+what covers it — that is part of why the series is state-derived.
+
+### The chart made the documented install order impossible
+
+The documentation provisions the cluster KEK Secret into `crystal-backup-system` **before**
+`helm install` runs, and it has to: the KEK is generated and escrowed out of band, and this chart
+never creates a Secret. So the namespace exists by then, and a chart that renders a Namespace
+object is asking Helm to adopt it:
+
+```
+Namespace "crystal-backup-system" ... exists and cannot be imported into the current release:
+invalid ownership metadata; label validation error: missing key "app.kubernetes.io/managed-by"
+```
+
+Every first-time installer who followed the documented order hit that, on the first command. The
+install did not half-work; it died. Under a GitOps controller the object was worse than an error
+— `install-argocd.md` warned in its own words that "a prune can delete the namespace holding your
+cluster KEK", a hazard that existed *only* because the chart claimed the namespace, and
+`install-flux.md` already devoted a section to telling the reader to turn the default off. When
+the documentation for two of three install paths tells you to disable a default, the default is
+wrong.
+
+**`namespace.create` now defaults to `false`.** `true` remains for the genuinely greenfield case.
+
+That file was also the only thing applying `namespace.podSecurityLabels`, and dropping it without
+replacing the guarantee would have traded a loud failure for a quiet one — `enforce: restricted`
+denies the `runAsUser: 0` + `DAC_OVERRIDE` the data movers need to preserve file ownership on
+restore, and it denies it weeks later, on the first mover Job, as a pod that never starts. So
+`podSecurityLabels` stops meaning "labels the chart stamps" and starts meaning "the posture this
+namespace must have", verified three ways: stamped when the chart creates the namespace, checked
+against the live namespace with `lookup` when it does not, and printed by `NOTES.txt`. A posture
+naming no enforce level, and one naming `restricted`, are refused at template time in every mode.
+
+`lookup` has two blind spots that are not edge cases — it returns nothing under `helm template`,
+which is how Argo CD renders, and nothing under `helm install --create-namespace`, because Helm
+creates the namespace after rendering. Both produce an unlabelled namespace and a silent guard,
+and `operations/dr-runbook.md` still documents a reinstall with `--create-namespace`, which is
+the second-worst moment to find out. So the operator **checks its own namespace once on startup**
+and says so in the log and as an Event on the namespace. It does not refuse to run: exiting on an
+upgrade of a cluster that has been running happily without the labels would turn a latent problem
+into an outage.
+
+### `networkPolicy.apiServerPort: 443` stopped the operator starting
+
+On k3s, RKE2 and kubeadm — most of the world. The `kubernetes` Service listens on 443 and
+kube-proxy DNATs to the API server's Endpoints on 6443 **before** the CNI evaluates egress, so a
+rule naming only 443 never matches the packet that leaves the pod:
+
+```
+Failed to start manager: failed to get server groups:
+Get "https://10.43.0.1:443/api": dial tcp: i/o timeout
+```
+
+It is now `networkPolicy.apiServerPorts`, a list, defaulting to `[443, 6443]` — a deliberate
+superset, because the chart cannot know which one a cluster uses and guessing wrong costs an
+operator that never starts. The cost of one extra outbound TCP port on a rule whose destination
+is already the API server is not comparable.
+
+The crucible knew this before the chart did. `deploy.sh` had carried `--set
+networkPolicy.apiServerPort=6443` with a comment quoting that exact startup error, so the
+workaround had been understood, written down and shipped in this repository for longer than the
+bug had been visible to anyone outside it.
+
+Two adjacent things were fixed in the same pass, both found by reading the rendered object rather
+than the template. `apiServerCIDRs` narrowed only the manifest-mover policy while the operator's
+own egress stayed at `0.0.0.0/0` — an asymmetry the name gave no hint of, and one that made the
+value worth less than it looked; it now narrows both. And the operator's egress listed `port: 443`
+twice, once from `apiServerPort` and once hardcoded for the storage probes, with nothing to tell a
+reader which was which. The two destinations are now named. Object storage keeps its own
+unnarrowed rule, because an S3 endpoint is not the API server.
+
+### The soak was in none of the six install pages
+
+The headline feature of 0.6.2, and there was no path to it by following the documentation. It is
+now on all six (`install`, `install-argocd`, `install-flux`, English and French), along with the
+three settings the crucible sets: "observability is opt-in, and off means no alerts". That
+sentence is load-bearing for the crucible too — if it ever leaves the install pages, those three
+`--set`s become silent adjustments again and have to come out.
+
+`test/chart/install_test.go` is new and holds the default render itself: what a first-time
+installer actually gets, which until this release nothing in this repository had ever looked at.
+
+### Nothing could say where a mover may run
+
+Diagnosing the RBD failure above settled the fact with a control: the same pod, the same PVC, two
+nodes. On a 5.15 kernel it mounted the clone and read the file; on 5.4 it stayed in
+`ContainerCreating` with `rbd: map failed: (22)`. Mapping an RBD *clone* — which is what restoring
+from a CSI snapshot is — needs the clone-child feature bit, and eight of that cluster's nine nodes
+did not have it.
+
+Then the second finding, which is ours. **The operator had no way to act on that.** The chart's
+`nodeSelector`, `tolerations` and `affinity` are the operator pod's and have never touched a mover;
+`mover.JobRequest` carried `NodeName` alone, set by the same-node restore path and nothing else.
+The only advice available was "upgrade every kernel first". It is correct advice and it is not
+something an administrator can do this afternoon, which makes it the wrong thing for a backup tool
+to require before it will work.
+
+**`mover.placement`** takes `nodeSelector`, `tolerations` and `affinity`, and applies them to
+**every** mover Job — per-PVC backup and restore, manifest capture, discovery, retention, prune,
+check, unlock, external sync. Every one, not most: "backup pods run on the backup nodes" is a
+sentence you can check with one `kubectl get pods -o wide`, and a rule with exceptions is one you
+meet for the first time while debugging. It is admin-only, with no per-namespace and no
+per-schedule override, because which nodes the platform's backup pods land on is not a tenant's
+decision — the same line adr/0019 draws about credentials, drawn again about scheduling. Empty is
+the default and produces a Job byte-identical to every release before this one.
+
+Three things about it are worth knowing before you set it:
+
+- **`nodeSelector` is hard and has no soft form.** On a cluster where few nodes match it does not
+  make movers *prefer* those nodes; it serialises every backup in the cluster through them, and
+  turns their absence into a cluster with no backups at all. When a preference is what you mean,
+  `affinity.nodeAffinity`'s `preferredDuringSchedulingIgnoredDuringExecution` degrades the way you
+  want: the capable nodes when they have room, elsewhere rather than nowhere when they do not.
+- **The same-node restore drops it, on purpose.** A restore into an existing RWO volume pins its
+  mover to the node the volume is attached to, because it can only be mounted there. On that Job
+  the selector and the affinity are removed and only the tolerations survive. This is not leniency:
+  the kubelet re-checks nodeSelector and node affinity on admission even for a pod it never
+  scheduled, so keeping them would not place the pod anywhere better — it would get it rejected
+  outright, on the one operation with no second choice of node. Dropping them makes the failure be
+  the real one, the CSI driver's, rather than a scheduling error about a pod that was never
+  scheduled. Tolerations stay because a `NoExecute` taint is enforced against running pods however
+  they were placed, and would evict a restore mid-copy.
+- **A placement the operator cannot make sense of stops it at startup** — an unknown field, an
+  invalid label key, a toleration the API server would refuse, an affinity term matching no node.
+  The alternative is the failure mode this whole release is about: a value visible in
+  `helm get values` that never reached a pod. Here that value is "which nodes can mount the
+  volume", so the pod it never reaches is a backup that does not exist.
+
+Guarded at four levels, because a knob wired to nothing is this project's recurring defect and this
+one is invisible when it fails: unit tests over `BuildJob` for the pod spec and the pinned-Job
+rule, `test/chart/placement_test.go` parsing the rendered ConfigMap **with the operator's own
+loader** rather than grepping it, an AST guard requiring the field at all ten `JobRequest` sites
+with no exemption list, and a crucible spec that labels one node, writes the placement into the
+ConfigMap the operator mounts, restarts it, and reads the answer off the pods the cluster created.
+
+### Also
+
+- **An upgraded soak reported one flat version and mixed two systems into one measurement.**
+  `CollectorInfo.OperatorVersion` was rewritten in full on every collector start, so an archive
+  reported whichever build started last, while `highwater/marks.json` persisted across restarts —
+  a fortnight of six days on one build and eight on another came out as one system, with §5's
+  mover-memory table silently averaging two. The gap between sessions was recorded; that the
+  measured system changed at that gap was recorded nowhere. The version now rides on the Session,
+  and consecutive same-version sessions collapse into spans — consecutive only, so a
+  `0.6.2 → 0.6.3 → 0.6.2` rollback yields three spans rather than erasing the rollback while
+  leaving its gap in place. §5 carries the disclosure above the first number, and a pod that
+  started inside a gap is `unattributed` rather than filed under the neighbouring build.
+  `crystalbackup_build_info` was already being scraped every minute and read by nothing; when it
+  and the sessions disagree both are reported and neither wins, because the disagreement is the
+  finding. Archives written before this field read `unknown`.
+- **Delta 9's API side: the snapshotter-Secret pre-check.** Resolving the VolumeSnapshotClass
+  already existed; what is new is checking the snapshotter Secret its parameters name. Missing →
+  the volume fails with `SnapshotPrecheckFailed` and the Secret named in the Event, rather than a
+  snapshot request that goes nowhere. Fail, not gate: a per-volume failure rolls up to
+  `PartiallyCompleted`, which is visible and alertable, where a gate waits for a human who is not
+  watching. When the Secret reference is CSI-templated (`${volumesnapshotcontent.name}`) it is not
+  statically knowable and the verdict is `NOT_CHECKABLE` with the reason — never "pass", never
+  "fail". The pre-check runs strictly *before* Expose, and that ordering is asserted rather than
+  assumed: a refusal that exposed first would leave a VolumeSnapshot behind.
+  **Neither half catches the shape that user hit**, and that is worth saying plainly, because the
+  four namespaces they had sitting in `Snapshotting` were exactly it. Both fields the 15-minute
+  progress deadline reads come from the cluster-wide snapshot-controller, which binds a
+  VolumeSnapshotContent within seconds of any request it can see — so it reports "acknowledged"
+  long before the storage system has done any work. A dead per-driver sidecar leaves precisely
+  that: content bound, `readyToUse` never, indistinguishable from a driver taking its time. The
+  pre-check is silent on it too, because the Secret existed. What ends that hang is
+  `snapshotReadyDeadline` above, at two hours — and it ends it without diagnosing it. Diagnosing
+  it means picking a maximum legitimate snapshot duration on storage we do not own, which is a
+  guess, and it is not attempted.
+- **Delta 9's other two parts are deliberately not implemented.** Trash monitoring and VSC ↔ RBD
+  reconciliation both need `rbd trash ls` / `rbd snap ls`, and adr/0003 accepts as a consequence
+  of its whole design that there are "no Ceph credentials anywhere in the backup system"; its own
+  risk table already assigns that ground to a platform alert. Recorded in the roadmap as a
+  decision, not carried as a gap, and the reasoning is written into `precheck.go` rather than left
+  in a commit message.
+- **Delta 13: `spec.s3.connections` reaches restic as `-o s3.connections=N`.** This operator had
+  no `-o` plumbing at all before; the seam is new and the field rides it. The field is a pointer
+  and the `Maximum` is the load-bearing half — `BackupLocation` is tenant-writable and every
+  namespace of a cluster points at one shared gateway (adr/0009), so an unbounded `connections` is
+  a tenant-authored denial of service against every *other* tenant's backups. `nil` emits no flag,
+  so restic's own default stays free to change across an engine bump rather than being frozen by
+  this CRD at whatever 5 meant in 0.19.1. Measured against the pinned
+  restic 0.19.1 rather than assumed: restic errors only on an unknown key inside a namespace it
+  applies, so the s3-scheme guard in `BuildJob` is tidiness and the test says exactly that instead
+  of claiming a correctness role it does not have. `ForcePathStyle` is resolved rather than left
+  ambiguous, and the answer is that it must **not** be forwarded — minio-go's `auto` bucket lookup
+  already resolves to path style for every non-AWS endpoint, so forwarding it would change only
+  the one case where it would be wrong. The point of the lot is the guard: thirteen `JobRequest`
+  sites now set the field, one exemption is argued in a map rather than skipped by a boolean, and
+  deleting the field from a single site fails an AST test by name. `JobRequest.GoMemLimit` existed,
+  was consumed, was covered by tests and was assigned by no caller from M1 until 0.6.1; this is
+  what stops the next one.
+- **`preflight.sh` would have reported that user's cluster READY.** A VolumeSnapshotClass whose
+  driver matches a StorageClass proves snapshot *availability*. It does not prove *usability* —
+  that a volume restored from that snapshot can be mounted and read on those nodes — and their
+  cluster answered yes to the first and no to the second. Preflight (now `2.0.0`, schema
+  `crystalbackup.preflight/v2`) reports every resolvable class as **USABILITY NOT ASSESSED**,
+  counted as a reservation and never as a pass; there is no code path that turns it into one.
+  The companion `website/public/snapshot-probe.sh` answers it by creating a PVC, writing a known
+  pattern, snapshotting, restoring and mounting the result read-only — per StorageClass, using the
+  same VolumeSnapshotClass tie-break and the same access mode the exposer would use, which is why
+  its selection block is spliced from the same generator. It says in its own header exactly which
+  objects it creates, it never touches an object it did not create, and **on any outcome that is
+  not FEASIBLE it deletes nothing**: the objects are the evidence, and that evidence took an
+  administrator thirty-six hours to obtain the hard way. It is checksummed and cosign-signed
+  alongside `preflight.sh`.
+- **`make check-translations` had been red on `main` since 0.6.2 and nobody noticed** — eleven
+  translated pages stale against their English sources, drifted in by that release's own site
+  pass. The gate exists, works, and self-tests; it just runs only in CI, not in the local gates,
+  so four days of local runs said nothing. The eleven are current again, and the target has been
+  added to the delivery runbook's §1 local gates, where the cheap checks run before the expensive
+  ones — a gate that exists only in CI was never in §1 at all.
+- **A silenced build step shipped the previous release's binary as this one.** Preparing this
+  release, `melange build` was run with its output redirected to keep the transcript readable. It
+  decided the package was up to date, skipped the rebuild, reused a three-day-old `.apk`, and
+  exited 0; apko then published an image whose digest was byte-identical to 0.6.2's. Nothing
+  failed. The next step would have been a two-hour crucible campaign against the *previous*
+  release's operator, reported as validation of this one. Three rules are now written into
+  `build/README.md`: never silence a step whose staleness is invisible in its exit code, check the
+  `.apk` mtime before pushing, and treat an unchanged digest after a code change as an alert rather
+  than a convenience. It is the same defect class as `check-alert-rules` opening with
+  `command -v promtool || exit 0` for five milestones — a step that declines to do the work and
+  reports success.
+- **The new `m6/stall` spec was reverting its own fault injection.** It parks the RBD node plugin
+  DaemonSet, and it timed out after 300s waiting for the pods to go away — which reads like a slow
+  cluster and invites a bigger timeout. It was not slow. rook ≥ 1.17 hands the CSI driver plane to
+  a ceph-csi-operator that owns that DaemonSet: six `SuccessfulDelete` and six `SuccessfulCreate`
+  events carry the same timestamp, with "node plugin daemonset updated successfully" in the
+  reconciler's log between them. The park lasted a fraction of a second, and no timeout would ever
+  have worked, because **a reconciler is not a race you can wait out**. The spec now stops the
+  reconciler before touching the object — the pattern `m6_precheck_test.go` already used on
+  `rook-ceph-operator` — and restores it after the unpark, in that order. Setting the Driver CR's
+  own nodePlugin affinity instead was rejected: rook rewrites that CR on every CephCluster
+  reconcile, so a reconcile inside the spec's 45-minute window would have un-injected the fault
+  silently and made the spec flaky rather than red.
+
 ## 0.6.2 — The instrument, not the measurement (2026-08-03)
 
 This release ships the **soak kit**: everything needed to run M6's two-week soak on a real
