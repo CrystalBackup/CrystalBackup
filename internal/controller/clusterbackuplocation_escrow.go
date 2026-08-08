@@ -38,10 +38,12 @@ import (
 // hiccup degrades bare-cluster DR completeness and never the backups themselves. That is true
 // of a hiccup and false of everything else, and the difference cost a real incident.
 //
-// One escrow state is genuinely advisory and stays so: EscrowWriteFailed, where the in-cluster
-// DEK is known-good and only the bucket copy is behind. Every other False state now blocks the
-// repository and therefore Ready — see reconcileDEKEscrow, which owns the rule and states it as
-// an invariant rather than as a list of cases.
+// TWO escrow states are genuinely advisory and stay so, and both share one property: an
+// in-cluster DEK is present, so nothing can be minted over anything. EscrowWriteFailed (the DEK is
+// known-good, only the bucket copy is behind) and EscrowUnverifiable (the bucket could not be read
+// at all, so the mirror cannot be confirmed either way). Every other False state blocks the
+// repository and therefore Ready — see reconcileDEKEscrow, which owns the rule and states it as an
+// invariant rather than as a list of cases.
 const ConditionDEKEscrowed = "DEKEscrowed"
 
 // EscrowStore is the bucket side of the wrapped-DEK escrow — internal/escrow.Store in
@@ -84,9 +86,24 @@ type EscrowFactory func(s3 cbv1.S3Spec, accessKey, secretKey string) (EscrowStor
 // they leave unanswered is "is there a recoverable key in the bucket?", and the cost of guessing
 // "no" is a forked repository.
 //
-// EscrowWriteFailed is the one False state that still does NOT block, and it is the only one
-// that fits the original advisory argument: the in-cluster DEK is known-good and only the bucket
-// copy is behind, so backups keep working correctly and bare-cluster DR is what degrades.
+// Two False states do NOT block, and both are on the safe side of the invariant for the same
+// reason — an in-cluster DEK is present, so EnsureDEK has nothing to mint:
+//
+//   - EscrowWriteFailed: the DEK is known-good and only the bucket copy is behind. Backups keep
+//     working correctly; bare-cluster DR is what degrades.
+//   - EscrowUnverifiable: the bucket could not be READ, so whether it mirrors the DEK is unknown.
+//     Nothing is written (Put is past that return), so a bucket this pass could not read cannot be
+//     overwritten by it.
+//
+// EscrowUnverifiable is deliberately a different reason from the no-DEK branch's
+// EscrowUnreachable even though it is the same underlying I/O failure, because the two verdicts
+// are opposite and one name for both would be this release's own defect repeated. It also had to
+// be learned twice: the first cut of 0.6.4 blocked here too, arguing the bucket might hold another
+// generation's key. That is about conflict DETECTION, not minting, and over-blocking does not err
+// safe — it just moves the outage. The crucible found it (m6/alerts drives a backup to fail by
+// replacing the location's S3 credentials with garbage; the Fetch then fails, the location went
+// Degraded, and the run started failing early enough to take the failure counter the alert reads
+// with it) after a unit test in this package had blessed it.
 //
 // Directionality is the whole point (03-security §4):
 //   - Secret exists → assert the bucket mirrors it. A bucket object with DIFFERENT bytes is
@@ -128,12 +145,12 @@ func (r *ClusterBackupLocationReconciler) reconcileDEKEscrow(ctx context.Context
 	// The KEK wrapper: needed to validate a recovered blob, and by the DEK manager either way.
 	identity, err := r.Secrets.GetValue(ctx, r.OperatorNamespace, loc.Spec.Encryption.ClusterKEKSecretRef.Name, kekIdentityDataKey)
 	if err != nil {
-		setCond(metav1.ConditionFalse, "KEKUnavailable", "cannot read the cluster KEK for the escrow")
+		setCond(metav1.ConditionFalse, reasonKEKUnavailable, "cannot read the cluster KEK for the escrow")
 		return true
 	}
 	wrapper, err := keys.NewAgeWrapper(string(identity))
 	if err != nil {
-		setCond(metav1.ConditionFalse, "KEKInvalid", "cannot parse the cluster KEK for the escrow")
+		setCond(metav1.ConditionFalse, reasonKEKInvalid, "cannot parse the cluster KEK for the escrow")
 		return true
 	}
 	dm := keys.NewDEKManager(r.Client, wrapper, r.OperatorNamespace)
@@ -148,8 +165,33 @@ func (r *ClusterBackupLocationReconciler) reconcileDEKEscrow(ctx context.Context
 	if haveSecret {
 		escrowed, found, err := store.Fetch(ctx, prefix, clusterID)
 		if err != nil {
-			setCond(metav1.ConditionFalse, "EscrowUnreachable", clampMessage(err.Error()))
-			return true
+			// Does NOT block, and the reason is the invariant rather than a judgement call: an
+			// in-cluster DEK exists, so EnsureDEK has nothing to mint and there is nothing to fork
+			// away from. Nothing is written either — Put is below this return — so an unreadable
+			// bucket cannot be overwritten by a pass that could not read it.
+			//
+			// This line blocked in the first cut of 0.6.4, on the argument that "the bucket may
+			// hold a different generation's key". That is a statement about CONFLICT DETECTION,
+			// not about minting, and it does not license a block: the worst case is movers running
+			// with a local DEK the bucket disagrees with, which surfaces as restic refusing the
+			// password — visible, and destructive of nothing.
+			//
+			// The crucible caught it and a unit test had blessed it. m6/alerts replaces a
+			// location's S3 credentials with garbage to make a backup fail on purpose; the Fetch
+			// then fails, the location went Degraded, and the backup began failing for the wrong
+			// reason — early, before the mover ran — which took the failure counter the alert
+			// reads with it. Over-blocking is not a safe direction to err in; it just moves the
+			// outage.
+			// A DIFFERENT reason from the no-DEK branch's EscrowUnreachable, because these are
+			// different situations with opposite verdicts and one name for both would be the
+			// defect this release is fixing three lines further down. Here: "I could not confirm
+			// the bucket mirrors your key, and you are fine." There: "I could not look, and a
+			// recoverable key may be sitting in there, so I refuse to proceed."
+			setCond(metav1.ConditionFalse, "EscrowUnverifiable",
+				"cannot read the bucket escrow to confirm it mirrors the in-cluster DEK, which is "+
+					"present and in use; backups are unaffected and bare-cluster DR cannot be "+
+					"verified until this clears: "+clampMessage(err.Error()))
+			return false
 		}
 		if found && !bytes.Equal(escrowed, wrapped) {
 			// The bucket disagrees with the cluster. Overwriting is allowed ONLY when the

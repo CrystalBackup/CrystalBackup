@@ -242,9 +242,13 @@ func TestEscrowOutcomes(t *testing.T) {
 		},
 		"bucket unreachable, local DEK present": {
 			opts:       escrowOpts{localDEK: goodDEK, store: &escrowStub{fetchErr: errors.New("timeout")}},
-			wantReason: "EscrowUnreachable", wantBlock: true,
-			why: "changed in 0.6.4: a local DEK does not make an unreadable bucket safe to ignore, " +
-				"because the bucket may hold a different generation's key",
+			wantReason: "EscrowUnverifiable", wantBlock: false,
+			why: "an in-cluster DEK exists, so EnsureDEK has nothing to mint and nothing can fork. " +
+				"This row said `true` in the first cut of 0.6.4, with a justification about the " +
+				"bucket possibly holding another generation's key — which is about conflict " +
+				"DETECTION and does not license a block. The crucible caught it (m6/alerts went " +
+				"red) after this very test had blessed it, which is why the invariant test below " +
+				"matters more than this table.",
 		},
 		"genuinely fresh location": {
 			opts:       escrowOpts{store: &escrowStub{fetchFound: false}},
@@ -318,6 +322,10 @@ func TestNoEscrowStateLetsAMintThroughUnlessItIsProvablySafe(t *testing.T) {
 		"AwaitingFirstDEK": "provably no DEK in the cluster AND none in the bucket; minting is correct",
 		"EscrowWriteFailed": "the in-cluster DEK is known-good and unchanged; only the bucket copy is " +
 			"behind, which degrades bare-cluster DR and not the backups",
+		"EscrowUnverifiable": "the bucket could not be read, but an in-cluster DEK is present: " +
+			"EnsureDEK has nothing to mint, and Put is never reached, so a bucket this pass could " +
+			"not read cannot be overwritten by it. Distinct from EscrowUnreachable, which is the " +
+			"same failure with NO local DEK and therefore blocks",
 	}
 
 	kekID, wrapper := newKEK(t)

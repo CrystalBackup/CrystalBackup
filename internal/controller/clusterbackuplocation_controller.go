@@ -109,6 +109,18 @@ const (
 	// (see internal/keys package doc for the DEK/KEK envelope this feeds).
 	kekIdentityDataKey = "identity"
 
+	// reasonKEKUnavailable and reasonKEKInvalid are the two ways the cluster KEK can stop a
+	// reconcile, and they are constants because FOUR controllers report them — the location, its
+	// escrow, the repository and the backup — and a reader correlating a Backup's failure with
+	// its location's condition is matching these strings by eye. A typo in one of them would not
+	// break anything and would silently break that correlation, which is the only way anybody
+	// diagnoses a KEK problem across two objects.
+	//
+	// They earned their extraction the ordinary way: 0.6.4's escrow gate added the third
+	// occurrence of each and goconst said so.
+	reasonKEKUnavailable = "KEKUnavailable"
+	reasonKEKInvalid     = "KEKInvalid"
+
 	// shortRequeueInterval paces retries for a location stuck on a fixable configuration
 	// fault (a missing/invalid KEK, an unreachable endpoint): frequent enough that a fix
 	// lands quickly, sparse enough not to hammer the API server or the S3 endpoint.
@@ -499,7 +511,7 @@ func (r *ClusterBackupLocationReconciler) validateEncryption(ctx context.Context
 	if _, err := keys.NewAgeWrapper(string(identity)); err != nil {
 		// keys.NewAgeWrapper's error never echoes the identity itself (see that package's
 		// doc), so it is safe to fold verbatim into a status message.
-		status.SetCondition(&loc.Status.Conditions, ConditionEncryptionValid, metav1.ConditionFalse, "KEKInvalid",
+		status.SetCondition(&loc.Status.Conditions, ConditionEncryptionValid, metav1.ConditionFalse, reasonKEKInvalid,
 			fmt.Sprintf("parse cluster KEK secret %s/%s: %v", r.OperatorNamespace, kekName, err), loc.Generation)
 		return false
 	}

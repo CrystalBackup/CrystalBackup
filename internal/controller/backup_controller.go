@@ -1083,11 +1083,11 @@ func resolvePlatformDEKCommon(ctx context.Context, c client.Client, secretsReade
 
 	identity, err := secretsReader.GetValue(ctx, operatorNamespace, kekName, kekIdentityDataKey)
 	if err != nil {
-		return "", "KEKUnavailable", fmt.Sprintf("read cluster KEK secret %s/%s: %v", operatorNamespace, kekName, err), false
+		return "", reasonKEKUnavailable, fmt.Sprintf("read cluster KEK secret %s/%s: %v", operatorNamespace, kekName, err), false
 	}
 	wrapper, err := keys.NewAgeWrapper(string(identity))
 	if err != nil {
-		return "", "KEKInvalid", fmt.Sprintf("parse cluster KEK secret %s/%s: %v", operatorNamespace, kekName, err), false
+		return "", reasonKEKInvalid, fmt.Sprintf("parse cluster KEK secret %s/%s: %v", operatorNamespace, kekName, err), false
 	}
 	d, err := keys.NewDEKManager(c, wrapper, operatorNamespace).EnsureDEK(ctx, loc.Name)
 	if err != nil {

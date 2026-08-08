@@ -4,6 +4,160 @@ All notable changes to Crystal Backup. Versioning follows
 [adr/0014](spec/adr/0014-versioning-and-release.md): milestone `Mn` → minor `0.n.z` on
 major 0; `1.0.0` is a deliberate post-M9 API-stability decision.
 
+## 0.6.4 — The operator minted a key over the one that could open the repository (2026-08-07)
+
+<!-- VALIDATION PLACEHOLDER — the 0.6.4 crucible campaign has NOT run. Replace with the check
+     count, failures, skips, wall clock, cluster, and the report link, in the shape 0.6.3 uses. -->
+
+**0.6.3 shipped in the evening and this was found before midnight, on the same cluster, by the
+same person.** It is a patch release with one defect at its centre, and that defect could destroy
+the only key to a repository.
+
+The setup was mundane. An administrator lost the operator's namespace to an Argo CD prune — the
+hazard 0.6.3's own install page warns about, made live by 0.6.3 itself, which stopped rendering the
+`Namespace` object so a prune saw it as no longer wanted. They rebuilt the namespace and restored
+the cluster KEK from escrow. The S3 credentials came two minutes later.
+
+In those two minutes the operator started, found a `ClusterBackupLocation` that had survived
+because it is cluster-scoped, and began reconciling it. It could not read the S3 credentials, so it
+could not read the bucket escrow, so it did not know whether a recoverable DEK existed. It
+provisioned the repository anyway. `EnsureDEK` minted a fresh DEK **four seconds after the KEK
+landed**, and for the next hour the location reported `Ready: True` while every mover failed:
+
+```
+Fatal: wrong password or no key found
+```
+
+against a repository holding 38 snapshots.
+
+**The escrow's conflict guard is the only reason this is a patch note and not a post-mortem.** When
+the credentials arrived, the operator compared the bucket object with its new DEK, found they
+disagreed, and refused to overwrite:
+
+```
+bucket escrow and in-cluster DEK disagree … refusing to overwrite the escrow object
+```
+
+The original key was still there, 244 bytes, dated three days earlier. The repository came back.
+
+### The rule was right and it had been inverted in seven places
+
+`reconcileDEKEscrow`'s doc comment already said what must not happen — *"EnsureDEK would mint a
+fresh DEK over a recoverable one"* — and the caller already turned its return value into
+`Ready: False` and a `Degraded` phase. Nothing was missing. The function simply returned "do not
+block" from every branch that failed **before it could ask the question**: no credentials, no KEK,
+an unparseable KEK, an S3 client that would not build, a DEK Secret that would not read, and an
+unreachable bucket. Six ways to be uncertain, all of them treated as certainty.
+
+So the list of cases is gone and an invariant replaces it: **provisioning is allowed only where
+this function has positively established that it is safe.** Two states qualify — an in-cluster DEK
+already exists, so there is nothing to mint; or there is provably no DEK anywhere, so minting is
+what should happen. Everything else blocks.
+
+`EscrowWriteFailed` is the one `False` state that still does not block, and it is the only one the
+old "advisory by design" argument ever fit: the in-cluster DEK is known-good, backups keep working
+correctly, and what degrades is bare-cluster DR.
+
+`EscrowConflict` blocks now too. A location in conflict was handing a wrong key to every mover
+while reporting `Ready`.
+
+**And the first cut of this fix over-applied its own rule, which the crucible caught and a unit
+test in this very package had blessed.** `EscrowUnreachable` was made to block in both branches —
+including the one where an in-cluster DEK is already present. That contradicts the invariant
+directly: a DEK that exists is one of the two states where minting cannot happen. The justification
+written into the test row was that "the bucket may hold a different generation's key", which is a
+statement about conflict *detection* and licenses nothing about minting.
+
+`m6/alerts` failed on it. That lane drives a backup to fail on purpose by replacing a location's S3
+credentials with garbage; the credentials Secret still reads, so the failure surfaces at `Fetch`,
+the location went `Degraded`, and the run then started failing **early — before the mover ran**,
+which took `crystalbackup_backup_failures_total` with it. An alert about failing backups stopped
+being able to see a failing backup.
+
+So: **over-blocking is not erring on the safe side. It moves the outage**, and here it moved it
+somewhere no rule was watching — the same shape as the thirty-six-hour stall 0.6.3 closed.
+
+Fixing it needed a second correction. Returning "do not block" from that branch left one reason,
+`EscrowUnreachable`, carrying two opposite verdicts — this release's own defect, reproduced three
+lines from where it was being fixed. The two states now have their own names because they say
+different things to the administrator: **`EscrowUnverifiable`** (the bucket could not be read, an
+in-cluster DEK is present, and you are fine) does not block; **`EscrowUnreachable`** (the bucket
+could not be read and there is no local DEK, so a recoverable key may be sitting in there) does.
+
+### One message for three emergencies
+
+The conflict branch tested `bucketErr != nil || clusterErr != nil || !bytes.Equal(…)` and emitted a
+single sentence for all three: *"the bucket copy does not decrypt to the same key"*. That asserts a
+comparison which, in two of the three cases, never happened. It sent the person diagnosing this —
+with the file open — looking for a key mismatch when the truth was a fresh mint.
+
+Three reasons now, because they are three different emergencies with three different remedies:
+`EscrowUnreadableUnderKEK` (the bucket object does not open under this cluster's KEK — the KEK
+itself is in question, and nothing can read that repository generation), `ClusterDEKUnreadableUnderKEK`
+(the local Secret is the foreign one; the bucket is the survivor), and `EscrowConflict` (both open,
+different keys — two repository generations, and the bucket may hold the only key to the older).
+
+### The escrow had no tests at all
+
+Not one, on the code with the worst failure mode in the product: everything else can lose a backup
+run, and this can lose the ability to read a repository.
+
+There are now fourteen cases pinning both halves of every outcome — the reason an administrator
+reads **and** whether the repository may be provisioned — because the incident was a correct reason
+beside a wrong decision. And above them, the guard that will outlive them: it enumerates inputs,
+reads whichever reason each one reaches, and fails on any reason outside a four-entry allow-list
+where each entry argues why minting cannot fork the repository. A `return false` copy-pasted into a
+branch added in two years fails there without anybody having written a case for it.
+
+### Also
+
+- **`report` no longer needs `--from`.** Asked for it by the administrator mid-incident, and the
+  reason is exactly that: getting a readable picture of the install meant running `selfcheck`,
+  capturing 17 KB of JSON and parsing it by hand. `report` already knew how to format that document
+  and `selfcheck` already knew how to produce it, in the same binary with the same RBAC — so
+  without `--from` it now collects the self-check itself and formats the current instant. One
+  collection path serves both subcommands; there is no second collector to drift.
+  With `--from` it still needs no cluster at all, which is what lets you attach the JSON to an
+  issue and have a maintainer regenerate the page. In that mode the collection flags are now
+  **refused rather than ignored**: `report --from x.json --full` used to be silently accepted and
+  would print a fully redacted page to somebody who had just asked for verbatim identifiers.
+- **The self-check verdict no longer reads `healthy` beside a non-zero leak residual.** During the
+  incident it said *"No rule breached among the 12 evaluated"* while `leakIndicators` counted seven
+  residual VolumeSnapshots, the oldest 65 hours. True in its own terms, and not an answer to the
+  question the reader is asking. The rule tally is untouched; the framing is not.
+- **An uninstall page with the order and a table of what each deletion removes.** The order is not
+  cosmetic: five finalizers across six kinds mean the operator must still be running when those
+  objects are deleted, or they hang in `Terminating` with nobody to release them. The table answers
+  the question asked verbatim during the incident — *does deleting a `Backup` delete the CSI
+  snapshot and the restic snapshot?* Yes to its own transient exposure snapshot (teardown restores
+  the content's `deletionPolicy` to `Delete` so the storage is reclaimed rather than leaked), never
+  to one you made yourself, and **no** to the repository. Only a confirmed `ClusterErasure` removes
+  repository data. Nothing in an uninstall deletes your backups, and that is the first fact a
+  frightened administrator needs.
+- **The DR runbook covers partial loss of the operator namespace.** More dangerous than total loss,
+  and for a reason worth stating: on total loss the location does not exist yet, so the operator
+  never reconciles one without credentials. On partial loss it survived, so the ordering trap above
+  is not a possibility but a certainty. Restore both Secrets before the operator starts.
+- **Upgrading 0.6.2 → 0.6.3 under Argo CD is now warned about where an upgrader meets it.**
+  `install-argocd.md` had the warning in general terms; `upgrading.md` said nothing, and 0.6.3 is
+  the release that turned it from theory into a live trap.
+- **Adopting the escrowed DEK by hand is documented**, reconstructed from the code during the
+  incident and written nowhere: the object key, the one-command KEK test with `age -d`, the Secret
+  name and data key, and the reason the operator must be scaled to zero first — otherwise
+  `EnsureDEK` re-mints before the escrow pass can adopt, which is a race the administrator loses.
+
+### Two things this release does NOT claim
+
+**It does not make the escrow bulletproof.** It makes the operator refuse to act while it does not
+know. An administrator who restores the wrong KEK still has an unreadable repository, and 0.6.4's
+contribution there is that it now says so in a reason of its own instead of a sentence about a
+comparison it never made.
+
+**And the incident's real first cause is not in this release at all.** The namespace was deleted by
+a prune, and nothing in the chart stops that. The warning is documentation; a chart-side guard —
+an annotation that makes Argo CD refuse to prune the namespace it must not touch — is a change to
+how the chart is installed, and it is not something to design at midnight in a patch release.
+
 ## 0.6.3 — The first hour on somebody else's cluster (2026-08-07)
 
 **Four defects blocked one user's first hour with 0.6.2** on their own RKE2 + Rook-Ceph cluster.

@@ -372,11 +372,11 @@ func resolvePlatformDEK(ctx context.Context, c client.Client, secretsReader *sec
 
 	identity, err := secretsReader.GetValue(ctx, operatorNamespace, kekName, kekIdentityDataKey)
 	if err != nil {
-		return "", "KEKUnavailable", fmt.Errorf("read cluster KEK secret %s/%s: %w", operatorNamespace, kekName, err)
+		return "", reasonKEKUnavailable, fmt.Errorf("read cluster KEK secret %s/%s: %w", operatorNamespace, kekName, err)
 	}
 	wrapper, err := keys.NewAgeWrapper(string(identity))
 	if err != nil {
-		return "", "KEKInvalid", fmt.Errorf("parse cluster KEK secret %s/%s: %w", operatorNamespace, kekName, err)
+		return "", reasonKEKInvalid, fmt.Errorf("parse cluster KEK secret %s/%s: %w", operatorNamespace, kekName, err)
 	}
 	dek, err = keys.NewDEKManager(c, wrapper, operatorNamespace).EnsureDEK(ctx, cbl.Name)
 	if err != nil {
