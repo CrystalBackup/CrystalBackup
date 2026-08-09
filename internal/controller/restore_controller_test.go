@@ -424,7 +424,16 @@ var _ = Describe("Restore controller", func() {
 			GinkgoHelper()
 			Eventually(func(g Gomega) {
 				var job batchv1.Job
-				g.Expect(k8sClient.Get(ctx, client.ObjectKey{Namespace: suiteOperatorNamespace, Name: jobName}, &job)).To(Succeed())
+				err := k8sClient.Get(ctx, client.ObjectKey{Namespace: suiteOperatorNamespace, Name: jobName}, &job)
+				if apierrors.IsNotFound(err) {
+					// The volume settled on its mover RESULT (which is all the controller needs) and the
+					// restore has already gone terminal and reclaimed the Job. Stamping Complete on it was
+					// only ever about freeing a concurrency slot in the live-Job census, and a Job that no
+					// longer exists frees it just as well. Tolerated rather than awaited: the alternative is
+					// a spec whose last iteration fails on a race with the teardown it is not testing.
+					return
+				}
+				g.Expect(err).To(Succeed())
 				for _, c := range job.Status.Conditions {
 					if c.Type == batchv1.JobComplete && c.Status == corev1.ConditionTrue {
 						return // a prior attempt landed
@@ -459,7 +468,7 @@ var _ = Describe("Restore controller", func() {
 
 		By("starting a held volume as each slot frees, until every volume completes")
 		succeeded := map[string]bool{}
-		for range pvcs {
+		for i := range pvcs {
 			var next string
 			Eventually(func(g Gomega) {
 				next = ""
@@ -476,6 +485,25 @@ var _ = Describe("Restore controller", func() {
 			})
 			markJobComplete(next)
 			succeeded[next] = true
+
+			// After the FIRST volume lands and while five siblings are still moving, the object must
+			// already say so. restoredVolumes used to be written only on the terminal pass, so a restore
+			// like this one read 0 for its whole duration and then 6 — an operator watching it could not
+			// tell it apart from a wedged one. Exactly one volume can be settled here: the others cannot
+			// finish until this loop drives their movers.
+			if i == 0 {
+				By("publishing progress on a non-terminal pass, not only at the end")
+				Eventually(func(g Gomega) {
+					var r cbv1.Restore
+					g.Expect(k8sClient.Get(ctx, client.ObjectKey{Namespace: nsName, Name: "recover-cap"}, &r)).To(Succeed())
+					g.Expect(r.Status.Phase).To(Equal(string(status.RestorePhaseRunning)))
+					g.Expect(r.Status.RestoredVolumes).To(Equal(int32(1)),
+						"the volume that landed must be visible while the restore is still running")
+					g.Expect(r.Status.FailedVolumes).To(BeZero())
+					g.Expect(r.Status.PlannedVolumes).To(Equal(int32(len(pvcs))),
+						"the denominator must be published from the first pass")
+				}, initTimeout, initPoll).Should(Succeed())
+			}
 		}
 
 		Eventually(func(g Gomega) {
@@ -483,6 +511,10 @@ var _ = Describe("Restore controller", func() {
 			g.Expect(k8sClient.Get(ctx, client.ObjectKey{Namespace: nsName, Name: "recover-cap"}, &r)).To(Succeed())
 			g.Expect(r.Status.Phase).To(Equal(string(status.RestorePhaseCompleted)))
 			g.Expect(r.Status.RestoredVolumes).To(Equal(int32(len(pvcs))))
+			// Every planned volume settled, and none of them failed: the three counters have to close
+			// the account on a terminal restore.
+			g.Expect(r.Status.FailedVolumes).To(BeZero())
+			g.Expect(r.Status.PlannedVolumes).To(Equal(int32(len(pvcs))))
 		}, initTimeout, initPoll).Should(Succeed())
 	})
 })

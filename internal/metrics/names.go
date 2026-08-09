@@ -71,13 +71,25 @@ const (
 	NameClusterBackupLastSuccess       = "crystalbackup_clusterbackup_last_success_timestamp_seconds"
 	NameClusterBackupNamespacesMatched = "crystalbackup_clusterbackup_namespaces_matched"
 	NameClusterBackupNamespacesFailed  = "crystalbackup_clusterbackup_namespaces_failed"
+	// NameClusterBackupNamespacesBlocked exists because namespaces_failed alone was a misleading
+	// alerting surface. It counts namespaces the run never backed up at all (an occupied Backup
+	// coordinate, a failed fan-out) — which namespaces_failed used to absorb, reporting them as
+	// failed backups of children that read Completed. Any expression that means "namespaces this
+	// run did not protect" has to sum the two.
+	NameClusterBackupNamespacesBlocked = "crystalbackup_clusterbackup_namespaces_blocked"
 	NameClusterBackupDuration          = "crystalbackup_clusterbackup_duration_seconds"
 	NameClusterBackupRunsTotal         = "crystalbackup_clusterbackup_runs_total"
 
 	// §2.3 Restore, both kinds.
-	NameRestoreLastSuccess   = "crystalbackup_restore_last_success_timestamp_seconds"
-	NameRestoreLastBytes     = "crystalbackup_restore_last_restored_bytes"
-	NameRestoreFailures      = "crystalbackup_restore_failures"
+	NameRestoreLastSuccess = "crystalbackup_restore_last_success_timestamp_seconds"
+	NameRestoreLastBytes   = "crystalbackup_restore_last_restored_bytes"
+	NameRestoreFailures    = "crystalbackup_restore_failures"
+	// NameRestoreVolumesFailed exists because restore_failures counts OBJECTS and nothing counted
+	// VOLUMES. A partially failed restore was one failure whether it lost one volume out of nine or
+	// all nine, and the only place the difference was written down was a condition message and the
+	// mover Jobs — which the controller tears down moments later. "What did not come back" has to be
+	// answerable from the metrics, not only from the object.
+	NameRestoreVolumesFailed = "crystalbackup_restore_volumes_failed"
 	NameRestoreDuration      = "crystalbackup_restore_duration_seconds"
 	NameRestoreFailuresTotal = "crystalbackup_restore_failures_total"
 
@@ -114,6 +126,11 @@ const (
 	// §2.9 Snapshot exposure and coexistence.
 	NameExposureReadyWait     = "crystalbackup_exposure_ready_wait_seconds"
 	NamePVCVolumeSnapshotting = "crystalbackup_pvc_volumesnapshot_count"
+	// NameOrphanReapStuck is the orphan reaper reporting what its DELETE did not achieve. It is in
+	// §2.9 because the objects it counts are overwhelmingly the snapshot pair, and because it is the
+	// only series that says a teardown is blocked rather than merely slow. See reaper.go for the
+	// 31-hour incident that produced it.
+	NameOrphanReapStuck = "crystalbackup_orphan_reap_stuck"
 
 	// §2.12 External backup synchronization.
 	NameExternalSyncLastSuccess = "crystalbackup_externalsync_last_success_timestamp_seconds"

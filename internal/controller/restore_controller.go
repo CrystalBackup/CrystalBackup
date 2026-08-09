@@ -215,11 +215,15 @@ func (r *RestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// terminal here would trip the already-terminal short-circuit at the top of Reconcile, and
 	// the apply in flight would never have its report recorded — leaving a namespace that was
 	// written to and a Restore object that never says what happened to it.
-	if drive.settled < len(plans) || !resourcesDone {
+	if drive.settled() < len(plans) || !resourcesDone {
 		restore.Status.Phase = string(status.RestorePhaseRunning)
+		// Progress, published while it can still be acted on: the counters below move on every pass,
+		// so `kubectl get restore` answers "how far along" during the restore and not only after it.
+		stampVolumeCounts(ctx, r.Recorder, &restore, drive.tally,
+			&restore.Status.PlannedVolumes, &restore.Status.RestoredVolumes, &restore.Status.FailedVolumes)
 		status.SetCondition(&restore.Status.Conditions, ConditionReady, metav1.ConditionFalse, "InProgress",
-			fmt.Sprintf("restoring: %d/%d volumes settled, manifests %s",
-				drive.settled, len(plans), doneWord(resourcesDone)), restore.Generation)
+			fmt.Sprintf("restoring: %d/%d volumes restored, %d failed, manifests %s",
+				drive.tally.Restored, drive.tally.Planned, drive.tally.Failed, doneWord(resourcesDone)), restore.Generation)
 		if err := r.Status().Update(ctx, &restore); err != nil {
 			return ctrl.Result{}, fmt.Errorf("update status for Restore %s/%s: %w", restore.Namespace, restore.Name, err)
 		}
@@ -238,14 +242,15 @@ func (r *RestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// A resource that failed to apply degrades the restore exactly as a failed volume does: the
 	// user asked for a namespace back and part of it is not there. Reporting Completed over a
 	// non-zero failedCount would be the one lie this status must never tell.
-	completed, failed := drive.completed, drive.failedCount
+	completed, failed := drive.completed(), drive.failedCount()
 	if restore.Status.Resources != nil {
 		completed += int(restore.Status.RestoredResources)
 		failed += int(restore.Status.Resources.FailedCount)
 	}
 	phase := status.RollUpRestoreOutcomes(completed, failed)
 	restore.Status.Phase = string(phase)
-	restore.Status.RestoredVolumes = int32(drive.completed)
+	stampVolumeCounts(ctx, r.Recorder, &restore, drive.tally,
+		&restore.Status.PlannedVolumes, &restore.Status.RestoredVolumes, &restore.Status.FailedVolumes)
 	restore.Status.RestoredBytes = drive.restoredBytes
 	setRestoreTerminalCondition(&restore.Status.Conditions, phase, drive.failures, restore.Generation)
 	if err := r.Status().Update(ctx, &restore); err != nil {
@@ -269,7 +274,7 @@ func (r *RestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	r.Engine.forgetResolution(restore.UID, rc.ownerID)
 	if phase == status.RestorePhaseCompleted {
 		r.Recorder.Eventf(&restore, nil, corev1.EventTypeNormal, "RestoreCompleted", "Restore",
-			"restored %d volume(s), %d bytes", drive.completed, drive.restoredBytes)
+			"restored %d volume(s), %d bytes", drive.completed(), drive.restoredBytes)
 	} else {
 		r.Recorder.Eventf(&restore, nil, corev1.EventTypeWarning, "RestoreFailed", "Restore",
 			"restore ended %s: %s", string(phase), clampMessage(joinFailures(drive.failures)))
@@ -778,6 +783,39 @@ func teardownRestoreResidue(ctx context.Context, e *restoreEngine, rc *restoreEx
 			}
 		}
 	}
+}
+
+// stampVolumeCounts publishes one drive pass's volume tally onto a restore's status counters, and
+// checks the invariant while it is there. The three fields exist on both restore kinds, whose status
+// structs are unrelated Go types, hence the pointers.
+//
+// It is called on EVERY pass, non-terminal ones included, and that is half the point. restoredVolumes
+// used to be written only on the terminal pass, so a long restore reported 0 volumes for its whole
+// duration and then the final number — the operator watching a DR could not tell a restore that was
+// working from one that was wedged. The other half is failedVolumes, which did not exist at all: a
+// partially failed restore published what came back and left "what did not" to the condition message
+// and to mover Jobs that are torn down moments later.
+//
+// The counters are all taken from ONE tally, so no future edit can move one without the others.
+func stampVolumeCounts(ctx context.Context, rec events.EventRecorder, obj client.Object,
+	t status.RestoreTally, planned, restored, failed *int32,
+) {
+	*planned = t.Planned
+	*restored = t.Restored
+	*failed = t.Failed
+	// TallyVolumeRestoreOutcomes makes this true by construction — driveVolumes classifies each
+	// planned volume exactly once — so this can only fire if a future edit reintroduces a second
+	// counting site. On that day the operator says so rather than publishing numbers it cannot stand
+	// behind. Cheap enough for every pass; somebody acts on these figures mid-disaster.
+	if t.SumsUp() {
+		return
+	}
+	logf.FromContext(ctx).Error(nil, "restore volume counters do not add up; the published counts are not trustworthy",
+		"restore", obj.GetName(), "namespace", obj.GetNamespace(), "planned", t.Planned,
+		"counted", t.Counted(), "restored", t.Restored, "failed", t.Failed, "inFlight", t.InFlight)
+	rec.Eventf(obj, nil, corev1.EventTypeWarning, "VolumeCountsInconsistent", "Restore",
+		"volume counters do not add up: %d volumes planned, %d counted (restored %d, failed %d, in flight %d)",
+		t.Planned, t.Counted(), t.Restored, t.Failed, t.InFlight)
 }
 
 // setRestoreTerminalCondition records the headline Ready condition of a terminal restore.

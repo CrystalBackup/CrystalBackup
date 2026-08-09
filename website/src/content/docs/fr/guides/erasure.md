@@ -84,8 +84,8 @@ kubectl get clustererasure erase-acme
 ```
 
 ```
-NAME         PHASE                  FORGOTTEN   AGE
-erase-acme   AwaitingConfirmation   0           5s
+NAME         PHASE                  TARGETED   FORGOTTEN   REMAINING   AGE
+erase-acme   AwaitingConfirmation   0          0           0           5s
 ```
 
 Lisez ce qu'il s'apprête à faire. Puis tapez l'identité :
@@ -105,9 +105,9 @@ kubectl get clustererasure erase-acme -w
 ```
 
 ```
-NAME         PHASE       FORGOTTEN   AGE
-erase-acme   Running     0           8s
-erase-acme   Completed   412         6m22s
+NAME         PHASE       TARGETED   FORGOTTEN   REMAINING   AGE
+erase-acme   Running     412        0           412         8s
+erase-acme   Completed   412        412         0           6m22s
 ```
 
 ```bash
@@ -116,6 +116,15 @@ kubectl get clustererasure erase-acme \
 ```
 
 Phases : `Pending`, `AwaitingConfirmation`, `Running`, `Completed`, `Blocked`, `Failed`.
+
+`snapshotsForgotten` est une **attestation, pas une intention**. Ce champ ne compte que ce dont
+la suppression est établie : il vaut donc `0` pendant toute la durée de l'effacement —
+`snapshotsTargeted` étant le périmètre en cours de traitement. Si l'effacement **échoue**,
+l'opérateur relit le dépôt sous le même filtre et publie ce qu'il y trouve : un effacement ayant
+retiré 4 snapshots sur 10 avant d'échouer affiche `snapshotsForgotten: 4` et
+`snapshotsRemaining: 6`, et un effacement dont le résidu n'a même pas pu être listé affiche `0`
+oublié et le périmètre entier restant. Un enregistrement qui sur-déclare une destruction clôt une
+conversation de conformité qui devait continuer : ce champ ne suppose jamais à la hausse.
 
 ## `Blocked`
 

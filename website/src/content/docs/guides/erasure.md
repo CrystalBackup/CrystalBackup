@@ -80,8 +80,8 @@ kubectl get clustererasure erase-acme
 ```
 
 ```
-NAME         PHASE                  FORGOTTEN   AGE
-erase-acme   AwaitingConfirmation   0           5s
+NAME         PHASE                  TARGETED   FORGOTTEN   REMAINING   AGE
+erase-acme   AwaitingConfirmation   0          0           0           5s
 ```
 
 Read what it is about to do. Then type the identity in:
@@ -101,9 +101,9 @@ kubectl get clustererasure erase-acme -w
 ```
 
 ```
-NAME         PHASE       FORGOTTEN   AGE
-erase-acme   Running     0           8s
-erase-acme   Completed   412         6m22s
+NAME         PHASE       TARGETED   FORGOTTEN   REMAINING   AGE
+erase-acme   Running     412        0           412         8s
+erase-acme   Completed   412        412         0           6m22s
 ```
 
 ```bash
@@ -112,6 +112,15 @@ kubectl get clustererasure erase-acme \
 ```
 
 Phases: `Pending`, `AwaitingConfirmation`, `Running`, `Completed`, `Blocked`, `Failed`.
+
+`snapshotsForgotten` is an **attestation, not a plan**. It counts only what the erasure is
+established to have removed, so it reads `0` for as long as the erasure is running —
+`snapshotsTargeted` is the scope it is working through. If the erasure **fails**, the operator
+lists the repository again under the same filter and publishes what it finds: an erasure that
+removed 4 of 10 snapshots before failing reads `snapshotsForgotten: 4` and
+`snapshotsRemaining: 6`, and one whose residue could not even be listed reads `0` forgotten with
+the whole scope remaining. A record that over-claims destruction ends a compliance conversation
+that should have continued, so this field never guesses upward.
 
 ## `Blocked`
 

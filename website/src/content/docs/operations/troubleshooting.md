@@ -138,7 +138,7 @@ missing — admission denies a non-matching value and admits an empty one.
 
 ```bash
 kubectl -n <ns> get restore <name> \
-  -o jsonpath='{.status.phase}{"\t"}{.status.restoredVolumes}{"\t"}{.status.restoredBytes}{"\n"}'
+  -o jsonpath='{.status.phase}{"\t"}{.status.restoredVolumes}{"/"}{.status.plannedVolumes}{"\t"}{.status.failedVolumes}{" failed\t"}{.status.restoredBytes}{"\n"}'
 kubectl -n <ns> get events --field-selector involvedObject.name=<restore-name>
 ```
 

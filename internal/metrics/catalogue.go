@@ -64,13 +64,21 @@ func Catalogue() map[string][]string {
 		NameClusterBackupLastSuccess:       clusterBackupLabels,
 		NameClusterBackupNamespacesMatched: clusterBackupLabels,
 		NameClusterBackupNamespacesFailed:  clusterBackupLabels,
+		// The SAME label set as namespaces_failed, and not by coincidence: an expression that means
+		// "namespaces this run did not protect" adds the two series together, so an instance has to
+		// come out with identical labels whichever term produced it.
+		NameClusterBackupNamespacesBlocked: clusterBackupLabels,
 		NameClusterBackupDuration:          clusterBackupLabels,
 		NameClusterBackupRunsTotal:         withLabel(clusterBackupLabels, resultLabel),
 
 		// §2.3 restore.
-		NameRestoreLastSuccess:   restoreLabels,
-		NameRestoreLastBytes:     restoreLabels,
-		NameRestoreFailures:      restoreLabels,
+		NameRestoreLastSuccess: restoreLabels,
+		NameRestoreLastBytes:   restoreLabels,
+		NameRestoreFailures:    restoreLabels,
+		// The SAME label set as NameRestoreFailures, and not by coincidence: the two describe the same
+		// set of restores, one counted in objects and one in volumes, so an expression that divides or
+		// joins them has to produce instances with identical labels.
+		NameRestoreVolumesFailed: restoreLabels,
 		NameRestoreDuration:      withLabel(restoreLabels, modeLabel),
 		NameRestoreFailuresTotal: withLabel(restoreLabels, modeLabel),
 
@@ -107,6 +115,7 @@ func Catalogue() map[string][]string {
 		// §2.9 snapshot exposure and coexistence.
 		NameExposureReadyWait:     {namespaceLabel, tenantLabel, exposerLabel, clusterLabel},
 		NamePVCVolumeSnapshotting: {namespaceLabel, pvcLabel, clusterLabel},
+		NameOrphanReapStuck:       {kindLabel},
 
 		// §2.12 external backup synchronization.
 		NameExternalSyncLastSuccess: externalSyncLabels,

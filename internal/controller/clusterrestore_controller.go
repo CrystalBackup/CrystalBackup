@@ -200,10 +200,15 @@ func (r *ClusterRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, drive.err
 	}
 
-	if drive.settled < len(plans) {
+	if drive.settled() < len(plans) {
 		cr.Status.Phase = string(status.RestorePhaseRunning)
+		// Progress, published while it can still be acted on: these counters move on every pass, so a
+		// DR in progress answers "how far along, and what has already failed" from the object itself.
+		stampVolumeCounts(ctx, r.Recorder, &cr, drive.tally,
+			&cr.Status.PlannedVolumes, &cr.Status.RestoredVolumes, &cr.Status.FailedVolumes)
 		status.SetCondition(&cr.Status.Conditions, ConditionReady, metav1.ConditionFalse, "InProgress",
-			fmt.Sprintf("restoring: %d/%d volumes settled", drive.settled, len(plans)), cr.Generation)
+			fmt.Sprintf("restoring: %d/%d volumes restored, %d failed",
+				drive.tally.Restored, drive.tally.Planned, drive.tally.Failed), cr.Generation)
 		if err := r.Status().Update(ctx, &cr); err != nil {
 			return ctrl.Result{}, fmt.Errorf("update status for ClusterRestore %s: %w", cr.Name, err)
 		}
@@ -218,14 +223,15 @@ func (r *ClusterRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	// The roll-up is over UNITS OF WORK, and a cluster-scoped resource is one just as a volume is:
 	// fold both halves into both counts or the phase misreports (a restore that applied 40
 	// cluster objects and failed 2, with no volumes, must not read Failed for "nothing succeeded").
-	completed, failed := drive.completed, drive.failedCount
+	completed, failed := drive.completed(), drive.failedCount()
 	if cr.Status.Resources != nil {
 		completed += int(cr.Status.RestoredResources)
 		failed += int(cr.Status.Resources.FailedCount)
 	}
 	phase := status.RollUpRestoreOutcomes(completed, failed)
 	cr.Status.Phase = string(phase)
-	cr.Status.RestoredVolumes = int32(drive.completed)
+	stampVolumeCounts(ctx, r.Recorder, &cr, drive.tally,
+		&cr.Status.PlannedVolumes, &cr.Status.RestoredVolumes, &cr.Status.FailedVolumes)
 	cr.Status.RestoredBytes = drive.restoredBytes
 	setRestoreTerminalCondition(&cr.Status.Conditions, phase, drive.failures, cr.Generation)
 	if err := r.Status().Update(ctx, &cr); err != nil {
@@ -254,7 +260,7 @@ func (r *ClusterRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	r.Engine.forgetResolution(cr.UID, rc.ownerID)
 	if phase == status.RestorePhaseCompleted {
 		r.Recorder.Eventf(&cr, nil, corev1.EventTypeNormal, "RestoreCompleted", "Restore",
-			"restored %d volume(s), %d bytes into namespace %s", drive.completed, drive.restoredBytes, cr.Spec.Target.Namespace)
+			"restored %d volume(s), %d bytes into namespace %s", drive.completed(), drive.restoredBytes, cr.Spec.Target.Namespace)
 	} else {
 		r.Recorder.Eventf(&cr, nil, corev1.EventTypeWarning, "RestoreFailed", "Restore",
 			"restore ended %s: %s", string(phase), clampMessage(joinFailures(drive.failures)))

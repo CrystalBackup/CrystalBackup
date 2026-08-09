@@ -45,6 +45,7 @@ func registeredDescs(t *testing.T) map[string][]string {
 		externalSyncDuration,
 		erasureForgottenTotal, erasureReclaimedTotal,
 		moverJobRetries, webhookDenials, exposureReadyWait,
+		orphanReapStuck,
 	}
 
 	out := map[string][]string{}

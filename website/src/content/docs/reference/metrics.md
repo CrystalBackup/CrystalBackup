@@ -21,21 +21,31 @@ silence. On a backup tool, silence is indistinguishable from health.
 
 ## How to read this page
 
-### Two kinds of series, and only two
+### Three kinds of series, and only three
 
-**Derived at scrape.** Every gauge here is recomputed from live object state each time
+**Derived at scrape.** Almost every gauge here is recomputed from live object state each time
 Prometheus scrapes, through the operator's cached client. The operator holds no counter for
 them, so restarting it changes nothing: the value after a restart is the value before it, because
 both are read from the same objects.
 
-**Event-driven.** The `_total` counters and the histograms are the exception. They are
-incremented once at the transition into a terminal phase, after the status write that makes the
-transition durable, and they **reset to zero when the operator restarts**. Write expressions over
-them with `increase()` or `rate()`, never against the raw value.
+**Event-driven.** The `_total` counters and the histograms are incremented once at the
+transition into a terminal phase, after the status write that makes the transition durable, and they
+**reset to zero when the operator restarts**. Write expressions over them with
+`increase()` or `rate()`, never against the raw value.
+
+**Set by a periodic sweep.** Exactly one gauge is neither:
+`crystalbackup_orphan_reap_stuck` is written by the orphan reaper at the end of each pass,
+because what it reports — leftover objects whose deletion has been requested and has not completed —
+is a judgement the reaper makes and not a field anything can read off an object. It behaves like a
+gauge (it goes back down when the deadlock clears) with one caveat worth knowing before you alert on
+it: **it is only as fresh as the last completed sweep**, which is every 10 minutes, and it reads
+`0` after an operator restart until the first sweep lands. Give any alert on it a
+`for:` longer than one sweep interval.
 
 The split is exact, and the generator enforces it: every `_total` family and every
-histogram is event-driven, and every other family is derived at scrape. If that ever stops being
-true, this page fails to regenerate rather than shipping the wrong rule.
+histogram is event-driven, the sweep-set gauge is declared as such, and every other family is
+derived at scrape. If that ever stops being true, this page fails to regenerate rather than shipping
+the wrong rule.
 
 Histograms expose the usual `_bucket`, `_sum` and `_count` series.
 Their bucket boundaries are printed under each table.
@@ -81,6 +91,7 @@ thing everywhere:
 | `webhook`, `reason` | code-chosen constants | Never request-derived. A reason taken from user input would be an unbounded-cardinality hole. |
 | `exposer` | `csi-generic`, `cephfs-shallow` | The SnapshotExposer kind. Comparing the two is the point of the histogram. |
 | `pvc` | a PVC name | The single per-PVC label in the catalogue. See [Snapshot exposure and coexistence](#snapshot-exposure-and-coexistence). |
+| `kind` | an object kind (`VolumeSnapshot`, `Job`, …) | A code-chosen constant from a fixed list, never read off an object. Every kind in that list is published on every sweep, including at `0`. |
 
 Label *values* are object names and bounded enums. No user-supplied free text becomes a label
 value anywhere in this catalogue.
@@ -127,13 +138,22 @@ Buckets of `crystalbackup_backup_duration_seconds`, in seconds: `60`, `300`, `90
 
 ## Cluster backup runs
 
-Run-level, with no `namespace` label: a ClusterBackup fans out over many namespaces, and its per-namespace detail is in the Backup families above. `namespaces_failed` above zero on a run that otherwise reports success is the signal — the run completed, and some namespace in it did not.
+Run-level, with no `namespace` label: a ClusterBackup fans out over many namespaces, and its per-namespace detail is in the Backup families above. `namespaces_failed` **or** `namespaces_blocked` above zero on a run that otherwise reports success is the signal — the run completed, and some namespace in it did not.
+
+Those two are deliberately separate series, and an expression meaning *"namespaces this run did not protect"* has to add them:
+
+```promql
+crystalbackup_clusterbackup_namespaces_failed + crystalbackup_clusterbackup_namespaces_blocked > 0
+```
+
+`namespaces_failed` counts namespaces whose child Backup **ran and failed**. `namespaces_blocked` counts namespaces the run **never backed up at all**, because the Backup coordinate was already occupied by an object the run did not create or the child could not be created. They were once one field, and merging them is how a run came to report 32 failed namespaces over child objects that read `Completed`: a count of namespaces nobody touched is not a count of backups that failed, and an administrator reading the number could not tell which had happened.
 
 | Series | Type | Labels | Meaning |
 | --- | --- | --- | --- |
 | `crystalbackup_clusterbackup_duration_seconds` | histogram | `schedule` `location` `cluster` | ClusterBackup run duration, from fan-out start until every child Backup is terminal. |
 | `crystalbackup_clusterbackup_last_success_timestamp_seconds` | gauge | `schedule` `location` `cluster` | Unix time of the last Completed ClusterBackup run for this series. |
-| `crystalbackup_clusterbackup_namespaces_failed` | gauge | `schedule` `location` `cluster` | Namespaces with a failed child Backup in the last ClusterBackup run for this series (status.namespacesFailed). |
+| `crystalbackup_clusterbackup_namespaces_blocked` | gauge | `schedule` `location` `cluster` | Namespaces the last ClusterBackup run for this series did NOT back up at all — the Backup coordinate was occupied by an object the run did not create, or the child could not be created (status.namespacesBlocked). |
+| `crystalbackup_clusterbackup_namespaces_failed` | gauge | `schedule` `location` `cluster` | Namespaces whose child Backup ran and failed in the last ClusterBackup run for this series (status.namespacesFailed). Namespaces the run never backed up are counted in crystalbackup_clusterbackup_namespaces_blocked instead; sum the two for namespaces left unprotected. |
 | `crystalbackup_clusterbackup_namespaces_matched` | gauge | `schedule` `location` `cluster` | Namespaces matched by the last ClusterBackup run for this series (status.namespacesMatched). |
 | `crystalbackup_clusterbackup_runs_total` | counter | `schedule` `location` `cluster` `result` | ClusterBackup runs that reached a terminal phase, by result (fleet run success ratio). |
 
@@ -143,6 +163,14 @@ Buckets of `crystalbackup_clusterbackup_duration_seconds`, in seconds: `60`, `30
 
 One family covers Restore and ClusterRestore alike. `mode` appears only on the duration histogram and the failure counter, because Recreate and Overwrite fail for entirely different reasons and a merged count hides which one is broken.
 
+`crystalbackup_restore_failures` counts failed restore OBJECTS and `crystalbackup_restore_volumes_failed` counts the volumes inside them, over the same set of restores — so one restore that lost a single volume out of nine and one that lost all nine stop being the same number. Read them together:
+
+```promql
+crystalbackup_restore_volumes_failed > 0
+```
+
+Both count **volumes only**. A restore whose volumes all landed and whose manifests failed to apply still counts in `restore_failures` and contributes `0` volumes, which is the same split `status.failedVolumes` documents on the object: the two halves of a restore are driven independently and fail for unrelated reasons, while the phase rolls up both. Neither series describes a restore that is still running — for that, read `status.restoredVolumes`, `failedVolumes` and `plannedVolumes`, which now move on every reconcile rather than only at the end.
+
 | Series | Type | Labels | Meaning |
 | --- | --- | --- | --- |
 | `crystalbackup_restore_duration_seconds` | histogram | `namespace` `tenant` `origin` `location` `cluster` `mode` | Restore/ClusterRestore duration, from creation to terminal phase. |
@@ -150,6 +178,7 @@ One family covers Restore and ClusterRestore alike. `mode` appears only on the d
 | `crystalbackup_restore_failures_total` | counter | `namespace` `tenant` `origin` `location` `cluster` `mode` | Restores/ClusterRestores that reached Failed or PartiallyFailed. AwaitingConfirmation is not a failure. |
 | `crystalbackup_restore_last_restored_bytes` | gauge | `namespace` `tenant` `origin` `location` `cluster` | status.restoredBytes of the last Completed Restore/ClusterRestore for this series. |
 | `crystalbackup_restore_last_success_timestamp_seconds` | gauge | `namespace` `tenant` `origin` `location` `cluster` | Unix time of the last Completed Restore/ClusterRestore for this series. |
+| `crystalbackup_restore_volumes_failed` | gauge | `namespace` `tenant` `origin` `location` `cluster` | Volumes that did not come back, summed over the Restores/ClusterRestores currently in a failed terminal phase (Failed or PartiallyFailed) for this series (status.failedVolumes). Counts volumes only — a restore whose manifests failed and whose volumes all landed contributes 0. |
 
 Buckets of `crystalbackup_restore_duration_seconds`, in seconds: `60`, `300`, `900`, `1800`, `3600`, `7200`, `14400`, `28800`.
 
@@ -221,6 +250,20 @@ The operator's own dynamic webhook only. Denials from the static ValidatingAdmis
 
 Buckets of `crystalbackup_exposure_ready_wait_seconds`, in seconds: `1`, `5`, `15`, `30`, `60`, `120`, `300`, `600`.
 
+## Leftover objects and the orphan reaper
+
+The orphan reaper is the periodic backstop that removes what a crashed teardown left behind — a temp clone PVC, a mover Job, a VolumeSnapshot and its content, a restore's twin PV. This series reports the part of that job it **cannot finish**.
+
+A `DELETE` accepted by the API server is a request, not a result. While a finalizer holds the object, "accepted" and "gone" can stay apart indefinitely, and the usual holder is the external snapshot controller's own protection finalizer (`snapshot.storage.kubernetes.io/volumesnapshot-bound-protection` and its content-side sibling). Crystal Backup will not strip a finalizer it does not own — that would tear up another controller's contract on an object that is not ours — so a non-zero value here does not clear itself. Alert on `crystalbackup_orphan_reap_stuck > 0` and go and look.
+
+The same fact also arrives as a `Warning` Event named `OrphanReapStuck` **on the stuck object itself**, and its message names the finalizers holding it. `kubectl describe volumesnapshot <name>` therefore explains a stuck `Terminating` without anyone reading operator logs. Whoever owns that finalizer has to release it.
+
+Before 0.6.5 none of this existed and the reaper simply logged `reaped` after every `DELETE` it issued. On one cluster it logged that every 10 minutes for 31 hours about the same three VolumeSnapshots, none of which it had removed — while `crystalbackup selfcheck` reported them correctly as residual the whole time. That is the disagreement this series ends.
+
+| Series | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `crystalbackup_orphan_reap_stuck` | gauge | `kind` | Orphaned managed objects whose deletion was requested and has NOT completed: still present, with a deletionTimestamp, held by a finalizer. Refreshed by each orphan-reaper sweep. Non-zero requires an administrator — the operator will not strip another controller's finalizer. |
+
 ## External sync
 
 The one family that deliberately breaks the absence rule above: a sync that has never completed publishes `last_success_timestamp_seconds` as **0**, not as nothing, so that a secondary broken from the day it was created is visible rather than being the one case an alert cannot see. Treat that `0` as a sentinel, never as a timestamp — `time() - 0` is fifty-odd years, and any staleness expression written against it needs the `> 0` guard the shipped rule uses.
@@ -256,6 +299,6 @@ administrator's job, on a real cadence — see
 
 ## See also
 
-- [Alerts](/CrystalBackup/docs/reference/alerts/) — the twelve rules built on these series.
+- [Alerts](/CrystalBackup/docs/reference/alerts/) — the 13 rules built on these series.
 - [Observability](/CrystalBackup/docs/guides/observability/) — scraping, logs, and the conditions
   that say *why*.

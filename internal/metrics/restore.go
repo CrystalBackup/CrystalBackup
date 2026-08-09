@@ -47,6 +47,14 @@ var (
 		NameRestoreFailures,
 		"Number of Restores/ClusterRestores currently in a failed terminal phase (Failed or PartiallyFailed) for this series.",
 		restoreLabels, nil)
+	// The same restores restore_failures counts, measured in VOLUMES instead of objects — so the two
+	// can be read side by side, and an alert can tell "one restore lost one volume" from "one restore
+	// lost all nine". Volumes only: a restore that lost only manifests reports 0 here and still counts
+	// in restore_failures, which is the same volumes/manifests split status.failedVolumes documents.
+	restoreVolumesFailedDesc = prometheus.NewDesc(
+		NameRestoreVolumesFailed,
+		"Volumes that did not come back, summed over the Restores/ClusterRestores currently in a failed terminal phase (Failed or PartiallyFailed) for this series (status.failedVolumes). Counts volumes only — a restore whose manifests failed and whose volumes all landed contributes 0.",
+		restoreLabels, nil)
 )
 
 // restoreSourceInfo is what the collector resolves about a restore's SOURCE: the identity
@@ -75,6 +83,7 @@ type restoreSeries struct {
 	lastSuccessUnix float64
 	lastBytes       float64
 	failures        float64
+	volumesFailed   float64
 }
 
 // collectRestores derives the unified restore family from BOTH kinds. resolveSource maps a
@@ -85,7 +94,7 @@ func collectRestores(ch chan<- prometheus.Metric, restores []cbv1.Restore, clust
 	clusterByLocation map[string]string,
 ) {
 	series := map[restoreSeriesKey]*restoreSeries{}
-	tally := func(key restoreSeriesKey, phase string, conds []metav1.Condition, restoredBytes int64) {
+	tally := func(key restoreSeriesKey, phase string, conds []metav1.Condition, restoredBytes int64, failedVolumes int32) {
 		s := series[key]
 		if s == nil {
 			s = &restoreSeries{}
@@ -98,7 +107,11 @@ func collectRestores(ch chan<- prometheus.Metric, restores []cbv1.Restore, clust
 				s.lastBytes = float64(restoredBytes)
 			}
 		case status.RestorePhaseFailed, status.RestorePhasePartiallyFailed:
+			// The object count and the volume count move together, in one place, over the same set of
+			// restores: read side by side they say how bad each failure was, and they cannot disagree
+			// about WHICH restores they describe.
 			s.failures++
+			s.volumesFailed += float64(failedVolumes)
 		}
 	}
 
@@ -114,7 +127,7 @@ func collectRestores(ch chan<- prometheus.Metric, restores []cbv1.Restore, clust
 			Origin:    src.origin,
 			Location:  src.location,
 			Cluster:   src.cluster,
-		}, r.Status.Phase, r.Status.Conditions, r.Status.RestoredBytes)
+		}, r.Status.Phase, r.Status.Conditions, r.Status.RestoredBytes, r.Status.FailedVolumes)
 	}
 
 	// A ClusterRestore is recorded under its SOURCE namespace (05-observability §2.3): the
@@ -130,7 +143,7 @@ func collectRestores(ch chan<- prometheus.Metric, restores []cbv1.Restore, clust
 			Origin:    apiconst.OriginCluster,
 			Location:  cr.Spec.Source.LocationRef.Name,
 			Cluster:   clusterByLocation[cr.Spec.Source.LocationRef.Name],
-		}, cr.Status.Phase, cr.Status.Conditions, cr.Status.RestoredBytes)
+		}, cr.Status.Phase, cr.Status.Conditions, cr.Status.RestoredBytes, cr.Status.FailedVolumes)
 	}
 
 	for key, s := range series {
@@ -138,6 +151,10 @@ func collectRestores(ch chan<- prometheus.Metric, restores []cbv1.Restore, clust
 			ch <- prometheus.MustNewConstMetric(restoreLastSuccessDesc, prometheus.GaugeValue, s.lastSuccessUnix, key.values()...)
 			ch <- prometheus.MustNewConstMetric(restoreLastBytesDesc, prometheus.GaugeValue, s.lastBytes, key.values()...)
 		}
+		// Both emitted unconditionally, zero included: a series that has a restore in it has been
+		// measured, and "no volume was lost" is an answer. (The never-measured rule this package
+		// applies elsewhere is about series that do not exist at all.)
 		ch <- prometheus.MustNewConstMetric(restoreFailuresDesc, prometheus.GaugeValue, s.failures, key.values()...)
+		ch <- prometheus.MustNewConstMetric(restoreVolumesFailedDesc, prometheus.GaugeValue, s.volumesFailed, key.values()...)
 	}
 }

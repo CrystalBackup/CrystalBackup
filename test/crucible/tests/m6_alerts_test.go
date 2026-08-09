@@ -400,8 +400,12 @@ var _ = Describe("Milestone M6 — alert rules fire on real conditions", Ordered
 	})
 
 	// ------------------------------------------------------------------
-	// RepositoryCheckFailed — the only critical rule, and the only one that says the RESTORE PATH
-	// is compromised. Provoked exactly the way M4 provokes it, because that provocation is already
+	// RepositoryCheckFailed — critical, and the only rule that says the RESTORE PATH is compromised
+	// from the first evaluation (0.6.5 added CrystalbackupBackupMissedCritical, which reaches
+	// `critical` only after three of a schedule's own periods have gone by with nothing captured —
+	// a magnitude no crucible lane is long-lived enough to accumulate, which is why it is covered by
+	// promtool evaluation and the offline predicate rather than here).
+	// Provoked exactly the way M4 provokes it, because that provocation is already
 	// known to reach `restic check`: bytes rewritten inside a pack object, name and length intact.
 	// ------------------------------------------------------------------
 	Describe("a repository whose check fails", Ordered, func() {

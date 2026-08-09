@@ -71,6 +71,7 @@ const GroupName = "crystalbackup"
 // build failures.
 const (
 	ruleBackupMissed              = "CrystalbackupBackupMissed"
+	ruleBackupMissedCritical      = "CrystalbackupBackupMissedCritical"
 	ruleBackupFailed              = "CrystalbackupBackupFailed"
 	ruleBackupStalled             = "CrystalbackupBackupStalled"
 	ruleRepositoryCheckFailed     = "CrystalbackupRepositoryCheckFailed"
@@ -243,9 +244,101 @@ var missedJoinKeys = []string{labelNamespace, labelSchedule, labelOrigin, labelL
 // operator cannot parse, which will never run and must still page.
 var backupMissedThreshold = Threshold{
 	Kind:   ThresholdPeriod,
-	Factor: 1.1,
+	Factor: missedWarningFactor,
 	Grace:  time.Hour,
-	Age:    26 * time.Hour,
+	Age:    missedFallbackPeriod + missedFallbackGrace,
+}
+
+// The two halves of the flat fallback, named rather than added up.
+//
+// spec §3 wrote this bound as "24 h + 2 h grace" and the code wrote it as `26 * time.Hour`, which
+// is the same number and a strictly worse declaration: it says how long, not what the duration is
+// made of. Naming the halves is what lets the CRITICAL fallback below be three of the same assumed
+// periods plus the same grace, instead of a second hour count typed by hand next to the first. A
+// hand-typed 74 h would be a number nobody could check, and it would stop tracking this one the
+// first time either was revised — the exact failure this whole package was built to remove from the
+// rule text.
+//
+// The value of backupMissedThreshold.Age is unchanged by this: 24 h + 2 h is 26 h, and an
+// administrator's existing alerting neither goes quiet nor goes loud on upgrade.
+const (
+	missedFallbackPeriod = 24 * time.Hour
+	missedFallbackGrace  = 2 * time.Hour
+
+	// missedWarningFactor is the warning deadline's proportional term: ONE period plus a tenth for
+	// jitter. It is named beside the critical factor so the pair reads as what it is — one missed
+	// run against three — rather than as two unrelated constants.
+	missedWarningFactor = 1.1
+
+	// missedCriticalPeriods is the escalation: THREE of the schedule's own periods.
+	//
+	// Three, not two and not four. Two is one skipped run plus a slow one, which is a bad night on
+	// a busy cluster and not yet a statement about restorability. Four on a weekly schedule is a
+	// month, by which time the news has stopped being news. Three periods means the schedule has
+	// been given three consecutive chances and taken none of them, which no jitter, no overrun and
+	// no single wedged run can explain: something is broken and nothing has been captured since it
+	// broke. That is the sentence `critical` exists to say.
+	missedCriticalPeriods = 3
+)
+
+// backupMissedCriticalThreshold: the SAME condition as backupMissedThreshold, at three times the
+// magnitude, so that severity tracks how much data is gone.
+//
+// THE INCIDENT, from the operator's own self-check on a live cluster on 2026-08-09:
+//
+//	verdict: degraded — "2 rule(s) breached, none critical." (breached 2, ok 10, critical 0)
+//
+// The two breaches were CrystalbackupBackupMissed at a value of 111735 seconds — thirty-one hours
+// with no successful backup — and CrystalbackupBackupStalled on a run past 8 h. Both warning. So a
+// cluster that had captured NOTHING for a day and a half rendered, in severity, identically to one
+// that was an hour late: same word at the top of the report, same routing class in Alertmanager,
+// same colour on the dashboard. Every number in that report was correct and the headline was the
+// wrong answer to the question the administrator was actually asking, which is the defect shape
+// this release has spent itself closing. Administrators act on these words. They do not have the
+// right to be unreliable.
+//
+// A single rule cannot fix it, because there is no one threshold that is both. Move the warning up
+// and a schedule that is genuinely one run late says nothing at all; call the warning critical and
+// every skipped nightly pages someone out of bed, which ends — always — in a permanent silence on
+// the rule that mattered. Two severities of one condition is the shape that carries magnitude, and
+// it is the ordinary Prometheus idiom for exactly this (a bound for "look today" and a higher one
+// for "act now").
+//
+// DERIVED FROM THE SAME SOURCE AS THE WARNING, and this is the part with teeth. The escalated bound
+// is Factor × the schedule's OWN period + Grace, read from crystalbackup_schedule_period_seconds
+// per series, exactly as the warning is — not a fixed hour count. A hardcoded critical bound would
+// reproduce, one severity up, the precise bug the derived warning was introduced to fix: at any
+// flat number an hourly schedule is most of a day dead before the page arrives, and a weekly one is
+// paged critical while it is perfectly healthy. Three periods is 3 h on an hourly schedule, 73 h on
+// a nightly one and three weeks on a weekly one, and every one of those is the right answer for
+// that schedule.
+//
+// The 15-minute hold, the join keys, the schedule_created fallback for a schedule that has never
+// succeeded, and the schedule_active guard are all the warning's, unchanged and for the warning's
+// reasons — the only difference between the two rules is the number and the severity, which is what
+// makes this an escalation rather than a second rule to keep in sync.
+//
+// BOTH FIRE. When a schedule crosses three periods the warning is already firing and stays firing;
+// this adds a second alert beside it rather than replacing it. That is deliberate: making the
+// warning stop at the critical bound would mean an administrator's existing warning-severity
+// routing GOES QUIET at exactly the moment the situation got worse, on upgrade, with nobody having
+// asked for it. Suppressing the duplicate is Alertmanager's job and it has a mechanism for it
+// (inhibit_rules on alertname/severity); silently editing the rule somebody is already paging on is
+// not.
+//
+// The fallback for an unparseable cron is three of the assumed daily periods plus the same grace —
+// 74 h against the warning's 26 h — from the same two named constants, so the two bounds cannot
+// drift apart. A schedule whose cron does not parse will never run at all, so it earns the
+// escalation more clearly than any other case; it just cannot be measured in periods it does not
+// have.
+var backupMissedCriticalThreshold = Threshold{
+	Kind:   ThresholdPeriod,
+	Factor: missedCriticalPeriods,
+	// The same flat grace as the warning, on purpose. It is there to keep a five-minute schedule
+	// from having a fifteen-and-a-half-minute critical deadline, and that argument does not get
+	// three times weaker because the factor got three times bigger.
+	Grace: backupMissedThreshold.Grace,
+	Age:   missedCriticalPeriods*missedFallbackPeriod + missedFallbackGrace,
 }
 
 // The two remaining fixed staleness bounds. Declared as values, and their expressions built FROM
@@ -301,6 +394,43 @@ var schedulePausedTooLongThreshold = Threshold{Kind: ThresholdAge, Age: 7 * 24 *
 // eight hours, and the incident this rule closes ran for THIRTY-SIX of them with every rule in this
 // table silent. Eight hours also keeps it well inside BackupMissed's 26h deadline, so a stalled
 // nightly is reported the same day rather than by the next night's absence.
+//
+// # WHY THIS ONE IS NOT ESCALATED, when BackupMissed is
+//
+// The 2026-08-09 report that produced backupMissedCriticalThreshold breached TWO rules at warning:
+// this one, and BackupMissed. Only BackupMissed got a critical tier. Three reasons, and the first is
+// the one that decides it:
+//
+//  1. IT IS NOT A STATEMENT ABOUT RESTORABILITY, WHICH IS WHAT `critical` MEANS HERE. A stall says a
+//     run has not finished. It does not say no run has finished. With concurrencyPolicy: Allow, a
+//     Backup can sit wedged forever while every subsequent night succeeds — restores work, the
+//     repository is current, and what is actually wrong is wreckage: a mover pod, a temp clone PVC
+//     and a snapshot pinned by an object nobody will finish. That is a warning indefinitely, not a
+//     page. And in the case where the stall DOES mean nothing is landing — 0.6.2's Forbid cascade,
+//     one backup in fifteen days — last_success stops advancing, so BackupMissed's critical branch
+//     is precisely what fires, derived from that schedule's own period. The escalation the incident
+//     asked for is already covered, by the rule that measures the thing that matters.
+//
+//  2. THERE IS NO PERIOD TO SCALE IT BY, and a fixed multiple would be the very defect being fixed.
+//     BackupMissed escalates against the schedule's OWN period because a flat hour count is wrong
+//     for every schedule that is not daily. An in-flight duration has no such anchor: how long a
+//     backup legitimately takes is a property of the VOLUME, not of the cron. Scaling this by
+//     schedule_period_seconds would send a 3 TB first full critical in twenty minutes on a
+//     five-minute schedule, which is nonsense; escalating it by, say, 3 × 8 h would be a hardcoded
+//     hour count of exactly the kind this lot exists to remove. Neither option is honest, and
+//     "escalate somehow" is not a reason to ship the less dishonest of two wrong bounds.
+//
+//  3. THE BOUND IS ALREADY AT THE EDGE OF WHAT WE CAN PROVE. Eight hours is off the top of this
+//     project's own published duration scale, and the comment above concedes it will occasionally
+//     fire on a genuine multi-terabyte first full. A tier above a bound that already admits false
+//     positives would be a CRITICAL page on a backup that is merely enormous — the single fastest
+//     way to teach an operator that critical means nothing here, which would cost more than this
+//     rule has ever been worth.
+//
+// If a later field report shows a stall that neither BackupMissed's critical branch nor
+// BackupFailed reaches, the answer is a bound derived from something real — a per-volume byte-rate
+// series, say, so "stalled" can mean "moving no data" rather than "taking a long time" — and not a
+// multiple of this eight hours.
 var backupStalledThreshold = Threshold{Kind: ThresholdAge, Age: 8 * time.Hour}
 
 // externalSyncPausedTooLongThreshold: the same week, for the same reason, on the other family.
@@ -337,8 +467,58 @@ func Rules() []Rule {
 				"  * the `and` guard on " + metrics.NameScheduleActive + " is what stops a deleted or",
 				"    paused schedule from paging forever on a last_success that will never advance again.",
 			}, "\n"),
-			Expr:      backupMissedExpr(),
+			Expr:      backupMissedExpr(backupMissedThreshold),
 			Predicate: backupMissed,
+		},
+		{
+			Name:     ruleBackupMissedCritical,
+			Severity: SeverityCritical,
+			// The warning's hold, for the warning's reason: this expression is built from timestamps
+			// read at scrape time, so it is true continuously once the bound is crossed, and the 15m
+			// absorbs a scrape gap or an operator restart re-listing objects. A rule that has already
+			// waited three of the schedule's periods gains nothing from waiting longer, and a
+			// DIFFERENT hold would make the two tiers fire out of step for no reason a reader could
+			// name.
+			For:       15 * time.Minute,
+			Threshold: backupMissedCriticalThreshold,
+			Summary: "NO BACKUP for {{ $labels.namespace }}/{{ $labels.schedule }} " +
+				"({{ $labels.origin }}) in 3 of its schedule's own periods",
+			Description: "This is CrystalbackupBackupMissed's condition at three times the magnitude: " +
+				"the schedule is active and has now missed three consecutive periods, so nothing has been " +
+				"captured since it broke and a restore would land on data that old. Treat it as data loss " +
+				"in progress, not as a late job. Same investigation as the warning — the namespace's " +
+				"Backup objects, then the mover Jobs in the operator namespace — with the addition that " +
+				"whatever is wrong has already survived three attempts, so a retry is not the fix.",
+			Rationale: strings.Join([]string{
+				"THE INCIDENT. On 2026-08-09 the operator's own self-check on a live cluster read:",
+				"`degraded — 2 rule(s) breached, none critical` over a cluster that had produced no",
+				"successful backup for THIRTY-ONE HOURS. Both breached rules were severity warning, so",
+				"thirty-one hours of nothing was routed, coloured and worded exactly like being one hour",
+				"late. Every number was right and the headline was the wrong answer to the question being",
+				"asked. Severity now tracks magnitude.",
+				"IT IS THE SAME CONDITION AS " + ruleBackupMissed + ", not a second rule: same series,",
+				"same five join keys, same schedule_created fallback for a series that has never",
+				"succeeded, same schedule_active guard, same 15m hold. The ONLY differences are the",
+				"threshold and the severity — which is what makes this an escalation instead of a second",
+				"copy of the logic to keep in sync.",
+				"THE BOUND IS DERIVED, LIKE THE WARNING'S. Three x " + metrics.NameSchedulePeriod + " + 1h,",
+				"per series. A fixed critical hour count would reintroduce, one severity up, the exact bug",
+				"the derived warning was added to fix: at any flat number an hourly schedule is most of a",
+				"day dead before the critical page arrives, and a weekly schedule is paged critical while",
+				"it is entirely healthy. Three periods is 3h hourly, 73h nightly, three weeks weekly.",
+				"BOTH TIERS FIRE. Crossing this bound does not resolve the warning, and that is on purpose:",
+				"narrowing the warning so it stopped here would make an administrator's existing",
+				"warning-severity routing go SILENT at the moment the situation got worse, on upgrade,",
+				"without anyone asking for it. Deduplicate in Alertmanager with an inhibit_rule keyed on",
+				"(namespace, schedule, origin, location, cluster) — the join keys are identical, so the two",
+				"alert instances line up label for label.",
+				"THE UNPARSEABLE-CRON FALLBACK is three of the assumed 24h periods plus the same 2h grace,",
+				"74h against the warning's 26h, from the same two constants so the pair cannot drift. That",
+				"schedule will never run at all, so it earns the escalation more plainly than anything else",
+				"here; it simply cannot be measured in periods it does not have.",
+			}, "\n"),
+			Expr:      backupMissedExpr(backupMissedCriticalThreshold),
+			Predicate: backupMissedCritical,
 		},
 		{
 			Name:     ruleBackupFailed,
@@ -431,6 +611,16 @@ func Rules() []Rule {
 				"never ready at 2h) and end in a Failed volume that BackupFailed pages on. This rule catches",
 				"what those cannot prove, including a Backup gated Pending forever and a mover that is",
 				"running and wedged, and it accepts firing on a genuinely enormous first full to do it.",
+				"WHY THERE IS NO CRITICAL TIER FOR THIS ONE, when " + ruleBackupMissed + " has one:",
+				"a stall says a run has not finished, NOT that no run has finished. Under",
+				"concurrencyPolicy: Allow a Backup can sit wedged forever while every subsequent night",
+				"succeeds — restores work, and what is actually wrong is wreckage rather than data loss. In",
+				"the case where a stall does mean nothing is landing, last_success stops advancing and",
+				"" + ruleBackupMissedCritical + " is what pages, derived from that schedule's own period.",
+				"There is also nothing honest to scale this bound by: how long a backup legitimately takes",
+				"is a property of the VOLUME, not of the cron, so a critical tier here would be either a",
+				"hardcoded multiple of 8h or a period multiple that sends a 3TB first full critical in",
+				"twenty minutes on a five-minute schedule. See backupStalledThreshold for the full account.",
 			}, "\n"),
 			Expr:      staleTimestampExpr(metrics.NameBackupInProgressSince, backupStalledThreshold.Age),
 			Predicate: backupStalled,
@@ -444,8 +634,13 @@ func Rules() []Rule {
 			Description: "restic found repository damage (R17). Restores from this repository may not work. " +
 				"Do not prune it until the check passes: inspect BackupRepository status.recentMaintenance.",
 			Rationale: strings.Join([]string{
-				"The only critical rule here, because it is the only one that says the RESTORE PATH is",
-				"compromised rather than that a backup is late.",
+				"Critical because it says the RESTORE PATH is compromised rather than that a backup is late,",
+				"and it says so from the FIRST evaluation rather than after a magnitude has accumulated:",
+				"repository damage does not get worse before it is worth paging about.",
+				"It was the table's only critical rule until 0.6.5, when " + ruleBackupMissedCritical + " was",
+				"added — that one reaches the same conclusion by a different road (nothing captured for three",
+				"of a schedule's own periods is a restore landing on data that old), and it needs a magnitude",
+				"to get there precisely because being one run late does not compromise anything.",
 				"A repository that has never been checked emits no series at all (spec §2.4), so this stays",
 				"silent on a fresh location instead of paging the moment one is created.",
 			}, "\n"),
@@ -728,7 +923,15 @@ func pausedTooLongExpr(activeSeries, createdSeries string, joinKeys []string, ag
 
 // backupMissedExpr assembles the one rule that is not a one-liner. See the Rationale on the rule
 // itself for why each of the three parts is there.
-func backupMissedExpr() string {
+//
+// It takes the Threshold rather than reading backupMissedThreshold directly because the same
+// fifteen-line shape now serves TWO severities of one condition: the warning at 1.1 periods and the
+// critical at three (see backupMissedCriticalThreshold for the incident that added the second). The
+// alternative was a second builder, or a copy of this string with different numbers in it, and
+// either one would let the two tiers drift apart on the next change to the join keys or to the
+// never-succeeded fallback — at which point the warning and the critical would be measuring
+// different things under names that promise they are not.
+func backupMissedExpr(t Threshold) string {
 	on := "on (" + strings.Join(missedJoinKeys, ", ") + ")"
 
 	// The age of the last success, falling back to the schedule's creation time when there has
@@ -738,8 +941,6 @@ func backupMissedExpr() string {
 	age := fmt.Sprintf(
 		"(\n      (time() - %s)\n      or %s\n      (time() - %s)\n    )",
 		metrics.NameBackupLastSuccess, on, metrics.NameScheduleCreated)
-
-	t := backupMissedThreshold
 
 	// group_left() is not decoration: the left side can legitimately carry two series for one join
 	// key while a tenant label is being changed, and without it Prometheus fails the WHOLE

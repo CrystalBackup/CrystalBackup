@@ -143,7 +143,7 @@ valeur vide.
 
 ```bash
 kubectl -n <ns> get restore <name> \
-  -o jsonpath='{.status.phase}{"\t"}{.status.restoredVolumes}{"\t"}{.status.restoredBytes}{"\n"}'
+  -o jsonpath='{.status.phase}{"\t"}{.status.restoredVolumes}{"/"}{.status.plannedVolumes}{"\t"}{.status.failedVolumes}{" échoués\t"}{.status.restoredBytes}{"\n"}'
 kubectl -n <ns> get events --field-selector involvedObject.name=<restore-name>
 ```
 

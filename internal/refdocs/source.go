@@ -84,13 +84,40 @@ type Family struct {
 	// counters.
 	Buckets []float64
 	// ScrapeDerived is true for a family the Collector recomputes from live object state on every
-	// scrape, false for one incremented at the site of an event.
+	// scrape, false for one written outside the scrape path (an event-driven counter, or a
+	// sweep-set gauge — see SweepSet).
 	//
 	// It is HARVESTED (which collector describes the family), not inferred from the name, so that
 	// buildFamilies can assert the correspondence the Metrics page states as a rule rather than
 	// restating it as a hope. See the check at the bottom of buildFamilies.
 	ScrapeDerived bool
+	// SweepSet marks the third kind of series, the one the page had no category for until 0.6.5: a
+	// GAUGE that a periodic Runnable sets, rather than the scrape collector deriving it or an event
+	// incrementing it.
+	//
+	// It is declared (sweepSetFamilies) rather than harvested, because nothing in a Desc can reveal
+	// it: such a gauge registers on the same registry as the event-driven counters, so the harvest
+	// alone cannot tell "written by a 10-minute sweep" from "incremented at a terminal transition".
+	// The two are very different to read — one is a level that goes back down, the other only ever
+	// climbs — so the page must not merge them. It is asserted against the harvest all the same: a
+	// family declared here that turns out to be scrape-derived fails the generation.
+	SweepSet bool
 }
+
+// sweepSetFamilies declares the gauges a periodic sweep writes.
+//
+// There is exactly one, and it earned its category the hard way. crystalbackup_orphan_reap_stuck
+// reports orphaned objects whose deletion the reaper REQUESTED and which are still there, held by a
+// finalizer. It cannot be derived at scrape: deciding an object is stuck needs the reaper's orphan
+// vetting (owner gone / volume terminal / past MinAge), which is a judgement, not a field on the
+// object. It must not be a counter either: the condition is a standing level that goes back down
+// when the deadlock clears, and the incident behind it — 31 hours of "reaped" logged over three
+// VolumeSnapshots the operator had only asked to delete — was precisely a repeated event being
+// mistaken for a repeated outcome.
+//
+// The cost is real and is stated on the page rather than hidden: the value is only as fresh as the
+// last completed sweep, and reads zero after a restart until the first sweep lands.
+var sweepSetFamilies = []string{metrics.NameOrphanReapStuck}
 
 // descPattern pulls the fqName, help and variable labels out of a Desc's String().
 //
@@ -229,6 +256,7 @@ func buildFamilies(scrape, event map[string]rawDesc, buckets map[string][]float6
 		f := Family{
 			Name: d.name, Help: d.help, Labels: d.labels,
 			Kind: kind, ScrapeDerived: scrapeDerived,
+			SweepSet: slices.Contains(sweepSetFamilies, d.name),
 		}
 		if kind == KindHistogram {
 			if f.Buckets = buckets[d.name]; len(f.Buckets) == 0 {
@@ -261,17 +289,38 @@ func buildFamilies(scrape, event map[string]rawDesc, buckets map[string][]float6
 		}
 	}
 
-	// The one claim the Metrics page makes about the catalogue AS A WHOLE: `_total` families and
-	// histograms are real counters that reset when the operator restarts, and everything else is
-	// recomputed from object state at scrape time and does not. Asserting it here is what lets the
-	// page state it as a rule instead of hedging — the day someone registers a gauge as an
-	// event-driven vec, this generator fails and the sentence never ships wrong.
+	// The one claim the Metrics page makes about the catalogue AS A WHOLE, now in three parts:
+	// `_total` families and histograms are real counters that reset when the operator restarts; the
+	// gauges DECLARED in sweepSetFamilies are written by a periodic Runnable and are only as fresh as
+	// its last pass; every other gauge is recomputed from object state at scrape time. Asserting it
+	// here is what lets the page state it as a rule instead of hedging.
+	//
+	// The third arm was added in 0.6.5 and the guard is the reason it was added HONESTLY. Registering
+	// crystalbackup_orphan_reap_stuck made this check fail with "the prose in metrics.go must be
+	// rewritten before regenerating" — which is exactly right, and is why the page now describes
+	// three kinds of series instead of quietly filing a sweep-set gauge under "recomputed every
+	// scrape, so a restart changes nothing". That sentence would have been false about the one series
+	// on the page whose whole purpose is to be believable.
 	for _, f := range all {
-		if f.ScrapeDerived != (f.Kind == KindGauge) {
-			return nil, fmt.Errorf("%s is a %s and %s; the Metrics page's rule that "+
-				"counters/histograms are event-driven and every other family is derived at scrape "+
-				"no longer holds, so the prose in metrics.go must be rewritten before regenerating",
-				f.Name, f.Kind, scrapeWord(f.ScrapeDerived))
+		switch {
+		case f.Kind != KindGauge:
+			if f.ScrapeDerived || f.SweepSet {
+				return nil, fmt.Errorf("%s is a %s and %s; a counter or histogram must be "+
+					"event-driven, so the prose in metrics.go must be rewritten before regenerating",
+					f.Name, f.Kind, scrapeWord(f.ScrapeDerived))
+			}
+		case f.SweepSet:
+			if f.ScrapeDerived {
+				return nil, fmt.Errorf("%s is declared in refdocs.sweepSetFamilies but is published by "+
+					"the scrape collector; it is derived at scrape and the declaration is stale", f.Name)
+			}
+		default:
+			if !f.ScrapeDerived {
+				return nil, fmt.Errorf("%s is a gauge and %s but is not declared in "+
+					"refdocs.sweepSetFamilies; the Metrics page's three-way split no longer holds, so "+
+					"the prose in metrics.go must be rewritten before regenerating",
+					f.Name, scrapeWord(f.ScrapeDerived))
+			}
 		}
 	}
 

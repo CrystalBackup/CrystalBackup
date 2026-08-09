@@ -239,6 +239,11 @@ var _ = Describe("ClusterBackupReconciler", func() {
 			g.Expect(cb.Status.NamespacesMatched).To(Equal(int32(2)))
 			g.Expect(cb.Status.NamespacesSucceeded).To(Equal(int32(2)))
 			g.Expect(cb.Status.NamespacesFailed).To(Equal(int32(0)))
+			g.Expect(cb.Status.NamespacesBlocked).To(Equal(int32(0)))
+			// The buckets must account for every matched namespace, or the numbers beside the phase
+			// are describing something other than these two children.
+			g.Expect(cb.Status.NamespacesSucceeded + cb.Status.NamespacesFailed + cb.Status.NamespacesBlocked).
+				To(Equal(cb.Status.NamespacesMatched))
 			g.Expect(cb.Status.PVCsSucceeded).To(Equal(int32(2)))
 			g.Expect(cb.Status.PVCsFailed).To(Equal(int32(0)))
 			g.Expect(cb.Status.AddedBytes).To(Equal(int64(2048)))
@@ -274,7 +279,11 @@ var _ = Describe("ClusterBackupReconciler", func() {
 			cb := getClusterRunG(g, run)
 			g.Expect(cb.Status.Phase).To(Equal(string(status.ClusterBackupPhasePartiallyFailed)))
 			g.Expect(cb.Status.NamespacesSucceeded).To(Equal(int32(1)))
+			// A child that RAN and failed: this is the one namespace namespacesFailed exists for.
 			g.Expect(cb.Status.NamespacesFailed).To(Equal(int32(1)))
+			g.Expect(cb.Status.NamespacesBlocked).To(Equal(int32(0)), "both namespaces got a child of this run")
+			g.Expect(cb.Status.NamespacesSucceeded + cb.Status.NamespacesFailed + cb.Status.NamespacesBlocked).
+				To(Equal(cb.Status.NamespacesMatched))
 			g.Expect(cb.Status.PVCsSucceeded).To(Equal(int32(1)))
 			g.Expect(cb.Status.PVCsFailed).To(Equal(int32(1)))
 			g.Expect(cb.Status.Failures).To(HaveLen(1))

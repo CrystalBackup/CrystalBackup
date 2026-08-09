@@ -53,6 +53,7 @@ import (
 // TestBackupFailedNamesBothOfItsSeries is what holds them to it.
 var seriesOfRule = map[string]string{
 	ruleBackupMissed:              metrics.NameScheduleActive,
+	ruleBackupMissedCritical:      metrics.NameScheduleActive,
 	ruleBackupFailed:              metrics.NameBackupFailuresTotal,
 	ruleBackupStalled:             metrics.NameBackupInProgressSince,
 	ruleRepositoryCheckFailed:     metrics.NameRepositoryCheckSuccess,
@@ -348,6 +349,188 @@ func TestBackupMissedDerivesTheDeadlineFromTheCron(t *testing.T) {
 	}
 	if breaches[0].Labels["schedule"] != "hourly" {
 		t.Errorf("breached schedule = %q, want hourly", breaches[0].Labels["schedule"])
+	}
+}
+
+// TestBackupMissedEscalatesWithMagnitudeAndScalesWithThePeriod is the 2026-08-09 incident, pinned
+// in the shape that would have caught it.
+//
+// That live self-check read `degraded — 2 rule(s) breached, none critical` over a cluster that had
+// captured nothing for THIRTY-ONE HOURS — 111735 seconds, which is the number this test uses. Both
+// breached rules were warning, so a day and a half of nothing was routed exactly like being an hour
+// late.
+//
+// The assertion is not merely "there is a critical tier". It is that the critical tier is DERIVED
+// from each schedule's own period, which is what stops the fix from being the original bug one
+// severity up:
+//
+//   - hourly (period 1h): warning at 1.1x1h+1h = 2h06m, critical at 3x1h+1h = 4h. At 31h it is
+//     thirty-one missed runs and unambiguously critical.
+//   - nightly (period 24h): warning at 27h24m, critical at 73h. At 31h it is ONE missed run — bad
+//     news, not yet a statement about restorability — and must stay warning-only.
+//
+// Any hardcoded critical bound fails this test in one direction or the other: a flat 73h leaves the
+// hourly schedule a day and a half dead at warning severity, and anything low enough to catch the
+// hourly one pages critical on a nightly that has skipped a single run.
+func TestBackupMissedEscalatesWithMagnitudeAndScalesWithThePeriod(t *testing.T) {
+	now := time.Date(2026, 8, 9, 12, 0, 0, 0, time.UTC)
+	// The incident's own value: 111735 seconds since the last success.
+	incident := metav1.NewTime(now.Add(-111735 * time.Second))
+
+	cluster := func(since metav1.Time) client.Client {
+		return newFakeClient(t,
+			ns("team-a"),
+			bs("team-a", "hourly", func(s *cbv1.BackupSchedule) { s.Spec.Schedule = "0 * * * *" }),
+			bs("team-a", "nightly", func(s *cbv1.BackupSchedule) { s.Spec.Schedule = "0 2 * * *" }),
+			backup("team-a", "hourly-run", "hourly", since),
+			backup("team-a", "nightly-run", "nightly", since),
+		)
+	}
+	breachedSchedules := func(t *testing.T, p Predicate, c client.Client) []string {
+		t.Helper()
+		breaches, err := p(context.Background(), c, now)
+		if err != nil {
+			t.Fatalf("predicate: %v", err)
+		}
+		out := make([]string, 0, len(breaches))
+		for _, b := range breaches {
+			out = append(out, b.Labels[labelSchedule])
+		}
+		slices.Sort(out)
+		return out
+	}
+
+	// The warning tier is unchanged and catches both — that is what it is for, and an upgrade must
+	// not make it quieter.
+	if got := breachedSchedules(t, backupMissed, cluster(incident)); !slices.Equal(got, []string{"hourly", "nightly"}) {
+		t.Errorf("warning tier breached %v at 31h, want both schedules — the existing bound must not "+
+			"move when a critical tier is added beside it", got)
+	}
+
+	// The critical tier, at the same instant, on the same cluster: the hourly schedule only.
+	if got := breachedSchedules(t, backupMissedCritical, cluster(incident)); !slices.Equal(got, []string{"hourly"}) {
+		t.Errorf("critical tier breached %v at 31h, want [hourly] only.\n"+
+			"    hourly deadline is 3x1h+1h = 4h (thirty-one missed runs); nightly is 3x24h+1h = 73h "+
+			"(one missed run).\n    A critical bound that catches the nightly one here is a fixed hour "+
+			"count, which is the very defect the derived warning was introduced to fix.", got)
+	}
+
+	// And the nightly schedule does escalate — once it has actually missed three of its own periods.
+	threePeriods := metav1.NewTime(now.Add(-80 * time.Hour))
+	if got := breachedSchedules(t, backupMissedCritical, cluster(threePeriods)); !slices.Equal(got, []string{"hourly", "nightly"}) {
+		t.Errorf("critical tier breached %v at 80h, want both: 80h is past the nightly schedule's "+
+			"73h critical deadline", got)
+	}
+}
+
+// TestBackupMissedCriticalFallbackIsThreeOfTheAssumedPeriods covers the one series that has no
+// period to scale by: a cron the operator cannot parse publishes no schedule_period_seconds at all
+// (deliberately — spec §2.1 refuses to invent one), so both tiers fall back to a fixed age.
+//
+// That schedule will NEVER run, which makes it the clearest case for escalation in the table; it
+// simply cannot be measured in periods it does not have. So the fallback is three of the SAME
+// assumed daily period plus the same grace as the warning's — 74h against 26h — and this test pins
+// both numbers, in both directions, because a fallback nobody has watched fire is the exact shape of
+// silence this package exists to remove.
+func TestBackupMissedCriticalFallbackIsThreeOfTheAssumedPeriods(t *testing.T) {
+	now := time.Date(2026, 8, 9, 12, 0, 0, 0, time.UTC)
+	broken := func(age time.Duration) client.Client {
+		return newFakeClient(t,
+			ns("team-a"),
+			bs("team-a", "broken-cron", func(s *cbv1.BackupSchedule) {
+				// Not a cron expression. schedule.Parse fails, so there is no period.
+				s.Spec.Schedule = "every second tuesday"
+				s.CreationTimestamp = metav1.NewTime(now.Add(-age))
+			}),
+		)
+	}
+	count := func(t *testing.T, p Predicate, c client.Client) int {
+		t.Helper()
+		breaches, err := p(context.Background(), c, now)
+		if err != nil {
+			t.Fatalf("predicate: %v", err)
+		}
+		return len(breaches)
+	}
+
+	// Between the two fallbacks: the warning has fired, the critical has not.
+	if n := count(t, backupMissed, broken(30*time.Hour)); n != 1 {
+		t.Errorf("warning breaches at 30h = %d, want 1: the 26h fallback is unchanged", n)
+	}
+	if n := count(t, backupMissedCritical, broken(30*time.Hour)); n != 0 {
+		t.Errorf("critical breaches at 30h = %d, want 0: the escalated fallback is 74h, and a "+
+			"critical tier that fires at the warning's bound is not an escalation", n)
+	}
+	// Just under, and just over, the escalated fallback.
+	if n := count(t, backupMissedCritical, broken(73*time.Hour)); n != 0 {
+		t.Errorf("critical breaches at 73h = %d, want 0: the fallback bound is 74h "+
+			"(3 x 24h + 2h), not 72h and not 73h", n)
+	}
+	if n := count(t, backupMissedCritical, broken(75*time.Hour)); n != 1 {
+		t.Errorf("critical breaches at 75h = %d, want 1: a cron that cannot be parsed will never run, "+
+			"so it is the clearest critical case in the table and must not be the one that never fires", n)
+	}
+
+	// The Detail says WHICH bound was used, because a reader of the self-check cannot otherwise tell
+	// a derived deadline from the fallback, and the difference decides what they go and fix.
+	breaches, err := backupMissedCritical(context.Background(), broken(75*time.Hour), now)
+	if err != nil {
+		t.Fatalf("predicate: %v", err)
+	}
+	if !strings.Contains(breaches[0].Detail, "fixed fallback 74h") ||
+		!strings.Contains(breaches[0].Detail, "does not parse") {
+		t.Errorf("Detail does not name the fallback bound and its cause: %q", breaches[0].Detail)
+	}
+}
+
+// TestMissedTiersAreOneConditionAtTwoMagnitudes is the structural half, and it is the one that
+// catches a "simplification" that reads perfectly well.
+//
+// Two things have to stay true for the escalation to mean anything. The tiers must differ ONLY in
+// magnitude — same kind, same grace, same shape — or they stop being one condition and become two
+// rules to keep in sync. And the WARNING's numbers must not have moved: an administrator upgrading
+// to 0.6.5 must not find their existing alerting suddenly quieter or louder, and the only way to
+// hold that is to state the old numbers here where a change to them fails the build.
+func TestMissedTiersAreOneConditionAtTwoMagnitudes(t *testing.T) {
+	warn := mustThreshold(t, ruleBackupMissed)
+	crit := mustThreshold(t, ruleBackupMissedCritical)
+
+	// The warning, exactly as it shipped before this lot. Do not "fix" these numbers: changing them
+	// changes what every existing installation pages about, silently, on upgrade.
+	if warn.Kind != ThresholdPeriod || warn.Factor != 1.1 ||
+		warn.Grace != time.Hour || warn.Age != 26*time.Hour {
+		t.Errorf("the warning bound moved: %+v, want ThresholdPeriod 1.1 x period + 1h, fallback 26h", warn)
+	}
+
+	if crit.Kind != warn.Kind {
+		t.Errorf("threshold kinds differ (%q vs %q): a critical tier measured differently from its "+
+			"warning is a second rule, not an escalation", crit.Kind, warn.Kind)
+	}
+	if crit.Grace != warn.Grace {
+		t.Errorf("graces differ (%s vs %s): the flat term exists to stop a five-minute schedule "+
+			"having a five-minute deadline, and that argument does not weaken with the factor",
+			crit.Grace, warn.Grace)
+	}
+	if crit.Factor <= warn.Factor {
+		t.Errorf("critical factor %g is not above the warning's %g — the critical tier would fire "+
+			"at or before the warning and carry no magnitude at all", crit.Factor, warn.Factor)
+	}
+	if crit.Age <= warn.Age {
+		t.Errorf("critical fallback %s is not above the warning's %s", crit.Age, warn.Age)
+	}
+	// And the escalated numbers are DERIVED from the warning's own terms rather than typed: three of
+	// the same assumed period, plus the same grace.
+	if crit.Factor != missedCriticalPeriods {
+		t.Errorf("critical factor = %g, want %d whole periods", crit.Factor, missedCriticalPeriods)
+	}
+	if want := missedCriticalPeriods*missedFallbackPeriod + missedFallbackGrace; crit.Age != want {
+		t.Errorf("critical fallback = %s, want %s (%d x %s + %s). A hand-typed hour count here is "+
+			"the drift this package exists to prevent, one severity up.",
+			crit.Age, want, missedCriticalPeriods, missedFallbackPeriod, missedFallbackGrace)
+	}
+	if warn.Age != missedFallbackPeriod+missedFallbackGrace {
+		t.Errorf("the warning fallback %s is no longer the sum of the two named halves (%s + %s), so "+
+			"the two tiers' fallbacks can now drift apart", warn.Age, missedFallbackPeriod, missedFallbackGrace)
 	}
 }
 

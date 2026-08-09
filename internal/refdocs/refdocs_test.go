@@ -48,23 +48,62 @@ func TestFamiliesMatchTheCatalogue(t *testing.T) {
 }
 
 // TestEventDrivenFamiliesAreCountersAndHistograms holds the sentence the Metrics page states as a
-// rule: `_total` families and histograms reset when the operator restarts, everything else is
-// recomputed at scrape and does not.
+// rule, in the three-way form it took in 0.6.5: `_total` families and histograms reset when the
+// operator restarts; a gauge DECLARED in sweepSetFamilies is written by a periodic Runnable and is
+// only as fresh as its last pass; every other gauge is recomputed at scrape and survives a restart
+// intact.
 //
 // buildFamilies refuses to generate when this breaks, so this test is the readable version of that
 // refusal — it names the family and the direction rather than failing a page build.
+//
+// The third arm is not a loosening. A sweep-set gauge has to be OPTED IN by name, and the opt-in is
+// checked against the harvest in both directions, so the failure mode the two-way rule caught still
+// fails: register a gauge on the event registry without declaring it, and this test says so.
 func TestEventDrivenFamiliesAreCountersAndHistograms(t *testing.T) {
 	families, err := Families()
 	if err != nil {
 		t.Fatalf("Families(): %v", err)
 	}
 	for _, f := range families {
-		if f.Kind == KindGauge && !f.ScrapeDerived {
-			t.Errorf("%s is a gauge but event-driven; the page says every gauge survives a restart", f.Name)
+		switch {
+		case f.Kind != KindGauge:
+			if f.ScrapeDerived {
+				t.Errorf("%s is a %s but derived at scrape; the page tells readers to wrap it in increase()",
+					f.Name, f.Kind)
+			}
+			if f.SweepSet {
+				t.Errorf("%s is a %s declared as sweep-set; only a gauge can be", f.Name, f.Kind)
+			}
+		case f.SweepSet:
+			if f.ScrapeDerived {
+				t.Errorf("%s is declared sweep-set but the scrape collector publishes it; the "+
+					"declaration is stale and the page would understate its freshness", f.Name)
+			}
+		default:
+			if !f.ScrapeDerived {
+				t.Errorf("%s is a gauge, is written outside the scrape path, and is NOT declared in "+
+					"sweepSetFamilies; the page would tell a reader it survives a restart, which it "+
+					"does not", f.Name)
+			}
 		}
-		if f.Kind != KindGauge && f.ScrapeDerived {
-			t.Errorf("%s is a %s but derived at scrape; the page tells readers to wrap it in increase()",
-				f.Name, f.Kind)
+	}
+}
+
+// TestSweepSetDeclarationIsNotStale: a name in sweepSetFamilies that no longer exists would be a
+// silent no-op, and the next sweep-set gauge would then slip through undeclared and be documented as
+// restart-safe.
+func TestSweepSetDeclarationIsNotStale(t *testing.T) {
+	families, err := Families()
+	if err != nil {
+		t.Fatalf("Families(): %v", err)
+	}
+	published := map[string]bool{}
+	for _, f := range families {
+		published[f.Name] = true
+	}
+	for _, name := range sweepSetFamilies {
+		if !published[name] {
+			t.Errorf("sweepSetFamilies declares %s, which nothing publishes", name)
 		}
 	}
 }

@@ -253,39 +253,19 @@ func RollUpVolumePhases(volumes []v1alpha1.VolumeStatus) BackupPhase {
 //	  bad == 0                                      -> Completed
 //	  ok == 0                                       -> Failed
 //	  else                                          -> PartiallyFailed
+//
+// It is now a THIN WRAPPER over OutcomeForBackupPhase + RollUpNamespaceOutcomes rather than its own
+// second traversal of the phase list, and that is the point: the run's counters are tallied from
+// exactly the same classification, so the phase and the numbers printed beside it cannot disagree.
+// The production incident this closes had a run reporting 32 failed namespaces over children that
+// read 29 Completed — two independent readings of the same children, and no check that either
+// matched the other. See internal/status/cluster_tally.go.
+//
+// One behaviour follows from the shared classification rather than from the table above: an
+// UNRECOGNIZED phase string used to be counted in neither ok nor bad, so a run made entirely of
+// unknown phases rolled up to Completed. It is now NamespaceInFlight — the absence of a verdict,
+// which holds the run non-terminal until a phase it understands arrives. Staying Running is
+// recoverable; announcing Completed over a namespace whose state nothing could read is not.
 func RollUpBackupPhases(childPhases []string) ClusterBackupPhase {
-	if len(childPhases) == 0 {
-		return ClusterBackupPhasePending
-	}
-
-	// Any in-flight child coarsens the whole run to Running.
-	for _, p := range childPhases {
-		switch p {
-		case "",
-			string(BackupPhasePending),
-			string(BackupPhaseSnapshottingHooks),
-			string(BackupPhaseSnapshotting),
-			string(BackupPhaseUploading):
-			return ClusterBackupPhaseRunning
-		}
-	}
-
-	// All children terminal: tally successes vs failures.
-	var ok, bad int
-	for _, p := range childPhases {
-		switch p {
-		case string(BackupPhaseCompleted), string(BackupPhasePartiallyCompleted):
-			ok++
-		case string(BackupPhaseFailed), string(BackupPhasePartiallyFailed):
-			bad++
-		}
-	}
-	switch {
-	case bad == 0:
-		return ClusterBackupPhaseCompleted
-	case ok == 0:
-		return ClusterBackupPhaseFailed
-	default:
-		return ClusterBackupPhasePartiallyFailed
-	}
+	return RollUpNamespaceOutcomes(OutcomesForBackupPhases(childPhases))
 }

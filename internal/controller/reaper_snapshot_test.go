@@ -143,7 +143,7 @@ func TestReapSnapshotObjectsOwnerGone(t *testing.T) {
 	originVSC, staticVSC, originVS := seedSnapshotResidue(t, c, "run-a", "c-db", "data-db-1")
 
 	r := &OrphanReaper{Client: c, OperatorNamespace: reaperTestOperatorNS, MinAge: 0}
-	r.reapSnapshotObjects(context.Background(), time.Now())
+	r.reapSnapshotObjects(context.Background(), time.Now(), nil)
 
 	if vscExists(t, c, originVSC) {
 		t.Errorf("Retain-parked dynamic origin VSC survived the sweep — the observed leak shape would persist")
@@ -182,7 +182,7 @@ func TestReapSnapshotObjectsSparesLiveWork(t *testing.T) {
 	}
 
 	r := &OrphanReaper{Client: c, OperatorNamespace: reaperTestOperatorNS, MinAge: 0}
-	r.reapSnapshotObjects(ctx, time.Now())
+	r.reapSnapshotObjects(ctx, time.Now(), nil)
 
 	if !vscExists(t, c, originVSC) || !vscExists(t, c, staticVSC) || !vsExists(t, c, "c-db", originVS) {
 		t.Errorf("the sweep touched a LIVE exposure (volume still Snapshotting) — that corrupts an in-flight backup")
@@ -197,7 +197,7 @@ func TestReapSnapshotObjectsRespectsMinAge(t *testing.T) {
 
 	r := &OrphanReaper{Client: c, OperatorNamespace: reaperTestOperatorNS, MinAge: time.Hour}
 	// cutoff = now-1h: everything just seeded is far too young.
-	r.reapSnapshotObjects(context.Background(), time.Now().Add(-time.Hour))
+	r.reapSnapshotObjects(context.Background(), time.Now().Add(-time.Hour), nil)
 
 	if !vscExists(t, c, originVSC) || !vscExists(t, c, staticVSC) || !vsExists(t, c, "c-db", originVS) {
 		t.Errorf("the sweep reaped an object younger than MinAge")
@@ -231,7 +231,7 @@ func TestReapSnapshotObjectsTerminalOwnerStillReaped(t *testing.T) {
 	}
 
 	r := &OrphanReaper{Client: c, OperatorNamespace: reaperTestOperatorNS, MinAge: 0}
-	r.reapSnapshotObjects(ctx, time.Now())
+	r.reapSnapshotObjects(ctx, time.Now(), nil)
 
 	if vscExists(t, c, originVSC) || vscExists(t, c, staticVSC) || vsExists(t, c, "c-db", originVS) {
 		t.Errorf("residue of a terminal volume must be reaped even while its Backup CR still exists")

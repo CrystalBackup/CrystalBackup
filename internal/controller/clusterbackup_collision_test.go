@@ -103,7 +103,13 @@ func expectRunNeverReportsSuccess(run, ns string) {
 			"a run whose only namespace was never backed up must NOT end Completed")
 		g.Expect(cb.Status.NamespacesSucceeded).To(Equal(int32(0)),
 			"a namespace this run never wrote to must not be counted as succeeded")
-		g.Expect(cb.Status.NamespacesFailed).To(Equal(int32(1)))
+		// Blocked, not failed. Nothing protected this namespace — which is why the phase above is
+		// still Failed — but no child of this run ran here, so there is no backup whose failure could
+		// be reported. Counting it as failed is what put a run's number in flat contradiction with an
+		// occupant object reading Completed.
+		g.Expect(cb.Status.NamespacesBlocked).To(Equal(int32(1)))
+		g.Expect(cb.Status.NamespacesFailed).To(Equal(int32(0)),
+			"no child of this run ran in this namespace, so nothing of this run's failed")
 		g.Expect(cb.Status.PVCsSucceeded).To(Equal(int32(0)),
 			"the occupant's volumes were written by somebody else; they are not this run's successes")
 		g.Expect(cb.Status.AddedBytes).To(Equal(int64(0)))
@@ -281,7 +287,8 @@ var _ = Describe("ClusterBackupReconciler run-name collisions", func() {
 			cb := getClusterRunG(g, run)
 			g.Expect(cb.Status.Phase).To(Equal(string(status.ClusterBackupPhasePartiallyFailed)))
 			g.Expect(cb.Status.NamespacesSucceeded).To(Equal(int32(1)))
-			g.Expect(cb.Status.NamespacesFailed).To(Equal(int32(1)))
+			g.Expect(cb.Status.NamespacesBlocked).To(Equal(int32(1)), "the collided namespace was never backed up")
+			g.Expect(cb.Status.NamespacesFailed).To(Equal(int32(0)), "no child of this run failed")
 			g.Expect(cb.Status.PVCsSucceeded).To(Equal(int32(1)))
 			g.Expect(cb.Status.AddedBytes).To(Equal(int64(512)), "only the healthy namespace's bytes count")
 			g.Expect(cb.Status.Failures).To(HaveLen(1))
@@ -311,6 +318,7 @@ var _ = Describe("ClusterBackupReconciler run-name collisions", func() {
 			cb := getClusterRunG(g, run)
 			g.Expect(cb.Status.Failures).To(BeEmpty())
 			g.Expect(cb.Status.NamespacesFailed).To(Equal(int32(0)))
+			g.Expect(cb.Status.NamespacesBlocked).To(Equal(int32(0)))
 		}, 3*time.Second, 500*time.Millisecond).Should(Succeed())
 	})
 })

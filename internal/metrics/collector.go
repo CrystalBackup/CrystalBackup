@@ -151,7 +151,12 @@ var (
 		clusterBackupLabels, nil)
 	clusterBackupNamespacesFailedDesc = prometheus.NewDesc(
 		NameClusterBackupNamespacesFailed,
-		"Namespaces with a failed child Backup in the last ClusterBackup run for this series (status.namespacesFailed).",
+		"Namespaces whose child Backup ran and failed in the last ClusterBackup run for this series (status.namespacesFailed). Namespaces the run never backed up are counted in "+
+			NameClusterBackupNamespacesBlocked+" instead; sum the two for namespaces left unprotected.",
+		clusterBackupLabels, nil)
+	clusterBackupNamespacesBlockedDesc = prometheus.NewDesc(
+		NameClusterBackupNamespacesBlocked,
+		"Namespaces the last ClusterBackup run for this series did NOT back up at all — the Backup coordinate was occupied by an object the run did not create, or the child could not be created (status.namespacesBlocked).",
 		clusterBackupLabels, nil)
 )
 
@@ -189,9 +194,11 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- clusterBackupLastSuccessDesc
 	ch <- clusterBackupNamespacesMatchedDesc
 	ch <- clusterBackupNamespacesFailedDesc
+	ch <- clusterBackupNamespacesBlockedDesc
 	ch <- restoreLastSuccessDesc
 	ch <- restoreLastBytesDesc
 	ch <- restoreFailuresDesc
+	ch <- restoreVolumesFailedDesc
 	ch <- repositorySizeDesc
 	ch <- repositorySnapshotCountDesc
 	ch <- repositoryLastCheckDesc
@@ -573,7 +580,14 @@ type clusterBackupSeries struct {
 	lastSuccessUnix   float64
 	namespacesMatched float64
 	namespacesFailed  float64
-	latestRunUnix     float64 // creation time of the run backing matched/failed, to keep the latest
+	namespacesBlocked float64
+	// latestRunUnix/latestRunName identify the run whose counts these gauges publish: the newest by
+	// creation time, and on a tie the greater NAME. The name is the tie-break because
+	// CreationTimestamp has one-second granularity and `>=` alone made the winner depend on List
+	// order — two runs of one series created in the same second would flip the published gauge
+	// between scrapes, which is a gauge nobody can alert on.
+	latestRunUnix float64
+	latestRunName string
 }
 
 func collectClusterBackups(ch chan<- prometheus.Metric, runs []cbv1.ClusterBackup, clusterByLocation map[string]string) {
@@ -600,17 +614,25 @@ func collectClusterBackups(ch chan<- prometheus.Metric, runs []cbv1.ClusterBacku
 		}
 		ch <- prometheus.MustNewConstMetric(clusterBackupNamespacesMatchedDesc, prometheus.GaugeValue, s.namespacesMatched, vals...)
 		ch <- prometheus.MustNewConstMetric(clusterBackupNamespacesFailedDesc, prometheus.GaugeValue, s.namespacesFailed, vals...)
+		ch <- prometheus.MustNewConstMetric(clusterBackupNamespacesBlockedDesc, prometheus.GaugeValue, s.namespacesBlocked, vals...)
 	}
 }
 
 // accumulateClusterBackup folds one run into its series: the latest Completed run's
-// success time, and the latest run's matched/failed namespace counts (by creation time).
+// success time, and the latest run's matched/failed/blocked namespace counts (by creation time,
+// tie-broken on name — see clusterBackupSeries).
+//
+// The three namespace gauges are taken from ONE run, together. Mixing them across runs would let
+// the exported matched/failed/blocked stop adding up even though the object they came from was
+// self-consistent.
 func accumulateClusterBackup(s *clusterBackupSeries, run *cbv1.ClusterBackup) {
 	created := float64(run.CreationTimestamp.Unix())
-	if created >= s.latestRunUnix {
+	if created > s.latestRunUnix || (created == s.latestRunUnix && run.Name >= s.latestRunName) {
 		s.latestRunUnix = created
+		s.latestRunName = run.Name
 		s.namespacesMatched = float64(run.Status.NamespacesMatched)
 		s.namespacesFailed = float64(run.Status.NamespacesFailed)
+		s.namespacesBlocked = float64(run.Status.NamespacesBlocked)
 	}
 	if run.Status.Phase == string(status.ClusterBackupPhaseCompleted) && run.Status.CompletionTime != nil {
 		if t := float64(run.Status.CompletionTime.Unix()); t > s.lastSuccessUnix {

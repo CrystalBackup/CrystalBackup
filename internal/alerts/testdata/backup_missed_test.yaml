@@ -300,3 +300,196 @@ tests:
             exp_annotations:
               summary: "No successful backup for team-a/hourly (namespace) within its schedule's deadline"
               description: "The schedule is active and its deadline has passed with no successful Backup. Check the namespace's Backup objects for a failed or stuck run, and the mover Jobs in the operator namespace."
+
+  # ── the escalated tier: CrystalbackupBackupMissedCritical ─────────────────
+  # THE 2026-08-09 INCIDENT. The operator's own self-check on a live cluster read
+  # `degraded — 2 rule(s) breached, none critical` with BackupMissed at 111735 seconds: thirty-one
+  # hours with nothing captured, routed exactly like being an hour late. The escalated rule is the
+  # same condition at three of the schedule's OWN periods, and these cases exist to prove the
+  # "own periods" half — a fixed critical hour count would fail one of the two directions below.
+  #
+  # A NIGHTLY schedule: warning deadline 86400*1.1 + 3600 = 98640s = 27h24m; critical deadline
+  # 86400*3 + 3600 = 262800s = 73h. At 31h it has missed ONE run, which is the warning's job.
+  - interval: 10m
+    name: nightly at 31h — warning fires, critical does not (one missed period)
+    input_series:
+      - series: 'crystalbackup_backup_last_success_timestamp_seconds{namespace="team-a",tenant="acme",schedule="nightly",origin="namespace",location="dr",cluster="prod"}'
+        values: "0x460"
+      - series: 'crystalbackup_schedule_period_seconds{namespace="team-a",tenant="acme",schedule="nightly",origin="namespace",location="dr",cluster="prod"}'
+        values: "86400x460"
+      - series: 'crystalbackup_schedule_created_timestamp_seconds{namespace="team-a",tenant="acme",schedule="nightly",origin="namespace",location="dr",cluster="prod"}'
+        values: "0x460"
+      - series: 'crystalbackup_schedule_active{namespace="team-a",tenant="acme",schedule="nightly",origin="namespace",location="dr",cluster="prod"}'
+        values: "1x460"
+    alert_rule_test:
+      # The incident's own instant. The warning is up...
+      - eval_time: 31h
+        alertname: CrystalbackupBackupMissed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              namespace: team-a
+              tenant: acme
+              schedule: nightly
+              origin: namespace
+              location: dr
+              cluster: prod
+            exp_annotations:
+              summary: "No successful backup for team-a/nightly (namespace) within its schedule's deadline"
+              description: "The schedule is active and its deadline has passed with no successful Backup. Check the namespace's Backup objects for a failed or stuck run, and the mover Jobs in the operator namespace."
+      # ...and the critical one is NOT. A nightly schedule that has skipped a single run is bad news,
+      # not a statement about restorability. A hardcoded critical bound low enough to catch the hourly
+      # case below would page here, which is how critical stops meaning anything.
+      - eval_time: 31h
+        alertname: CrystalbackupBackupMissedCritical
+        exp_alerts: []
+      # Just under its own three periods: 72h50m is inside 73h, and the 15m hold is still ahead.
+      - eval_time: 72h50m
+        alertname: CrystalbackupBackupMissedCritical
+        exp_alerts: []
+      # Past 73h and past the hold. THREE consecutive nights with nothing captured.
+      - eval_time: 74h
+        alertname: CrystalbackupBackupMissedCritical
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              namespace: team-a
+              tenant: acme
+              schedule: nightly
+              origin: namespace
+              location: dr
+              cluster: prod
+            exp_annotations:
+              summary: "NO BACKUP for team-a/nightly (namespace) in 3 of its schedule's own periods"
+              description: "This is CrystalbackupBackupMissed's condition at three times the magnitude: the schedule is active and has now missed three consecutive periods, so nothing has been captured since it broke and a restore would land on data that old. Treat it as data loss in progress, not as a late job. Same investigation as the warning — the namespace's Backup objects, then the mover Jobs in the operator namespace — with the addition that whatever is wrong has already survived three attempts, so a retry is not the fix."
+      # And the warning has NOT resolved. Both tiers fire together, on purpose: narrowing the warning
+      # so it stopped here would silence an administrator's existing routing at the exact moment the
+      # situation got worse. Deduplicating is Alertmanager's job (inhibit_rules), not the rule's.
+      - eval_time: 74h
+        alertname: CrystalbackupBackupMissed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              namespace: team-a
+              tenant: acme
+              schedule: nightly
+              origin: namespace
+              location: dr
+              cluster: prod
+            exp_annotations:
+              summary: "No successful backup for team-a/nightly (namespace) within its schedule's deadline"
+              description: "The schedule is active and its deadline has passed with no successful Backup. Check the namespace's Backup objects for a failed or stuck run, and the mover Jobs in the operator namespace."
+
+  # The other direction, and the one a fixed critical bound gets catastrophically wrong. An HOURLY
+  # schedule's critical deadline is 3600*3 + 3600 = 14400s = 4h. At 31h it has missed thirty-one runs
+  # in a row; under any flat threshold tuned for a nightly schedule it would still be warning-only, a
+  # day and a half in, which is the original defect one severity up.
+  - interval: 10m
+    name: hourly at 4h and at 31h — the critical tier scales down with the period
+    input_series:
+      - series: 'crystalbackup_backup_last_success_timestamp_seconds{namespace="team-a",tenant="acme",schedule="hourly",origin="namespace",location="dr",cluster="prod"}'
+        values: "0x200"
+      - series: 'crystalbackup_schedule_period_seconds{namespace="team-a",tenant="acme",schedule="hourly",origin="namespace",location="dr",cluster="prod"}'
+        values: "3600x200"
+      - series: 'crystalbackup_schedule_created_timestamp_seconds{namespace="team-a",tenant="acme",schedule="hourly",origin="namespace",location="dr",cluster="prod"}'
+        values: "0x200"
+      - series: 'crystalbackup_schedule_active{namespace="team-a",tenant="acme",schedule="hourly",origin="namespace",location="dr",cluster="prod"}'
+        values: "1x200"
+    alert_rule_test:
+      # 3h40m: past the warning's 2h06m, still inside the critical 4h. Two missed hourly runs.
+      - eval_time: 3h40m
+        alertname: CrystalbackupBackupMissedCritical
+        exp_alerts: []
+      # 4h30m: past 4h and past the 15m hold.
+      - eval_time: 4h30m
+        alertname: CrystalbackupBackupMissedCritical
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              namespace: team-a
+              tenant: acme
+              schedule: hourly
+              origin: namespace
+              location: dr
+              cluster: prod
+            exp_annotations:
+              summary: "NO BACKUP for team-a/hourly (namespace) in 3 of its schedule's own periods"
+              description: "This is CrystalbackupBackupMissed's condition at three times the magnitude: the schedule is active and has now missed three consecutive periods, so nothing has been captured since it broke and a restore would land on data that old. Treat it as data loss in progress, not as a late job. Same investigation as the warning — the namespace's Backup objects, then the mover Jobs in the operator namespace — with the addition that whatever is wrong has already survived three attempts, so a retry is not the fix."
+      # The incident's instant, on an hourly schedule: thirty-one missed runs, and critical.
+      - eval_time: 31h
+        alertname: CrystalbackupBackupMissedCritical
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              namespace: team-a
+              tenant: acme
+              schedule: hourly
+              origin: namespace
+              location: dr
+              cluster: prod
+            exp_annotations:
+              summary: "NO BACKUP for team-a/hourly (namespace) in 3 of its schedule's own periods"
+              description: "This is CrystalbackupBackupMissed's condition at three times the magnitude: the schedule is active and has now missed three consecutive periods, so nothing has been captured since it broke and a restore would land on data that old. Treat it as data loss in progress, not as a late job. Same investigation as the warning — the namespace's Backup objects, then the mover Jobs in the operator namespace — with the addition that whatever is wrong has already survived three attempts, so a retry is not the fix."
+
+  # The escalated FALLBACK, for the one series that has no period to scale by: a cron the operator
+  # cannot parse publishes no schedule_period_seconds at all. Three of the same assumed daily period
+  # plus the same grace — 3*24h + 2h = 74h — against the warning's 26h. That schedule will never run,
+  # so it is the clearest critical case in the table, and a fallback nobody has watched fire is the
+  # shape of silence this whole file exists to remove.
+  - interval: 10m
+    name: unparseable cron — the escalated flat fallback is 74h, not 26h and not never
+    input_series:
+      - series: 'crystalbackup_backup_last_success_timestamp_seconds{namespace="team-a",tenant="acme",schedule="broken-cron",origin="namespace",location="dr",cluster="prod"}'
+        values: "0x460"
+      - series: 'crystalbackup_schedule_created_timestamp_seconds{namespace="team-a",tenant="acme",schedule="broken-cron",origin="namespace",location="dr",cluster="prod"}'
+        values: "0x460"
+      - series: 'crystalbackup_schedule_active{namespace="team-a",tenant="acme",schedule="broken-cron",origin="namespace",location="dr",cluster="prod"}'
+        values: "1x460"
+    alert_rule_test:
+      # Past the warning's 26h fallback, nowhere near the escalated one.
+      - eval_time: 30h
+        alertname: CrystalbackupBackupMissedCritical
+        exp_alerts: []
+      # Just under 74h.
+      - eval_time: 73h50m
+        alertname: CrystalbackupBackupMissedCritical
+        exp_alerts: []
+      # Past 74h and past the hold.
+      - eval_time: 75h
+        alertname: CrystalbackupBackupMissedCritical
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              namespace: team-a
+              tenant: acme
+              schedule: broken-cron
+              origin: namespace
+              location: dr
+              cluster: prod
+            exp_annotations:
+              summary: "NO BACKUP for team-a/broken-cron (namespace) in 3 of its schedule's own periods"
+              description: "This is CrystalbackupBackupMissed's condition at three times the magnitude: the schedule is active and has now missed three consecutive periods, so nothing has been captured since it broke and a restore would land on data that old. Treat it as data loss in progress, not as a late job. Same investigation as the warning — the namespace's Backup objects, then the mover Jobs in the operator namespace — with the addition that whatever is wrong has already survived three attempts, so a retry is not the fix."
+
+  # The guards are the WARNING's, unchanged, and the escalated rule must inherit every one of them.
+  # A paused schedule is 0 rather than absent, and a deleted one leaves its Backups' last_success
+  # behind: both would page forever without `and on(...) schedule_active == 1`, and the critical tier
+  # paging forever about a schedule somebody deliberately stopped would be worse than the silence
+  # this rule was added to break.
+  - interval: 1h
+    name: paused and deleted schedules — silent at critical too, long past every bound
+    input_series:
+      - series: 'crystalbackup_backup_last_success_timestamp_seconds{namespace="team-a",tenant="acme",schedule="paused",origin="namespace",location="dr",cluster="prod"}'
+        values: "0x100"
+      - series: 'crystalbackup_schedule_created_timestamp_seconds{namespace="team-a",tenant="acme",schedule="paused",origin="namespace",location="dr",cluster="prod"}'
+        values: "0x100"
+      - series: 'crystalbackup_schedule_period_seconds{namespace="team-a",tenant="acme",schedule="paused",origin="namespace",location="dr",cluster="prod"}'
+        values: "86400x100"
+      - series: 'crystalbackup_schedule_active{namespace="team-a",tenant="acme",schedule="paused",origin="namespace",location="dr",cluster="prod"}'
+        values: "0x100"
+      # Deleted: only the Backup-derived series survives the object.
+      - series: 'crystalbackup_backup_last_success_timestamp_seconds{namespace="team-a",tenant="acme",schedule="retired",origin="namespace",location="dr",cluster="prod"}'
+        values: "0x100"
+    alert_rule_test:
+      - eval_time: 90h
+        alertname: CrystalbackupBackupMissedCritical
+        exp_alerts: []

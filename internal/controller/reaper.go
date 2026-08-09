@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"time"
 
@@ -29,12 +30,14 @@ import (
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	cbv1 "github.com/CrystalBackup/CrystalBackup/api/v1alpha1"
 	"github.com/CrystalBackup/CrystalBackup/internal/apiconst"
 	"github.com/CrystalBackup/CrystalBackup/internal/exposer"
+	"github.com/CrystalBackup/CrystalBackup/internal/metrics"
 	"github.com/CrystalBackup/CrystalBackup/internal/status"
 )
 
@@ -49,6 +52,92 @@ const (
 	// than this is ever swept.
 	defaultReaperMinAge = 30 * time.Minute
 )
+
+// The kinds the reaper reports on. They are the `kind` label values of
+// crystalbackup_orphan_reap_stuck and must stay in step with metrics.OrphanReapStuckKinds — pinned
+// by TestStuckKindsAreAllPublished, because a kind this package names and that package does not
+// enumerate would never be reset to zero.
+const (
+	kindJob                   = "Job"
+	kindPVC                   = "PersistentVolumeClaim"
+	kindSecret                = "Secret"
+	kindPV                    = "PersistentVolume"
+	kindVolumeSnapshot        = "VolumeSnapshot"
+	kindVolumeSnapshotContent = "VolumeSnapshotContent"
+	kindRoleBinding           = "RoleBinding"
+	kindClusterRoleBinding    = "ClusterRoleBinding"
+)
+
+// eventReasonReapStuck is the Event reason for a deletion the reaper requested and that Kubernetes
+// has not completed. It is the ONE thing in this file that must reach a human without anybody
+// reading a log line, so it is a Warning on the stuck object itself: `kubectl describe` on the
+// object an administrator is already staring at explains why it will not go away, and names the
+// finalizers to talk to.
+const eventReasonReapStuck = "OrphanReapStuck"
+
+// reapOutcome is what a DELETE the reaper issued ACTUALLY achieved — which is not the same question
+// as whether the apiserver accepted it, and the 0.6.5 incident is the proof.
+//
+// For 31 hours the reaper logged "reaped leftover VolumeSnapshot" every 10 minutes for the same
+// three objects, and reaped none of them: their deletion was blocked on external-snapshotter's
+// bound-protection finalizers, so each carried a deletionTimestamp and was going nowhere. In the
+// same binary, the self-check's leakIndicators reported those objects as residual — total 8,
+// residual 8, oldest 31 h. One of the two was lying and it was the reaper, because a successful
+// `Delete` call means the deletion was ACCEPTED FOR PROCESSING, and with a finalizer in play
+// "accepted" and "gone" can be separated by forever.
+//
+// This is the project's standing rule applied to object deletion: verify the artifact, not the job.
+// So the reaper reads the object back and reports which of these three actually happened. Nothing
+// but reapConfirmedGone may ever be worded as a completed reap.
+type reapOutcome int
+
+const (
+	// reapConfirmedGone: a read after the delete says the object is not there (NotFound, its kind
+	// does not exist on this cluster, or the name now belongs to a DIFFERENT object — a successor
+	// with another UID, which means ours did complete). This is the only outcome that is a success.
+	reapConfirmedGone reapOutcome = iota
+
+	// reapStuck: the object is still there and now carries a deletionTimestamp, i.e. one or more
+	// finalizers are holding it. This is the case that was reported as success for 31 hours, and the
+	// one that actually needs a person: the operator will not strip a finalizer belonging to another
+	// controller (doing so on external-snapshotter's bound-protection would break the contract that
+	// keeps a content from being destroyed under a live snapshot), so nothing in this process can
+	// resolve it. It gets a Warning Event naming the finalizers, and a metric.
+	reapStuck
+
+	// reapRequested: the delete was accepted but the outcome could not be established — the object
+	// still reads as present with NO deletionTimestamp (a stale cached read, the overwhelmingly
+	// likely case immediately after a delete), or the confirming read itself failed. Deliberately
+	// NOT reported as either success or a leak: it is one sweep's worth of not knowing, and the next
+	// sweep resolves it into one of the other two. Calling it "reaped" is the original defect;
+	// calling it stuck would cry wolf on every healthy delete whose watch had not caught up yet.
+	reapRequested
+)
+
+// reapTally accumulates ONE sweep's stuck objects per kind, so the sweep publishes a complete
+// picture at the end instead of a running one. A nil tally is valid and records nothing, which is
+// what a caller driving a single sub-sweep in a test gets.
+type reapTally struct {
+	stuck map[string]int
+}
+
+func newReapTally() *reapTally { return &reapTally{stuck: map[string]int{}} }
+
+func (t *reapTally) markStuck(kind string) {
+	if t == nil {
+		return
+	}
+	t.stuck[kind]++
+}
+
+// publish hands the tally to the metric. Called ONLY from a sweep that ran to completion — see
+// metrics.SetOrphanReapStuck for why a partial tally must never be published as a whole one.
+func (t *reapTally) publish() {
+	if t == nil {
+		return
+	}
+	metrics.SetOrphanReapStuck(t.stuck)
+}
 
 // OrphanReaper is the periodic backstop that keeps a run from leaking storage objects when the
 // happy-path teardown was missed (an operator crash mid-cleanup, a namespace deleted out from under
@@ -78,6 +167,26 @@ type OrphanReaper struct {
 	// MinAge and Interval default to defaultReaperMinAge / defaultReaperInterval when zero.
 	MinAge   time.Duration
 	Interval time.Duration
+
+	// APIReader is the UNCACHED reader used for the read-back that confirms a deletion. Optional:
+	// when nil, Client is used.
+	//
+	// It matters because the whole fix rests on that read being believable, and the cached client is
+	// exactly the wrong instrument for it: an informer cache lags the write it is confirming, so
+	// "still present, no deletionTimestamp" is its normal answer immediately after a successful
+	// delete. Reading through the cache cannot produce a false "gone" (an object absent from the
+	// cache after a delete really is being deleted), but it can and does produce a false
+	// "unconfirmed", which the reaper then has to carry to the next sweep. Going straight to the
+	// apiserver — a handful of GETs per sweep, only for objects that were actually reap-eligible —
+	// resolves most deletions inside the same sweep. See the read-after-write lesson: a transient
+	// NotFound on a cached client is not an absence, and its mirror image is that a cached hit is
+	// not a presence.
+	APIReader client.Reader
+
+	// Recorder puts a STUCK deletion where `kubectl describe` will show it, on the stuck object
+	// itself. Optional: a nil Recorder degrades to logs only, which is what the envtest suites and
+	// the fake-client tests that do not care about events get.
+	Recorder events.EventRecorder
 }
 
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;delete
@@ -86,6 +195,7 @@ type OrphanReaper struct {
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;delete
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=rolebindings,verbs=get;list;watch;create;delete
 // +kubebuilder:rbac:groups=crystalbackup.io,resources=backups;restores;clusterrestores,verbs=get;list;watch
+// +kubebuilder:rbac:groups="";events.k8s.io,resources=events,verbs=create;patch
 
 // Start runs the sweep loop until ctx is cancelled. It satisfies manager.Runnable. It applies the
 // production defaults for Interval and MinAge here (not in sweepOnce), so a caller can drive
@@ -116,8 +226,14 @@ func (r *OrphanReaper) Start(ctx context.Context) error {
 // sweepOnce reaps every orphaned native exposure object in one pass. It is best-effort: a delete
 // that races another actor (NotFound) is success, and a single object's failure is logged and does
 // not abort the rest of the sweep.
+//
+// It also owns the per-sweep stuck tally: every sub-sweep records into the same reapTally, and the
+// tally is published ONLY on the paths that reach the end. An early return (a List that failed) is
+// a sweep whose picture is incomplete, and publishing it would be the same category of
+// overstatement this file exists to stop.
 func (r *OrphanReaper) sweepOnce(ctx context.Context) error {
 	log := logf.FromContext(ctx).WithName("orphan-reaper")
+	tally := newReapTally()
 	sel := client.MatchingLabels{apiconst.LabelManagedBy: apiconst.ManagedByValue}
 	inOperatorNS := client.InNamespace(r.OperatorNamespace)
 	// r.MinAge is used literally: Start applies the production default, so a direct sweepOnce caller
@@ -154,45 +270,170 @@ func (r *OrphanReaper) sweepOnce(ctx context.Context) error {
 		return err
 	}
 
-	reap := func(obj client.Object) {
+	reap := func(kind string, obj client.Object) {
 		orphaned, err := r.orphaned(ctx, obj, cutoff)
 		if err != nil {
-			log.Error(err, "orphan reaper: orphan check failed", "kind", obj.GetObjectKind().GroupVersionKind().Kind, "name", obj.GetName())
+			log.Error(err, "orphan reaper: orphan check failed", "kind", kind, "name", obj.GetName())
 			return
 		}
 		if !orphaned {
 			return
 		}
-		if err := r.Delete(ctx, obj, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil && !apierrors.IsNotFound(err) {
-			log.Error(err, "orphan reaper: delete failed", "name", obj.GetName())
-			return
-		}
-		log.Info("orphan reaper: reaped leftover exposure object", "name", obj.GetName(),
+		r.reapAndReport(ctx, kind, obj, tally, "leftover exposure object",
+			nil, // a Job/PVC/Secret needs no preparation: the object IS the whole thing to remove.
+			func() error {
+				return r.Delete(ctx, obj, client.PropagationPolicy(metav1.DeletePropagationBackground))
+			},
 			"run", obj.GetLabels()[apiconst.LabelClusterBackup], "pvc", obj.GetLabels()[apiconst.LabelPVC])
 	}
 
 	for i := range jobs.Items {
-		reap(&jobs.Items[i])
+		reap(kindJob, &jobs.Items[i])
 	}
 	for i := range pvcs.Items {
-		reap(&pvcs.Items[i])
+		reap(kindPVC, &pvcs.Items[i])
 	}
 	for i := range secrets.Items {
-		reap(&secrets.Items[i])
+		reap(kindSecret, &secrets.Items[i])
 	}
 	for i := range pvs.Items {
-		r.reapRestorePV(ctx, &pvs.Items[i], cutoff)
+		r.reapRestorePV(ctx, &pvs.Items[i], cutoff, tally)
 	}
 	// The labelled snapshot residue (VolumeSnapshots + VolumeSnapshotContents) — the leak
 	// audit's missing half. See reapSnapshotObjects for why its internal order matters.
-	r.reapSnapshotObjects(ctx, cutoff)
+	r.reapSnapshotObjects(ctx, cutoff, tally)
 	// Transient manifest-mover RoleBindings, swept on their own (much shorter) clock — see
 	// reapManifestBindings.
-	r.reapManifestBindings(ctx)
+	r.reapManifestBindings(ctx, tally)
 	// And their cluster-scoped counterparts from a cluster-manifests capture (adr/0011 §1),
 	// which live in no namespace and so need a separate list.
-	r.reapClusterManifestBindings(ctx)
+	r.reapClusterManifestBindings(ctx, tally)
+	// The sweep completed: this tally is the whole picture, so it may be published as such.
+	tally.publish()
 	return nil
+}
+
+// reapAndReport performs the honest reap of ONE object the caller has already vetted as orphaned,
+// and is the single place in this file allowed to say a reap happened.
+//
+// The shape is prepare-then-delete-then-VERIFY, and each part is load-bearing:
+//
+//   - prepare (may be nil) is the idempotent, non-destructive work a reap needs that is NOT the
+//     delete — today, restoring a dynamic VolumeSnapshotContent's deletionPolicy to Delete. It runs
+//     on EVERY sweep, including when a deletion is already pending, because a content that is stuck
+//     on a finalizer while still Retain-parked would orphan its storage-side snapshot in the backend
+//     the instant the finalizer clears. See
+//     exposer.PrepareOrphanVolumeSnapshotContentForReclaim.
+//   - del is NOT re-issued when a deletion is already pending (the object arrived from the List with
+//     a deletionTimestamp). That is the 31-hour loop: the same three objects, a fresh DELETE and a
+//     fresh "reaped" line every 10 minutes, forever. Re-asking cannot help — a finalizer is not
+//     waiting for a second request — so the reaper reports and moves on. This is also why the
+//     function never blocks, never sleeps and never retries a stuck object within a sweep: the next
+//     sweep is the retry, and a stuck object costs one GET per sweep and nothing else.
+//   - the outcome is then READ BACK rather than assumed.
+//
+// The three outcomes are worded so that no reader can mistake one for another: only
+// reapConfirmedGone gets the word "reaped". A stuck object additionally gets a Warning Event on
+// itself, naming the finalizers, because that is the actionable detail and because an administrator
+// must not have to read operator logs to discover that a deletion is deadlocked.
+func (r *OrphanReaper) reapAndReport(
+	ctx context.Context,
+	kind string,
+	obj client.Object,
+	tally *reapTally,
+	subject string,
+	prepare func() error,
+	del func() error,
+	kv ...any,
+) {
+	log := logf.FromContext(ctx).WithName("orphan-reaper")
+	// Built by appending rather than as one composite literal: logcheck requires every log KEY to be
+	// an inlined literal (so no named constants), and goconst counts repeated literals unless they sit
+	// in a call's argument list. Both linters are satisfied by this shape and by no other.
+	base := make([]any, 0, 6+len(kv))
+	base = append(base, "kind", kind, "namespace", obj.GetNamespace(), "name", obj.GetName())
+	base = append(base, kv...)
+
+	if prepare != nil {
+		if err := prepare(); err != nil && !apierrors.IsNotFound(err) && !apimeta.IsNoMatchError(err) {
+			log.Error(err, "orphan reaper: preparing the object for reclamation failed; "+
+				"NOT deleting it — a delete on an unprepared object can orphan storage", base...)
+			return
+		}
+	}
+
+	alreadyPending := !obj.GetDeletionTimestamp().IsZero()
+	if !alreadyPending {
+		if err := del(); err != nil && !apierrors.IsNotFound(err) && !apimeta.IsNoMatchError(err) {
+			log.Error(err, "orphan reaper: delete failed", base...)
+			return
+		}
+	}
+
+	outcome, finalizers, confirmErr := r.confirmReap(ctx, obj)
+	switch outcome {
+	case reapConfirmedGone:
+		log.Info("orphan reaper: reaped "+subject+"; confirmed gone by a read-back", base...)
+
+	case reapStuck:
+		tally.markStuck(kind)
+		held := strings.Join(finalizers, ",")
+		stuckKV := append(append([]any{}, base...), "finalizers", held, "deletionRequestedAlready", alreadyPending)
+		// Info, not Error: nothing failed and there is nothing here for the operator process to fix.
+		// The severity lives on the Event and the metric, which are the two channels an administrator
+		// actually watches.
+		log.Info("orphan reaper: deletion is STUCK — the object still exists with a deletionTimestamp, "+
+			"held by a finalizer; this is NOT a completed reap and only an administrator can clear it", stuckKV...)
+		if r.Recorder != nil {
+			r.Recorder.Eventf(obj, nil, corev1.EventTypeWarning, eventReasonReapStuck, "Reap",
+				"Deletion of this orphaned CrystalBackup object has been requested but has not completed: "+
+					"it still exists with a deletionTimestamp and is held by finalizer(s) %s. CrystalBackup "+
+					"will not remove a finalizer it does not own, so this will not clear on its own — "+
+					"the controller behind that finalizer must release it, or an administrator must.",
+				held)
+		}
+
+	case reapRequested:
+		// One sweep's worth of not knowing. Worded as a request, never as an outcome.
+		requestedKV := base
+		if confirmErr != nil {
+			requestedKV = append(append([]any{}, base...), "confirmError", confirmErr.Error())
+		}
+		log.Info("orphan reaper: deletion REQUESTED and accepted, outcome not yet confirmed; "+
+			"the next sweep resolves it as gone or as stuck", requestedKV...)
+	}
+}
+
+// confirmReap reads obj back and reports which reapOutcome actually holds, plus the finalizers
+// holding a stuck object.
+//
+// It reads through APIReader when one is set, deliberately (see the field's comment). The UID
+// comparison is not defensive noise: reaping by label can name an object that has since been
+// recreated with the same name by a later run, and a present-but-different UID means OUR object did
+// in fact complete its deletion. Without that check the successor's own (absent) deletionTimestamp
+// would be read as "unconfirmed" forever.
+func (r *OrphanReaper) confirmReap(ctx context.Context, obj client.Object) (reapOutcome, []string, error) {
+	reader := client.Reader(r.Client)
+	if r.APIReader != nil {
+		reader = r.APIReader
+	}
+	probe, ok := obj.DeepCopyObject().(client.Object)
+	if !ok {
+		return reapRequested, nil, fmt.Errorf("object %T is not a client.Object after a deep copy", obj)
+	}
+	if err := reader.Get(ctx, client.ObjectKeyFromObject(obj), probe); err != nil {
+		if apierrors.IsNotFound(err) || apimeta.IsNoMatchError(err) {
+			return reapConfirmedGone, nil, nil
+		}
+		return reapRequested, nil, err
+	}
+	if uid := obj.GetUID(); uid != "" && probe.GetUID() != "" && probe.GetUID() != uid {
+		return reapConfirmedGone, nil, nil // a successor took the name; ours is gone.
+	}
+	if !probe.GetDeletionTimestamp().IsZero() {
+		return reapStuck, probe.GetFinalizers(), nil
+	}
+	return reapRequested, nil, nil
 }
 
 // reapSnapshotObjects sweeps the labelled VolumeSnapshot / VolumeSnapshotContent residue whose
@@ -213,7 +454,16 @@ func (r *OrphanReaper) sweepOnce(ctx context.Context) error {
 //
 // Best-effort per object, like the native sweep. A cluster without the snapshot CRDs (NoMatch)
 // skips silently: no such kind, no such residue.
-func (r *OrphanReaper) reapSnapshotObjects(ctx context.Context, cutoff time.Time) {
+//
+// This is the sweep the 0.6.5 honesty defect was found in, and it is where the stakes are highest:
+// both halves of the snapshot pair carry external-snapshotter's bound-protection finalizers
+// (snapshot.storage.kubernetes.io/volumesnapshot-bound-protection on the snapshot,
+// volumesnapshotcontent-bound-protection on the content), which is precisely the mechanism that can
+// hold a requested deletion indefinitely. Every delete here therefore goes through reapAndReport,
+// and nothing here strips a finalizer: bound-protection exists to stop a content being destroyed
+// under a live snapshot, and tearing it off would be this operator breaking another controller's
+// contract on objects it does not own.
+func (r *OrphanReaper) reapSnapshotObjects(ctx context.Context, cutoff time.Time, tally *reapTally) {
 	log := logf.FromContext(ctx).WithName("orphan-reaper")
 	sel := client.MatchingLabels{apiconst.LabelManagedBy: apiconst.ManagedByValue}
 	hasPVC := client.HasLabels{apiconst.LabelPVC}
@@ -252,14 +502,16 @@ func (r *OrphanReaper) reapSnapshotObjects(ctx context.Context, cutoff time.Time
 		if !orphaned {
 			return
 		}
-		if err := exposer.ReapOrphanVolumeSnapshotContent(ctx, r.Client, item); err != nil {
-			log.Error(err, "orphan reaper: VolumeSnapshotContent reap failed", "name", item.GetName())
-			return
-		}
 		// A content reaching this path means BOTH the inline teardown and the terminal re-entry
 		// sweep missed it (or its Backup CR is long gone) — worth noticing, never routine.
-		log.Info("orphan reaper: reaped leftover VolumeSnapshotContent; its nominal teardown never completed",
-			"name", item.GetName(), "preProvisioned", exposer.IsPreProvisionedContent(item),
+		// The reclaim POLICY restore is the prepare half and runs even on an already-terminating
+		// content (a Retain-parked content that vanishes when its finalizer clears takes its backend
+		// snapshot out of anyone's reach); the object delete is the half that is not re-issued.
+		r.reapAndReport(ctx, kindVolumeSnapshotContent, item, tally,
+			"leftover VolumeSnapshotContent whose nominal teardown never completed",
+			func() error { return exposer.PrepareOrphanVolumeSnapshotContentForReclaim(ctx, r.Client, item) },
+			func() error { return r.Delete(ctx, item) },
+			"preProvisioned", exposer.IsPreProvisionedContent(item),
 			"run", item.GetLabels()[apiconst.LabelClusterBackup], "pvc", item.GetLabels()[apiconst.LabelPVC])
 	}
 
@@ -277,13 +529,10 @@ func (r *OrphanReaper) reapSnapshotObjects(ctx context.Context, cutoff time.Time
 		if !orphaned {
 			continue
 		}
-		if err := r.Delete(ctx, item); err != nil && !apierrors.IsNotFound(err) {
-			log.Error(err, "orphan reaper: VolumeSnapshot delete failed",
-				"namespace", item.GetNamespace(), "name", item.GetName())
-			continue
-		}
-		log.Info("orphan reaper: reaped leftover VolumeSnapshot; its nominal teardown never completed",
-			"namespace", item.GetNamespace(), "name", item.GetName(),
+		r.reapAndReport(ctx, kindVolumeSnapshot, item, tally,
+			"leftover VolumeSnapshot whose nominal teardown never completed",
+			nil, // deleting the snapshot object is the whole reap; its content is handled in its own pass.
+			func() error { return r.Delete(ctx, item) },
 			"run", item.GetLabels()[apiconst.LabelClusterBackup], "pvc", item.GetLabels()[apiconst.LabelPVC])
 	}
 	for _, item := range dynamicVSCs {
@@ -304,7 +553,7 @@ func (r *OrphanReaper) reapSnapshotObjects(ctx context.Context, cutoff time.Time
 // It uses manifestBindingMinAge rather than the reaper's general MinAge. The general default is
 // calibrated for a temp clone PVC, where the cost of waiting is storage; here it is a live
 // privilege.
-func (r *OrphanReaper) reapManifestBindings(ctx context.Context) {
+func (r *OrphanReaper) reapManifestBindings(ctx context.Context, tally *reapTally) {
 	log := logf.FromContext(ctx).WithName("orphan-reaper")
 
 	var bindings rbacv1.RoleBindingList
@@ -350,15 +599,15 @@ func (r *OrphanReaper) reapManifestBindings(ctx context.Context) {
 			continue
 		}
 
-		if err := r.Delete(ctx, rb); err != nil && !apierrors.IsNotFound(err) {
-			log.Error(err, "deleting orphaned transient manifest RoleBinding",
-				"namespace", rb.Namespace, "name", rb.Name)
-			continue
-		}
-		// Logged at a level an operator will see. A binding reaching this path means the
-		// nominal teardown did not run — worth noticing, not routine housekeeping.
-		log.Info("reaped an orphaned manifest-mover RoleBinding; its nominal teardown did not run",
-			"namespace", rb.Namespace, "name", rb.Name, "job", jobName)
+		// Through reapAndReport like every other delete in this file. A RoleBinding is the LEAST
+		// likely object here to carry a finalizer — but the grant it holds is a live privilege, so
+		// "the reaper said it removed the grant" is the single worst sentence in this codebase to be
+		// wrong about, and it is now said only after a read-back confirms the object is gone.
+		r.reapAndReport(ctx, kindRoleBinding, rb, tally,
+			"an orphaned manifest-mover RoleBinding whose nominal teardown did not run",
+			nil,
+			func() error { return r.Delete(ctx, rb) },
+			"job", jobName)
 	}
 }
 
@@ -368,7 +617,7 @@ func (r *OrphanReaper) reapManifestBindings(ctx context.Context) {
 // they carry no namespace and are listed as ClusterRoleBindings rather than RoleBindings. The
 // grant they hold is a bounded (enumerated) read of the whole cluster, so the same MinAge that
 // treats a leaked namespaced read as a security cost applies here.
-func (r *OrphanReaper) reapClusterManifestBindings(ctx context.Context) {
+func (r *OrphanReaper) reapClusterManifestBindings(ctx context.Context, tally *reapTally) {
 	log := logf.FromContext(ctx).WithName("orphan-reaper")
 
 	var bindings rbacv1.ClusterRoleBindingList
@@ -408,12 +657,11 @@ func (r *OrphanReaper) reapClusterManifestBindings(ctx context.Context) {
 			continue // still running
 		}
 
-		if err := r.Delete(ctx, crb); err != nil && !apierrors.IsNotFound(err) {
-			log.Error(err, "deleting orphaned transient cluster-manifest ClusterRoleBinding", "name", crb.Name)
-			continue
-		}
-		log.Info("reaped an orphaned cluster-manifest ClusterRoleBinding; its nominal teardown did not run",
-			"name", crb.Name, "job", jobName)
+		r.reapAndReport(ctx, kindClusterRoleBinding, crb, tally,
+			"an orphaned cluster-manifest ClusterRoleBinding whose nominal teardown did not run",
+			nil,
+			func() error { return r.Delete(ctx, crb) },
+			"job", jobName)
 	}
 }
 
@@ -421,7 +669,7 @@ func (r *OrphanReaper) reapClusterManifestBindings(ctx context.Context) {
 // object only — Retain). An unfinished transplant is handed back to the provisioner by
 // restoring reclaimPolicy Delete; the PV controller then reclaims the released volume and
 // removes the object, so storage is freed exactly once and never by a bare object delete.
-func (r *OrphanReaper) reapRestorePV(ctx context.Context, pv *corev1.PersistentVolume, cutoff time.Time) {
+func (r *OrphanReaper) reapRestorePV(ctx context.Context, pv *corev1.PersistentVolume, cutoff time.Time, tally *reapTally) {
 	log := logf.FromContext(ctx).WithName("orphan-reaper")
 	orphaned, err := r.orphaned(ctx, pv, cutoff)
 	if err != nil {
@@ -433,11 +681,12 @@ func (r *OrphanReaper) reapRestorePV(ctx context.Context, pv *corev1.PersistentV
 	}
 	switch pv.Labels[apiconst.LabelPVRole] {
 	case apiconst.PVRoleTwin:
-		if err := r.Delete(ctx, pv); err != nil && !apierrors.IsNotFound(err) {
-			log.Error(err, "Orphan reaper: twin PV delete failed", "pv", pv.Name)
-			return
-		}
-		log.Info("Orphan reaper: reaped leftover twin PV", "pv", pv.Name)
+		// A PV is the other kind that routinely sits on a finalizer it did not choose
+		// (kubernetes.io/pv-protection, held while a claim is still bound), so this delete gets the
+		// same read-back as the snapshot pair rather than a bare "reaped" line.
+		r.reapAndReport(ctx, kindPV, pv, tally, "leftover twin PV",
+			nil, // a twin PV is an alias: reclaimPolicy is Retain by construction, nothing to restore.
+			func() error { return r.Delete(ctx, pv) })
 	case apiconst.PVRoleTransplant:
 		// Defensive delivered-check (mirror of rexposer.Cleanup's): a final claim BOUND to
 		// this PV outside the operator namespace means the handover in fact succeeded and

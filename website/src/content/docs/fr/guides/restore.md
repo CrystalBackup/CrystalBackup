@@ -195,11 +195,22 @@ kubectl -n team-x get restore recover-uploads -w
 ```
 
 ```
-NAME              PHASE                  AGE
-recover-uploads   AwaitingConfirmation   4s
-recover-uploads   Running                31s
-recover-uploads   Completed              2m18s
+NAME              PHASE                  RESTORED   FAILED   VOLUMES   AGE
+recover-uploads   AwaitingConfirmation   0          0        0         4s
+recover-uploads   Running                2          0        9         31s
+recover-uploads   Running                7          1        9         1m44s
+recover-uploads   PartiallyFailed        8          1        9         2m18s
 ```
+
+`RESTORED` et `FAILED` évoluent à **chaque** réconciliation, rapportés aux `VOLUMES` planifiés :
+les trois colonnes répondent donc aux questions que l'on se pose pendant l'opération — est-ce que
+ça avance, où en est-on, et qu'est-ce qui n'est pas revenu. `VOLUMES - RESTORED - FAILED` est ce
+qui reste en vol ; sur un restore terminal cette différence vaut `0`.
+
+Ces compteurs ne comptent **que les volumes**. La moitié manifestes est dans
+`status.restoredResources` et `status.resources.failedCount`, et la phase agrège les deux — un
+restore peut donc afficher `PartiallyFailed` avec `FAILED` à `0` parce que ce sont des objets, et
+non des données, qui ont échoué à s'appliquer.
 
 Phases : `Pending`, `AwaitingConfirmation`, `Running`, `Completed`, `PartiallyFailed`,
 `Failed`. Un restore rapporte les échecs par ressource et **continue** ; il ne s'interrompt
@@ -207,7 +218,7 @@ pas au premier.
 
 ```bash
 kubectl -n team-x get restore recover-uploads \
-  -o jsonpath='{.status.restoredVolumes}{" volumes, "}{.status.restoredBytes}{" bytes, "}{.status.restoredResources}{" resources\n"}'
+  -o jsonpath='{.status.restoredVolumes}{"/"}{.status.plannedVolumes}{" volumes revenus, "}{.status.failedVolumes}{" perdus, "}{.status.restoredBytes}{" octets, "}{.status.restoredResources}{" ressources\n"}'
 ```
 
 Le rapport par ressource est plafonné à 100 entrées avec 20 chemins de champs modifiés

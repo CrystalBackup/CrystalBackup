@@ -73,15 +73,38 @@ var sections = []section{
 		prefixes: []string{"crystalbackup_clusterbackup_"},
 		note: "Run-level, with no `namespace` label: a ClusterBackup fans out over many " +
 			"namespaces, and its per-namespace detail is in the Backup families above. " +
-			"`namespaces_failed` above zero on a run that otherwise reports success is the " +
-			"signal — the run completed, and some namespace in it did not.",
+			"`namespaces_failed` **or** `namespaces_blocked` above zero on a run that otherwise " +
+			"reports success is the signal — the run completed, and some namespace in it did not.\n\n" +
+			"Those two are deliberately separate series, and an expression meaning *\"namespaces " +
+			"this run did not protect\"* has to add them:\n\n" +
+			"```promql\ncrystalbackup_clusterbackup_namespaces_failed + " +
+			"crystalbackup_clusterbackup_namespaces_blocked > 0\n```\n\n" +
+			"`namespaces_failed` counts namespaces whose child Backup **ran and failed**. " +
+			"`namespaces_blocked` counts namespaces the run **never backed up at all**, because the " +
+			"Backup coordinate was already occupied by an object the run did not create or the child " +
+			"could not be created. They were once one field, and merging them is how a run came to " +
+			"report 32 failed namespaces over child objects that read `Completed`: a count of " +
+			"namespaces nobody touched is not a count of backups that failed, and an administrator " +
+			"reading the number could not tell which had happened.",
 	},
 	{
 		title:    "Restore",
 		prefixes: []string{"crystalbackup_restore_"},
 		note: "One family covers Restore and ClusterRestore alike. `mode` appears only on the " +
 			"duration histogram and the failure counter, because Recreate and Overwrite fail for " +
-			"entirely different reasons and a merged count hides which one is broken.",
+			"entirely different reasons and a merged count hides which one is broken.\n\n" +
+			"`crystalbackup_restore_failures` counts failed restore OBJECTS and " +
+			"`crystalbackup_restore_volumes_failed` counts the volumes inside them, over the same " +
+			"set of restores — so one restore that lost a single volume out of nine and one that " +
+			"lost all nine stop being the same number. Read them together:\n\n" +
+			"```promql\ncrystalbackup_restore_volumes_failed > 0\n```\n\n" +
+			"Both count **volumes only**. A restore whose volumes all landed and whose manifests " +
+			"failed to apply still counts in `restore_failures` and contributes `0` volumes, which " +
+			"is the same split `status.failedVolumes` documents on the object: the two halves of a " +
+			"restore are driven independently and fail for unrelated reasons, while the phase rolls " +
+			"up both. Neither series describes a restore that is still running — for that, read " +
+			"`status.restoredVolumes`, `failedVolumes` and `plannedVolumes`, which now move on every " +
+			"reconcile rather than only at the end.",
 	},
 	{
 		title:    "Repository",
@@ -137,6 +160,29 @@ var sections = []section{
 			"live PVCs, and the pile-up it detects is worth that cost. It counts VolumeSnapshots " +
 			"from **every** tool, an incumbent backup product's included — the ceph-csi flatten " +
 			"thresholds do not care who created the snapshot.",
+	},
+	{
+		title:    "Leftover objects and the orphan reaper",
+		prefixes: []string{"crystalbackup_orphan_"},
+		note: "The orphan reaper is the periodic backstop that removes what a crashed teardown left " +
+			"behind — a temp clone PVC, a mover Job, a VolumeSnapshot and its content, a restore's " +
+			"twin PV. This series reports the part of that job it **cannot finish**.\n\n" +
+			"A `DELETE` accepted by the API server is a request, not a result. While a finalizer holds " +
+			"the object, \"accepted\" and \"gone\" can stay apart indefinitely, and the usual holder is " +
+			"the external snapshot controller's own protection finalizer " +
+			"(`snapshot.storage.kubernetes.io/volumesnapshot-bound-protection` and its content-side " +
+			"sibling). Crystal Backup will not strip a finalizer it does not own — that would tear up " +
+			"another controller's contract on an object that is not ours — so a non-zero value here " +
+			"does not clear itself. Alert on `crystalbackup_orphan_reap_stuck > 0` and go and look.\n\n" +
+			"The same fact also arrives as a `Warning` Event named `OrphanReapStuck` **on the stuck " +
+			"object itself**, and its message names the finalizers holding it. `kubectl describe " +
+			"volumesnapshot <name>` therefore explains a stuck `Terminating` without anyone reading " +
+			"operator logs. Whoever owns that finalizer has to release it.\n\n" +
+			"Before 0.6.5 none of this existed and the reaper simply logged `reaped` after every " +
+			"`DELETE` it issued. On one cluster it logged that every 10 minutes for 31 hours about the " +
+			"same three VolumeSnapshots, none of which it had removed — while `crystalbackup " +
+			"selfcheck` reported them correctly as residual the whole time. That is the disagreement " +
+			"this series ends.",
 	},
 	{
 		title:    "External sync",
@@ -200,7 +246,12 @@ func RenderMetrics(families []Family) ([]byte, error) {
 		}
 	}
 
-	b.WriteString(metricsOutro)
+	// The rule COUNT is read from the table rather than spelled, for the same reason nothing else on
+	// this page is spelled. It said "the twelve rules" as a word until 0.6.5 added a thirteenth, at
+	// which point a page whose entire promise is that it cannot go stale carried a wrong number in
+	// its last paragraph — and no verify target could see it, because a prose numeral is not a fact
+	// the generator reads from anywhere.
+	fmt.Fprintf(&b, metricsOutro, RuleCount())
 	return []byte(b.String()), nil
 }
 
@@ -259,21 +310,31 @@ silence. On a backup tool, silence is indistinguishable from health.
 
 ## How to read this page
 
-### Two kinds of series, and only two
+### Three kinds of series, and only three
 
-**Derived at scrape.** Every gauge here is recomputed from live object state each time
+**Derived at scrape.** Almost every gauge here is recomputed from live object state each time
 Prometheus scrapes, through the operator's cached client. The operator holds no counter for
 them, so restarting it changes nothing: the value after a restart is the value before it, because
 both are read from the same objects.
 
-**Event-driven.** The ` + "`_total`" + ` counters and the histograms are the exception. They are
-incremented once at the transition into a terminal phase, after the status write that makes the
-transition durable, and they **reset to zero when the operator restarts**. Write expressions over
-them with ` + "`increase()`" + ` or ` + "`rate()`" + `, never against the raw value.
+**Event-driven.** The ` + "`_total`" + ` counters and the histograms are incremented once at the
+transition into a terminal phase, after the status write that makes the transition durable, and they
+**reset to zero when the operator restarts**. Write expressions over them with
+` + "`increase()`" + ` or ` + "`rate()`" + `, never against the raw value.
+
+**Set by a periodic sweep.** Exactly one gauge is neither:
+` + "`crystalbackup_orphan_reap_stuck`" + ` is written by the orphan reaper at the end of each pass,
+because what it reports — leftover objects whose deletion has been requested and has not completed —
+is a judgement the reaper makes and not a field anything can read off an object. It behaves like a
+gauge (it goes back down when the deadlock clears) with one caveat worth knowing before you alert on
+it: **it is only as fresh as the last completed sweep**, which is every 10 minutes, and it reads
+` + "`0`" + ` after an operator restart until the first sweep lands. Give any alert on it a
+` + "`for:`" + ` longer than one sweep interval.
 
 The split is exact, and the generator enforces it: every ` + "`_total`" + ` family and every
-histogram is event-driven, and every other family is derived at scrape. If that ever stops being
-true, this page fails to regenerate rather than shipping the wrong rule.
+histogram is event-driven, the sweep-set gauge is declared as such, and every other family is
+derived at scrape. If that ever stops being true, this page fails to regenerate rather than shipping
+the wrong rule.
 
 Histograms expose the usual ` + "`_bucket`" + `, ` + "`_sum`" + ` and ` + "`_count`" + ` series.
 Their bucket boundaries are printed under each table.
@@ -319,6 +380,7 @@ thing everywhere:
 | ` + "`webhook`" + `, ` + "`reason`" + ` | code-chosen constants | Never request-derived. A reason taken from user input would be an unbounded-cardinality hole. |
 | ` + "`exposer`" + ` | ` + "`csi-generic`" + `, ` + "`cephfs-shallow`" + ` | The SnapshotExposer kind. Comparing the two is the point of the histogram. |
 | ` + "`pvc`" + ` | a PVC name | The single per-PVC label in the catalogue. See [Snapshot exposure and coexistence](#snapshot-exposure-and-coexistence). |
+| ` + "`kind`" + ` | an object kind (` + "`VolumeSnapshot`" + `, ` + "`Job`" + `, …) | A code-chosen constant from a fixed list, never read off an object. Every kind in that list is published on every sweep, including at ` + "`0`" + `. |
 
 Label *values* are object names and bounded enums. No user-supplied free text becomes a label
 value anywhere in this catalogue.
@@ -348,7 +410,7 @@ administrator's job, on a real cadence — see
 
 ## See also
 
-- [Alerts](/CrystalBackup/docs/reference/alerts/) — the twelve rules built on these series.
+- [Alerts](/CrystalBackup/docs/reference/alerts/) — the %d rules built on these series.
 - [Observability](/CrystalBackup/docs/guides/observability/) — scraping, logs, and the conditions
   that say *why*.
 `

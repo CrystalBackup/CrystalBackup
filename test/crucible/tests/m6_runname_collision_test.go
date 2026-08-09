@@ -182,7 +182,12 @@ sync`)
 			Expect(cb.Status.NamespacesMatched).To(Equal(int32(1)))
 			Expect(cb.Status.NamespacesSucceeded).To(Equal(int32(0)),
 				"a namespace this run never backed up must not be counted as succeeded: %s", m6CollideDescribe(cb))
-			Expect(cb.Status.NamespacesFailed).To(Equal(int32(1)))
+			// Blocked, not failed: nothing of this run's ran in that namespace, so there is no
+			// backup of its own whose failure it could report. The phase above is still Failed —
+			// the namespace went unprotected — but the counter now says which of the two happened.
+			Expect(cb.Status.NamespacesBlocked).To(Equal(int32(1)))
+			Expect(cb.Status.NamespacesFailed).To(Equal(int32(0)),
+				"a namespace this run never backed up is blocked, not a failed backup: %s", m6CollideDescribe(cb))
 			Expect(cb.Status.PVCsSucceeded).To(Equal(int32(0)),
 				"the occupant's volumes belong to run #1: %s", m6CollideDescribe(cb))
 			Expect(cb.Status.AddedBytes).To(Equal(int64(0)))
@@ -264,9 +269,10 @@ func m6RecreateClusterBackup(name, namespace string) *cbv1.ClusterBackup {
 // m6CollideDescribe renders the counters a false success moves, so a red line names the lie rather
 // than only the phase that carried it.
 func m6CollideDescribe(cb *cbv1.ClusterBackup) string {
-	msg := fmt.Sprintf("phase=%s matched=%d succeeded=%d failed=%d pvcsSucceeded=%d addedBytes=%d",
+	msg := fmt.Sprintf("phase=%s matched=%d succeeded=%d failed=%d blocked=%d pvcsSucceeded=%d addedBytes=%d",
 		cb.Status.Phase, cb.Status.NamespacesMatched, cb.Status.NamespacesSucceeded,
-		cb.Status.NamespacesFailed, cb.Status.PVCsSucceeded, cb.Status.AddedBytes)
+		cb.Status.NamespacesFailed, cb.Status.NamespacesBlocked, cb.Status.PVCsSucceeded,
+		cb.Status.AddedBytes)
 	for _, f := range cb.Status.Failures {
 		msg += fmt.Sprintf("\n  failure[%s]: %s", f.Namespace, f.Message)
 	}

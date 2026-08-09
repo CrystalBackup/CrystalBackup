@@ -184,11 +184,21 @@ kubectl -n team-x get restore recover-uploads -w
 ```
 
 ```
-NAME              PHASE                  AGE
-recover-uploads   AwaitingConfirmation   4s
-recover-uploads   Running                31s
-recover-uploads   Completed              2m18s
+NAME              PHASE                  RESTORED   FAILED   VOLUMES   AGE
+recover-uploads   AwaitingConfirmation   0          0        0         4s
+recover-uploads   Running                2          0        9         31s
+recover-uploads   Running                7          1        9         1m44s
+recover-uploads   PartiallyFailed        8          1        9         2m18s
 ```
+
+`RESTORED` and `FAILED` move on **every** reconcile, against the `VOLUMES` the restore planned,
+so the three columns answer the questions you actually have while it runs: is it moving, how far
+along is it, and what did not come back. `VOLUMES - RESTORED - FAILED` is what is still in
+flight; on a terminal restore that difference is `0`.
+
+They count **volumes only**. The manifest half is `status.restoredResources` and
+`status.resources.failedCount`, and the phase rolls up both — so a restore can read
+`PartiallyFailed` with `FAILED` at `0` because objects, not data, failed to apply.
 
 Phases: `Pending`, `AwaitingConfirmation`, `Running`, `Completed`, `PartiallyFailed`,
 `Failed`. A restore reports per-resource failures and **continues**; it does not abort on
@@ -196,7 +206,7 @@ the first one.
 
 ```bash
 kubectl -n team-x get restore recover-uploads \
-  -o jsonpath='{.status.restoredVolumes}{" volumes, "}{.status.restoredBytes}{" bytes, "}{.status.restoredResources}{" resources\n"}'
+  -o jsonpath='{.status.restoredVolumes}{"/"}{.status.plannedVolumes}{" volumes back, "}{.status.failedVolumes}{" lost, "}{.status.restoredBytes}{" bytes, "}{.status.restoredResources}{" resources\n"}'
 ```
 
 The per-resource report is capped at 100 entries with 20 changed field paths each — etcd's

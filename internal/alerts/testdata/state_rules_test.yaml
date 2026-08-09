@@ -3,8 +3,9 @@
 # Run with `make test-alert-rules`. The rule file is the GENERATED chart artifact, not a copy: a
 # test that restated the expression here would pass forever against its own transcription.
 #
-# CrystalbackupRepositoryCheckFailed is the only critical rule in the table, and the one whose
-# ABSENCE semantics carry meaning. spec/05-observability.md §2.4 says a repository that has never
+# CrystalbackupRepositoryCheckFailed was the table's only critical rule until 0.6.5 added
+# CrystalbackupBackupMissedCritical (covered in backup_missed_test.yaml), and it remains the one
+# whose ABSENCE semantics carry meaning. spec/05-observability.md §2.4 says a repository that has never
 # been checked emits no `last_check_success` series at all, precisely so a freshly created location
 # does not page the moment it exists. That is a property of the collector AND of the rule together,
 # and nothing but an evaluation can hold them to it — `== 0` against a missing series is a silence

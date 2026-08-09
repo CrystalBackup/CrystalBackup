@@ -259,8 +259,34 @@ func Fidelity(ruleName string) string {
 // the alert joins against is one per matched namespace. Resolving it any other way would make the
 // self-check answer a different question from the alert on precisely the schedules that cover the
 // most namespaces.
+//
+// Two rules share the body below — the warning at 1.1 periods and the critical at three — and they
+// differ in NOTHING but the bound they resolve. See backupMissedCritical.
 func backupMissed(ctx context.Context, r client.Reader, now time.Time) ([]Breach, error) {
-	t, err := thresholdOf(ruleBackupMissed)
+	return backupMissedAgainst(ctx, r, now, ruleBackupMissed)
+}
+
+// backupMissedCritical is the same predicate reading the ESCALATED rule's bound — three of the
+// schedule's own periods instead of 1.1 — so the self-check reproduces both tiers of the condition
+// and its Verdict can reach `unhealthy` on a cluster with no Prometheus.
+//
+// It exists as a second function rather than a parameter on the table because Rule.Predicate is a
+// func value with a fixed signature, and that is the right trade: the two rules share ONE
+// implementation below, so there is no second copy of the join, the fallback or the deadline
+// arithmetic to keep in step with the first. What differs between them is the rule NAME they look
+// their bound up by, which is exactly what differs between them in rules.go.
+//
+// The name is passed in rather than inferred because a predicate that guessed its own rule is how
+// the critical tier would end up silently measuring the warning's bound: still 12 green rules, still
+// a report saying "none critical", which is the defect this rule was added to close.
+func backupMissedCritical(ctx context.Context, r client.Reader, now time.Time) ([]Breach, error) {
+	return backupMissedAgainst(ctx, r, now, ruleBackupMissedCritical)
+}
+
+func backupMissedAgainst(
+	ctx context.Context, r client.Reader, now time.Time, rule string,
+) ([]Breach, error) {
+	t, err := thresholdOf(rule)
 	if err != nil {
 		return nil, err
 	}

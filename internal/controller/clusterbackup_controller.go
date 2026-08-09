@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"slices"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -379,34 +380,203 @@ func childBackupLabels(cb *cbv1.ClusterBackup, ns string) map[string]string {
 	return l
 }
 
+// namespaceVerdict is ONE line in a run's ledger: the namespace, the single outcome that feeds both
+// the run's counters and the run's phase, and the FailureRecord (nil when there is nothing to
+// explain) that says why. One struct per namespace, one outcome per struct — so a namespace cannot
+// be counted twice, cannot be counted in two buckets, and cannot be counted in a bucket without
+// its explanation travelling with it.
+type namespaceVerdict struct {
+	namespace string
+	outcome   status.NamespaceOutcome
+	failure   *cbv1.FailureRecord
+}
+
+// runLedger is the complete accounting of one aggregation pass: one verdict per namespace the run is
+// answerable for, plus the volume-level tallies gathered in the SAME traversal. Nothing outside
+// buildRunLedger contributes to it, which is the property the old code lacked — its namespace
+// counters were incremented from two unrelated places (the fan-out's collision map and the child
+// phases) and no total was ever checked, so the two readings drifted apart in production without
+// anything noticing.
+type runLedger struct {
+	verdicts      []namespaceVerdict
+	pvcsSucceeded int32
+	pvcsFailed    int32
+	addedBytes    int64
+}
+
+// outcomes projects the ledger onto the outcome list the tally and the phase roll-up both consume.
+func (l runLedger) outcomes() []status.NamespaceOutcome {
+	out := make([]status.NamespaceOutcome, 0, len(l.verdicts))
+	for _, v := range l.verdicts {
+		out = append(out, v.outcome)
+	}
+	return out
+}
+
+// buildRunLedger decides, in one pass, what the run has to say about every namespace it is
+// answerable for. It is a pure function of its inputs — no client, no clock — because the counters
+// an administrator acts on deserve to be testable without an API server, and because the incident
+// that produced this shape was invisible to every test the aggregation had.
+//
+// The namespaces it is answerable for are the MATCHED set, plus any namespace holding a child this
+// run demonstrably created (stamped with runUID) that the selector no longer matches. The second
+// part is not hypothetical bookkeeping: a selector edited mid-run, or a label removed from a
+// namespace, used to drop that namespace's child out of the ledger entirely — its bytes and its
+// success vanished from the run's totals, and a child still uploading could no longer hold the run
+// non-terminal. What a run DID is not undone by the selector changing its mind afterwards.
+//
+// Only Backups sitting at the run's own coordinate (name == runName) are considered. The caller's
+// List is label-scoped, and a label is not a coordinate: keying a map by namespace alone let any
+// labelled Backup in that namespace stand in for the run's child, last write winning.
+func buildRunLedger(
+	runName string, runUID types.UID, matched []string, children []cbv1.Backup, collided map[string]string,
+) runLedger {
+	atCoordinate := make(map[string]*cbv1.Backup, len(children))
+	for i := range children {
+		c := &children[i]
+		if c.Name != runName {
+			continue
+		}
+		atCoordinate[c.Namespace] = c
+	}
+	isMatched := make(map[string]bool, len(matched))
+	for _, ns := range matched {
+		isMatched[ns] = true
+	}
+
+	l := runLedger{verdicts: make([]namespaceVerdict, 0, len(matched))}
+
+	// count folds one child's volumes into the volume-level tallies. Skipped volumes are counted in
+	// NEITHER bucket, deliberately and for the reason RollUpVolumePhases gives: a PVC on a CSI with
+	// no VolumeSnapshotClass is a property of the environment, not a backup degradation, so it is
+	// neutral here too. pvcsSucceeded + pvcsFailed is therefore not the PVC count, and must not be
+	// read as one.
+	count := func(child *cbv1.Backup) {
+		for _, v := range child.Status.Volumes {
+			switch v.Phase {
+			case status.VolumePhaseCompleted:
+				l.pvcsSucceeded++
+			case status.VolumePhaseFailed:
+				l.pvcsFailed++
+			}
+			l.addedBytes += v.AddedBytes
+		}
+	}
+
+	verdictFor := func(ns string, child *cbv1.Backup) namespaceVerdict {
+		// A namespace whose coordinate is occupied by a Backup this run did not create was NOT
+		// backed up, and the occupant's status is not this run's to read: the caller's List picks
+		// such an occupant up (a projection and a previous run's child both carry the cluster-backup
+		// label), so reading its phase would be exactly the false success this guard exists to stop.
+		// Decided before the child lookup so no volume of it is ever tallied.
+		if msg, bad := collided[ns]; bad {
+			return namespaceVerdict{namespace: ns, outcome: status.NamespaceBlocked,
+				failure: &cbv1.FailureRecord{Namespace: ns, Backup: runName, Message: msg}}
+		}
+		if child == nil {
+			// Fanned out but not observed yet: no verdict, which keeps the run non-terminal.
+			return namespaceVerdict{namespace: ns, outcome: status.NamespaceInFlight}
+		}
+		// Defence in depth, independent of the collision detection above: a discovery PROJECTION is
+		// a view of snapshots that already exist in the repository, derived by
+		// discovery.VolumesFromSnapshots — every one of its volumes reads Completed by construction,
+		// and none of them was written by this run. Even if the coordinate check upstream ever
+		// regressed, a projection must not be able to increment pvcsSucceeded.
+		if child.Annotations[apiconst.AnnotationProjected] == apiconst.AnnotationProjectedValue {
+			return namespaceVerdict{namespace: ns, outcome: status.NamespaceBlocked,
+				failure: &cbv1.FailureRecord{
+					Namespace: ns, Backup: child.Name,
+					Message: clampMessage((&runNameCollisionError{
+						Namespace: ns, Name: child.Name,
+						Detail: "it is a discovery projection of snapshots already in the repository",
+					}).Error()),
+				}}
+		}
+		count(child)
+		v := namespaceVerdict{namespace: ns, outcome: status.OutcomeForBackupPhase(child.Status.Phase)}
+		if v.outcome == status.NamespaceFailed {
+			v.failure = &cbv1.FailureRecord{
+				Namespace: ns, Backup: child.Name, Message: childFailureMessage(child),
+			}
+		}
+		return v
+	}
+
+	for _, ns := range matched {
+		l.verdicts = append(l.verdicts, verdictFor(ns, atCoordinate[ns]))
+	}
+	// The run's own children in namespaces the selector no longer matches, in a stable order so the
+	// ledger (and the capped failure list built from it) does not churn between passes. Only the UID
+	// stamp admits a child here: an unmatched namespace gets no collision check this pass, so an
+	// unstamped occupant is an object of unknown provenance and stays out of the accounting rather
+	// than being guessed at either way.
+	var strays []string
+	for ns, child := range atCoordinate {
+		if isMatched[ns] || child.Annotations[apiconst.AnnotationParentUID] != string(runUID) {
+			continue
+		}
+		strays = append(strays, ns)
+	}
+	slices.Sort(strays)
+	for _, ns := range strays {
+		l.verdicts = append(l.verdicts, verdictFor(ns, atCoordinate[ns]))
+	}
+	return l
+}
+
 // aggregateAndWrite lists every child of the run in one label-scoped, cluster-wide call, folds the
-// children into the run's counters/failures/phase, and writes the run status exactly once. The
-// roll-up is driven off the MATCHED-namespace set (not merely the children found): a matched
-// namespace whose child has not yet appeared in cache counts as in-flight, which keeps the run
-// Running until every matched namespace has a reporting child.
+// children into the run's counters/failures/phase, and writes the run status exactly once.
+//
+// Every namespace counter comes from ONE tally over ONE ledger (buildRunLedger), and the run's phase
+// is rolled up from the very outcomes that tally counted — so the phase cannot contradict the
+// numbers, and no counter can move without the total moving with it. That is the shape the incident
+// demanded: a run reported namespacesFailed 32 over 33 children reading 29 Completed / 3
+// PartiallyFailed / 1 Pending, because "namespaces the fan-out refused to touch" and "namespaces
+// whose child failed" were two different facts incrementing one field from two places, with nothing
+// asserting that the buckets still added up to the namespaces being counted.
 func (r *ClusterBackupReconciler) aggregateAndWrite(
 	ctx context.Context, cb *cbv1.ClusterBackup, loc *cbv1.ClusterBackupLocation, matched []string,
 	fanoutFailures []cbv1.FailureRecord, collided map[string]string, captureDone bool,
 ) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+
 	var children cbv1.BackupList
 	if err := r.List(ctx, &children, client.MatchingLabels{apiconst.LabelClusterBackup: cb.Name}); err != nil {
 		return ctrl.Result{}, fmt.Errorf("list child Backups for run %s: %w", cb.Name, err)
 	}
-	byNS := make(map[string]*cbv1.Backup, len(children.Items))
-	for i := range children.Items {
-		c := &children.Items[i]
-		byNS[c.Namespace] = c
-	}
+
+	ledger := buildRunLedger(cb.Name, cb.UID, matched, children.Items, collided)
+	outcomes := ledger.outcomes()
+	tally := status.TallyNamespaceOutcomes(outcomes)
 
 	st := &cb.Status
 	// Recompute every tally from scratch each pass so the aggregate is a pure function of the
 	// current children (idempotent; no drift from a partial prior write).
+	//
+	// namespacesMatched stays the SELECTOR's answer — how many namespaces the selector picked — and
+	// is deliberately not the tally's denominator: the ledger also accounts for the run's own
+	// children in namespaces the selector has since stopped matching, and inflating "matched" with
+	// those would misreport what the selector did.
 	st.NamespacesMatched = int32(len(matched))
-	st.NamespacesSucceeded = 0
-	st.NamespacesFailed = 0
-	st.PVCsSucceeded = 0
-	st.PVCsFailed = 0
-	st.AddedBytes = 0
+	st.NamespacesSucceeded = tally.Succeeded
+	st.NamespacesFailed = tally.Failed
+	st.NamespacesBlocked = tally.Blocked
+	st.PVCsSucceeded = ledger.pvcsSucceeded
+	st.PVCsFailed = ledger.pvcsFailed
+	st.AddedBytes = ledger.addedBytes
+	// The invariant the incident violated. TallyNamespaceOutcomes makes it true by construction, so
+	// this can only fire if a future edit reintroduces a second increment site — and on that day the
+	// operator says so in the log and the events rather than publishing a number it cannot stand
+	// behind. Cheap enough to run on every pass; an administrator acts on these figures.
+	if !tally.SumsUp() {
+		log.Error(nil, "aggregate counters do not add up; run status is not trustworthy",
+			"run", cb.Name, "namespaces", tally.Namespaces, "counted", tally.Counted(),
+			"succeeded", tally.Succeeded, "failed", tally.Failed,
+			"blocked", tally.Blocked, "inFlight", tally.InFlight)
+		r.Recorder.Eventf(cb, nil, corev1.EventTypeWarning, "AggregateInconsistent", "Aggregate",
+			"run counters do not add up: %d namespaces accounted for, %d counted",
+			tally.Namespaces, tally.Counted())
+	}
 	// The cluster-scoped capture's headline count. Recomputed from the durable snapshot record
 	// each pass like every other tally, so it survives the from-scratch reset above; zero until
 	// the capture completes (or when the run opted out).
@@ -415,80 +585,33 @@ func (r *ClusterBackupReconciler) aggregateAndWrite(
 	} else {
 		st.ClusterResourcesCaptured = 0
 	}
+	// Failures are rebuilt in the same order every pass — the fan-out's own create failures first,
+	// then the ledger's, namespace by namespace — so the capped list keeps a stable first-N rather
+	// than depending on map iteration order.
 	st.Failures = nil
 	for _, f := range fanoutFailures {
 		st.Failures = status.AppendCappedFailure(st.Failures, f, status.DefaultFailureCap)
 	}
-
-	childPhases := make([]string, 0, len(matched))
-	for _, ns := range matched {
-		// A namespace whose coordinate is occupied by a Backup this run did not create is a hard
-		// per-namespace FAILURE, and its occupant's status is not this run's to read: the List above
-		// picks such an occupant up (a projection and a previous run's child both carry the
-		// cluster-backup label), so counting it would be exactly the false success this guard exists
-		// to stop. Recorded before the child lookup so no volume of it is ever tallied.
-		if msg, bad := collided[ns]; bad {
-			childPhases = append(childPhases, string(status.BackupPhaseFailed))
-			st.NamespacesFailed++
-			st.Failures = status.AppendCappedFailure(st.Failures, cbv1.FailureRecord{
-				Namespace: ns, Backup: cb.Name, Message: msg,
-			}, status.DefaultFailureCap)
+	for _, v := range ledger.verdicts {
+		if v.failure == nil {
 			continue
 		}
-
-		child := byNS[ns]
-		if child == nil {
-			childPhases = append(childPhases, "") // fanned out but not observed yet → in-flight.
-			continue
-		}
-		// Defence in depth, independent of the collision detection above: a discovery PROJECTION is
-		// a view of snapshots that already exist in the repository, derived by
-		// discovery.VolumesFromSnapshots — every one of its volumes reads Completed by construction,
-		// and none of them was written by this run. Even if the coordinate check upstream ever
-		// regressed, a projection must not be able to increment pvcsSucceeded.
-		if child.Annotations[apiconst.AnnotationProjected] == apiconst.AnnotationProjectedValue {
-			childPhases = append(childPhases, string(status.BackupPhaseFailed))
-			st.NamespacesFailed++
-			st.Failures = status.AppendCappedFailure(st.Failures, cbv1.FailureRecord{
-				Namespace: ns, Backup: child.Name,
-				Message: clampMessage((&runNameCollisionError{
-					Namespace: ns, Name: child.Name,
-					Detail: "it is a discovery projection of snapshots already in the repository",
-				}).Error()),
-			}, status.DefaultFailureCap)
-			continue
-		}
-		childPhases = append(childPhases, child.Status.Phase)
-
-		for _, v := range child.Status.Volumes {
-			switch v.Phase {
-			case status.VolumePhaseCompleted:
-				st.PVCsSucceeded++
-			case status.VolumePhaseFailed:
-				st.PVCsFailed++
-			}
-			st.AddedBytes += v.AddedBytes
-		}
-
-		switch child.Status.Phase {
-		case string(status.BackupPhaseCompleted), string(status.BackupPhasePartiallyCompleted):
-			st.NamespacesSucceeded++
-		case string(status.BackupPhaseFailed), string(status.BackupPhasePartiallyFailed):
-			st.NamespacesFailed++
-			st.Failures = status.AppendCappedFailure(st.Failures, cbv1.FailureRecord{
-				Namespace: ns, Backup: child.Name, Message: childFailureMessage(child),
-			}, status.DefaultFailureCap)
-		}
+		st.Failures = status.AppendCappedFailure(st.Failures, *v.failure, status.DefaultFailureCap)
 	}
 
-	phase := status.RollUpBackupPhases(childPhases)
+	phase := status.RollUpNamespaceOutcomes(outcomes)
 	switch {
-	case len(matched) == 0:
+	case len(outcomes) == 0:
 		// A valid selector that matches no namespace has nothing to protect: terminate the run
 		// (vacuously Completed) rather than hot-loop in Pending, but surface it so a misaimed
 		// selector is diagnosable. The terminal guard then freezes it after this single event.
 		// No cluster capture runs for such a run (gated on matched in Reconcile), so nothing is
 		// stranded by terminating here.
+		//
+		// Keyed on the LEDGER being empty, not on matched: a run whose selector stopped matching
+		// while its own children were still working has something to account for, and declaring it
+		// vacuously Completed over a child still uploading would be the same class of false success
+		// this file exists to prevent.
 		phase = status.ClusterBackupPhaseCompleted
 		r.Recorder.Eventf(cb, nil, corev1.EventTypeWarning, "NoNamespacesMatched", "SelectNamespaces",
 			"namespace selector matched no namespaces; nothing to back up")
@@ -655,10 +778,13 @@ func emitClusterBackupRootSpan(
 	if !anchor.Valid() {
 		return
 	}
-	attrs := make([]attribute.KeyValue, 0, 8)
+	attrs := make([]attribute.KeyValue, 0, 9)
 	attrs = append(attrs,
 		attribute.Int("crystalbackup.namespaces_matched", int(st.NamespacesMatched)),
-		attribute.Int("crystalbackup.namespaces_failed", int(st.NamespacesFailed)))
+		attribute.Int("crystalbackup.namespaces_failed", int(st.NamespacesFailed)),
+		// Carried beside failed, never folded into it: a trace that showed only "failed" would hide
+		// every namespace the run never touched, which is the larger of the two problems.
+		attribute.Int("crystalbackup.namespaces_blocked", int(st.NamespacesBlocked)))
 	attrs = append(attrs, tracing.StringAttr(tracing.AttrClusterBackup, cb.Name)...)
 	attrs = append(attrs, tracing.StringAttr(tracing.AttrSchedule, cb.Spec.ScheduleRef)...)
 	attrs = append(attrs, tracing.StringAttr(tracing.AttrLocation, cb.Spec.LocationRef.Name)...)
@@ -666,10 +792,13 @@ func emitClusterBackupRootSpan(
 	attrs = append(attrs, tracing.StringAttr(tracing.AttrOrigin, apiconst.OriginCluster)...)
 	attrs = append(attrs, tracing.StringAttr(tracing.AttrPhase, string(phase))...)
 
+	// Both buckets mark the span as errored. A namespace nothing backed up is as much a DR shortfall
+	// as one whose backup failed, and a span that only looked at namespacesFailed would come out
+	// green over a run that protected nothing.
 	var spanErr error
-	if st.NamespacesFailed > 0 {
-		spanErr = fmt.Errorf("run %s ended %s: %d of %d namespace(s) failed",
-			cb.Name, phase, st.NamespacesFailed, st.NamespacesMatched)
+	if unprotected := st.NamespacesFailed + st.NamespacesBlocked; unprotected > 0 {
+		spanErr = fmt.Errorf("run %s ended %s: %d of %d namespace(s) unprotected (%d failed, %d never backed up)",
+			cb.Name, phase, unprotected, st.NamespacesMatched, st.NamespacesFailed, st.NamespacesBlocked)
 	}
 	// startTime, not the object's creation, exactly as the run-duration histogram measures it: a
 	// run that waited on a concurrencyPolicy or a gated location did not spend that time moving

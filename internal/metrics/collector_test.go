@@ -325,6 +325,7 @@ func TestCollectorClusterBackupSeries(t *testing.T) {
 			CompletionTime:    &completion,
 			NamespacesMatched: 6,
 			NamespacesFailed:  1,
+			NamespacesBlocked: 2,
 		},
 	}
 
@@ -340,5 +341,49 @@ func TestCollectorClusterBackupSeries(t *testing.T) {
 	}
 	if got, ok := gatherValue(t, reg, "crystalbackup_clusterbackup_namespaces_failed", want); !ok || got != 1 {
 		t.Fatalf("namespaces_failed = %v (found=%v), want 1", got, ok)
+	}
+	// Exported beside failed, never folded into it. A run that never touched two namespaces has to
+	// be visible to an alert, and namespaces_failed alone would report the number as zero.
+	if got, ok := gatherValue(t, reg, "crystalbackup_clusterbackup_namespaces_blocked", want); !ok || got != 2 {
+		t.Fatalf("namespaces_blocked = %v (found=%v), want 2", got, ok)
+	}
+}
+
+// TestCollectorClusterBackupPicksOneRunDeterministically pins the tie-break. CreationTimestamp has
+// one-second granularity, and two runs of one series created in the same second used to leave the
+// winner to List order — a gauge that flips between scrapes is a gauge nobody can alert on. The
+// greater name wins, and all three namespace gauges come from that ONE run so they still add up.
+func TestCollectorClusterBackupPicksOneRunDeterministically(t *testing.T) {
+	loc := &cbv1.ClusterBackupLocation{
+		ObjectMeta: metav1.ObjectMeta{Name: "dr"},
+		Spec:       cbv1.ClusterBackupLocationSpec{ClusterID: "c1"},
+	}
+	sameSecond := metav1.Date(2026, 7, 17, 2, 0, 0, 0, time.UTC)
+	mk := func(name string, matched, failed, blocked int32) *cbv1.ClusterBackup {
+		return &cbv1.ClusterBackup{
+			ObjectMeta: metav1.ObjectMeta{Name: name, CreationTimestamp: sameSecond},
+			Spec: cbv1.ClusterBackupSpec{ScheduleRef: "daily",
+				ClusterBackupRunSpec: cbv1.ClusterBackupRunSpec{LocationRef: cbv1.LocalObjectReference{Name: "dr"}}},
+			Status: cbv1.ClusterBackupStatus{
+				Phase:             string(status.ClusterBackupPhaseRunning),
+				NamespacesMatched: matched, NamespacesFailed: failed, NamespacesBlocked: blocked,
+			},
+		}
+	}
+	// nightly-b is the greater name, so its numbers are the ones published — whichever order the
+	// List returns them in.
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(NewCollector(newFakeClient(t, loc,
+		mk("nightly-b", 9, 4, 5), mk("nightly-a", 3, 1, 0)), testOperatorNamespace))
+
+	want := map[string]string{"schedule": "daily", "location": "dr", "cluster": "c1"}
+	for name, exp := range map[string]float64{
+		"crystalbackup_clusterbackup_namespaces_matched": 9,
+		"crystalbackup_clusterbackup_namespaces_failed":  4,
+		"crystalbackup_clusterbackup_namespaces_blocked": 5,
+	} {
+		if got, ok := gatherValue(t, reg, name, want); !ok || got != exp {
+			t.Errorf("%s = %v (found=%v), want %v", name, got, ok, exp)
+		}
 	}
 }

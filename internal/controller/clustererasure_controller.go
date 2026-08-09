@@ -197,6 +197,13 @@ func (r *ClusterErasureReconciler) drive(ctx context.Context, er *cbv1.ClusterEr
 	// snapshots were removed" has to be answerable afterwards, and afterwards they are gone. It is
 	// also the last chance to discover that the scope is empty, which is a legitimate Completed
 	// (nothing matched) rather than a failure.
+	//
+	// The measurement lands in snapshotsTargeted, NEVER in snapshotsForgotten. That distinction is the
+	// whole defect this shape closes: the pre-erasure count used to be written straight into
+	// snapshotsForgotten and never re-derived, so a forget that failed left a Failed object still
+	// attesting "10 snapshots forgotten". This is the artifact somebody points at to assert that a GDPR
+	// erasure was carried out — a field that overstates destruction here is a false attestation, not a
+	// wrong dashboard. From here on, forgotten only ever moves on an OBSERVATION of what happened.
 	if er.Status.Phase != erasurePhaseRunning {
 		snaps, err := r.Lister.ListFiltered(ctx, repo, erasureCountJobName(er.Name), filterTags...)
 		if err != nil {
@@ -204,13 +211,20 @@ func (r *ClusterErasureReconciler) drive(ctx context.Context, er *cbv1.ClusterEr
 			return r.park(ctx, er, erasurePhasePending, "ScopeUnreadable",
 				fmt.Sprintf("could not list the snapshots this erasure would remove: %v", err))
 		}
-		er.Status.SnapshotsForgotten = int32(len(snaps)) //nolint:gosec // a repository's snapshot count is not int32-overflow territory
-		if len(snaps) == 0 {
+		targeted := int32(len(snaps)) //nolint:gosec // a repository's snapshot count is not int32-overflow territory
+		if targeted == 0 {
+			// Nothing matched: the record is complete and empty in every field, which is the honest
+			// account of an erasure that had nothing to erase.
+			r.stampErasureRecord(er, status.ErasureFullyForgotten(0))
 			return r.complete(ctx, er, loc, "nothing matched the target; no snapshot was removed")
 		}
+		// Running: the scope is measured and NOTHING has gone yet, so the record says exactly that —
+		// forgotten 0, all of it still there. It is also the state a crash mid-forget leaves behind, and
+		// it under-claims rather than over-claims, which is the only safe direction for an attestation.
+		r.stampErasureRecord(er, status.ErasureScopeMeasured(targeted))
 		er.Status.Phase = erasurePhaseRunning
 		status.SetCondition(&er.Status.Conditions, ConditionReady, metav1.ConditionFalse, "Erasing",
-			fmt.Sprintf("erasing %d snapshot(s) from repository %s", len(snaps), repo.Name), er.Generation)
+			fmt.Sprintf("erasing %d snapshot(s) from repository %s", targeted, repo.Name), er.Generation)
 		if err := r.Status().Update(ctx, er); err != nil {
 			return ctrl.Result{}, fmt.Errorf("update status for ClusterErasure %s: %w", er.Name, err)
 		}
@@ -276,7 +290,7 @@ func (r *ClusterErasureReconciler) drive(ctx context.Context, er *cbv1.ClusterEr
 		r.mu.Unlock()
 		r.Recorder.Eventf(er, nil, corev1.EventTypeWarning, "ErasureStarted", "Erase",
 			"forget+prune enqueued on repository %s for %d snapshot(s) — this is irreversible",
-			repo.Name, er.Status.SnapshotsForgotten)
+			repo.Name, er.Status.SnapshotsTargeted)
 		return ctrl.Result{RequeueAfter: erasureRequeueInterval}, nil
 	}
 
@@ -286,13 +300,104 @@ func (r *ClusterErasureReconciler) drive(ctx context.Context, er *cbv1.ClusterEr
 		delete(r.inflight, key)
 		r.mu.Unlock()
 		if e := h.Err(); e != nil {
-			return r.fail(ctx, er, "ErasureFailed", e.Error())
+			// The op failed somewhere between "nothing forgotten" and "everything forgotten, space not
+			// yet reclaimed" — the forget and the prune are one queued op precisely because they are
+			// inseparable, which means the failure says nothing about how far it got. So MEASURE: list
+			// the repository again under this erasure's own filter and derive the record from what is
+			// still there. That is what turns "4 of 10 were removed before this failed" into a record
+			// that says 4 forgotten, 6 remaining, instead of the 10-forgotten attestation this object
+			// used to publish over a Failed phase.
+			rec, note := r.observeErasureResidue(ctx, er, repo, filterTags)
+			r.stampErasureRecord(er, rec)
+			return r.fail(ctx, er, "ErasureFailed", fmt.Sprintf("%v (%s)", e, note))
 		}
+		// forget AND prune both reported success over the measured scope, so the whole scope is gone.
+		// This is the one place the record takes an operation's own success report rather than a
+		// listing, and status/erasure_tally.go records why: a verification listing cannot tell "not
+		// forgotten" from "written since", so on this path it could only invent a partial erasure out
+		// of a complete one, while on the failure path the same ambiguity makes the record claim LESS
+		// destruction — the safe direction for an attestation.
+		rec := status.ErasureFullyForgotten(erasureTargetedScope(er))
+		r.stampErasureRecord(er, rec)
 		return r.complete(ctx, er, loc, fmt.Sprintf("%d snapshot(s) forgotten and their space pruned",
-			er.Status.SnapshotsForgotten))
+			rec.Forgotten))
 	default:
 		return ctrl.Result{RequeueAfter: erasureRequeueInterval}, nil
 	}
+}
+
+// stampErasureRecord writes an ErasureRecord onto the object's three counters. It is the ONLY place
+// any of them is assigned, so the trio always moves together and snapshotsForgotten can never be set
+// from a value that was not derived with the other two.
+func (r *ClusterErasureReconciler) stampErasureRecord(er *cbv1.ClusterErasure, rec status.ErasureRecord) {
+	er.Status.SnapshotsTargeted = rec.Targeted
+	er.Status.SnapshotsForgotten = rec.Forgotten
+	er.Status.SnapshotsRemaining = rec.Remaining
+}
+
+// erasureTargetedScope reads the scope this erasure measured, tolerating an object written by an
+// operator OLDER than snapshotsTargeted.
+//
+// Before this release the pre-erasure count was written into snapshotsForgotten, so an erasure that
+// was already Running when the operator was upgraded carries its scope in the OLD field and nothing
+// in the new one. Reading it back keeps that record's denominator instead of resetting it to zero —
+// and the old value cannot be anything other than the pre-erasure count, because that is the only
+// thing the old code ever put there. The condition is deliberately narrow (targeted unset AND
+// forgotten set), so it can never override a scope this release measured.
+func erasureTargetedScope(er *cbv1.ClusterErasure) int32 {
+	if er.Status.SnapshotsTargeted == 0 && er.Status.SnapshotsForgotten > 0 {
+		return er.Status.SnapshotsForgotten
+	}
+	return er.Status.SnapshotsTargeted
+}
+
+// observeErasureResidue establishes what a FAILED erasure actually removed, by listing the repository
+// again under the very filter tags the forget ran with. It returns the record to publish and a short
+// note for the failure condition and event.
+//
+// Two answers are possible and both are honest:
+//
+//   - the listing succeeds ⇒ whatever it still finds is remaining, and the rest of the measured scope
+//     is established as forgotten. A prune that failed after its forget therefore reports the truth:
+//     the snapshots are gone, their space is not yet reclaimed.
+//   - the listing fails ⇒ nothing is established, so nothing is claimed: zero forgotten, the whole
+//     scope possibly still there. An erasure whose outcome nobody could read must read as an erasure
+//     that destroyed nothing, and the note says the residue is unverified so a compliance reader is
+//     not left inferring it from a suspiciously round number.
+//
+// The listing runs under its own Job name so a verification can never collide with, or re-adopt, the
+// count that measured the scope.
+func (r *ClusterErasureReconciler) observeErasureResidue(ctx context.Context, er *cbv1.ClusterErasure,
+	repo *cbv1.BackupRepository, filterTags []string,
+) (status.ErasureRecord, string) {
+	log := logf.FromContext(ctx)
+	targeted := erasureTargetedScope(er)
+
+	snaps, err := r.Lister.ListFiltered(ctx, repo, erasureVerifyJobName(er.Name), filterTags...)
+	if err != nil {
+		log.Error(err, "erasure: verify the residue after a failed erasure", "erasure", er.Name)
+		return status.ErasureResidueUnverifiable(targeted),
+			fmt.Sprintf("the residue could not be listed (%v), so this record claims no destruction: "+
+				"treat all %d targeted snapshot(s) as still present until a re-run establishes otherwise", err, targeted)
+	}
+	remaining := int32(len(snaps)) //nolint:gosec // a repository's snapshot count is not int32-overflow territory
+	rec := status.ErasureResidueObserved(targeted, remaining)
+	if !rec.SumsUp() {
+		// A residue LARGER than the measured scope. Not an arithmetic bug: snapshots matching this
+		// target have been written since the scope was measured (a nightly backup of a namespace being
+		// offboarded, say). The record claims no destruction and the operator says why, rather than
+		// adjusting a number to make the books balance.
+		log.Info("erasure: the residue exceeds the measured scope; new snapshots match this target",
+			"erasure", er.Name, "targeted", targeted, "remaining", remaining)
+		r.Recorder.Eventf(er, nil, corev1.EventTypeWarning, "ErasureScopeGrew", "Erase",
+			"the residue listing found %d snapshot(s) where the scope measured %d: data matching this "+
+				"target has been written since, and this record therefore claims no destruction",
+			remaining, targeted)
+		return rec, fmt.Sprintf("%d snapshot(s) match the target where %d were measured, so nothing is "+
+			"claimed as forgotten; new data matching the target has been written since", remaining, targeted)
+	}
+	return rec, fmt.Sprintf("%d of %d snapshot(s) were forgotten before the failure; %d remain",
+		rec.Forgotten, targeted, rec.Remaining)
 }
 
 // park records a non-terminal phase and requeues. It is the shape every "not yet" answer takes,
@@ -391,4 +496,13 @@ func erasureResourceName(erasure, step string) string {
 // names so a count never collides with (or re-adopts) a forget.
 func erasureCountJobName(erasure string) string {
 	return "er-" + erasure + "-count"
+}
+
+// erasureVerifyJobName names the snapshots Job that establishes the residue after a FAILED erasure.
+// Distinct from the count's name for the same reason the count is distinct from the forget's: the two
+// listings ask different questions at different times, and a verification that re-adopted the count's
+// completed Job would read the pre-erasure repository back as the post-erasure one — which is exactly
+// the fiction this whole change exists to remove.
+func erasureVerifyJobName(erasure string) string {
+	return "er-" + erasure + "-verify"
 }

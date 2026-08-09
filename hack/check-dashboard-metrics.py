@@ -175,14 +175,28 @@ def parse_catalogue() -> tuple[dict[str, str], dict[str, set[str]], set[str]]:
             blob, re.MULTILINE):
         label_consts[ident] = value
 
-    # var ident -> []string{...} of label names
+    # var ident -> []string{...} of label names.
+    #
+    # This pattern harvests EVERY []string in the package, and the package holds two unrelated
+    # kinds of them: slices of label NAMES (what this script is after) and slices of label VALUES
+    # — orphanReapStuckKinds, for one, whose elements are Kubernetes kind names and include a
+    # concatenation. Failing here on a slice that cannot be read as label names was therefore a
+    # false positive, and it turned `make check-dashboards` red over a metric that was declared
+    # perfectly correctly.
+    #
+    # An unresolvable slice is recorded as such instead. The strictness this used to assert belongs
+    # one step later, at `record`, which is where a slice is actually USED as a metric's label set:
+    # if a genuine label slice fails to resolve, the metric that references it lands in `unresolved`
+    # and is reported with the series name — a far more useful message than this one gave, and one
+    # that cannot fire over a slice nothing uses as labels.
     label_slices: dict[str, list[str]] = {}
+    unresolvable_slices: dict[str, str] = {}
     for ident, body in re.findall(r'^\s*(?:var\s+)?(\w+)\s*=\s*\[\]string\{([^}]*)\}',
                                   blob, re.MULTILINE):
         resolved = _resolve_label_expr("[]string{%s}" % body, label_consts, {})
         if resolved is None:
-            raise Fail("cannot resolve the label slice %s = []string{%s} — update this script"
-                       % (ident, body.strip()))
+            unresolvable_slices[ident] = " ".join(body.split())
+            continue
         label_slices[ident] = sorted(resolved)
 
     series_labels: dict[str, set[str]] = {}
@@ -198,7 +212,14 @@ def parse_catalogue() -> tuple[dict[str, str], dict[str, set[str]], set[str]]:
             return
         labels = _resolve_label_expr(expr, label_consts, label_slices)
         if labels is None:
-            unresolved.append("%s: cannot resolve the label set of %s from %r" % (where, series, expr))
+            # Name the offending slice when the expression reaches one this run could not read, so
+            # the message says what to go and look at rather than only where it was noticed.
+            culprit = next((f"{ident} = []string{{{body}}}"
+                            for ident, body in unresolvable_slices.items()
+                            if re.search(r"\b%s\b" % re.escape(ident), expr)), None)
+            detail = f" — via the unreadable slice {culprit}" if culprit else ""
+            unresolved.append("%s: cannot resolve the label set of %s from %r%s"
+                              % (where, series, expr, detail))
             return
         series_labels[series] = labels
         if is_histogram:

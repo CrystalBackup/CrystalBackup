@@ -8,7 +8,7 @@ tableOfContents:
 
 <!-- GENERATED FILE — do not edit. Run `make observability-docs` after changing internal/metrics or internal/alerts. -->
 
-12 alert rules ship with the chart. This page is generated from
+13 alert rules ship with the chart. This page is generated from
 `internal/alerts`, so every expression, threshold and annotation below is the one the
 chart actually installs — not a transcription of it.
 
@@ -81,6 +81,7 @@ separately, by `make alert-rules-covered`.
 | Alert | Severity | `for` | Fires when |
 | --- | --- | --- | --- |
 | [CrystalbackupBackupMissed](#crystalbackupbackupmissed) | warning | `15m` | nothing has happened for 1.1 × the schedule's own period + 1h (falling back to 26h) |
+| [CrystalbackupBackupMissedCritical](#crystalbackupbackupmissedcritical) | **critical** | `15m` | nothing has happened for 3 × the schedule's own period + 1h (falling back to 74h) |
 | [CrystalbackupBackupFailed](#crystalbackupbackupfailed) | warning | none — fires on the first evaluation | the measured value goes above 0 |
 | [CrystalbackupBackupStalled](#crystalbackupbackupstalled) | warning | `30m` | nothing has happened for 8h |
 | [CrystalbackupRepositoryCheckFailed](#crystalbackuprepositorycheckfailed) | **critical** | `5m` | a state gauge reports the bad state (no numeric bound) |
@@ -135,6 +136,44 @@ The deadline is the schedule's OWN period (1.1x + 1h), not a fixed 26h: a flat t
 - the `and` guard on `crystalbackup_schedule_active` is what stops a deleted or paused schedule from paging forever on a last_success that will never advance again.
 :::
 
+## CrystalbackupBackupMissedCritical
+
+**Severity** **critical** · **`for`** `15m` · **Threshold** nothing has happened for 3 × the schedule's own period + 1h (falling back to 74h)
+
+> NO BACKUP for {{ $labels.namespace }}/{{ $labels.schedule }} ({{ $labels.origin }}) in 3 of its schedule's own periods
+
+**What to do.** This is CrystalbackupBackupMissed's condition at three times the magnitude: the schedule is active and has now missed three consecutive periods, so nothing has been captured since it broke and a restore would land on data that old. Treat it as data loss in progress, not as a late job. Same investigation as the warning — the namespace's Backup objects, then the mover Jobs in the operator namespace — with the addition that whatever is wrong has already survived three attempts, so a retry is not the fix.
+
+```promql
+(
+  (
+    (
+      (time() - crystalbackup_backup_last_success_timestamp_seconds)
+      or on (namespace, schedule, origin, location, cluster)
+      (time() - crystalbackup_schedule_created_timestamp_seconds)
+    )
+    > on (namespace, schedule, origin, location, cluster) group_left()
+      (crystalbackup_schedule_period_seconds * 3 + 3600)
+  )
+  or
+  (
+    ((
+      (time() - crystalbackup_backup_last_success_timestamp_seconds)
+      or on (namespace, schedule, origin, location, cluster)
+      (time() - crystalbackup_schedule_created_timestamp_seconds)
+    ) > 266400)
+    unless on (namespace, schedule, origin, location, cluster)
+      crystalbackup_schedule_period_seconds
+  )
+)
+and on (namespace, schedule, origin, location, cluster)
+  (crystalbackup_schedule_active == 1)
+```
+
+:::note[Why this threshold]
+THE INCIDENT. On 2026-08-09 the operator's own self-check on a live cluster read: `degraded — 2 rule(s) breached, none critical` over a cluster that had produced no successful backup for THIRTY-ONE HOURS. Both breached rules were severity warning, so thirty-one hours of nothing was routed, coloured and worded exactly like being one hour late. Every number was right and the headline was the wrong answer to the question being asked. Severity now tracks magnitude. IT IS THE SAME CONDITION AS CrystalbackupBackupMissed, not a second rule: same series, same five join keys, same schedule_created fallback for a series that has never succeeded, same schedule_active guard, same 15m hold. The ONLY differences are the threshold and the severity — which is what makes this an escalation instead of a second copy of the logic to keep in sync. THE BOUND IS DERIVED, LIKE THE WARNING'S. Three x `crystalbackup_schedule_period_seconds` + 1h, per series. A fixed critical hour count would reintroduce, one severity up, the exact bug the derived warning was added to fix: at any flat number an hourly schedule is most of a day dead before the critical page arrives, and a weekly schedule is paged critical while it is entirely healthy. Three periods is 3h hourly, 73h nightly, three weeks weekly. BOTH TIERS FIRE. Crossing this bound does not resolve the warning, and that is on purpose: narrowing the warning so it stopped here would make an administrator's existing warning-severity routing go SILENT at the moment the situation got worse, on upgrade, without anyone asking for it. Deduplicate in Alertmanager with an inhibit_rule keyed on (namespace, schedule, origin, location, cluster) — the join keys are identical, so the two alert instances line up label for label. THE UNPARSEABLE-CRON FALLBACK is three of the assumed 24h periods plus the same 2h grace, 74h against the warning's 26h, from the same two constants so the pair cannot drift. That schedule will never run at all, so it earns the escalation more plainly than anything else here; it simply cannot be measured in periods it does not have.
+:::
+
 ## CrystalbackupBackupFailed
 
 **Severity** warning · **`for`** none — fires on the first evaluation · **Threshold** the measured value goes above 0
@@ -169,7 +208,7 @@ time() - crystalbackup_backup_in_progress_since_timestamp_seconds > 28800
 ```
 
 :::note[Why this threshold]
-THE INCIDENT. On 0.6.2 a nightly cascade left six movers whose pods could not mount their temp clone PVC in ContainerCreating for thirty-six hours, and four more namespaces in Snapshotting beside them. Nothing failed, so none of the eleven rules in this table could fire — every one of them watches for a FAILURE. concurrencyPolicy: Forbid then meant no further nightly ran at all: one backup in fifteen days, with a green dashboard. A stall is not a failure and it is not a missed schedule. It needs its own series and its own rule, and `crystalbackup_backup_in_progress_since_timestamp_seconds` is that series. It is STATE-DERIVED, recomputed from the Backup objects on every scrape, and that is load-bearing rather than incidental. The lesson is written out at length under CrystalbackupBackupFailed above: a CounterVec child materialises AT ONE, so a counter cannot page on a first occurrence, and after an operator restart it does not reset — it DISAPPEARS. A stall is a first occurrence by definition, and the operator restarting is one of the things that can cause one, so a counter was never an option here. The series is ABSENT when nothing is in flight, which is what keeps this silent on a healthy cluster rather than merely below a bound — the same absence discipline last_failure follows, and for the same reason: a published 0 would make time()-0 fifty-four years and page the whole fleet forever. It reports the OLDEST unfinished Backup of the series, so tonight's fresh run cannot reset the clock on last night's wedged one. WHY THE BOUND IS SO LOOSE: see backupStalledThreshold. The tight, provable deadlines live in the controller (a mover pod that never reached Running at 30m; a snapshot acknowledged and never ready at 2h) and end in a Failed volume that BackupFailed pages on. This rule catches what those cannot prove, including a Backup gated Pending forever and a mover that is running and wedged, and it accepts firing on a genuinely enormous first full to do it.
+THE INCIDENT. On 0.6.2 a nightly cascade left six movers whose pods could not mount their temp clone PVC in ContainerCreating for thirty-six hours, and four more namespaces in Snapshotting beside them. Nothing failed, so none of the eleven rules in this table could fire — every one of them watches for a FAILURE. concurrencyPolicy: Forbid then meant no further nightly ran at all: one backup in fifteen days, with a green dashboard. A stall is not a failure and it is not a missed schedule. It needs its own series and its own rule, and `crystalbackup_backup_in_progress_since_timestamp_seconds` is that series. It is STATE-DERIVED, recomputed from the Backup objects on every scrape, and that is load-bearing rather than incidental. The lesson is written out at length under CrystalbackupBackupFailed above: a CounterVec child materialises AT ONE, so a counter cannot page on a first occurrence, and after an operator restart it does not reset — it DISAPPEARS. A stall is a first occurrence by definition, and the operator restarting is one of the things that can cause one, so a counter was never an option here. The series is ABSENT when nothing is in flight, which is what keeps this silent on a healthy cluster rather than merely below a bound — the same absence discipline last_failure follows, and for the same reason: a published 0 would make time()-0 fifty-four years and page the whole fleet forever. It reports the OLDEST unfinished Backup of the series, so tonight's fresh run cannot reset the clock on last night's wedged one. WHY THE BOUND IS SO LOOSE: see backupStalledThreshold. The tight, provable deadlines live in the controller (a mover pod that never reached Running at 30m; a snapshot acknowledged and never ready at 2h) and end in a Failed volume that BackupFailed pages on. This rule catches what those cannot prove, including a Backup gated Pending forever and a mover that is running and wedged, and it accepts firing on a genuinely enormous first full to do it. WHY THERE IS NO CRITICAL TIER FOR THIS ONE, when CrystalbackupBackupMissed has one: a stall says a run has not finished, NOT that no run has finished. Under concurrencyPolicy: Allow a Backup can sit wedged forever while every subsequent night succeeds — restores work, and what is actually wrong is wreckage rather than data loss. In the case where a stall does mean nothing is landing, last_success stops advancing and CrystalbackupBackupMissedCritical is what pages, derived from that schedule's own period. There is also nothing honest to scale this bound by: how long a backup legitimately takes is a property of the VOLUME, not of the cron, so a critical tier here would be either a hardcoded multiple of 8h or a period multiple that sends a 3TB first full critical in twenty minutes on a five-minute schedule. See backupStalledThreshold for the full account.
 :::
 
 ## CrystalbackupRepositoryCheckFailed
@@ -185,7 +224,7 @@ crystalbackup_repository_last_check_success == 0
 ```
 
 :::note[Why this threshold]
-The only critical rule here, because it is the only one that says the RESTORE PATH is compromised rather than that a backup is late. A repository that has never been checked emits no series at all (spec §2.4), so this stays silent on a fresh location instead of paging the moment one is created.
+Critical because it says the RESTORE PATH is compromised rather than that a backup is late, and it says so from the FIRST evaluation rather than after a magnitude has accumulated: repository damage does not get worse before it is worth paging about. It was the table's only critical rule until 0.6.5, when CrystalbackupBackupMissedCritical was added — that one reaches the same conclusion by a different road (nothing captured for three of a schedule's own periods is a restore landing on data that old), and it needs a magnitude to get there precisely because being one run late does not compromise anything. A repository that has never been checked emits no series at all (spec §2.4), so this stays silent on a fresh location instead of paging the moment one is created.
 :::
 
 ## CrystalbackupStaleLocks

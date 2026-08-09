@@ -141,7 +141,7 @@ var _ = Describe("transient manifest-mover RoleBinding", func() {
 			makeJob(jobName, false)
 			Expect(ensureManifestRoleBinding(ctx, k8sClient, req(tenantNS, jobName))).To(Succeed())
 
-			reaper().reapManifestBindings(ctx)
+			reaper().reapManifestBindings(ctx, nil)
 
 			_, err := get(tenantNS, jobName)
 			Expect(err).NotTo(HaveOccurred(), "reaping a live grant would break an in-flight backup")
@@ -154,7 +154,7 @@ var _ = Describe("transient manifest-mover RoleBinding", func() {
 			delete(rb.Labels, apiconst.LabelMoverJob)
 			Expect(k8sClient.Update(ctx, rb)).To(Succeed())
 
-			reaper().reapManifestBindings(ctx)
+			reaper().reapManifestBindings(ctx, nil)
 
 			_, err = get(tenantNS, jobName)
 			Expect(err).NotTo(HaveOccurred(), "an erroneous delete here breaks a live backup; refuse to guess")
@@ -167,7 +167,7 @@ var _ = Describe("transient manifest-mover RoleBinding", func() {
 			rb.Labels[apiconst.LabelOperatorNS] = "some-other-operator"
 			Expect(k8sClient.Update(ctx, rb)).To(Succeed())
 
-			reaper().reapManifestBindings(ctx)
+			reaper().reapManifestBindings(ctx, nil)
 
 			_, err = get(tenantNS, jobName)
 			Expect(err).NotTo(HaveOccurred(), "one operator must not reap another's in-flight grant")

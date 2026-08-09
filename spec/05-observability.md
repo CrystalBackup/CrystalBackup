@@ -171,7 +171,8 @@ on restart from `ClusterBackupSchedule.status.lastRunName` → the run's aggrega
 | `crystalbackup_clusterbackup_last_success_timestamp_seconds` | gauge | schedule, location, cluster | Unix time of the last `Completed` `ClusterBackup` run (fleet DR health). |
 | `crystalbackup_clusterbackup_duration_seconds` | histogram | schedule, location, cluster | Run duration (fan-out start → all children terminal). Same buckets as §2.1. |
 | `crystalbackup_clusterbackup_namespaces_matched` | gauge | schedule, location, cluster | Namespaces matched by the last run (`status.namespacesMatched`). |
-| `crystalbackup_clusterbackup_namespaces_failed` | gauge | schedule, location, cluster | Namespaces with a failed child `Backup` in the last run (`status.namespacesFailed`). |
+| `crystalbackup_clusterbackup_namespaces_failed` | gauge | schedule, location, cluster | Namespaces whose child `Backup` **ran and failed** in the last run (`status.namespacesFailed`). |
+| `crystalbackup_clusterbackup_namespaces_blocked` | gauge | schedule, location, cluster | Namespaces the last run **never backed up** — coordinate occupied by an object the run did not create, or the child could not be created (`status.namespacesBlocked`). |
 | `crystalbackup_clusterbackup_runs_total` | counter | schedule, location, cluster, result | Runs by terminal `result` ∈ `completed`\|`partiallyfailed`\|`failed` (fleet run success ratio). |
 
 ### 2.3 Restore
@@ -186,6 +187,7 @@ Both `Restore` (namespaced) and `ClusterRestore` (recorded under the **origin** 
 | `crystalbackup_restore_duration_seconds` | histogram | namespace, tenant, origin, location, cluster, mode | Restore duration; `mode` ∈ `Recreate`, `Overwrite`. Same buckets as backup. |
 | `crystalbackup_restore_last_restored_bytes` | gauge | namespace, tenant, origin, location, cluster | `status.restoredBytes` of the last completed restore. |
 | `crystalbackup_restore_failures_total` | counter | namespace, tenant, origin, location, cluster, mode | Restores ending `Failed`. `AwaitingConfirmation` (R23) is not a failure. |
+| `crystalbackup_restore_volumes_failed` | gauge | namespace, tenant, origin, location, cluster | Volumes that **did not come back**, summed over the restores currently in a failed terminal phase (`status.failedVolumes`). The object-level count (`crystalbackup_restore_failures`) cannot tell one lost volume from nine. Volumes only — a restore whose manifests failed contributes `0` (see [02-api.md](02-api.md) `status.failedVolumes`: the two halves are driven independently and the phase rolls up both). |
 
 ### 2.4 Repository, maintenance & verification (R17)
 
@@ -293,6 +295,7 @@ emitted here). The operator's webhook metric counts only the dynamic rule(s).
 | Metric | Type | Labels | Description |
 |---|---|---|---|
 | `crystalbackup_exposure_ready_wait_seconds` | histogram | namespace, tenant, exposer, cluster | Wait from snapshot exposure start (VSC re-bind + temp PVC creation) until the exposed PVC is bound and the mover can start. **Backup path only** — `internal/rexposer`, which exposes a RESTORE target, is a different mechanism and is not instrumented here (M6 note; a restore's wait shows up inside `crystalbackup_restore_duration_seconds`). |
+| `crystalbackup_orphan_reap_stuck` | gauge | kind | Orphaned managed objects whose deletion the orphan reaper **requested** and which are still present with a `deletionTimestamp` — held by a finalizer. Refreshed by each completed sweep (default 10 min), published for every kind including at 0. Non-zero needs an **administrator**: CrystalBackup will not strip a finalizer it does not own (typically external-snapshotter's `volumesnapshot-bound-protection` / `volumesnapshotcontent-bound-protection`), so it cannot clear on its own. Added in 0.6.5 after the reaper logged `reaped` for 31 hours over three VolumeSnapshots it had only *asked* to delete, while the same binary's self-check `leakIndicators` correctly reported them as residual. |
 | `crystalbackup_pvc_volumesnapshot_count` | gauge | namespace, pvc, cluster | VolumeSnapshot objects per source PVC (includes an incumbent tool's, e.g. Velero's, cf. [ADR 0006](adr/0006-coexistence-with-backup-tools.md)). **Documented exception to the §1 no-per-PVC-label rule**: cardinality is bounded by the live PVC count, the series is deleted with the PVC, and the ceph-csi flatten-threshold risk during coexistence justifies per-PVC visibility. |
 
 ### 2.10 Inherited controller-runtime metrics
@@ -421,7 +424,7 @@ if even one of them is still expected to copy, the relationship is still being m
 
 ## 3. Alert rules
 
-**Shipped in M6, and no longer written here.** The twelve rules live in a Go table,
+**Shipped in M6, and no longer written here.** The thirteen rules live in a Go table,
 `internal/alerts/rules.go`, from which the chart's `PrometheusRule` body is GENERATED into
 `charts/crystal-backup/rules/crystalbackup.rules.yaml` (`make alert-rules`). Enable it with
 `metrics.rules.enabled=true`; `metrics.rules.labels` sets whatever the Prometheus Operator's
@@ -445,9 +448,10 @@ needs.
 | Alert | Severity | For | Fires when |
 |---|---|---|---|
 | `CrystalbackupBackupMissed` | warning | 15m | An active schedule has gone past **its own** deadline (1.1 × the cron period + 1 h) with no successful `Backup`. Falls back to the schedule's creation time when nothing has ever succeeded, and to a fixed 26 h when the cron expression cannot be parsed. |
+| `CrystalbackupBackupMissedCritical` | **critical** | 15m | The same condition as the rule above at **three of the schedule's own periods** (3 × the cron period + 1 h; a 74 h fallback when the cron cannot be parsed). Added in 0.6.5 after a live self-check reported `degraded — 2 rule(s) breached, none critical` over a cluster that had captured nothing for thirty-one hours: at one severity, thirty-one hours of nothing was indistinguishable from being an hour late. The escalated bound is DERIVED from the same `crystalbackup_schedule_period_seconds` as the warning, never a fixed hour count — a flat critical threshold would leave an hourly schedule a day dead at warning severity and page critical on a healthy weekly one. Both tiers fire together; deduplicating is Alertmanager's job (`inhibit_rules`), because narrowing the warning to stop here would silence an administrator's existing routing on upgrade. |
 | `CrystalbackupBackupFailed` | warning | — | A `Backup` reached `Failed` or `PartiallyFailed` in the last hour — read from the counter with `increase()`, **or** from `crystalbackup_backup_last_failure_timestamp_seconds` being less than an hour old. The second disjunct is what makes the rule survive an operator restart, which the counter alone does not (§1). |
 | `CrystalbackupBackupStalled` | warning | 30m | A `Backup` has been unfinished for more than **8 h** (`crystalbackup_backup_in_progress_since_timestamp_seconds`). Added after the 0.6.2 field report, and the only rule here whose subject is a run still in flight: every other one waits for something to fail, which is why a 36-hour hang was invisible to the whole table. The bound is loose on purpose — the TIGHT deadlines live in the controller (a mover pod that never reached Running at 30 m, a snapshot acknowledged and never ready at 2 h) and end in a `Failed` volume that `BackupFailed` pages on; this rule catches what those cannot prove, and accepts firing on a genuinely enormous first full to do it. |
-| `CrystalbackupRepositoryCheckFailed` | **critical** | 5m | `restic check` found repository damage. The only critical rule: it is the only one that says the RESTORE PATH is compromised rather than that a backup is late. |
+| `CrystalbackupRepositoryCheckFailed` | **critical** | 5m | `restic check` found repository damage. Critical from the FIRST evaluation, unlike `BackupMissedCritical` above: repository damage does not need a magnitude to accumulate before it is worth paging about. |
 | `CrystalbackupStaleLocks` | warning | 30m | Stale restic locks persist past the reaper's own cycle. |
 | `CrystalbackupMaintenanceStalled` | warning | 1h | No successful prune for 26 h. Cannot fire on an `Immutable` location, which emits no series (§2.4). |
 | `CrystalbackupDiscoveryFailed` | warning | 30m | Discovery is failing, so `kubectl get backups` no longer matches the repository. |
@@ -481,6 +485,18 @@ an alert. `crystalbackup_schedule_period_seconds` (§2.1) is what makes the dead
 expression, so changing a schedule moves its alert with no rule edit. `ExternalSyncStale` keeps its
 fixed 26 h because a sync's schedule is optional — a manual sync has no period to derive from
 (§8 q3 remains open for that one).
+
+**Severity tracks magnitude on `BackupMissed`, and on nothing else (0.6.5).** The escalated tier
+above is the same expression with `3` where the warning has `1.1`, read from the same series — the
+one thing it must never be is a hardcoded hour count, which would reintroduce at `critical` exactly
+the bug the derived warning was written to fix. `BackupStalled` deliberately did **not** get a
+second tier, and the reasoning is worth keeping: a stall says a run has not finished, not that no
+run has finished (with `concurrencyPolicy: Allow` a wedged `Backup` can sit beside successful
+nightlies, which is wreckage rather than data loss), and when a stall does mean nothing is landing,
+`last_success` stops advancing and `BackupMissedCritical` is what pages. There is also nothing
+honest to scale an in-flight duration by: how long a backup legitimately takes is a property of the
+**volume**, not of the cron. A per-volume throughput series would be the way to escalate that one —
+"moving no data" instead of "taking a long time" — not a multiple of the 8 h.
 
 **The two items this section previously listed as blocked are now shipped**, because the series they
 waited on now exist — and a third rule came with them, because guarding a rule on a pause is only
@@ -616,7 +632,7 @@ self-service story without platform access. Events are UX, not an alerting path 
 | CR | Reason | Type |
 |---|---|---|
 | `Backup` | `BackupStarted`, `SnapshotReady` (per PVC), `HookExecuted`, `VolumeUploaded`, `ManifestsUploaded`, `RetentionApplied`, `BackupCompleted` | Normal |
-| `Backup` | `HookFailed`, `SnapshotTimeout`, `VolumeFailed`, `BackupPartiallyFailed`, `BackupFailed` | Warning |
+| `Backup` | `HookFailed`, `ConsistencyDegraded` (a `pre` hook failed under `onError: Continue`, so the run proceeded CRASH-CONSISTENT — emitted once per run, beside the `ApplicationConsistent=False` condition), `UnfreezeFailed`, `SnapshotTimeout`, `VolumeFailed`, `BackupPartiallyFailed`, `BackupFailed` | Warning |
 | `BackupSchedule` | `BackupCreated` | Normal |
 | `BackupSchedule` | `MissedSchedule` (operator downtime across a cron window) | Warning |
 | `ClusterBackupSchedule` | `ClusterBackupCreated` | Normal |
@@ -631,6 +647,16 @@ self-service story without platform access. Events are UX, not an alerting path 
 | `BackupRepository` | `CheckFailed`, `StaleLockRemoved`, `DiscoveryFailed` | Warning |
 | `BackupLocation`/`ClusterBackupLocation` | `LocationValidated` | Normal |
 | `BackupLocation`/`ClusterBackupLocation` | `LocationUnreachable` | Warning |
+| residue object (`VolumeSnapshot`, `VolumeSnapshotContent`, `PersistentVolume`, temp PVC, mover `Job`, …) | `OrphanReapStuck` | Warning |
+
+The last row is the **one documented exception** to "on the user's own CRs". The orphan reaper raises
+it on the stuck object itself, naming the finalizers holding it, because that object is what an
+administrator is looking at when they ask why a `Terminating` VolumeSnapshot will not go away — and
+because there may be no CR left to hang it on (the reaper's whole purpose is residue whose owning
+`Backup` is gone). It is emitted once per sweep for as long as the deadlock lasts; the apiserver's
+own event aggregation collapses the repeats into one series with a count, which is exactly the
+signal wanted. The durable, alertable form of the same fact is
+`crystalbackup_orphan_reap_stuck` (§2.9) — §6's "Events are UX, not an alerting path" still holds.
 
 ## 7. Grafana dashboards
 
