@@ -29,7 +29,7 @@ class: text-center
 <div class="mt-6 flex gap-2 justify-center">
   <span class="pill">Apache-2.0</span>
   <span class="pill">restic-compatible</span>
-  <span class="pill">v0.6.3 · M0–M6 livrés</span>
+  <span class="pill">v0.6.4 · M0–M6 livrés</span>
 </div>
 
 <p class="tiny muted mt-10">Meetup — 45 min · slides + démo live</p>
@@ -67,7 +67,7 @@ alexis@infrabuilder.com · github.com/CrystalBackup
 <div class="panel accent" style="max-width: 320px">
 <span class="eyebrow">disclaimer honnête</span>
 
-Ce projet est **jeune** (v0.6.3), écrit **avec assistance IA** sous direction humaine,
+Ce projet est **jeune** (v0.6.4), écrit **avec assistance IA** sous direction humaine,
 et testé sur de vrais clusters **parce que** personne ne devrait me croire sur parole.
 
 </div>
@@ -232,7 +232,7 @@ et un RTO en réunions.
 | DR depuis le dépôt seul | <span class="mark-ok">✓</span> | <span class="mark-mid">~</span> | <span class="mark-no">–</span> | <span class="mark-no">–</span> | <span class="mark-mid">~</span> |
 | Relisible avec un outil standard | <span class="mark-ok">✓ restic</span> | <span class="mark-mid">~</span> | <span class="mark-ok">✓</span> | <span class="mark-ok">✓</span> | <span class="mark-no">–</span> |
 
-<p class="tiny muted mt-3">Colonne Crystal Backup = v0.6.3 livrée, chaque ✓ exercé par un rapport d'acceptation publié. Les autres colonnes : à vérifier contre leurs docs — capacités mouvantes, objectifs différents. Ceci n'est <strong>pas</strong> un benchmark.</p>
+<p class="tiny muted mt-3">Colonne Crystal Backup = v0.6.4 livrée, chaque ✓ exercé par un rapport d'acceptation publié. Les autres colonnes : à vérifier contre leurs docs — capacités mouvantes, objectifs différents. Ceci n'est <strong>pas</strong> un benchmark.</p>
 
 <!--
 [06:00 → 07:30]
@@ -818,7 +818,7 @@ Réponse : ne me croyez pas. Voici comment le projet se teste, et voici ses bugs
 <div class="panel mt-4">
 📜 Chaque milestone est accepté là-dessus <strong>avant</strong> de sortir. Les rapports sont publiés — les 90 checks, les durées, les skips, <strong>et les défauts trouvés</strong>.
 
-<p class="tiny muted mt-2">Dernier : <code>…/reports/crucible-m6-3.html</code> — 90/90, 0 skip, 2 h 43.</p>
+<p class="tiny muted mt-2">Dernier : <code>…/reports/crucible-m6-4.html</code> — 90/90, 0 skip, 2 h 44.</p>
 </div>
 
 </v-click>
@@ -1142,7 +1142,7 @@ Le champ `mode: Immutable` est accepté — **il ne donne pas de WORM aujourd'hu
 <v-click>
 
 <div class="panel danger mt-6">
-⚠️ <strong>0.6.3 s'offre au test en conditions réelles, pas à la production.</strong> API <code>v1alpha1</code> — elle bougera encore. Testez sur un cluster dont vous pouvez encaisser la perte, <strong>à côté de</strong> vos backups actuels. Et testez vos restores — c'est la pratique sur laquelle ce projet tourne.
+⚠️ <strong>0.6.4 s'offre au test en conditions réelles, pas à la production.</strong> API <code>v1alpha1</code> — elle bougera encore. Testez sur un cluster dont vous pouvez encaisser la perte, <strong>à côté de</strong> vos backups actuels. Et testez vos restores — c'est la pratique sur laquelle ce projet tourne.
 </div>
 
 </v-click>
@@ -1179,7 +1179,7 @@ kubectl label namespace crystal-backup-system \
   pod-security.kubernetes.io/warn=restricted --overwrite
 
 helm install crystal-backup oci://ghcr.io/crystalbackup/charts/crystal-backup \
-  --version 0.6.3 -n crystal-backup-system
+  --version 0.6.4 -n crystal-backup-system
 ```
 
 <p class="tiny muted mt-2">Pas de <code>--create-namespace</code> : le chart ne possède pas ce namespace — la KEK du cluster y vit <strong>avant</strong> l'install, et rien ne doit pouvoir l'emporter. Les labels PSA ne sont pas décoratifs : <code>helm install</code> relit le namespace et <strong>refuse</strong> si le niveau <code>enforce</code> ne colle pas.</p>
