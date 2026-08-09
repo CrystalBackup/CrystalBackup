@@ -53,7 +53,8 @@ const testOperatorNamespace = "crystal-backup-system"
 // object already carries), so seeding VolumeSnapshotClasses via Create — rather than
 // WithObjects, which would require the scheme to already recognise the GVK — needs no
 // upfront scheme registration for the (out-of-module) snapshot CRDs at all.
-func newRegistryTestClient(t *testing.T, storageClasses []*storagev1.StorageClass, vsClasses []*unstructured.Unstructured) client.Client {
+// extra carries any additional typed objects the test needs seeded (PersistentVolumes, in practice).
+func newRegistryTestClient(t *testing.T, storageClasses []*storagev1.StorageClass, vsClasses []*unstructured.Unstructured, extra ...client.Object) client.Client {
 	t.Helper()
 
 	scheme := runtime.NewScheme()
@@ -64,10 +65,11 @@ func newRegistryTestClient(t *testing.T, storageClasses []*storagev1.StorageClas
 		t.Fatalf("AddToScheme(storagev1): %v", err)
 	}
 
-	objs := make([]client.Object, 0, len(storageClasses))
+	objs := make([]client.Object, 0, len(storageClasses)+len(extra))
 	for _, sc := range storageClasses {
 		objs = append(objs, sc)
 	}
+	objs = append(objs, extra...)
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
 
 	ctx := context.Background()
@@ -105,6 +107,200 @@ func pvcOnStorageClass(namespace, name, storageClass string) *corev1.PersistentV
 	return &corev1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
 		Spec:       corev1.PersistentVolumeClaimSpec{StorageClassName: &storageClass},
+	}
+}
+
+// csiPV builds a PersistentVolume served by driver, named so a PVC can bind to it by volumeName.
+func csiPV(name, driver, storageClass string) *corev1.PersistentVolume {
+	return &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Spec: corev1.PersistentVolumeSpec{
+			StorageClassName:       storageClass,
+			PersistentVolumeSource: corev1.PersistentVolumeSource{CSI: &corev1.CSIPersistentVolumeSource{Driver: driver}},
+		},
+	}
+}
+
+// nfsPV builds a statically provisioned NFS PersistentVolume — no CSI driver anywhere on it. It
+// takes a storageClass name on purpose: for a static binding that string is only a matching LABEL
+// between PVC and PV, and Kubernetes never requires the StorageClass object to exist.
+func nfsPV(name, storageClass string) *corev1.PersistentVolume {
+	return &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Spec: corev1.PersistentVolumeSpec{
+			StorageClassName: storageClass,
+			PersistentVolumeSource: corev1.PersistentVolumeSource{
+				NFS: &corev1.NFSVolumeSource{Server: "nfs.example.invalid", Path: "/export/data"},
+			},
+		},
+	}
+}
+
+// pvcBoundTo builds a PVC bound to volumeName while ALSO naming a StorageClass, which is the normal
+// shape of a bound PVC and the shape that makes the two sources of truth disagreeable.
+func pvcBoundTo(namespace, name, storageClass, volumeName string) *corev1.PersistentVolumeClaim {
+	pvc := pvcOnStorageClass(namespace, name, storageClass)
+	pvc.Spec.VolumeName = volumeName
+	pvc.Status.Phase = corev1.ClaimBound
+	return pvc
+}
+
+// TestRegistryForResolvesABoundPVCThroughItsPersistentVolume is the base case for the primary
+// path: a bound PVC's driver comes off its PV, and the resolution is identical to what the class
+// would have said when the two agree.
+func TestRegistryForResolvesABoundPVCThroughItsPersistentVolume(t *testing.T) {
+	c := newRegistryTestClient(t,
+		[]*storagev1.StorageClass{newStorageClass("ceph-block", rbdProvisioner)},
+		[]*unstructured.Unstructured{newVolumeSnapshotClass("ceph-block-snapclass", rbdProvisioner)},
+		csiPV("pv-data", rbdProvisioner, "ceph-block"),
+	)
+	pvc := pvcBoundTo("c-db", "data", "ceph-block", "pv-data")
+
+	exp, err := NewRegistry(c, testOperatorNamespace).For(context.Background(), pvc)
+	if err != nil {
+		t.Fatalf("For: unexpected error: %v", err)
+	}
+	if exp.Kind() != KindCSIGeneric {
+		t.Errorf("Kind() = %q, want %q", exp.Kind(), KindCSIGeneric)
+	}
+}
+
+// TestRegistryForPrefersThePVOverAStorageClassThatDisagrees is the test that matters, and the one
+// the StorageClass-first implementation fails.
+//
+// A StorageClass's provisioner is immutable, but the CLASS is not permanent: deleting it and
+// re-creating one of the same name over a different backend is legal, and is what a cluster
+// migrating from one storage system to another actually does. Every PersistentVolume provisioned
+// under the old class keeps spec.storageClassName pointing at that name — a dangling string that
+// now resolves to the wrong driver.
+//
+// Here the data lives on RBD; the class of that name now says CephFS. Resolving through the class
+// would return cephfsShallowExposer and take the shallow-snapshot path over a block volume: not an
+// error, a confident WRONG answer, whose eventual symptom is a VolumeSnapshot that never becomes
+// ready and a SnapshotReadyDeadlineExceeded two hours later blaming the storage. The PV is the only
+// object that knows what is holding the bytes.
+func TestRegistryForPrefersThePVOverAStorageClassThatDisagrees(t *testing.T) {
+	c := newRegistryTestClient(t,
+		// The class was re-created over CephFS; the PV underneath is still RBD.
+		[]*storagev1.StorageClass{newStorageClass("standard", cephfsProvisioner)},
+		[]*unstructured.Unstructured{
+			newVolumeSnapshotClass("cephfs-snapclass", cephfsProvisioner),
+			newVolumeSnapshotClass("rbd-snapclass", rbdProvisioner),
+		},
+		csiPV("pv-legacy", rbdProvisioner, "standard"),
+	)
+	pvc := pvcBoundTo("c-db", "data", "standard", "pv-legacy")
+
+	exp, err := NewRegistry(c, testOperatorNamespace).For(context.Background(), pvc)
+	if err != nil {
+		t.Fatalf("For: unexpected error: %v", err)
+	}
+	if exp.Kind() != KindCSIGeneric {
+		t.Fatalf("Kind() = %q, want %q — resolution followed the StorageClass instead of the PersistentVolume", exp.Kind(), KindCSIGeneric)
+	}
+	gen, ok := exp.(*csiGenericExposer)
+	if !ok {
+		t.Fatalf("resolved exposer type = %T, want *csiGenericExposer", exp)
+	}
+	if got := vsClassName(gen.vsClass); got != "rbd-snapclass" {
+		t.Errorf("resolved VolumeSnapshotClass = %q, want %q (the PV's driver, not the class's)", got, "rbd-snapclass")
+	}
+}
+
+// TestRegistryForStaticNFSVolumeIsUnsupportedNotUnresolvable is the incident, reduced.
+//
+// A 200Gi PVC, Bound, on a hand-made NFS PersistentVolume, naming a StorageClass that does not
+// exist as an object. Resolving through the class produced "StorageClass not found" — a hard error,
+// which the Backup controller retried forever, which held the head of its namespace's volume queue
+// for thirty hours and starved every nightly run behind it.
+//
+// Two claims, both required. The verdict must be ErrUnsupported, because that is the TRUE statement
+// about a plain NFS volume: there is no CSI driver to ask for a snapshot, ever. And ErrUnsupported
+// is what the Backup controller turns into Skipped — terminal in the queue, neutral in the roll-up —
+// so the honest verdict is also the one that lets the rest of the namespace through. The two
+// properties are not a coincidence worth relying on silently, hence this test.
+func TestRegistryForStaticNFSVolumeIsUnsupportedNotUnresolvable(t *testing.T) {
+	c := newRegistryTestClient(t,
+		nil, // "slow" is referenced by both PVC and PV, and exists as neither
+		[]*unstructured.Unstructured{newVolumeSnapshotClass("ceph-block-snapclass", rbdProvisioner)},
+		nfsPV("recette-back", "slow"),
+	)
+	pvc := pvcBoundTo("develop", "recette-back", "slow", "recette-back")
+
+	_, err := NewRegistry(c, testOperatorNamespace).For(context.Background(), pvc)
+	if err == nil {
+		t.Fatal("For: expected an error for a static NFS volume, got nil")
+	}
+	if !errors.Is(err, ErrUnsupported) {
+		t.Errorf("For error = %v, want ErrUnsupported (a plain NFS volume can never be CSI-snapshotted)", err)
+	}
+	// And it must not look transient: a caller that requeues on IsNotFound would reproduce the
+	// thirty-hour block, since the missing StorageClass is still missing on every retry.
+	if apierrors.IsNotFound(err) {
+		t.Errorf("For error = %v, must not satisfy apierrors.IsNotFound — that is what made this retry forever", err)
+	}
+}
+
+// TestRegistryForFollowsTheCSIMigrationAnnotation covers the volumes that are CSI-served without
+// carrying a .spec.csi stanza: an in-tree PersistentVolume whose plugin has been superseded keeps
+// its original source and names the real driver in pv.kubernetes.io/migrated-to. Reading only
+// .spec.csi.driver would declare every one of them unsnapshottable.
+func TestRegistryForFollowsTheCSIMigrationAnnotation(t *testing.T) {
+	const migratedDriver = "pd.csi.storage.gke.io"
+	pv := &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "pv-legacy-pd",
+			Annotations: map[string]string{migratedToAnnotation: migratedDriver},
+		},
+		Spec: corev1.PersistentVolumeSpec{
+			StorageClassName: "standard",
+			PersistentVolumeSource: corev1.PersistentVolumeSource{
+				GCEPersistentDisk: &corev1.GCEPersistentDiskVolumeSource{PDName: "disk-1"},
+			},
+		},
+	}
+	c := newRegistryTestClient(t,
+		[]*storagev1.StorageClass{newStorageClass("standard", "kubernetes.io/gce-pd")},
+		[]*unstructured.Unstructured{newVolumeSnapshotClass("pd-snapclass", migratedDriver)},
+		pv,
+	)
+	pvc := pvcBoundTo("c-db", "data", "standard", "pv-legacy-pd")
+
+	exp, err := NewRegistry(c, testOperatorNamespace).For(context.Background(), pvc)
+	if err != nil {
+		t.Fatalf("For: unexpected error: %v", err)
+	}
+	gen, ok := exp.(*csiGenericExposer)
+	if !ok {
+		t.Fatalf("resolved exposer type = %T, want *csiGenericExposer", exp)
+	}
+	if got := vsClassName(gen.vsClass); got != "pd-snapclass" {
+		t.Errorf("resolved VolumeSnapshotClass = %q, want %q (the migrated-to driver)", got, "pd-snapclass")
+	}
+}
+
+// TestRegistryForMissingPVIsRetryableNotAVerdict separates the two ways resolution can fail. A PVC
+// naming a PersistentVolume that cannot be read says nothing about snapshot capability: a cached
+// client can answer NotFound for an object that exists, and a bound PVC whose PV is genuinely gone
+// is a broken cluster somebody can fix. So it must stay a plain, IsNotFound-carrying error the
+// caller requeues on — NOT ErrUnsupported, which would silently mark a snapshottable volume Skipped
+// and let a backup report success over data it never touched.
+func TestRegistryForMissingPVIsRetryableNotAVerdict(t *testing.T) {
+	c := newRegistryTestClient(t,
+		[]*storagev1.StorageClass{newStorageClass("ceph-block", rbdProvisioner)},
+		[]*unstructured.Unstructured{newVolumeSnapshotClass("ceph-block-snapclass", rbdProvisioner)},
+	)
+	pvc := pvcBoundTo("c-db", "data", "ceph-block", "pv-vanished")
+
+	_, err := NewRegistry(c, testOperatorNamespace).For(context.Background(), pvc)
+	if err == nil {
+		t.Fatal("For: expected an error for a PVC bound to a missing PersistentVolume, got nil")
+	}
+	if errors.Is(err, ErrUnsupported) {
+		t.Errorf("For error = %v, incorrectly matched ErrUnsupported (an unreadable PV is not a verdict about the storage)", err)
+	}
+	if !apierrors.IsNotFound(err) {
+		t.Errorf("For error = %v, want apierrors.IsNotFound so the caller can requeue", err)
 	}
 }
 

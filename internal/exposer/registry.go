@@ -30,9 +30,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-// ErrUnsupported is returned by Registry.For when the PVC's StorageClass provisioner has no
-// matching VolumeSnapshotClass anywhere in the cluster — i.e. there is no known way to
-// snapshot this volume at all (the textbook case: rancher.io/local-path). It is a sentinel
+// ErrUnsupported is returned by Registry.For when there is no known way to snapshot this volume at
+// all, which happens two ways: the driver serving it has no matching VolumeSnapshotClass anywhere in
+// the cluster (the textbook case: rancher.io/local-path), or the volume is not a CSI volume in the
+// first place (a static NFS / hostPath / local / iSCSI PersistentVolume — nothing to ask for a
+// snapshot). Both are verdicts about the storage, not about the cluster's health today. It is a sentinel
 // error so the Backup controller can test errors.Is(err, ErrUnsupported) to distinguish "skip
 // this volume, mark it Skipped/CSISnapshotUnsupported" (ADR 0003) from every other resolution
 // failure (a missing StorageClass, a broken client, ...) that warrants a hard error instead.
@@ -82,16 +84,16 @@ func NewRegistry(c client.Client, operatorNamespace string) *Registry {
 
 // For resolves the SnapshotExposer for pvc, per ADR 0003's Ceph-aware selection:
 //
-//  1. Read pvc.Spec.StorageClassName and GET that StorageClass to learn its Provisioner. A
-//     PVC with no StorageClassName, or naming a StorageClass that does not exist, is a clear,
-//     distinct error — NOT ErrUnsupported, because it is not a verdict about snapshot
-//     capability, it is "this PVC cannot even be resolved".
-//  2. LIST VolumeSnapshotClasses and find one whose "driver" field equals the provisioner. No
+//  1. Learn the CSI driver that actually serves this volume — from its PersistentVolume when the
+//     PVC names one, and only from its StorageClass when it does not. See driverFor: the PV is
+//     the source of truth, and the StorageClass is a mutable indirection that can name a
+//     DIFFERENT driver than the one holding the data.
+//  2. LIST VolumeSnapshotClasses and find one whose "driver" field equals the driver. No
 //     match -> ErrUnsupported: the volume cannot be snapshotted at all, which the Backup
 //     controller treats as "skip this volume" (status.volumes[].phase Skipped, reason
 //     CSISnapshotUnsupported), never a hard failure.
-//  3. A CephFS provisioner (name contains ".cephfs.csi.") with a match -> cephfsShallowExposer.
-//     Any other provisioner with a match -> csiGenericExposer.
+//  3. A CephFS driver (name contains ".cephfs.csi.") with a match -> cephfsShallowExposer.
+//     Any other driver with a match -> csiGenericExposer.
 //
 // The returned exposer is preconfigured with the resolved VolumeSnapshotClass OBJECT, so its
 // Expose never has to re-run this resolution and its Precheck can read the class's parameters
@@ -108,30 +110,122 @@ func (r *Registry) For(ctx context.Context, pvc *corev1.PersistentVolumeClaim) (
 	if pvc == nil {
 		return nil, errors.New("exposer: nil PVC")
 	}
+	driver, origin, err := r.driverFor(ctx, pvc)
+	if err != nil {
+		return nil, err
+	}
+
+	vsClass, err := r.findVolumeSnapshotClass(ctx, driver)
+	if err != nil {
+		return nil, fmt.Errorf("exposer: list VolumeSnapshotClasses for driver %q: %w", driver, err)
+	}
+	if vsClass == nil {
+		return nil, fmt.Errorf("%w: driver %q (%s) has no matching VolumeSnapshotClass",
+			ErrUnsupported, driver, origin)
+	}
+
+	if strings.Contains(driver, cephfsProvisionerMarker) {
+		return newCephFSShallowExposer(r.client, r.operatorNamespace, vsClass), nil
+	}
+	return newCSIGenericExposer(r.client, r.operatorNamespace, vsClass), nil
+}
+
+// migratedToAnnotation is the signal Kubernetes leaves on an in-tree PersistentVolume whose plugin
+// has been superseded by a CSI driver (CSI migration): the volume source stays gcePersistentDisk /
+// awsElasticBlockStore / cinder / azureDisk, but the driver that serves it — and therefore the one a
+// VolumeSnapshotClass must name — is in this annotation. Reading only .spec.csi.driver would call
+// every such volume unsnapshottable.
+const migratedToAnnotation = "pv.kubernetes.io/migrated-to"
+
+// driverFor resolves the CSI driver serving pvc, and a human-readable phrase naming where that
+// answer came from (for the ErrUnsupported message: an administrator reading "driver X has no
+// matching VolumeSnapshotClass" needs to know whether X came from the PV or the class).
+//
+// # Why the PersistentVolume, and not the StorageClass
+//
+// A StorageClass's provisioner is immutable, which makes it tempting to treat the class as the
+// volume's identity. It is not. A class can be DELETED and re-created under the same name with a
+// different provisioner — perfectly legal, and a normal thing to do when migrating a cluster from
+// one storage backend to another. Every PersistentVolume created under the old class keeps
+// spec.storageClassName pointing at that name: a dangling string that now resolves to the WRONG
+// driver. Resolving through it does not produce an error, it produces a confident wrong answer —
+// the operator would route an NFS volume to the RBD exposer, cut a VolumeSnapshot that can never
+// become ready, and report SnapshotReadyDeadlineExceeded two hours later. A plausible, coherent,
+// entirely false diagnosis that accuses the storage. The PV names the driver holding the data;
+// nothing else does.
+//
+// Statically provisioned volumes make the same point from the other side: for a static binding,
+// storageClassName is only a matching LABEL between PVC and PV, and Kubernetes never requires the
+// StorageClass object to exist at all. A PVC bound to a hand-made PV whose class was never created
+// is valid, common, and not a misconfiguration — but resolving through the class turns it into
+// "StorageClass not found", which is neither true nor actionable.
+//
+// The StorageClass is therefore consulted for exactly one case: a PVC that names NO volume, i.e.
+// one not yet bound to anything. There the class is the only evidence available — and a volume with
+// no PV has no data to back up yet either.
+func (r *Registry) driverFor(ctx context.Context, pvc *corev1.PersistentVolumeClaim) (driver string, origin string, err error) {
+	if pvc.Spec.VolumeName != "" {
+		var pv corev1.PersistentVolume
+		if err := r.client.Get(ctx, client.ObjectKey{Name: pvc.Spec.VolumeName}, &pv); err != nil {
+			// Deliberately NOT wrapped as ErrUnsupported: a PVC naming a PV we cannot read is not a
+			// verdict about snapshot capability. A NotFound here is a broken or momentarily
+			// inconsistent cluster (a cached client can answer NotFound for an object that exists),
+			// so it must retry rather than settle — bounded by the Backup controller's Pending
+			// deadline, which is what stops a retry from becoming a head-of-line block.
+			return "", "", fmt.Errorf("exposer: get PersistentVolume %q bound to PVC %s/%s: %w",
+				pvc.Spec.VolumeName, pvc.Namespace, pvc.Name, err)
+		}
+		if pv.Spec.CSI != nil && pv.Spec.CSI.Driver != "" {
+			return pv.Spec.CSI.Driver, fmt.Sprintf("PersistentVolume %q", pv.Name), nil
+		}
+		if migrated := pv.Annotations[migratedToAnnotation]; migrated != "" {
+			return migrated, fmt.Sprintf("PersistentVolume %q, CSI-migrated", pv.Name), nil
+		}
+		// Not a CSI volume at all: NFS, hostPath, local, iSCSI, an in-tree plugin with no
+		// migration. There is no CSI driver to ask for a snapshot, so this is ErrUnsupported —
+		// "never, on this storage" — and the Backup controller makes it Skipped, which is neutral in
+		// the roll-up and terminal in the queue. That is the honest verdict AND the one that lets
+		// the other volumes of the namespace through.
+		return "", "", fmt.Errorf("%w: PersistentVolume %q bound to PVC %s/%s is a %s volume, not CSI",
+			ErrUnsupported, pv.Name, pvc.Namespace, pvc.Name, persistentVolumeSourceName(&pv))
+	}
+
 	if pvc.Spec.StorageClassName == nil || *pvc.Spec.StorageClassName == "" {
-		return nil, fmt.Errorf("exposer: PVC %s/%s has no spec.storageClassName set", pvc.Namespace, pvc.Name)
+		return "", "", fmt.Errorf("exposer: PVC %s/%s is bound to no volume and has no spec.storageClassName set",
+			pvc.Namespace, pvc.Name)
 	}
 	scName := *pvc.Spec.StorageClassName
 
 	var sc storagev1.StorageClass
 	if err := r.client.Get(ctx, client.ObjectKey{Name: scName}, &sc); err != nil {
-		return nil, fmt.Errorf("exposer: get StorageClass %q for PVC %s/%s: %w", scName, pvc.Namespace, pvc.Name, err)
+		return "", "", fmt.Errorf("exposer: get StorageClass %q for unbound PVC %s/%s: %w",
+			scName, pvc.Namespace, pvc.Name, err)
 	}
-	provisioner := sc.Provisioner
+	if migrated := sc.Annotations[migratedToAnnotation]; migrated != "" {
+		return migrated, fmt.Sprintf("StorageClass %q, CSI-migrated", scName), nil
+	}
+	return sc.Provisioner, fmt.Sprintf("StorageClass %q", scName), nil
+}
 
-	vsClass, err := r.findVolumeSnapshotClass(ctx, provisioner)
-	if err != nil {
-		return nil, fmt.Errorf("exposer: list VolumeSnapshotClasses for provisioner %q: %w", provisioner, err)
+// persistentVolumeSourceName names the non-CSI source a PersistentVolume carries, so the
+// ErrUnsupported message says "is a nfs volume" rather than leaving an administrator to go and look.
+// The list is the sources still creatable on a supported Kubernetes; anything else answers
+// "non-CSI", which is the only claim this function needs to be right about.
+func persistentVolumeSourceName(pv *corev1.PersistentVolume) string {
+	switch s := pv.Spec.PersistentVolumeSource; {
+	case s.NFS != nil:
+		return "nfs"
+	case s.HostPath != nil:
+		return "hostPath"
+	case s.Local != nil:
+		return "local"
+	case s.ISCSI != nil:
+		return "iscsi"
+	case s.FC != nil:
+		return "fc"
+	default:
+		return "non-CSI"
 	}
-	if vsClass == nil {
-		return nil, fmt.Errorf("%w: provisioner %q (StorageClass %q) has no matching VolumeSnapshotClass",
-			ErrUnsupported, provisioner, scName)
-	}
-
-	if strings.Contains(provisioner, cephfsProvisionerMarker) {
-		return newCephFSShallowExposer(r.client, r.operatorNamespace, vsClass), nil
-	}
-	return newCSIGenericExposer(r.client, r.operatorNamespace, vsClass), nil
 }
 
 // findVolumeSnapshotClass returns the VolumeSnapshotClass whose "driver" field equals

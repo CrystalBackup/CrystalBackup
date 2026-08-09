@@ -60,13 +60,39 @@ func IsPreProvisionedContent(vsc *unstructured.Unstructured) bool {
 // The caller owns the orphan decision (owner gone / volume terminal, MinAge passed); this
 // function owns only the how. Idempotent and NotFound-tolerant like every teardown step.
 func ReapOrphanVolumeSnapshotContent(ctx context.Context, c client.Client, vsc *unstructured.Unstructured) error {
-	if !IsPreProvisionedContent(vsc) {
-		if err := setOriginVSCToDelete(ctx, c, vsc); err != nil {
-			return err
-		}
+	if err := PrepareOrphanVolumeSnapshotContentForReclaim(ctx, c, vsc); err != nil {
+		return err
 	}
 	if err := c.Delete(ctx, vsc); err != nil && !absentOK(err) {
 		return fmt.Errorf("delete orphaned VolumeSnapshotContent %s: %w", vsc.GetName(), err)
 	}
 	return nil
+}
+
+// PrepareOrphanVolumeSnapshotContentForReclaim is the NON-DESTRUCTIVE half of
+// ReapOrphanVolumeSnapshotContent, split out so a caller that must NOT re-issue a delete can still
+// perform it: it restores a dynamically-provisioned content's deletionPolicy to Delete (idempotent,
+// a no-op when already Delete) and does nothing at all to a pre-provisioned static alias, whose
+// Retain is correct by construction.
+//
+// The split exists because of a case the 0.6.5 reporting fix would otherwise have regressed. The
+// reaper no longer re-issues a DELETE on an object whose deletion is already pending — re-asking
+// cannot move a finalizer, and the repeated request is what produced 31 hours of false success
+// claims. But an origin content can be found ALREADY terminating and still Retain-parked: the crash
+// window reclaimOrigin describes (something else deleted the content after Ready's handover patch,
+// before Cleanup restored the policy), with a finalizer holding the object meanwhile. Skipping this
+// restore on that object means that the moment the finalizer clears, the content disappears with
+// deletionPolicy=Retain and its storage-side snapshot is orphaned in the backend forever — an
+// invisible, billable leak, and precisely the failure the reaper exists to prevent.
+//
+// So this half runs on EVERY sweep, pending deletion or not. It is a write, which is why it is
+// deliberately narrow: one merge patch of one field, only on a content the caller has already vetted
+// as orphaned, and only when the field is not already what it needs to be. Patching a terminating
+// object is permitted (unlike ADDING a finalizer to one), and it does not interfere with whatever
+// controller is holding it.
+func PrepareOrphanVolumeSnapshotContentForReclaim(ctx context.Context, c client.Client, vsc *unstructured.Unstructured) error {
+	if IsPreProvisionedContent(vsc) {
+		return nil
+	}
+	return setOriginVSCToDelete(ctx, c, vsc)
 }

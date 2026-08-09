@@ -44,17 +44,38 @@ limitations under the License.
 // Two independent passes, both required to agree:
 //
 //  1. EXTRACTION. The string constants that parameterise the routing — the CephFS provisioner
-//     marker, the exposer Kind values, the snapshot API group/version — are read out of the
-//     declarations in internal/exposer/*.go by go/parser. Nothing is typed out here.
+//     marker, the exposer Kind values, the snapshot API group/version, the CSI-migration
+//     annotation — are read out of the declarations in internal/exposer/*.go by go/parser.
+//     Nothing is typed out here.
 //
 //  2. EXECUTION. The emitted shell rule is then re-evaluated in Go and compared, provisioner by
 //     provisioner, against what the REAL Registry.For returns when driven with a fake client.
 //     Extraction alone would catch a changed constant but not a changed structure — a new
 //     routing branch would leave the constants intact and the emitted rule wrong. Executing the
-//     real resolver over probe provisioners catches that.
+//     real resolver over probe provisioners catches that. Each provisioner is probed twice, once
+//     through a bound PVC and once through an unbound one, because Registry.For sources the driver
+//     from the PersistentVolume in the first case and the StorageClass in the second; probing one
+//     path would leave the other free to drift, and the bound path is the one real PVCs take.
+//     A third probe pins the branch no provisioner can reach: a PVC bound to a non-CSI volume.
 //
-// On top of both, the generator enumerates every Kind* constant the package declares and fails
-// if it finds one this generator has no rule for. Adding a third exposer to internal/exposer
+// # What the model has to cover, and what it once did not
+//
+// The comparison in pass 2 is only as good as its model of the SCRIPTS. The scripts do not call
+// Registry.For; they read a StorageClass, DERIVE a driver from it, and look for a
+// VolumeSnapshotClass matching that driver. For a long while every probe here had an effective
+// driver identical to its .provisioner, so the derivation was invisible to the guard — and when
+// driverFor learned to prefer the pv.kubernetes.io/migrated-to annotation on the StorageClass path,
+// the scripts kept reading .provisioner and this guard stayed green. A CSI-migrated in-tree class
+// would have been reported DATA SKIPPED for volumes the operator snapshots perfectly well.
+//
+// So the derivation is now modelled too (storageClassDriver), emitted into the scripts rather than
+// hand-written in each of them (cb_sc_driver), and probed by a class whose serving driver differs
+// from its provisioner. driverServingVolumes — the truth used to seed the fake cluster — is
+// deliberately a SEPARATE function from storageClassDriver, the model: collapsing them would make
+// the two agree by construction rather than by being right.
+//
+// On top of both passes, the generator enumerates every Kind* constant the package declares and
+// fails if it finds one this generator has no rule for. Adding a third exposer to internal/exposer
 // therefore breaks `make preflight-table-verify` in CI with a message naming the new kind,
 // rather than shipping a script that quietly never mentions it.
 package main
@@ -81,6 +102,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"github.com/CrystalBackup/CrystalBackup/internal/exposer"
@@ -93,6 +115,14 @@ const (
 	endMarker   = "# <<< END GENERATED <<<"
 
 	exposerPkgDir = "internal/exposer"
+
+	// probeNamespace is where the probe PVCs live. Nothing depends on the name — it is a constant
+	// so the string is written once.
+	probeNamespace = "tenant"
+
+	// verdictSkip is the token the emitted shell rule prints for a volume that cannot be
+	// snapshotted at all: internal/exposer's ErrUnsupported, reduced to the script's vocabulary.
+	verdictSkip = "skip"
 )
 
 // scripts are the published shell scripts that carry the generated region, relative to the
@@ -154,6 +184,10 @@ func emit(root, outDir, rel string, facts *facts) error {
 		return fmt.Errorf("read %s: %w", scriptPath, err)
 	}
 
+	if err := checkMigratedAnnotationRead(string(src), scriptPath, facts); err != nil {
+		return err
+	}
+
 	spliced, err := splice(string(src), facts.render())
 	if err != nil {
 		return fmt.Errorf("%s: %w", scriptPath, err)
@@ -187,6 +221,28 @@ func emit(root, outDir, rel string, facts *facts) error {
 	return nil
 }
 
+// checkMigratedAnnotationRead is the one thing about the migrated-to annotation the generated region
+// cannot own. The DERIVATION is generated (cb_sc_driver), but the annotation's NAME also has to
+// appear inside the scripts' kubectl jsonpath expressions, where every dot must be backslash-escaped
+// — and a jsonpath assembled from a shell variable would mean turning every one of those
+// single-quoted expressions inside out, trading a readable query for an unreadable one.
+//
+// So the name is checked instead of substituted: if migratedToAnnotation ever changes in
+// internal/exposer, `make preflight-table` fails here naming the new value, rather than emitting a
+// script that reads an annotation nothing sets and calls every migrated volume unsnapshottable.
+func checkMigratedAnnotationRead(src, scriptPath string, facts *facts) error {
+	escaped := strings.ReplaceAll(facts.migratedToAnnotation, ".", `\.`)
+	if strings.Contains(src, escaped) {
+		return nil
+	}
+	return fmt.Errorf("%s does not read the %q annotation anywhere:\n"+
+		"  expected its jsonpath-escaped form %q to appear in a kubectl query.\n"+
+		"  internal/exposer resolves a CSI-migrated volume's driver from that annotation, on both the\n"+
+		"  StorageClass and the PersistentVolume. A script that never reads it reports every migrated\n"+
+		"  volume as unsnapshottable — confidently, and wrongly. Update the jsonpath in %s",
+		scriptPath, facts.migratedToAnnotation, escaped, filepath.Base(scriptPath))
+}
+
 // facts is everything read out of internal/exposer that the script needs.
 type facts struct {
 	cephfsMarker    string
@@ -194,6 +250,12 @@ type facts struct {
 	kindCephFS      string
 	snapshotGroup   string
 	snapshotVersion string
+
+	// migratedToAnnotation is the annotation Kubernetes leaves on an in-tree StorageClass and on its
+	// PersistentVolumes when a CSI driver has superseded the plugin. driverFor prefers it over both
+	// .provisioner and .spec.csi.driver, so it is as much a routing parameter as the CephFS marker
+	// is, and it is read out of the source for the same reason.
+	migratedToAnnotation string
 }
 
 // extract reads the string constants out of the exposer package's declarations. It never falls
@@ -265,6 +327,7 @@ func extract(dir string) (*facts, error) {
 		{"KindCephFSShallow", &f.kindCephFS},
 		{"volumeSnapshotGroup", &f.snapshotGroup},
 		{"volumeSnapshotVersion", &f.snapshotVersion},
+		{"migratedToAnnotation", &f.migratedToAnnotation},
 	} {
 		v, ok := consts[want.name]
 		if !ok || v == "" {
@@ -299,10 +362,40 @@ func checkKindCoverage(consts map[string]string) error {
 		"  then re-run `make preflight-table`", strings.Join(unknown, ", "))
 }
 
-// probe is one provisioner fed through the real Registry.For.
+// probe is one StorageClass, declared the way an administrator would declare it, fed through the
+// real Registry.For AND through this generator's model of what the scripts will say about it.
 type probe struct {
+	// provisioner is the StorageClass's declared .provisioner. For an in-tree plugin superseded by
+	// a CSI driver this is NOT the driver serving the volumes — migratedTo is — and that difference
+	// is the whole reason this struct has three fields instead of two.
 	provisioner string
-	hasVSClass  bool
+
+	// migratedTo is the pv.kubernetes.io/migrated-to annotation, carried both by the StorageClass
+	// and by the PersistentVolumes provisioned under it. Empty for a class that is not CSI-migrated.
+	migratedTo string
+
+	// hasVSClass seeds a VolumeSnapshotClass for the class's EFFECTIVE driver, and for that driver
+	// only. On a migrated class that means the cluster holds a snapshot class for the CSI driver and
+	// none whatsoever for the in-tree provisioner name — which is the true shape, and the shape that
+	// tells a script reading the wrong field from a script reading the right one.
+	hasVSClass bool
+}
+
+// driverServingVolumes is what KUBERNETES does with this class: the volumes of a CSI-migrated class
+// are served by the driver in the annotation, whatever .provisioner still says. It seeds the fake
+// cluster — the VolumeSnapshotClass is created for THIS driver and for no other, which is why a
+// migrated probe's cluster holds a class for ebs.csi.aws.com and nothing at all for
+// kubernetes.io/aws-ebs.
+//
+// It is deliberately NOT the same function as storageClassDriver, which models what the published
+// scripts derive. Collapsing the two would make this guard incapable of ever failing on the axis it
+// was just blind to: the model would then agree with reality by construction instead of by being
+// right, and that is the difference between a guard and a decoration.
+func (p probe) driverServingVolumes() string {
+	if p.migratedTo != "" {
+		return p.migratedTo
+	}
+	return p.provisioner
 }
 
 // verifyAgainstRegistry drives the REAL exposer.Registry.For over a fake cluster and asserts
@@ -311,15 +404,29 @@ type probe struct {
 // routing structure around them has changed.
 func verifyAgainstRegistry(f *facts) error {
 	probes := []probe{
-		{"rook-ceph.rbd.csi.ceph.com", true},
-		{"rook-ceph.cephfs.csi.ceph.com", true},
-		{"cephfs.csi.ceph.com", true},
-		{"driver.longhorn.io", true},
-		{"ebs.csi.aws.com", true},
-		{"pd.csi.storage.gke.io", true},
-		{"rancher.io/local-path", false},
-		{"kubernetes.io/no-provisioner", false},
-		{"rook-ceph.cephfs.csi.ceph.com", false}, // CephFS with no snapshot class is still a skip.
+		{provisioner: "rook-ceph.rbd.csi.ceph.com", hasVSClass: true},
+		{provisioner: "rook-ceph.cephfs.csi.ceph.com", hasVSClass: true},
+		{provisioner: "cephfs.csi.ceph.com", hasVSClass: true},
+		{provisioner: "driver.longhorn.io", hasVSClass: true},
+		{provisioner: "ebs.csi.aws.com", hasVSClass: true},
+		{provisioner: "pd.csi.storage.gke.io", hasVSClass: true},
+		{provisioner: "rancher.io/local-path", hasVSClass: false},
+		{provisioner: "kubernetes.io/no-provisioner", hasVSClass: false},
+		// CephFS with no snapshot class is still a skip.
+		{provisioner: "rook-ceph.cephfs.csi.ceph.com", hasVSClass: false},
+
+		// A CSI-migrated in-tree StorageClass: the provisioner names a plugin that no longer serves
+		// anything, and the driver that does is in the annotation. The cluster holds a snapshot class
+		// for ebs.csi.aws.com and NONE for kubernetes.io/aws-ebs, so a resolver reading .provisioner
+		// concludes "no snapshot class, skip this class" while the operator snapshots it happily.
+		//
+		// This probe exists because that is not a hypothetical: the driver resolution in
+		// internal/exposer gained the migrated-to read on the StorageClass path in the same release
+		// as this comment, the published scripts kept reading .provisioner, and this guard — whose
+		// entire job is to make that drift impossible — did not fire, because no probe here had an
+		// effective driver different from its provisioner. Every probe above pins the routing; this
+		// one pins the INPUT to the routing, which is where the guard was blind.
+		{provisioner: "kubernetes.io/aws-ebs", migratedTo: "ebs.csi.aws.com", hasVSClass: true},
 	}
 
 	scheme := runtime.NewScheme()
@@ -332,10 +439,19 @@ func verifyAgainstRegistry(f *facts) error {
 
 	ctx := context.Background()
 	for i, p := range probes {
+		// served is the truth about the cluster; modelled is what the published scripts would derive
+		// from the same StorageClass. For every probe but the migrated one they are the same string,
+		// and the point of the migrated one is that they are not.
+		served := p.driverServingVolumes()
+		modelled := storageClassDriver(p.provisioner, p.migratedTo)
+
 		scName := fmt.Sprintf("sc-%d", i)
 		sc := &storagev1.StorageClass{
 			ObjectMeta:  metav1.ObjectMeta{Name: scName},
 			Provisioner: p.provisioner,
+		}
+		if p.migratedTo != "" {
+			sc.Annotations = map[string]string{f.migratedToAnnotation: p.migratedTo}
 		}
 		c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(sc).Build()
 		if p.hasVSClass {
@@ -346,7 +462,7 @@ func verifyAgainstRegistry(f *facts) error {
 				Kind:    "VolumeSnapshotClass",
 			})
 			vsc.SetName(fmt.Sprintf("vsc-%d", i))
-			if err := unstructured.SetNestedField(vsc.Object, p.provisioner, "driver"); err != nil {
+			if err := unstructured.SetNestedField(vsc.Object, served, "driver"); err != nil {
 				return err
 			}
 			if err := c.Create(ctx, vsc); err != nil {
@@ -354,42 +470,172 @@ func verifyAgainstRegistry(f *facts) error {
 			}
 		}
 
-		pvc := &corev1.PersistentVolumeClaim{
-			ObjectMeta: metav1.ObjectMeta{Name: "probe", Namespace: "tenant"},
-			Spec:       corev1.PersistentVolumeClaimSpec{StorageClassName: &scName},
+		// Both resolution paths, against the same expected verdict. Registry.For takes a bound PVC's
+		// driver from its PersistentVolume and an unbound one's from its StorageClass, so probing
+		// only one of them would leave the other free to drift — and the bound path is the one
+		// nearly every real PVC takes. The emitted shell rule maps a DRIVER to an exposer and is
+		// therefore common to both; that is exactly the invariant worth pinning here.
+		pvName := fmt.Sprintf("pv-%d", i)
+		pvcs := map[string]*corev1.PersistentVolumeClaim{
+			"unbound (driver from the StorageClass)": {
+				ObjectMeta: metav1.ObjectMeta{Name: "probe", Namespace: probeNamespace},
+				Spec:       corev1.PersistentVolumeClaimSpec{StorageClassName: &scName},
+			},
+			"bound (driver from the PersistentVolume)": {
+				ObjectMeta: metav1.ObjectMeta{Name: "probe-bound", Namespace: probeNamespace},
+				Spec: corev1.PersistentVolumeClaimSpec{
+					StorageClassName: &scName,
+					VolumeName:       pvName,
+				},
+			},
+		}
+		// The PV the bound probe resolves through, built the way the class it came from would build
+		// it: a CSI volume naming the driver, or — for a migrated class — an in-tree volume whose
+		// source is the superseded plugin and whose driver is only in the annotation. Both sources
+		// resolve to the same effective driver, so any difference in verdict between the two paths is
+		// a difference in ROUTING and not in inputs.
+		pv := &corev1.PersistentVolume{
+			ObjectMeta: metav1.ObjectMeta{Name: pvName},
+			Spec:       corev1.PersistentVolumeSpec{StorageClassName: scName},
+		}
+		if p.migratedTo != "" {
+			pv.Annotations = map[string]string{f.migratedToAnnotation: p.migratedTo}
+			pv.Spec.PersistentVolumeSource = corev1.PersistentVolumeSource{
+				AWSElasticBlockStore: &corev1.AWSElasticBlockStoreVolumeSource{VolumeID: "vol-0probe"},
+			}
+		} else {
+			pv.Spec.PersistentVolumeSource = corev1.PersistentVolumeSource{
+				CSI: &corev1.CSIPersistentVolumeSource{Driver: p.provisioner},
+			}
+		}
+		if err := c.Create(ctx, pv); err != nil {
+			return fmt.Errorf("seed PersistentVolume: %w", err)
 		}
 
-		got := ""
-		ex, err := exposer.NewRegistry(c, "crystal-backup-system").For(ctx, pvc)
-		switch {
-		case err == nil:
-			got = ex.Kind()
-		case errors.Is(err, exposer.ErrUnsupported):
-			got = "skip"
-		default:
-			return fmt.Errorf("probe %q (vsclass=%v): unexpected error from Registry.For: %w",
-				p.provisioner, p.hasVSClass, err)
+		// The scripts never call Registry.For. They read a StorageClass, derive a driver from it, and
+		// look for a VolumeSnapshotClass whose .driver matches THAT — so both halves of the chain are
+		// modelled here. A guard that modelled only the second half is precisely the guard that missed
+		// the migrated class: the emitted rule was right about the driver it was handed, and the
+		// script was handing it the wrong one. Deriving the wrong driver does not merely mislabel the
+		// row, it makes the snapshot-class lookup miss, and a working class comes out DATA SKIPPED.
+		modelSeesVSClass := p.hasVSClass && served == modelled
+		want := f.predict(modelled, modelSeesVSClass)
+		for path, pvc := range pvcs {
+			got, err := probeVerdict(ctx, c, pvc)
+			if err != nil {
+				return fmt.Errorf("probe %q (vsclass=%v, %s): unexpected error from Registry.For: %w",
+					p.provisioner, p.hasVSClass, path, err)
+			}
+			if got != want {
+				return fmt.Errorf("the generated shell rule disagrees with internal/exposer.Registry.For:\n"+
+					"  StorageClass .provisioner %q, %s annotation %q\n"+
+					"  the volumes are served by driver %q; the scripts would derive %q\n"+
+					"  a VolumeSnapshotClass exists for the serving driver: %v; the scripts would find one: %v\n"+
+					"  resolved via the %s path: Registry.For says %q, the scripts would say %q\n"+
+					"  The driver resolution in internal/exposer/registry.go has changed shape. Update the emitted\n"+
+					"  rule — and storageClassDriver, the derivation the scripts feed it — in hack/gen-preflight-table,\n"+
+					"  so the published scripts keep telling the truth",
+					p.provisioner, f.migratedToAnnotation, p.migratedTo,
+					served, modelled, p.hasVSClass, modelSeesVSClass, path, got, want)
+			}
 		}
+	}
 
-		if want := f.predict(p.provisioner, p.hasVSClass); got != want {
-			return fmt.Errorf("the generated shell rule disagrees with internal/exposer.Registry.For:\n"+
-				"  provisioner %q (VolumeSnapshotClass present: %v)\n"+
-				"  Registry.For says %q, the generated rule would say %q\n"+
-				"  The routing in internal/exposer/registry.go has changed shape. Update the emitted rule in\n"+
-				"  hack/gen-preflight-table so the preflight script keeps telling the truth",
-				p.provisioner, p.hasVSClass, got, want)
-		}
+	// The structural branch the per-provisioner probes above cannot reach: a PVC bound to a
+	// PersistentVolume that is not a CSI volume at all. No provisioner is involved — there is no
+	// driver to route — so the verdict must be "skip" whatever classes the cluster holds. It is
+	// pinned here because it is the branch that decides whether a statically provisioned NFS volume
+	// is skipped (correct, and terminal) or errors (which once held a namespace's queue for thirty
+	// hours), and nothing else in this generator would notice it disappearing.
+	if err := verifyNonCSIVolumeIsSkipped(ctx, scheme, f); err != nil {
+		return err
 	}
 	return nil
 }
 
+// probeVerdict runs the real Registry.For over pvc and reduces the outcome to the vocabulary the
+// emitted shell rule speaks: an exposer Kind, or "skip".
+func probeVerdict(ctx context.Context, c client.Client, pvc *corev1.PersistentVolumeClaim) (string, error) {
+	ex, err := exposer.NewRegistry(c, "crystal-backup-system").For(ctx, pvc)
+	switch {
+	case err == nil:
+		return ex.Kind(), nil
+	case errors.Is(err, exposer.ErrUnsupported):
+		return verdictSkip, nil
+	default:
+		return "", err
+	}
+}
+
+// verifyNonCSIVolumeIsSkipped drives Registry.For with a PVC bound to a statically provisioned NFS
+// PersistentVolume, in a cluster that DOES hold a usable snapshot class for a real driver — so a
+// verdict of "skip" can only come from the volume itself being non-CSI, not from an empty cluster.
+func verifyNonCSIVolumeIsSkipped(ctx context.Context, scheme *runtime.Scheme, f *facts) error {
+	const staticClass = "slow" // named by PVC and PV, existing as neither: legal for a static binding
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
+		&corev1.PersistentVolume{
+			ObjectMeta: metav1.ObjectMeta{Name: "pv-static-nfs"},
+			Spec: corev1.PersistentVolumeSpec{
+				StorageClassName: staticClass,
+				PersistentVolumeSource: corev1.PersistentVolumeSource{
+					NFS: &corev1.NFSVolumeSource{Server: "nfs.example.invalid", Path: "/export"},
+				},
+			},
+		},
+	).Build()
+	vsc := &unstructured.Unstructured{}
+	vsc.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   f.snapshotGroup,
+		Version: f.snapshotVersion,
+		Kind:    "VolumeSnapshotClass",
+	})
+	vsc.SetName("rbd-snapclass")
+	if err := unstructured.SetNestedField(vsc.Object, "rook-ceph.rbd.csi.ceph.com", "driver"); err != nil {
+		return err
+	}
+	if err := c.Create(ctx, vsc); err != nil {
+		return fmt.Errorf("seed VolumeSnapshotClass: %w", err)
+	}
+
+	scName := staticClass
+	got, err := probeVerdict(ctx, c, &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "probe-static", Namespace: probeNamespace},
+		Spec:       corev1.PersistentVolumeClaimSpec{StorageClassName: &scName, VolumeName: "pv-static-nfs"},
+	})
+	if err != nil {
+		return fmt.Errorf("a PVC bound to a non-CSI PersistentVolume must resolve to a skip, but Registry.For "+
+			"returned an error: %w\n"+
+			"  An error here is not a verdict the preflight script can print, and in the Backup controller it is\n"+
+			"  a volume that never leaves Pending — which blocks every volume queued behind it in its namespace", err)
+	}
+	if got != verdictSkip {
+		return fmt.Errorf("a PVC bound to a non-CSI (NFS) PersistentVolume resolved to %q, want %q", got, verdictSkip)
+	}
+	return nil
+}
+
+// storageClassDriver is the Go twin of the emitted cb_sc_driver — the driver the published scripts
+// derive for a StorageClass, and it must be the same choice driverFor makes on its unbound path:
+// the migrated-to annotation when the class carries one, else .provisioner.
+//
+// The annotation wins because on a CSI-migrated class .provisioner names an in-tree plugin that no
+// longer serves anything. No VolumeSnapshotClass will ever carry that name, so a script resolving
+// through it finds none and reports the class DATA SKIPPED — a confident wrong answer about a class
+// the operator snapshots perfectly well.
+func storageClassDriver(provisioner, migratedTo string) string {
+	if migratedTo != "" {
+		return migratedTo
+	}
+	return provisioner
+}
+
 // predict is the Go twin of the shell function render emits — the same decision, so the
 // comparison above is meaningful. Keep the two in lockstep; that is the whole contract.
-func (f *facts) predict(provisioner string, hasVSClass bool) string {
+func (f *facts) predict(driver string, hasVSClass bool) string {
 	if !hasVSClass {
-		return "skip"
+		return verdictSkip
 	}
-	if strings.Contains(provisioner, f.cephfsMarker) {
+	if strings.Contains(driver, f.cephfsMarker) {
 		return f.kindCephFS
 	}
 	return f.kindCSIGeneric
@@ -415,10 +661,30 @@ func (f *facts) render() string {
 	w("CB_KIND_CSI_GENERIC=%s", shQuote(f.kindCSIGeneric))
 	w("CB_KIND_CEPHFS_SHALLOW=%s", shQuote(f.kindCephFS))
 	w("CB_CEPHFS_MARKER=%s", shQuote(f.cephfsMarker))
+	w("CB_MIGRATED_TO_ANNOTATION=%s", shQuote(f.migratedToAnnotation))
 	w("")
-	w("# cb_exposer_for PROVISIONER HAS_SNAPSHOT_CLASS")
-	w("#   HAS_SNAPSHOT_CLASS is 'yes' when some VolumeSnapshotClass in the cluster has")
-	w("#   .driver == PROVISIONER. Prints the exposer kind, or 'skip'.")
+	w("# cb_sc_driver DECLARED_PROVISIONER MIGRATED_TO")
+	w("#   The driver serving a StorageClass's volumes: its %s", f.migratedToAnnotation)
+	w("#   annotation when it carries one, else its .provisioner. Same choice driverFor makes for a")
+	w("#   PVC that is bound to nothing yet.")
+	w("#")
+	w("#   The annotation wins because on a CSI-migrated class .provisioner names an in-tree plugin")
+	w("#   that no longer serves anything: no VolumeSnapshotClass will ever carry that name, so")
+	w("#   resolving through it finds none and calls a class DATA SKIPPED that is snapshotted fine.")
+	w("#   This derivation is GENERATED for the same reason the rule below is — it is part of the")
+	w("#   routing, and a hand-written copy of it in each script drifted within one release.")
+	w("cb_sc_driver() {")
+	w("\tif [ -n \"$2\" ]; then")
+	w("\t\tprintf '%%s\\n' \"$2\"")
+	w("\t\treturn 0")
+	w("\tfi")
+	w("\tprintf '%%s\\n' \"$1\"")
+	w("}")
+	w("")
+	w("# cb_exposer_for DRIVER HAS_SNAPSHOT_CLASS")
+	w("#   DRIVER is the driver serving the volume — cb_sc_driver's answer for an unbound PVC, or the")
+	w("#   PersistentVolume's own driver for a bound one. HAS_SNAPSHOT_CLASS is 'yes' when some")
+	w("#   VolumeSnapshotClass in the cluster has .driver == DRIVER. Prints the exposer kind, or 'skip'.")
 	// The case arm and the printfs read the variables above rather than re-embedding the
 	// literals, so each fact appears exactly once even inside the generated region. The quoted
 	// "$CB_CEPHFS_MARKER" is matched literally by POSIX case; only the surrounding * are globs.

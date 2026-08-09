@@ -135,7 +135,7 @@
 # into a `kubectl delete` is the one mistake this script must never make.
 set -u
 
-SCRIPT_VERSION='1.0.0'
+SCRIPT_VERSION='1.1.0'
 
 # >>> BEGIN GENERATED — exposer selection (make preflight-table) >>>
 # Generated from internal/exposer by `make preflight-table` — do not edit by hand.
@@ -148,10 +148,30 @@ CB_SNAPSHOT_VERSION='v1'
 CB_KIND_CSI_GENERIC='csi-generic'
 CB_KIND_CEPHFS_SHALLOW='cephfs-shallow'
 CB_CEPHFS_MARKER='.cephfs.csi.'
+CB_MIGRATED_TO_ANNOTATION='pv.kubernetes.io/migrated-to'
 
-# cb_exposer_for PROVISIONER HAS_SNAPSHOT_CLASS
-#   HAS_SNAPSHOT_CLASS is 'yes' when some VolumeSnapshotClass in the cluster has
-#   .driver == PROVISIONER. Prints the exposer kind, or 'skip'.
+# cb_sc_driver DECLARED_PROVISIONER MIGRATED_TO
+#   The driver serving a StorageClass's volumes: its pv.kubernetes.io/migrated-to
+#   annotation when it carries one, else its .provisioner. Same choice driverFor makes for a
+#   PVC that is bound to nothing yet.
+#
+#   The annotation wins because on a CSI-migrated class .provisioner names an in-tree plugin
+#   that no longer serves anything: no VolumeSnapshotClass will ever carry that name, so
+#   resolving through it finds none and calls a class DATA SKIPPED that is snapshotted fine.
+#   This derivation is GENERATED for the same reason the rule below is — it is part of the
+#   routing, and a hand-written copy of it in each script drifted within one release.
+cb_sc_driver() {
+	if [ -n "$2" ]; then
+		printf '%s\n' "$2"
+		return 0
+	fi
+	printf '%s\n' "$1"
+}
+
+# cb_exposer_for DRIVER HAS_SNAPSHOT_CLASS
+#   DRIVER is the driver serving the volume — cb_sc_driver's answer for an unbound PVC, or the
+#   PersistentVolume's own driver for a bound one. HAS_SNAPSHOT_CLASS is 'yes' when some
+#   VolumeSnapshotClass in the cluster has .driver == DRIVER. Prints the exposer kind, or 'skip'.
 cb_exposer_for() {
 	if [ "$2" != yes ]; then
 		printf '%s\n' skip
@@ -686,7 +706,12 @@ record_class() {
 "
 	[ -n "$JSON_SC" ] && JSON_SC="${JSON_SC},"
 	JSON_SC="${JSON_SC}{\"storageClass\":$(json_str "$1")"
+	# "provisioner" keeps its meaning — what the class declares. The driver every decision was
+	# actually made for is a separate key, because on a CSI-migrated class it is a different string
+	# and a consumer that assumed they were the same would be wrong in silence.
 	JSON_SC="${JSON_SC},\"provisioner\":$(json_str "$SC_PROV")"
+	JSON_SC="${JSON_SC},\"effectiveDriver\":$(json_str "$SC_DRIVER")"
+	JSON_SC="${JSON_SC},\"csiMigrated\":$([ "$SC_DRIVER" != "$SC_PROV" ] && printf true || printf false)"
 	JSON_SC="${JSON_SC},\"volumeSnapshotClass\":$(json_str "$SC_VSCLASS")"
 	JSON_SC="${JSON_SC},\"exposer\":$(json_str "$SC_EXPOSER")"
 	JSON_SC="${JSON_SC},\"verdict\":$(json_str "$2")"
@@ -774,18 +799,24 @@ cleanup_class() {
 # --- one StorageClass, end to end ------------------------------------------------------------------
 
 SC_PROV=''
+SC_DRIVER=''
 SC_VSCLASS=''
 SC_EXPOSER=''
 
 probe_class() {
-	# $1 index, $2 storageclass, $3 provisioner, $4 volumesnapshotclass, $5 exposer kind,
-	# $6 volumeBindingMode
+	# $1 index, $2 storageclass, $3 declared provisioner, $4 effective driver,
+	# $5 volumesnapshotclass, $6 exposer kind, $7 volumeBindingMode
+	#
+	# The provisioner and the driver are separate arguments because on a CSI-migrated class they are
+	# separate strings, and every decision below belongs to the driver while the report belongs to
+	# the provisioner.
 	_idx=$1
 	_sc=$2
 	SC_PROV=$3
-	SC_VSCLASS=$4
-	SC_EXPOSER=$5
-	_binding=$6
+	SC_DRIVER=$4
+	SC_VSCLASS=$5
+	SC_EXPOSER=$6
+	_binding=$7
 	CHAIN=''
 
 	_base="cbprobe-${RUN_ID}-${_idx}"
@@ -798,6 +829,12 @@ probe_class() {
 
 	out "$(printf '%s%s%s  %svia %s, exposer %s, restored clone %s%s' \
 		"$C_BOLD" "$_sc" "$C_RESET" "$C_DIM" "$SC_VSCLASS" "$SC_EXPOSER" "$_mode" "$C_RESET")"
+	if [ "$SC_DRIVER" != "$SC_PROV" ]; then
+		out "$(printf '  %sCSI-migrated: declared provisioner %s is a superseded in-tree plugin; the%s' \
+			"$C_DIM" "$SC_PROV" "$C_RESET")"
+		out "$(printf '  %sdriver serving this class — and the one resolved above — is %s%s' \
+			"$C_DIM" "$SC_DRIVER" "$C_RESET")"
+	fi
 
 	if [ "$DRY_RUN" = yes ]; then
 		k_create "$(yaml_pvc_src "$_src" "$_sc")"
@@ -1023,15 +1060,26 @@ reader: ${_rsha}"
 
 # --- discovery -----------------------------------------------------------------------------------
 
-# select_classes prints one US-separated 'name/provisioner/vsclass/exposer/bindingMode' row per
-# StorageClass.
+# select_classes prints one US-separated row per StorageClass:
+#
+#   name / declared provisioner / effective driver / vsclass / exposer / bindingMode
+#
+# The declared provisioner and the effective driver are BOTH carried because they are not always the
+# same string. On a StorageClass whose in-tree plugin a CSI driver has superseded, .provisioner names
+# the retired plugin and the pv.kubernetes.io/migrated-to annotation names the driver that will
+# actually serve the PVC this probe is about to create — so the driver is what the VolumeSnapshotClass
+# lookup and the exposer choice must use, while the provisioner is what the report should print. The
+# derivation is not written here: cb_sc_driver, in the generated region, owns it, and preflight.sh
+# reads it from the same place. A hand-written copy in each script is what drifted last time.
 #
 # US (0x1f) and not tab, for the reason preflight.sh states at length and this script proved by
 # getting it wrong first: tab is IFS *whitespace*, so `IFS=<tab> read` collapses runs of tabs and
 # an empty field silently shifts every field after it. The class with no VolumeSnapshotClass has
 # exactly that — an empty vsclass — so with tabs the one row that must be recognised as "nothing
 # to probe here" came back with the binding mode sitting in the exposer's place, and the probe
-# went off to create five objects on a StorageClass that cannot be snapshotted at all.
+# went off to create five objects on a StorageClass that cannot be snapshotted at all. The
+# migrated-to annotation, absent on almost every class, is a second empty middle field, so the
+# kubectl output is translated to US before it is read.
 VSCLASSES=''
 select_classes() {
 	if ! k_get volumesnapshotclass -o jsonpath='{range .items[*]}{.driver}{"	"}{.metadata.name}{"\n"}{end}'; then
@@ -1039,10 +1087,10 @@ select_classes() {
 	fi
 	VSCLASSES=$K_OUT
 
-	if ! k_get storageclass -o jsonpath='{range .items[*]}{.metadata.name}{"	"}{.provisioner}{"	"}{.volumeBindingMode}{"\n"}{end}'; then
+	if ! k_get storageclass -o jsonpath='{range .items[*]}{.metadata.name}{"	"}{.provisioner}{"	"}{.metadata.annotations.pv\.kubernetes\.io/migrated-to}{"	"}{.volumeBindingMode}{"\n"}{end}'; then
 		die_unassessed "cannot list StorageClasses ($(printf '%s' "$K_ERR" | tr '\n' ' ')). Nothing was created."
 	fi
-	printf '%s\n' "$K_OUT" | while IFS='	' read -r _n _p _b; do
+	printf '%s\n' "$K_OUT" | tr '\t' "$US" | while IFS="$US" read -r _n _p _m _b; do
 		[ -n "$_n" ] || continue
 		if [ -n "$WANT_SC" ]; then
 			case $WANT_SC in
@@ -1050,12 +1098,13 @@ select_classes() {
 			*) continue ;;
 			esac
 		fi
-		_c=$(printf '%s\n' "$VSCLASSES" | awk -F'\t' -v p="$_p" '$1==p {print $2}' | grep '.' | cb_pick_vsclass)
+		_d=$(cb_sc_driver "$_p" "$_m")
+		_c=$(printf '%s\n' "$VSCLASSES" | awk -F'\t' -v p="$_d" '$1==p {print $2}' | grep '.' | cb_pick_vsclass)
 		_h=no
 		[ -n "$_c" ] && _h=yes
-		_e=$(cb_exposer_for "$_p" "$_h")
-		printf '%s%s%s%s%s%s%s%s%s\n' \
-			"$_n" "$US" "$_p" "$US" "$_c" "$US" "$_e" "$US" "${_b:-Immediate}"
+		_e=$(cb_exposer_for "$_d" "$_h")
+		printf '%s%s%s%s%s%s%s%s%s%s%s\n' \
+			"$_n" "$US" "$_p" "$US" "$_d" "$US" "$_c" "$US" "$_e" "$US" "${_b:-Immediate}"
 	done
 }
 
@@ -1281,23 +1330,28 @@ fi
 SELECTED=$(select_classes)
 
 _i=0
-while IFS="$US" read -r _n _p _c _e _b; do
+while IFS="$US" read -r _n _p _drv _c _e _b; do
 	[ -n "$_n" ] || continue
 	_i=$((_i + 1))
 	if [ "$_e" = skip ]; then
 		SC_PROV=$_p
+		SC_DRIVER=$_drv
 		SC_VSCLASS=''
 		SC_EXPOSER=skip
 		CHAIN=''
 		out "$(printf '%s%s%s: %sNOT ASSESSED%s' "$C_BOLD" "$_n" "$C_RESET" "$C_UNK" "$C_RESET")"
-		out "  no VolumeSnapshotClass has driver '${_p}' — there is no snapshot to take, so there is"
+		out "  no VolumeSnapshotClass has driver '${_drv}' — there is no snapshot to take, so there is"
 		out '  nothing here to probe. preflight.sh already reports this class as data-skipped.'
+		if [ "$_drv" != "$_p" ]; then
+			out "  (that driver is the one in this class's $CB_MIGRATED_TO_ANNOTATION annotation, not its"
+			out "  declared provisioner '${_p}', which names an in-tree plugin a CSI driver has superseded.)"
+		fi
 		out ''
 		record_class "$_n" NOT_ASSESSED '' \
-			"no VolumeSnapshotClass has driver '${_p}'; volumes on this class are skipped at backup time and there is nothing to probe" ''
+			"no VolumeSnapshotClass has driver '${_drv}'; volumes on this class are skipped at backup time and there is nothing to probe" ''
 		continue
 	fi
-	probe_class "$_i" "$_n" "$_p" "$_c" "$_e" "$_b"
+	probe_class "$_i" "$_n" "$_p" "$_drv" "$_c" "$_e" "$_b"
 done <<EOF
 $SELECTED
 EOF

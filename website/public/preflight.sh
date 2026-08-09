@@ -25,6 +25,15 @@
 #   are reported Skipped with reason CSISnapshotUnsupported — visibly, but the backup still ends
 #   Completed. If you never look, you never notice.
 #
+#   The per-StorageClass table this prints predicts DYNAMICALLY provisioned volumes, and says so
+#   where it prints. For a volume its class provisioned, the class's provisioner IS the driver
+#   serving it, so the class is the right unit to answer by. For a volume you bound by hand it is
+#   not: CrystalBackup reads the driver from the PersistentVolume, because a class can be deleted
+#   and re-created over a different backend while every old volume keeps pointing at the name, and
+#   because a statically bound PVC's storageClassName is only a matching label — Kubernetes never
+#   requires the object to exist. So this script reads your PersistentVolumes too, and names the
+#   PVCs the table does not describe rather than letting the table stand for them.
+#
 # WHAT IT CANNOT ANSWER, AND WILL NOT PRETEND TO
 #
 #   Half of that question. A VolumeSnapshotClass whose .driver matches your StorageClass proves
@@ -88,7 +97,7 @@
 # variable here would be a bug in the script, not a fact about the cluster.
 set -u
 
-SCRIPT_VERSION='2.0.0'
+SCRIPT_VERSION='2.1.0'
 
 # The companion that answers the half of the headline question this script deliberately cannot.
 # Named here once, printed wherever the answer is missing.
@@ -106,10 +115,30 @@ CB_SNAPSHOT_VERSION='v1'
 CB_KIND_CSI_GENERIC='csi-generic'
 CB_KIND_CEPHFS_SHALLOW='cephfs-shallow'
 CB_CEPHFS_MARKER='.cephfs.csi.'
+CB_MIGRATED_TO_ANNOTATION='pv.kubernetes.io/migrated-to'
 
-# cb_exposer_for PROVISIONER HAS_SNAPSHOT_CLASS
-#   HAS_SNAPSHOT_CLASS is 'yes' when some VolumeSnapshotClass in the cluster has
-#   .driver == PROVISIONER. Prints the exposer kind, or 'skip'.
+# cb_sc_driver DECLARED_PROVISIONER MIGRATED_TO
+#   The driver serving a StorageClass's volumes: its pv.kubernetes.io/migrated-to
+#   annotation when it carries one, else its .provisioner. Same choice driverFor makes for a
+#   PVC that is bound to nothing yet.
+#
+#   The annotation wins because on a CSI-migrated class .provisioner names an in-tree plugin
+#   that no longer serves anything: no VolumeSnapshotClass will ever carry that name, so
+#   resolving through it finds none and calls a class DATA SKIPPED that is snapshotted fine.
+#   This derivation is GENERATED for the same reason the rule below is — it is part of the
+#   routing, and a hand-written copy of it in each script drifted within one release.
+cb_sc_driver() {
+	if [ -n "$2" ]; then
+		printf '%s\n' "$2"
+		return 0
+	fi
+	printf '%s\n' "$1"
+}
+
+# cb_exposer_for DRIVER HAS_SNAPSHOT_CLASS
+#   DRIVER is the driver serving the volume — cb_sc_driver's answer for an unbound PVC, or the
+#   PersistentVolume's own driver for a bound one. HAS_SNAPSHOT_CLASS is 'yes' when some
+#   VolumeSnapshotClass in the cluster has .driver == DRIVER. Prints the exposer kind, or 'skip'.
 cb_exposer_for() {
 	if [ "$2" != yes ]; then
 		printf '%s\n' skip
@@ -178,7 +207,10 @@ usage() {
 	fi
 	cat <<'USAGE'
 CrystalBackup preflight — read-only. Creates nothing, changes nothing, writes no file.
-Reports, per StorageClass, which exposer would be chosen and which volumes would be skipped.
+Reports, per StorageClass, which exposer would be chosen and which volumes would be skipped. That
+table predicts DYNAMICALLY provisioned volumes. For a volume bound by hand the driver comes from
+the PersistentVolume, not from the class it names, so the PersistentVolumes are read as well and
+the PVCs the table does not describe are named individually.
 
 It reports snapshot AVAILABILITY. It cannot report snapshot USABILITY — whether a volume
 restored from a snapshot can be mounted and read on your nodes — because answering that
@@ -432,27 +464,68 @@ check_snapshot_classes() {
 	fi
 }
 
+# --- the volume inventory the checks below share -------------------------------------------------
+#
+# PVCs and PersistentVolumes are listed once, here, because two checks read them: the StorageClass
+# table reports a skipped class with the damage it actually does, and the check after it works out
+# which of your PVCs that table describes at all.
+#
+# Failing to list either is a finding, not an abort — the same degradation the checks above use for
+# VolumeSnapshotClasses. Without the PVCs the StorageClass verdicts still hold, they just lose their
+# weight; without the PersistentVolumes the check below reports UNKNOWN rather than assuming your
+# volumes are served by the drivers their classes name.
+#
+#   PVC_ROWS  storageClassName / namespace / name / volumeName
+#   PV_ROWS   name / .spec.csi.driver / pv.kubernetes.io/migrated-to / then one field per non-CSI
+#             source, present only when that is what the volume is: nfs / hostPath / local / iscsi /
+#             fc. A row with no driver, no migrated-to and none of those is some other non-CSI
+#             source, which is the only claim that has to be right about it.
+#
+# Both are US-separated, for the reason set out where US is defined: spec.volumeName is EMPTY on an
+# unbound PVC and spec.csi.driver is EMPTY on a hand-made NFS volume, and those are precisely the
+# rows that must not scramble. kubectl's jsonpath can emit a tab but not a US, so the tabs are
+# translated on arrival — no name of a Kubernetes object can contain either.
+PVC_KNOWN=no
+PVC_ROWS=''
+PV_KNOWN=no
+PV_ROWS=''
+PV_ERR=''
+collect_volume_inventory() {
+	if k_get pvc -A -o jsonpath='{range .items[*]}{.spec.storageClassName}{"	"}{.metadata.namespace}{"	"}{.metadata.name}{"	"}{.spec.volumeName}{"\n"}{end}'; then
+		PVC_ROWS=$(printf '%s\n' "$K_OUT" | tr '\t' "$US")
+		PVC_KNOWN=yes
+	fi
+	if k_get pv -o jsonpath='{range .items[*]}{.metadata.name}{"	"}{.spec.csi.driver}{"	"}{.metadata.annotations.pv\.kubernetes\.io/migrated-to}{"	"}{.spec.nfs.server}{"	"}{.spec.hostPath.path}{"	"}{.spec.local.path}{"	"}{.spec.iscsi.iqn}{"	"}{.spec.fc.targetWWNs}{.spec.fc.wwids}{"\n"}{end}'; then
+		PV_ROWS=$(printf '%s\n' "$K_OUT" | tr '\t' "$US")
+		PV_KNOWN=yes
+	else
+		PV_ERR=$K_ERR
+	fi
+}
+
 # --- the core: what happens to each StorageClass ------------------------------------------------
 
+# SC_KNOWN distinguishes "this cluster defines no StorageClass" from "the StorageClasses could not
+# be read". The check after this one needs that apart: with no class in the cluster, a bound PVC
+# naming one is a class that genuinely does not exist; with the listing refused, the same PVC is a
+# question that was not answered, and the two must not print the same sentence.
+SC_KNOWN=no
 check_storage_classes() {
-	if ! k_get storageclass -o jsonpath='{range .items[*]}{.metadata.name}{"	"}{.provisioner}{"	"}{.metadata.annotations.storageclass\.kubernetes\.io/is-default-class}{"\n"}{end}'; then
+	# The migrated-to annotation is read alongside the provisioner because on a CSI-migrated in-tree
+	# class the provisioner names a plugin that no longer serves anything — see cb_sc_driver in the
+	# generated region above, which owns that choice.
+	if ! k_get storageclass -o jsonpath='{range .items[*]}{.metadata.name}{"	"}{.provisioner}{"	"}{.metadata.annotations.pv\.kubernetes\.io/migrated-to}{"	"}{.metadata.annotations.storageclass\.kubernetes\.io/is-default-class}{"\n"}{end}'; then
 		record storage-classes UNKNOWN "StorageClass coverage" \
 			"could not list StorageClasses ($(clean "$K_ERR")). THE MAIN QUESTION THIS SCRIPT EXISTS TO ANSWER WAS NOT ANSWERED."
 		return
 	fi
-	_scs=$K_OUT
+	SC_KNOWN=yes
+	# US, not tab, from here on: the migrated-to annotation is absent on almost every class, and an
+	# empty middle field is exactly what `IFS=<tab> read` collapses.
+	_scs=$(printf '%s\n' "$K_OUT" | tr '\t' "$US")
 	if ! printf '%s' "$_scs" | grep -q '.'; then
 		record storage-classes WARN "StorageClass coverage" "this cluster defines no StorageClass at all."
 		return
-	fi
-
-	# PVC inventory, so a skipped class can be reported with the damage it actually does. Failing
-	# to list PVCs is not fatal — the verdicts still hold, they just lose their weight.
-	PVC_KNOWN=no
-	PVC_ROWS=''
-	if k_get pvc -A -o jsonpath='{range .items[*]}{.spec.storageClassName}{"	"}{.metadata.namespace}{"\n"}{end}'; then
-		PVC_ROWS=$K_OUT
-		PVC_KNOWN=yes
 	fi
 
 	_skipped_classes=0
@@ -461,16 +534,22 @@ check_storage_classes() {
 	_resolved_pvcs=0
 	_no_default=yes
 
-	while IFS='	' read -r _name _prov _default; do
+	while IFS="$US" read -r _name _prov _migrated _default; do
 		[ -n "$_name" ] || continue
 		[ "$_default" = "true" ] && _no_default=no
 
-		# Candidate VolumeSnapshotClasses for this provisioner, resolved exactly as the operator
-		# resolves them: match on .driver, then the generated tie-break picks the winner.
+		# The driver this class's volumes are actually served by. Usually the provisioner; on a
+		# CSI-migrated in-tree class the annotation instead, because the provisioner then names a
+		# plugin that no longer serves anything and no VolumeSnapshotClass will ever carry its name.
+		# The derivation is generated, not written here — see cb_sc_driver.
+		_drv=$(cb_sc_driver "$_prov" "$_migrated")
+
+		# Candidate VolumeSnapshotClasses for that driver, resolved exactly as the operator resolves
+		# them: match on .driver, then the generated tie-break picks the winner.
 		_cands=''
 		_ncand=0
 		if [ "$VSCLASSES_KNOWN" = yes ]; then
-			_cands=$(printf '%s\n' "$VSCLASSES" | awk -F'\t' -v p="$_prov" '$1==p {print $2}')
+			_cands=$(printf '%s\n' "$VSCLASSES" | awk -F'\t' -v p="$_drv" '$1==p {print $2}')
 			_ncand=$(count_lines "$_cands")
 		fi
 
@@ -481,15 +560,15 @@ check_storage_classes() {
 			_verdict='unknown'
 			_chosen=''
 		else
-			_verdict=$(cb_exposer_for "$_prov" "$_has")
+			_verdict=$(cb_exposer_for "$_drv" "$_has")
 			_chosen=$(printf '%s\n' "$_cands" | grep '.' | cb_pick_vsclass)
 		fi
 
 		_pvcn=0
 		_pvcns=0
 		if [ "$PVC_KNOWN" = yes ]; then
-			_pvcn=$(count_lines "$(printf '%s\n' "$PVC_ROWS" | awk -F'\t' -v sc="$_name" '$1==sc')")
-			_pvcns=$(count_lines "$(printf '%s\n' "$PVC_ROWS" | awk -F'\t' -v sc="$_name" '$1==sc {print $2}' | LC_ALL=C sort -u)")
+			_pvcn=$(count_lines "$(printf '%s\n' "$PVC_ROWS" | awk -F"$US" -v sc="$_name" '$1==sc')")
+			_pvcns=$(count_lines "$(printf '%s\n' "$PVC_ROWS" | awk -F"$US" -v sc="$_name" '$1==sc {print $2}' | LC_ALL=C sort -u)")
 		fi
 
 		# _usability is deliberately never 'ASSESSED'. There is no branch of this script that can
@@ -501,7 +580,7 @@ check_storage_classes() {
 			_skipped_classes=$((_skipped_classes + 1))
 			_skipped_pvcs=$((_skipped_pvcs + _pvcn))
 			_usability='NOT_APPLICABLE'
-			_note="no VolumeSnapshotClass has driver '$_prov' — volumes on this class are SKIPPED, reason $CB_SKIP_REASON"
+			_note="no VolumeSnapshotClass has driver '$_drv' — volumes on this class are SKIPPED, reason $CB_SKIP_REASON"
 			;;
 		"$CB_KIND_CEPHFS_SHALLOW")
 			_resolved_classes=$((_resolved_classes + 1))
@@ -523,8 +602,15 @@ check_storage_classes() {
 		if [ "$_ncand" -gt 1 ]; then
 			_note="$_note; $_ncand classes match this driver, the operator would use '$_chosen'"
 		fi
+		# When the two differ, the row must say which string its verdict was resolved for. The
+		# PROVISIONER column prints what the class DECLARES — that is what `kubectl get sc` shows and
+		# what an administrator will look for — so the driver the verdict actually used is named here,
+		# in the row, rather than being quietly substituted into a column labelled something else.
+		if [ "$_drv" != "$_prov" ]; then
+			_note="this StorageClass is CSI-MIGRATED: its declared provisioner '$_prov' is an in-tree plugin that no longer serves its volumes, and its $CB_MIGRATED_TO_ANNOTATION annotation names '$_drv', which is the driver the verdict above was resolved for. $_note"
+		fi
 
-		SC_ROWS="${SC_ROWS}${_name}${US}${_prov}${US}${_default:-false}${US}${_chosen}${US}${_verdict}${US}${_usability}${US}${_pvcn}${US}${_pvcns}${US}$(clean "$_note")
+		SC_ROWS="${SC_ROWS}${_name}${US}${_prov}${US}${_drv}${US}${_default:-false}${US}${_chosen}${US}${_verdict}${US}${_usability}${US}${_pvcn}${US}${_pvcns}${US}$(clean "$_note")
 "
 	done <<EOF
 $_scs
@@ -564,7 +650,224 @@ EOF
 	else
 		record default-sc PASS "Default StorageClass" "set"
 	fi
-	unset _scs _skipped_classes _skipped_pvcs _resolved_classes _resolved_pvcs _no_default _name _prov _default _cands _ncand _has _verdict _usability _chosen _pvcn _pvcns _note
+	unset _scs _skipped_classes _skipped_pvcs _resolved_classes _resolved_pvcs _no_default _name _prov _migrated _drv _default _cands _ncand _has _verdict _usability _chosen _pvcn _pvcns _note
+}
+
+# --- which volumes the table above is actually about ----------------------------------------------
+#
+# The table is per StorageClass, and for a volume that is already bound the StorageClass is not what
+# decides. CrystalBackup resolves the driver from the PersistentVolume the claim names, and consults
+# the class only for a PVC bound to nothing yet. Two reasons, and a real cluster has each:
+#
+#   A StorageClass's provisioner cannot be changed — but the class itself is not permanent. Delete
+#   it, create one of the same name over a different backend, and every PersistentVolume made under
+#   the old one still carries spec.storageClassName pointing at that name: a dangling string that
+#   now resolves to the WRONG driver. Predicting through it does not produce an error, it produces a
+#   confident wrong answer.
+#
+#   A statically bound volume makes the same point from the other side. There storageClassName is
+#   only a matching LABEL between the claim and the volume, and Kubernetes never requires the
+#   StorageClass OBJECT to exist. A PVC bound to a hand-made NFS volume whose class was never created
+#   is legal, ordinary, and nothing to fix.
+#
+# So this check reads the PersistentVolumes and names the PVCs the table cannot speak for. It is the
+# one place in this script that can say "that row is not about your volume".
+PV_CLASSIFIED=''
+
+# real_verdict_phrase DRIVER — what CrystalBackup would do with a volume served by DRIVER, in the
+# same words the table uses, resolved through the same generated rule. The driver comes from the
+# PersistentVolume here rather than from a class, which is the entire point: cb_exposer_for takes a
+# DRIVER, so one rule answers for both paths and there is no second copy to drift.
+real_verdict_phrase() {
+	if [ "$VSCLASSES_KNOWN" = no ]; then
+		printf 'verdict undetermined, the VolumeSnapshotClasses could not be listed'
+		return
+	fi
+	_rvp_has=no
+	if printf '%s\n' "$VSCLASSES" | awk -F'\t' -v d="$1" '$1==d {f=1} END {exit !f}'; then
+		_rvp_has=yes
+	fi
+	_rvp=$(cb_exposer_for "$1" "$_rvp_has")
+	case $_rvp in
+	skip) printf 'DATA SKIPPED, reason %s: no VolumeSnapshotClass has driver %s' "$CB_SKIP_REASON" "$1" ;;
+	*) printf 'exposer %s, usability NOT ASSESSED' "$_rvp" ;;
+	esac
+	unset _rvp _rvp_has
+}
+
+# pv_bucket KIND — the classified rows of one kind.
+pv_bucket() {
+	printf '%s\n' "$PV_CLASSIFIED" | awk -F"$US" -v k="$1" '$1==k'
+}
+
+# PV_NO_CLASS stands in, inside the classified rows, for a PVC that names no StorageClass at all —
+# legal, and a different thing from naming one that does not exist. It is a value no StorageClass
+# name can take, so it cannot collide with a real one.
+PV_NO_CLASS='(none)'
+
+# pv_examples KIND LIMIT — a readable list of one bucket's PVCs, bounded at LIMIT. Bounded because a
+# cluster can hold hundreds of them, and a detail line nobody finishes is a detail nobody reads; the
+# count that precedes it is always the true one.
+pv_examples() {
+	_pe_n=0
+	_pe_out=''
+	while IFS="$US" read -r _pe_kind _pe_pvc _pe_class _pe_pv _pe_drv _pe_extra; do
+		[ -n "$_pe_kind" ] || continue
+		_pe_n=$((_pe_n + 1))
+		[ "$_pe_n" -le "$2" ] || continue
+		if [ "$_pe_class" = "$PV_NO_CLASS" ]; then
+			_pe_cls='naming no StorageClass'
+		else
+			_pe_cls="naming class '$_pe_class'"
+		fi
+		case $_pe_kind in
+		mismatch)
+			_pe_item="$_pe_pvc (its class '$_pe_class' resolves to $_pe_extra, but its volume $_pe_pv is served by $_pe_drv — $(real_verdict_phrase "$_pe_drv"))"
+			;;
+		noncsi)
+			_pe_item="$_pe_pvc, $_pe_cls (volume $_pe_pv, source: $_pe_extra)"
+			;;
+		noclass)
+			_pe_item="$_pe_pvc, $_pe_cls (volume $_pe_pv is served by $_pe_drv — $(real_verdict_phrase "$_pe_drv"))"
+			;;
+		nocmp)
+			_pe_item="$_pe_pvc (volume $_pe_pv is served by $_pe_drv — $(real_verdict_phrase "$_pe_drv"))"
+			;;
+		*)
+			_pe_item="$_pe_pvc (volume $_pe_pv)"
+			;;
+		esac
+		_pe_out="${_pe_out}${_pe_item}; "
+	done <<EOF
+$(pv_bucket "$1")
+EOF
+	if [ "$_pe_n" -gt "$2" ]; then
+		_pe_out="${_pe_out}and $((_pe_n - $2)) more; "
+	fi
+	# The list ends the sentence it is part of, rather than running the next one onto its last
+	# semicolon.
+	printf '%s' "${_pe_out%"; "}. "
+	unset _pe_n _pe_out _pe_kind _pe_pvc _pe_class _pe_pv _pe_drv _pe_extra _pe_item _pe_cls
+}
+
+check_bound_volume_drivers() {
+	_title='Bound volumes — the PersistentVolume decides the driver'
+	if [ "$PVC_KNOWN" = no ]; then
+		record bound-volumes UNKNOWN "$_title" \
+			"PersistentVolumeClaims could not be listed, so which of your volumes the StorageClass table describes — and which it does not — was NOT established."
+		unset _title
+		return
+	fi
+	if [ "$PV_KNOWN" = no ]; then
+		record bound-volumes UNKNOWN "$_title" \
+			"could not list PersistentVolumes ($(clean "$PV_ERR")). CrystalBackup takes a bound volume's driver from its PersistentVolume, so without them the StorageClass table below is a prediction for DYNAMICALLY provisioned volumes only and nothing here can tell you which of your volumes that is. Nothing is claimed either way."
+		unset _title
+		return
+	fi
+
+	# One awk pass rather than a lookup per PVC: a cluster with a few hundred claims would otherwise
+	# fork awk a few hundred times. The three inventories are tagged with a leading field and
+	# concatenated; awk indexes the first two and classifies the third.
+	PV_CLASSIFIED=$(
+		{
+			printf '%s\n' "$SC_ROWS" | sed "s/^/S${US}/"
+			printf '%s\n' "$PV_ROWS" | sed "s/^/V${US}/"
+			printf '%s\n' "$PVC_ROWS" | sed "s/^/C${US}/"
+		} | awk -F"$US" -v SEP="$US" -v NOCLASS="$PV_NO_CLASS" \
+			-v cmpok="$([ "$SC_KNOWN" = yes ] && printf 1 || printf 0)" '
+			# Field 4 of an SC row, not field 3: the comparison below must be against the EFFECTIVE
+			# driver of the class. Comparing a bound PV against the declared provisioner of a
+			# CSI-migrated class would report every one of its volumes as a mismatch — the PV carries
+			# the migrated driver, the class declares the retired plugin, and they agree in every way
+			# that matters. (No apostrophes in here: this awk program is a single-quoted shell word.)
+			$1 == "S" && $2 != "" { drvOf[$2] = $4; scknown[$2] = 1; next }
+			$1 == "V" && $2 != "" {
+				pvknown[$2] = 1
+				drv[$2] = $3
+				mig[$2] = $4
+				if ($5 != "") { src[$2] = "nfs" }
+				else if ($6 != "") { src[$2] = "hostPath" }
+				else if ($7 != "") { src[$2] = "local" }
+				else if ($8 != "") { src[$2] = "iscsi" }
+				else if ($9 != "") { src[$2] = "fc" }
+				else { src[$2] = "non-CSI" }
+				next
+			}
+			$1 == "C" && $4 != "" {
+				if ($5 == "") { next }   # not bound to anything: the class IS what the operator reads
+				pvc = $3 "/" $4
+				pv = $5
+				class = ($2 == "" ? NOCLASS : $2)
+				if (!(pv in pvknown)) { print "pvgone" SEP pvc SEP class SEP pv SEP "" SEP ""; next }
+				d = (drv[pv] != "" ? drv[pv] : mig[pv])
+				if (d == "") { print "noncsi" SEP pvc SEP class SEP pv SEP "" SEP src[pv]; next }
+				if (cmpok != 1) { print "nocmp" SEP pvc SEP class SEP pv SEP d SEP ""; next }
+				if ($2 == "" || !($2 in scknown)) { print "noclass" SEP pvc SEP class SEP pv SEP d SEP ""; next }
+				if (drvOf[$2] != d) { print "mismatch" SEP pvc SEP class SEP pv SEP d SEP drvOf[$2]; next }
+				print "agree" SEP pvc SEP class SEP pv SEP d SEP ""
+			}
+		'
+	)
+
+	_nb=$(count_lines "$PV_CLASSIFIED")
+	_n_agree=$(count_lines "$(pv_bucket agree)")
+	_n_mismatch=$(count_lines "$(pv_bucket mismatch)")
+	_n_noncsi=$(count_lines "$(pv_bucket noncsi)")
+	_n_noclass=$(count_lines "$(pv_bucket noclass)")
+	_n_nocmp=$(count_lines "$(pv_bucket nocmp)")
+	_n_pvgone=$(count_lines "$(pv_bucket pvgone)")
+
+	_level=PASS
+	_detail=''
+
+	# A driver that is not the one its class names. WARN, because the row the reader would have
+	# trusted is about a different backend — but not FAIL: the volume itself is very likely fine,
+	# and its real verdict is printed here.
+	if [ "$_n_mismatch" -gt 0 ]; then
+		_level=WARN
+		_detail="${_detail}$_n_mismatch bound PVC(s) sit on a PersistentVolume whose CSI driver is NOT the provisioner of the StorageClass they name: $(pv_examples mismatch 4)THE TABLE BELOW DOES NOT DESCRIBE THESE VOLUMES — read the verdict quoted here instead, which is the one CrystalBackup will use. A StorageClass deleted and re-created over a different backend leaves exactly this shape: the provisioner of a class can never change, but the class can be replaced, and volumes made under the old one keep naming it. "
+	fi
+
+	# No CSI driver at all. WARN, because 'the data is never backed up' is a reservation whatever
+	# its cause — and worded so nobody goes looking for the setting that fixes it, because there
+	# is none.
+	if [ "$_n_noncsi" -gt 0 ]; then
+		_level=WARN
+		_detail="${_detail}$_n_noncsi bound PVC(s) sit on a PersistentVolume that is not a CSI volume at all: $(pv_examples noncsi 4)Their DATA WILL BE SKIPPED, reason $CB_SKIP_REASON — the manifests are still captured and the Backup still reports Completed. This is NOT a misconfiguration and there is no setting that changes it: a volume with no CSI driver has nothing that can be asked for a snapshot. Expected for a hand-made NFS, hostPath, local, iSCSI or FC volume; back those up by whatever means the storage behind them provides. "
+	fi
+
+	# A named class that does not exist. This is what a static binding looks like, so it is reported
+	# as a fact and NEVER raises the level: the volume's driver was read from the PersistentVolume,
+	# which is exactly what the operator does, and everything about it works.
+	if [ "$_n_noclass" -gt 0 ]; then
+		_detail="${_detail}$_n_noclass bound PVC(s) name a StorageClass that does not exist — or name none at all — and are served by a CSI driver read from their PersistentVolume: $(pv_examples noclass 4)This is normal, legal and nothing to correct: for a statically provisioned volume storageClassName is only a matching label between the claim and the volume, and Kubernetes never requires the object to exist. It is reported only because the table below has no row for these volumes; their verdict is the one quoted here. "
+	fi
+
+	if [ "$_n_nocmp" -gt 0 ]; then
+		[ "$_level" = PASS ] && _level=UNKNOWN
+		_detail="${_detail}$_n_nocmp bound PVC(s) are served by a CSI driver read from their PersistentVolume, but the StorageClasses could not be listed, so whether that driver agrees with the class each PVC names was NOT checked: $(pv_examples nocmp 4)"
+	fi
+
+	if [ "$_n_pvgone" -gt 0 ]; then
+		[ "$_level" = PASS ] && _level=UNKNOWN
+		_detail="${_detail}$_n_pvgone bound PVC(s) name a PersistentVolume that was not in the listing: $(pv_examples pvgone 4)Their driver was NOT established. The likeliest cause is a volume deleted between the two reads, in which case running this again settles it."
+	fi
+
+	if [ -z "$_detail" ]; then
+		if [ "$_nb" -eq 0 ]; then
+			_detail="no PVC in this cluster is bound to a PersistentVolume yet, so there is nothing the table below can misdescribe. It predicts what would happen to volumes provisioned on each class from now on."
+		else
+			_detail="all $_nb bound PVC(s) sit on a PersistentVolume whose CSI driver is exactly the provisioner of the StorageClass they name, so every row of the table below applies to its volumes as printed."
+		fi
+	elif [ "$SC_KNOWN" = yes ]; then
+		# Only worth counting when there is a table to be counted against; with the StorageClasses
+		# unreadable there is no row for any volume and "0 of N described" would be a statistic
+		# about nothing.
+		_detail="$_n_agree of $_nb bound PVC(s) are described by the table below as printed. $_detail"
+	fi
+
+	record bound-volumes "$_level" "$_title" "$_detail"
+	unset _title _nb _n_agree _n_mismatch _n_noncsi _n_noclass _n_nocmp _n_pvgone _level _detail
 }
 
 # A volumeMode: Block PVC is the one case the StorageClass table above reports as covered and is
@@ -787,14 +1090,30 @@ report_text() {
 $RESULTS
 EOF
 
-	printf '\n%sWHAT WOULD BE BACKED UP%s\n' "$C_BOLD" "$C_RESET"
+	printf '\n%sWHAT WOULD BE BACKED UP%s  %s(per StorageClass)%s\n' \
+		"$C_BOLD" "$C_RESET" "$C_DIM" "$C_RESET"
+	# The scope of the table, printed where the table is read and not only where it is coded. A
+	# reader who takes these rows for the whole answer is wrong about every volume they bound by
+	# hand, and the row would never have told them: it would just have been about a different
+	# driver, confidently.
+	printf '  %sThese rows predict DYNAMICALLY provisioned volumes — the ones a class created, whose%s\n' "$C_DIM" "$C_RESET"
+	printf '  %sPersistentVolume is therefore served by that class'"'"'s own provisioner. They do NOT predict%s\n' "$C_DIM" "$C_RESET"
+	printf '  %sa volume you bound by hand: CrystalBackup reads a bound volume'"'"'s driver from its%s\n' "$C_DIM" "$C_RESET"
+	printf '  %sPersistentVolume, not from the class it names. The check "Bound volumes" above names the%s\n' "$C_DIM" "$C_RESET"
+	printf '  %sPVCs this table does not describe, and gives their real verdict.%s\n\n' "$C_DIM" "$C_RESET"
 	if ! printf '%s' "$SC_ROWS" | grep -q '.'; then
 		printf '  %sNo StorageClass verdict could be produced — see the checks above.%s\n' "$C_UNK" "$C_RESET"
 	else
+		# The column is labelled "(declared)" because that is exactly what it holds: the class's own
+		# .provisioner, the string `kubectl get sc` shows. On a CSI-migrated class the verdict was
+		# resolved for a DIFFERENT driver, so those rows are flagged [migrated] and their note names
+		# the driver used. A column that silently printed one string while the verdict came from
+		# another would be the same species of lie this table was just corrected for.
 		printf '  %-22s %-30s %-16s %-14s %s\n' \
-			'STORAGECLASS' 'PROVISIONER' 'SNAPSHOT CLASS' 'USABILITY' 'PVCs'
+			'STORAGECLASS' 'PROVISIONER (declared)' 'SNAPSHOT CLASS' 'USABILITY' 'PVCs'
 		_any_resolved=no
-		while IFS="$US" read -r _n _p _d _vsc _v _u _pn _pns _note; do
+		_any_migrated=no
+		while IFS="$US" read -r _n _p _drv _d _vsc _v _u _pn _pns _note; do
 			[ -n "$_n" ] || continue
 			# Column 3 is the VolumeSnapshotClass the operator would resolve — a name, or the
 			# absence of one. Column 4 is what is known about using it, and its best value is
@@ -808,13 +1127,26 @@ EOF
 			esac
 			_star=''
 			[ "$_d" = true ] && _star=' (default)'
+			_pcell=$_p
+			if [ "$_drv" != "$_p" ]; then
+				_pcell="$_p [migrated]"
+				_any_migrated=yes
+			fi
 			printf '  %s%-22s%s %-30s %s%-16s%s %s%-14s%s %s in %s ns\n' \
-				"$C_BOLD" "$_n$_star" "$C_RESET" "$_p" \
+				"$C_BOLD" "$_n$_star" "$C_RESET" "$_pcell" \
 				"$_c" "$_label" "$C_RESET" "$_uc" "$_ul" "$C_RESET" "$_pn" "$_pns"
 			printf '      %s%s%s\n' "$C_DIM" "$_note" "$C_RESET"
 		done <<EOF
 $SC_ROWS
 EOF
+		if [ "$_any_migrated" = yes ]; then
+			printf '\n  %s[migrated] marks a StorageClass whose declared provisioner is an in-tree plugin a CSI%s\n' "$C_WARN" "$C_RESET"
+			printf '  %sdriver has superseded. Its verdict was resolved for the driver in its%s\n' "$C_WARN" "$C_RESET"
+			printf '  %s%s annotation, NOT for the provisioner printed above — the%s\n' "$C_WARN" "$CB_MIGRATED_TO_ANNOTATION" "$C_RESET"
+			printf '  %srow'"'"'s own note names it. Resolving through the provisioner would have reported these%s\n' "$C_WARN" "$C_RESET"
+			printf '  %sclasses DATA SKIPPED, which is what CrystalBackup'"'"'s own preflight did until 0.6.5.%s\n' "$C_WARN" "$C_RESET"
+		fi
+		unset _any_migrated _pcell _drv
 		if [ "$_any_resolved" = yes ]; then
 			printf '\n  %sA named SNAPSHOT CLASS means a snapshot of that StorageClass can be REQUESTED.%s\n' "$C_WARN" "$C_RESET"
 			printf '  %sWhether the volume restored from it MOUNTS on your nodes and reads back is a%s\n' "$C_WARN" "$C_RESET"
@@ -848,6 +1180,10 @@ report_json() {
 	printf '{"schema":"crystalbackup.preflight/v2"'
 	printf ',"scriptVersion":%s' "$(json_str "$SCRIPT_VERSION")"
 	printf ',"usabilityAssessed":false'
+	# The same scope caveat the text report prints above the table, for the reader that is a
+	# program. A machine acting on storageClasses[] alone draws the same wrong conclusion about a
+	# statically bound volume as a human would, and has even less chance of noticing.
+	printf ',"storageClassScope":{"appliesTo":"dynamically-provisioned","boundVolumeDriverFrom":"PersistentVolume","check":"bound-volumes"}'
 	printf ',"usabilityProbe":{"script":%s,"docs":%s}' \
 		"$(json_str "$CB_PROBE_URL")" "$(json_str "$CB_PROBE_DOCS")"
 	printf ',"jsonEncoder":%s' "$(json_str "$JSON_ENCODER")"
@@ -870,7 +1206,11 @@ EOF
 
 	printf ',"storageClasses":['
 	_first=1
-	while IFS="$US" read -r _n _p _d _vsc _v _u _pn _pns _note; do
+	# "provisioner" keeps meaning what the class declares — changing that value under an unchanged
+	# key would silently rewrite history for every consumer. The driver the verdict was actually
+	# resolved for is a NEW key, so a reader that cares can tell the two apart and one that does not
+	# is at least not lied to.
+	while IFS="$US" read -r _n _p _drv _d _vsc _v _u _pn _pns _note; do
 		[ -n "$_n" ] || continue
 		[ "$_first" = 1 ] || printf ','
 		_first=0
@@ -878,8 +1218,10 @@ EOF
 		[ "$_v" = skip ] && _bk=false
 		_res=true
 		{ [ "$_v" = skip ] || [ "$_v" = unknown ]; } && _res=false
-		printf '{"name":%s,"provisioner":%s,"isDefault":%s,"volumeSnapshotClass":%s,"exposer":%s,"snapshotClassResolved":%s,"usability":%s,"dataBackedUp":%s,"skipReason":%s,"pvcCount":%s,"namespaceCount":%s,"note":%s}' \
-			"$(json_str "$_n")" "$(json_str "$_p")" "$([ "$_d" = true ] && printf true || printf false)" \
+		printf '{"name":%s,"provisioner":%s,"effectiveDriver":%s,"csiMigrated":%s,"isDefault":%s,"volumeSnapshotClass":%s,"exposer":%s,"snapshotClassResolved":%s,"usability":%s,"dataBackedUp":%s,"skipReason":%s,"pvcCount":%s,"namespaceCount":%s,"note":%s}' \
+			"$(json_str "$_n")" "$(json_str "$_p")" "$(json_str "$_drv")" \
+			"$([ "$_drv" != "$_p" ] && printf true || printf false)" \
+			"$([ "$_d" = true ] && printf true || printf false)" \
 			"$(json_str "$_vsc")" "$(json_str "$_v")" "$_res" "$(json_str "$_u")" "$_bk" \
 			"$([ "$_v" = skip ] && json_str "$CB_SKIP_REASON" || printf null)" \
 			"$_pn" "$_pns" "$(json_str "$_note")"
@@ -931,7 +1273,9 @@ check_vap
 check_snapshot_crds
 check_snapshot_controller
 check_snapshot_classes
+collect_volume_inventory
 check_storage_classes
+check_bound_volume_drivers
 check_block_volumes
 check_rbac
 check_cert_manager
