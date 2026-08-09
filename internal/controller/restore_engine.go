@@ -46,6 +46,7 @@ import (
 	"github.com/CrystalBackup/CrystalBackup/internal/repo/queue"
 	"github.com/CrystalBackup/CrystalBackup/internal/restic"
 	"github.com/CrystalBackup/CrystalBackup/internal/rexposer"
+	"github.com/CrystalBackup/CrystalBackup/internal/status"
 )
 
 // This file is the CR-AGNOSTIC restore execution engine both restore controllers drive
@@ -431,15 +432,31 @@ func (e *restoreEngine) exposureFor(rc *restoreExecContext, plan *restoreVolumeP
 }
 
 // volumeDrive aggregates one reconcile pass over all planned volumes.
+//
+// The counts live in ONE place: tally, built from one classification of every planned volume, in the
+// single pass that drove them (status.RestoreTally). settled/completed/failedCount are METHODS over
+// that tally rather than fields of their own, so they cannot fall out of step with each other or
+// with the total. Three independently incremented fields is exactly the mechanism that let a
+// ClusterBackup run publish 32 failed namespaces beside children reading Completed, and a restore's
+// counters have no reason to be built that way.
 type volumeDrive struct {
-	settled, completed, failedCount int
-	restoredBytes                   int64
-	failures                        []string
+	tally         status.RestoreTally
+	restoredBytes int64
+	failures      []string
 	// err is the first TRANSIENT advise error of the pass (budget not yet exhausted),
 	// surfaced after every volume has been driven so one flaky volume never stalls its
 	// siblings' progress.
 	err error
 }
+
+// settled is how many planned volumes need no further driving (restored or failed).
+func (d volumeDrive) settled() int { return int(d.tally.Settled()) }
+
+// completed is how many planned volumes have their data back.
+func (d volumeDrive) completed() int { return int(d.tally.Restored) }
+
+// failedCount is how many planned volumes settled without their data.
+func (d volumeDrive) failedCount() int { return int(d.tally.Failed) }
 
 // ownerRunningMovers counts this owner's live, still-running mover Jobs — the supply side
 // of the restoreOwnerMoverCap admission in startVolume.
@@ -465,43 +482,72 @@ func (e *restoreEngine) ownerRunningMovers(ctx context.Context, rc *restoreExecC
 // loop of both restore controllers. An advise error settles the volume as failed once its
 // per-volume budget is exhausted; before that it is only remembered (drive.err) for the
 // caller's usual backoff, and the remaining volumes still advance this pass.
+//
+// Every branch below appends EXACTLY ONE outcome per plan, which is what makes the tally's total
+// equal to len(plans) by construction rather than by convention — including the branch that only
+// remembers a transient error, where the honest classification is "no verdict yet" and not "fine".
 func (e *restoreEngine) driveVolumes(ctx context.Context, rc *restoreExecContext, plans []restoreVolumePlan) volumeDrive {
 	var d volumeDrive
 	running, err := e.ownerRunningMovers(ctx, rc)
 	if err != nil {
+		// No volume was driven, so no volume has a verdict. The tally stays empty rather than
+		// reporting len(plans) volumes in flight for a pass that never looked at them: the caller
+		// returns on d.err without writing status.
 		d.err = err
 		return d
 	}
 	rc.startBudget = restoreOwnerMoverCap - running
+	outcomes := make([]status.VolumeRestoreOutcome, 0, len(plans))
 	for i := range plans {
 		key := rc.ownerID + "/" + plans[i].pvc
 		outcome, err := e.adviseVolume(ctx, rc, &plans[i])
-		if err != nil {
-			if e.noteVolumeError(key) {
-				d.settled++
-				d.failedCount++
-				d.failures = append(d.failures, plans[i].pvc+": gave up after repeated errors, last: "+err.Error())
-				continue
-			}
+		budgetExhausted := err != nil && e.noteVolumeError(key)
+		if err == nil {
+			e.clearVolumeError(key)
+		}
+		verdict := classifyVolumeOutcome(outcome, err, budgetExhausted)
+		outcomes = append(outcomes, verdict)
+		switch {
+		case err != nil && budgetExhausted:
+			d.failures = append(d.failures, plans[i].pvc+": gave up after repeated errors, last: "+err.Error())
+		case err != nil:
+			// The budget is not exhausted, so the volume keeps its place in flight; the error is only
+			// remembered for the caller's backoff and the siblings still advance this pass.
 			if d.err == nil {
 				d.err = err
 			}
-			continue
-		}
-		e.clearVolumeError(key)
-		if !outcome.settled {
-			continue
-		}
-		d.settled++
-		if outcome.failed {
-			d.failedCount++
+		case verdict == status.VolumeRestoreFailed:
 			d.failures = append(d.failures, plans[i].pvc+": "+outcome.reason)
-			continue
+		case verdict == status.VolumeRestoreRestored:
+			d.restoredBytes += outcome.restoredBytes
 		}
-		d.completed++
-		d.restoredBytes += outcome.restoredBytes
 	}
+	d.tally = status.TallyVolumeRestoreOutcomes(outcomes)
 	return d
+}
+
+// classifyVolumeOutcome is THE mapping from one volume's drive step to its verdict, and the only one:
+// the tally, the phase roll-up and the published counters all descend from it, so a volume's outcome
+// is decided exactly once per pass.
+//
+// The subtle arm is the middle one. An advise error whose per-volume budget is NOT yet exhausted is
+// the absence of a verdict, not a failure: the next pass may well restore the volume, and telling an
+// operator mid-disaster that a volume is lost when it is merely retrying is the kind of report this
+// release exists to stop. It is equally not "nothing" — the volume still occupies its place in the
+// denominator, which is what keeps the buckets adding up to the plan.
+func classifyVolumeOutcome(outcome volumeOutcome, adviseErr error, budgetExhausted bool) status.VolumeRestoreOutcome {
+	switch {
+	case adviseErr != nil && budgetExhausted:
+		return status.VolumeRestoreFailed
+	case adviseErr != nil:
+		return status.VolumeRestoreInFlight
+	case !outcome.settled:
+		return status.VolumeRestoreInFlight
+	case outcome.failed:
+		return status.VolumeRestoreFailed
+	default:
+		return status.VolumeRestoreRestored
+	}
 }
 
 // resolveMoverOutcome returns a terminal restore mover Job's result. On SUCCESS it stamps the

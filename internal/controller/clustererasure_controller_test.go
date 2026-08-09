@@ -159,7 +159,7 @@ var _ = Describe("ClusterErasureReconciler", func() {
 		}, initTimeout, initPoll).Should(Succeed())
 	})
 
-	It("records how many snapshots it is about to erase BEFORE erasing them", func() {
+	It("records the scope it is about to erase BEFORE erasing, and claims no destruction yet", func() {
 		const (
 			location = "cer-count-loc"
 			name     = "cer-count"
@@ -173,13 +173,22 @@ var _ = Describe("ClusterErasureReconciler", func() {
 
 		createErasure(name, location, cbv1.ErasureTarget{Namespace: "team-x"}, "team-x")
 
-		// The count is the compliance record, and afterwards the evidence is gone — so it has to be
-		// persisted before the forget, not derived from it. Two snapshots match; the third belongs
-		// to another namespace and must not be counted (nor, later, erased).
+		// The scope is the compliance record's denominator, and afterwards the evidence is gone — so it
+		// has to be persisted before the forget, not derived from it. Two snapshots match; the third
+		// belongs to another namespace and must not be counted (nor, later, erased).
+		//
+		// It lands in snapshotsTargeted, and snapshotsForgotten stays 0. This assertion used to read
+		// `SnapshotsForgotten == 2` HERE, at phase Running, which is exactly the defect: the
+		// pre-erasure count was written into the field that attests destruction, so a forget that then
+		// failed left a Failed object claiming it had removed two snapshots. While an erasure is in
+		// flight the honest record is "2 targeted, 0 forgotten, 2 still there".
 		Eventually(func(g Gomega) {
 			er := getErasureG(g, name)
-			g.Expect(er.Status.SnapshotsForgotten).To(Equal(int32(2)),
+			g.Expect(er.Status.SnapshotsTargeted).To(Equal(int32(2)),
 				"the scope must exclude the snapshot belonging to another namespace")
+			g.Expect(er.Status.SnapshotsForgotten).To(BeZero(),
+				"nothing has been erased yet: this field attests destruction, it is not a plan")
+			g.Expect(er.Status.SnapshotsRemaining).To(Equal(int32(2)))
 			g.Expect(er.Status.Phase).To(Equal(erasurePhaseRunning))
 		}, initTimeout, initPoll).Should(Succeed())
 	})
