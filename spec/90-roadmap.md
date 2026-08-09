@@ -572,6 +572,29 @@ file-level restore.
         quiescence hooks documented as the only way to recover some consistency.
       A PVC in `Pending` under `WaitForFirstConsumer` has no PV and therefore nothing to back up:
       **skipped cleanly**, never waited on.
+
+      **A mount is bounded before it is attempted, and the bound is not optional.** Raised during
+      0.6.5 and recorded here because it constrains the design rather than the implementation: a
+      volume that cannot be SNAPSHOTTED and a volume that cannot be MOUNTED are different axes, and
+      this exposer is the first one to depend on the second. The vocabulary already exists and must
+      be reused rather than re-invented — `ErrUnsupported` means "never, on this storage",
+      `ErrPrecheckFailed` means "not on this cluster today" (`internal/exposer/registry.go`), and
+      every mount failure belongs on the second axis. Three shapes an administrator will actually
+      hit, all **indistinguishable at mount time**: a backend that is gone for good (a PVC restored
+      from an old backup), an unused PVC still pointing at a decommissioned backend, and a live
+      backend under maintenance that is back tomorrow. Only TIME separates them, so the product must
+      not guess: the failure is retryable, the history is what tells an operator whether it is
+      chronic or a blip, and "no pod mounts it" must never become a silent exclusion — a detached
+      PVC is precisely a volume somebody wants backed up.
+
+      The hazard that decides the mechanism: a dead NFS server does not FAIL a mount, it HANGS it.
+      A hard mount blocks uninterruptibly in the kernel, the mover pod sits in `ContainerCreating`,
+      and deleting it can wedge on the node — so the maintenance window of a volume nobody uses
+      becomes a degraded node. It cannot be fixed with mount options, because for a PVC-backed volume
+      they come from `pv.spec.mountOptions`, which belongs to the user's PersistentVolume and is not
+      ours to mutate. Therefore: a **bounded, out-of-band reachability probe before the Job is
+      created**, plus `activeDeadlineSeconds` on the Job as the backstop. Never an unbounded mount
+      attempt, and never a probe whose own timeout is the mount's timeout.
 - [ ] **Mover placement** (promoted from the backlog): pin the mover to the node where the volume
       is attached, reusing the `VolumeAttachment` resolution already written for restore
       (`internal/rexposer`), including its refusals — no single attached node, or a not-ready node,
@@ -596,8 +619,12 @@ file-level restore.
 
 **Decisions to take at milestone start, not now**: whether notifier delivery is durable (which
 decides whether it is a stateless Deployment or needs state) and the exact webhook payload —
-specifically what must never leave, since a namespace name is a customer name; and who wins when
-an application starts while the mover holds an unmounted RWO volume.
+specifically what must never leave, since a namespace name is a customer name; who wins when
+an application starts while the mover holds an unmounted RWO volume; and whether a volume on a
+backend this cluster can no longer reach is worth backing up in degraded mode at all, or whether a
+named `Skipped` is the honest final answer for it — the question a statically provisioned NFS volume
+on a live cluster put on the table in 0.6.5, and one that decides how much of the probe above is
+even needed.
 
 ## M8 — Proof: restore drills, restore alerting, cluster-scoped DR hardening (0.8)
 
@@ -684,6 +711,58 @@ therefore a harness/ops activity rather than a product feature.
 ## Backlog / future (not scheduled)
 
 Recorded in [00-requirements.md §6](00-requirements.md); no milestone yet.
+
+- **An aborted pre phase never releases what it already froze** (found 0.6.5, not fixed there; the
+  top candidate for the next release). `hooks.Run` stops the chain at the first `onError: Fail`
+  failure — correctly — but the hooks that ALREADY SUCCEEDED have quiesced their applications.
+  `failHooks` then writes a terminal `Failed`, and the already-terminal short-circuit at the top of
+  `Reconcile` means `closeFreezeWindow` never runs. Nothing thaws them, and nothing says so.
+
+  That is R16's own priority — the release matters more than the backup — inverted on the single path
+  where a human is least likely to be looking, because the Backup reports `Failed` for a reason that
+  reads as "the quiesce did not work" when part of it worked and is still in effect. Fixing it means
+  running the release from a terminal writer, with the attempt budget, which is a structural change
+  to the path 0.6.5 rewrote twice; it needs its own lot and its own campaign rather than a twelfth
+  entry in a release already carrying eleven.
+- **A `Fail`-policy post-hook failure blocks the release of every later pod** (found 0.6.5, not fixed
+  there). `hooks.Run` marks the rest of the chain `Skipped`, and a retry re-runs it from the start, so
+  a permanently broken first hook means the later pods are never successfully thawed across all three
+  attempts. `UnfreezeFailed` does fire, so it is loud — but it is loud about the wrong pod. Stopping
+  the chain is right for the pre phase and wrong for the post phase, where every entry is a thaw owed
+  to a different application; separating them needs a per-phase rule inside `hooks.Run`.
+- **The errored-pass class beyond the Backup controller** (raised 0.6.5, not audited).
+  `clusterbackup_controller.go`, `restore_controller.go` and `restore_engine.go` share the
+  single-status-writer shape that produced the class in `backup_controller.go` — an error returned
+  upstream of the one status write discards the pass. 0.6.5 closed it in the Backup controller and
+  convinced itself by two independent methods that none remains THERE; the other three were never
+  swept, and the honest statement is that nobody has looked rather than that they are clean.
+- **`PVCSelector.matchLabels` with an empty value diverges from Kubernetes semantics** (found 0.6.5
+  while consolidating the predicate; pinned as the behaviour that ships, not corrected). Kubernetes
+  reads `matchLabels: {key: ""}` as *the label must be present and empty*; this rule compares
+  `labels[k]` against the required value, and a missing key reads as `""`, so an empty required value
+  is satisfied by a PVC that does not carry the key at all. Correcting it would change which PVCs an
+  existing schedule covers, which is not something to do as a side effect of moving a function —
+  it needs its own note in the release that changes it. Pinned by `TestPVCSelectorMatches`.
+- **A run cannot recognise its own unstamped terminal child** (found 0.6.5, deliberately not fixed
+  there). `classifyCoordinate` admits into its adoption window only a child holding no result of any
+  kind, so a run whose children were fanned out before `crystalbackup.io/parent-uid` existed — an
+  operator upgraded while a run was in flight — declares every one of its own terminal children a
+  foreign occupant of that coordinate. On the cluster that surfaced this, all 32 terminal children of
+  one run were classified that way.
+
+  0.6.5 made the *reporting* honest instead: `namespacesBlocked` is now a separate counter from
+  `namespacesFailed`, so "this run never backed up this namespace" no longer masquerades as "it tried
+  and failed". That is the whole of the fix, and it is deliberately partial — 32 namespaces that were
+  in fact protected still read as blocked.
+
+  Not fixed in 0.6.5 for two reasons. It is a **migration artefact that self-heals**: every run fanned
+  out by a stamping build is stamped, so the condition cannot recur once the in-flight run drains. And
+  the plausible fix — widening the window to also accept a child whose `creationTimestamp` is at or
+  after the run object's — reopens the guard installed by commit `d3d2659` against *a run reporting
+  success for data it never wrote*. That discriminator looks sound (run names carry a timestamp, so a
+  same-named earlier run's child is necessarily older than the current run object), and "looks sound"
+  is precisely the standard that should not be enough for this guard. It deserves its own lot and its
+  own campaign, not a slot in a release already carrying six.
 
 - **Namespace-plane backup as a partial repo copy** (`restic copy` from the cluster DR repo
   into the user's bucket instead of an independent re-backup) — could supersede independent

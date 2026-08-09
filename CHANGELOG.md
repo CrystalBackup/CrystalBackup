@@ -4,6 +4,352 @@ All notable changes to Crystal Backup. Versioning follows
 [adr/0014](spec/adr/0014-versioning-and-release.md): milestone `Mn` → minor `0.n.z` on
 major 0; `1.0.0` is a deliberate post-M9 API-stability decision.
 
+## 0.6.5 — One volume held the queue, and every night after it was skipped (unreleased)
+
+> **Campaign not yet run.** This section is written as the lots land; the crucible verdict and the
+> report link go in when the campaign has actually passed, not before. A release note that describes
+> a campaign it has not seen is the exact habit this project spent M6 removing.
+
+A nightly schedule on a live cluster produced nothing for **thirty-one hours**. Nothing crashed,
+nothing alerted above `warning`, and the operator's own dashboard read *0% backup success* — which
+was true, and which nobody could act on because every number around it was either silent or wrong.
+
+The cause was one `PersistentVolumeClaim`, in one namespace, out of thirty-three.
+
+`develop/recette4-back`: `Bound`, 200 GiB, a hand-made **NFS** `PersistentVolume`, naming
+`storageClassName: slow` — a StorageClass that does not exist as an object. That is not a
+misconfiguration. For a static binding, `storageClassName` is only a matching **label** between the
+claim and the volume, and Kubernetes never requires the class object to exist. The administrator had
+done nothing wrong.
+
+The operator resolved that PVC's snapshot capability through its StorageClass, got
+`StorageClass "slow" not found`, and returned an error. `Reconcile` advances one volume per pass and
+picked the first non-terminal one by position, so the error re-drove the same volume forever and the
+five volumes behind it in that namespace **were never attempted at all** — which is why they carried
+no reason, and why not one of 0.6.3's three phase deadlines could fire on them: a deadline needs a
+phase, and they had never left `Pending`. The `Backup` never went terminal, so its `ClusterBackup`
+did not either, so the schedule's `concurrencyPolicy: Forbid` skipped every following night.
+
+### The StorageClass was never the volume's identity
+
+The fix is not a better error path. It is that the question was being asked of the wrong object.
+
+A StorageClass's `provisioner` is immutable, which makes the class look like a stable identity. It
+is not: the class can be **deleted and re-created under the same name over a different backend**,
+which is a normal step when migrating a cluster's storage. Every `PersistentVolume` provisioned
+under the old class keeps `spec.storageClassName` pointing at that name — a dangling string that now
+resolves to the **wrong driver**. Resolving through it does not fail; it succeeds and is wrong. An
+NFS volume routes to the RBD exposer, a `VolumeSnapshot` is cut that can never become ready, and two
+hours later `SnapshotReadyDeadlineExceeded` blames the storage. A coherent, actionable, entirely
+false diagnosis.
+
+`Registry.For` now takes a bound PVC's CSI driver from its **PersistentVolume**, and consults the
+StorageClass only for a PVC bound to nothing — where the class is the only evidence available, and
+where there is no data to back up yet either. A PV with no `spec.csi` and no
+`pv.kubernetes.io/migrated-to` is not a CSI volume, so it is `ErrUnsupported` → `Skipped` /
+`CSISnapshotUnsupported`: terminal in the queue, neutral in the roll-up. The honest verdict about a
+plain NFS volume and the verdict that lets its namespace through turn out to be the same one.
+
+### The fix that was rejected, because it guessed
+
+The first version of this classified the error: a `NotFound` became an immediate `Failed`, on the
+reasoning that a missing reference is a configuration fact no retry can change. That is wrong in
+both directions. A StorageClass absent this second can be created the next; a bound PVC whose PV
+reads `NotFound` may be looking at a cache that has not caught up — this operator has been bitten by
+exactly that before. And an error that looks transient can be permanent. Every such guess is wrong
+sometimes, and the direction that hurts is failing a volume whose data was fine.
+
+So nothing judges permanence any more. A volume whose exposer cannot be resolved records the cause,
+**stays `Pending`, and does not error the reconcile**. Two mechanisms replace the guess, and neither
+is sufficient alone:
+
+- `firstNonTerminalVolume` prefers a volume that has not been tried over a **parked** one (`Pending`
+  with an `ExposerUnresolvable` reason already recorded). A broken volume can no longer starve
+  healthy ones; it keeps its turn once the queue drains. This is the rule stated by the product
+  owner and it is the point of the release: *blocking a backup that could have succeeded, because
+  something scheduled ahead of it is broken, is not acceptable.*
+- **`pendingResolveDeadline` (1 h)** — the fourth deadline, bounding the one phase the other three
+  left unbounded. They each hang off an object that carries its own creation time (the origin
+  `VolumeSnapshot`, the mover `Job`); a volume that never created anything had no clock at all. Its
+  clock is a new `status.volumes[].firstAttemptAt`, stamped on the first **attempt** rather than at
+  enumeration — volumes wait their turn, and a clock shared with the run would have failed the next
+  volume the instant it reached the head of the queue, having never been tried.
+
+The recorded cause survives the deadline: a volume failed by the clock keeps
+`ExposerUnresolvable: <cause>` rather than being overwritten with the deadline's own name, because
+the cause is what an administrator can act on and the clock is not.
+
+### The published preflight script was predicting the wrong thing, and its guard was blind
+
+`preflight.sh` promises administrators, per StorageClass, which exposer CrystalBackup would choose.
+After the change above that framing is incomplete: it is still right for **dynamically** provisioned
+volumes, and it cannot speak for a volume bound by hand. The table now says so where the table is
+read, and a new `bound-volumes` check reports every bound PVC whose PV contradicts — or is simply
+absent from — the class it names. A PVC naming a class that does not exist is reported explicitly as
+**normal and nothing to correct**, because it is.
+
+Worse than the drift was what did not catch it. `make preflight-table-verify` exists to make exactly
+this impossible, and it stayed green — because every probe it drove had an effective driver identical
+to its `.provisioner`, so the scripts' *derivation* of a driver was invisible to the guard. When
+`driverFor` learned to prefer `pv.kubernetes.io/migrated-to`, a CSI-migrated in-tree class would have
+been printed **DATA SKIPPED** for volumes the operator snapshots perfectly well. The guard now probes
+a class whose serving driver differs from its provisioner, and the derivation is **generated into
+both scripts** instead of hand-written in each. The truth used to seed the fake cluster and the model
+of what the scripts derive are deliberately separate functions: collapsing them would make the two
+agree by construction rather than by being right, which is how it went blind in the first place.
+
+A guard that misses the drift it exists to catch is a worse defect than the drift.
+
+### `Forbid` now tells a run that is working from a run that is wedged
+
+The thirty-one hours were not caused by the stuck volume alone. The run stayed non-terminal, and
+`concurrencyPolicy: Forbid` asked only *"is a previous run non-terminal?"* — which is right when the
+previous run is working and catastrophic when it is not. Every following night was skipped.
+
+`Forbid` now skips the new run only while the previous one is genuinely progressing, and otherwise
+terminates it and lets the new one start. The predicate needs **both** halves, and neither alone can
+authorise a kill:
+
+- **Nothing is legitimately in flight.** `Uploading` counts as in flight **unconditionally** — no
+  elapsed time overrides it, because nothing in the product bounds a running mover *by design*, and a
+  multi-terabyte first full legitimately runs for hours. `Snapshotting` likewise. **`Pending` is the
+  only phase judged**, because it is the only one whose clock lives on the volume; a
+  `firstAttemptAt` of nil means *queued*, not stuck.
+- **No progress for four hours**, measured on a progress clock rather than the run's age. The four
+  hours are **derived** from the deadline ladder (`pendingResolveDeadline` + `snapshotReadyDeadline`
+  + `moverStartDeadline` = 3h30m), and a test pins the derivation so the number cannot drift away
+  from the bounds it is supposed to cover.
+
+A slow upload therefore cannot be killed at any age: the first clause rejects it on the phase alone,
+and the second is a *floor* that can only delay a kill the first has already authorised. A killed run
+is never given a success phase, so `lastSuccessTime` cannot advance, and each volume keeps its own
+recorded cause with the termination prefixed to it — so *"we shot a stuck run"* is distinguishable
+from *"it failed"*. The fix applies to **every** `concurrencyPolicy` value rather than to `Forbid`
+alone, because `Forbid` and `Skip` are identical in this build and branching would have let the
+defect be re-armed by choosing the other value.
+
+### `namespacesFailed: 32` for a run whose children were 29 Completed and 3 PartiallyFailed
+
+The same run reported 32 failed namespaces. Not one of those 32 had failed.
+
+The children had been fanned out before `crystalbackup.io/parent-uid` existed, and the operator was
+upgraded while the run was in flight. `classifyCoordinate` admits into its adoption window only a
+child holding no result of any kind, so every one of the run's 32 **terminal** children was
+classified a foreign occupant of its coordinate — and each collision incremented
+`NamespacesFailed`, a field that a second, independent site also fed from the child phases. "This
+run never backed up this namespace" and "it tried and failed" were the same number.
+
+Every namespace count now comes from **one** classification, in one pass, with a total the
+controller checks on every write (and an `AggregateInconsistent` Warning if it ever fails to add
+up). `namespacesBlocked` is a new, separate counter, with its own metric — because
+`namespaces_failed` alone would now read 0 over 32 unprotected namespaces. `Skipped` stays neutral
+end to end.
+
+**A sum invariant would not have caught this, and that is the lesson worth keeping.** The published
+numbers *did* add up: 0 + 32 + 1 = 33. Only reading the counters back **against the children they
+claim to summarise** finds it. Three further honesty defects fell out of the same rewrite: children
+are now matched at the run's coordinate rather than by namespace key alone; a stamped child in a
+de-selected namespace keeps its success and its bytes instead of vanishing; and a child phase the
+roll-up does not recognise now reads `Running` rather than counting for nothing and letting the run
+report `Completed`.
+
+The trigger itself — a run unable to recognise its own unstamped terminal child — is deliberately
+**not** fixed here. It is a migration artefact that cannot recur once a stamping build has fanned
+out, and the plausible fix reopens the guard against a run reporting success for data it never
+wrote. It is recorded in the roadmap's backlog with the reasoning, and it needs its own campaign.
+
+### The reaper logged "reaped" 186 times for three objects it never deleted
+
+Every ten minutes, for thirty-one hours, the orphan reaper logged that it had reaped three
+`VolumeSnapshot` objects. It had not. Their deletion was stuck on the snapshot pair's
+bound-protection finalizers, so each sweep re-issued the `DELETE` and logged success again. The
+operator's own leak detector was right the whole time — it counts what is *there* — so the same
+binary shipped a component asserting a leak was gone and another reporting eight residual objects,
+the oldest 31 hours old.
+
+A successful `DELETE` means *accepted for processing*. With a finalizer, that and *gone* can be
+separated by forever. Only a confirmed absence may now be called a reap: the reaper reads the object
+back through an uncached reader and distinguishes **confirmed gone**, **deletion requested but
+unconfirmed**, and **stuck** — the last naming the finalizers holding it, as a Warning Event on the
+object itself (so `kubectl describe` explains its own `Terminating`) and as a new
+`crystalbackup_orphan_reap_stuck{kind}` gauge published for every kind, including at zero. An object
+already terminating gets no new `DELETE`. Nothing force-removes a finalizer: stripping
+external-snapshotter's own finalizer is a destructive act on another controller's contract, and this
+release is about honest reporting, not forced removal.
+
+### `selfcheck` answers what an administrator actually asks after installing
+
+`selfcheck` produced a JSON installation report whose inventory contained **no PVC information at
+all**, so the one question a fresh installer has — *what will and will not be backed up* — had no
+answer anywhere in the product.
+
+`--format text` renders a compact answer in three parts: whether anything is wrong, **what the CRs
+will do** in plain sentences (including each cron translated into words *and its next occurrence*,
+retention in words, and the maintenance windows), and a per-PVC census with the treatment class.
+The classes are not a mapping table: they are `SnapshotExposer.Kind()` and the controller's own
+reason constants, with a test that parses the controller and fails on a rename. `csi-generic` and
+`cephfs-shallow` are the "with copy" and "without copy" the shape of the question implies, and
+**"best-effort" is absent**, with a sentence saying this version has no filesystem fallback — a class
+the operator cannot deliver would be worse than no class.
+
+The census also reports what nothing else could: PVCs **selected by no schedule at all**, and PVCs
+selected only by a schedule that cannot fire, which are *covered on paper and unprotected in fact*.
+It costs `5 + k` API requests regardless of how many PVCs exist — measured, printed in the output,
+and asserted equal at 10 and at 400 PVCs — by putting a read-through cache under the real resolver
+rather than reimplementing it. Secrets are only ever fetched by name, never listed, which is exactly
+the right the chart grants.
+
+JSON remains the default output. The soak kit redirects a bare `selfcheck` into a `.json` file,
+including in a shipped CronJob built to run unattended for months, and flipping the default would
+have made it write text into that file silently.
+
+### Thirty-one hours without a backup was a `warning`
+
+The self-check on the affected cluster read *"2 rule(s) breached, none critical"*. Both breached
+rules were `warning`, so a cluster producing nothing for thirty-one hours was indistinguishable, in
+severity, from one running an hour late.
+
+`CrystalbackupBackupMissedCritical` escalates with magnitude, and its bound is **derived** from the
+same per-schedule source as the warning's — `3 × the schedule's own period + 1h`, so it is 4 h for an
+hourly schedule and 73 h for a nightly one instead of one hardcoded number for both. The warning's
+`26h` fallback became `missedFallbackPeriod + missedFallbackGrace` for the same reason, at the same
+value: **no existing threshold moved**, and a test pins all three constants so an accidental change
+fails the build. Both tiers fire together; narrowing the warning would have silenced an
+administrator's existing routing at the moment things got worse.
+
+`BackupStalled` deliberately gets **no** escalation. A stall says *a* run has not finished, not that
+*none* has — under `concurrencyPolicy: Allow` a wedged Backup sits beside successful nightlies. And
+there is nothing honest to scale it by: an in-flight duration is a property of the volume, not of the
+cron, so scaling by period would send a 3 TB first full critical after twenty minutes. The real
+answer is a per-volume throughput series, not a multiple of eight hours.
+
+The verdict logic needed no change and never had the defect: it already escalated on any critical
+breach. The defect was that **no rule in the table could ever be critical about missing backups**, so
+the escalation was unreachable — which is why the test for it now goes through the real rule table
+instead of a synthetic result that could stay green while the incident was live.
+
+### A failed erasure claimed it had destroyed data
+
+`ClusterErasure.status.snapshotsForgotten` was written from the count taken **before** the work and
+never re-derived. An erasure that failed therefore reported having forgotten N snapshots. This is not
+an operational annoyance: an erasure object is the compliance record somebody points at to assert
+that data was destroyed.
+
+Every number is now either measured after the work or the conservative floor, never the optimistic
+assumption. The pre-erasure count goes to a new `snapshotsTargeted`; `snapshotsForgotten` stays 0
+while running; on failure the controller **re-lists the repository** under the erasure's own tags and
+derives what was actually forgotten, publishing the residue. Four of ten reads 4 forgotten and 6
+remaining. A prune that failed after a successful forget reads 10 and 0. A residue that cannot be
+listed claims **nothing**.
+
+`Restore` and `ClusterRestore` gained the denominator they never had — `plannedVolumes` and
+`failedVolumes`, stamped on non-terminal passes too, so a long restore visibly progresses instead of
+reading 0 until it ends. A restore is the operation people run on their worst day; *how far along is
+it and what did not come back* has to be answerable from `kubectl get restore`.
+
+### The same defect, three times, and what closing it structurally required
+
+The head-of-line block was found three times in three lots, in the same family of functions, which is
+the signal that the per-call-site shape was the defect rather than any individual site. `Reconcile`
+returned a volume's error at step (10), **before** the status write at step (11) — so nothing that
+pass computed was ever persisted. Reverting the fixed `Expose` path in a mutation test did not merely
+lose a timestamp: the assertion that failed was that `status.volumes` was **nil**. The enumeration
+itself never reached etcd. And because the error returned upstream of the deadline evaluation, the
+two bounds that exist to end exactly this were unreachable on the one path that needed them.
+
+A failure to advance a volume now records its cause and lets the pass persist what it knows. The
+volume's **phase is deliberately untouched**, since that is what the next pass dispatches on and what
+its durable clock is measured against. A failed readiness check is treated as *not ready*, which is
+what makes `snapshotProgressDeadline` and `snapshotReadyDeadline` reachable when the check itself
+cannot be carried out — and only a clean `ready == true` still creates a mover Job, so the change
+cannot manufacture one. `advancePending` no longer has an `error` result at all: the signature is now
+the invariant, and reintroducing the bug requires changing it.
+
+Propagating the error after persisting was considered and rejected, for a reason worth recording:
+the backoff would be charged to the wrong object. It is the *Backup* that requeues, so one durably
+failing volume would stretch the poll driving every **other** volume in that namespace from five
+seconds to the rate limiter's ceiling — the same head-of-line block moved into the time domain.
+
+Every remaining instance in this controller was then closed, in two further passes, because a
+guarantee that holds on three paths out of four is not a guarantee:
+
+- **step (9b) `openFreezeWindow`** — a durable hooks-resolution failure (RBAC narrowed under a
+  running operator) discarded `status.volumes` entirely and the run never terminated: the
+  thirty-hour signature with nothing per-volume to read. It now routes into `failHooks`, the
+  mechanism that already knows how to record a failed quiesce and decide its consequence, whose own
+  status write is what finally persists the volumes. Deliberately without retries: the API's own
+  `postHookAttempts` doc states that post hooks are retried where pre hooks are not, and giving a
+  failed pods-*list* patience that a failed pods-*exec* does not have would be incoherent. R16 is
+  kept — `Expose` is never reached, so a quiesce that did not happen never becomes a backup claiming
+  consistency;
+- **steps (10b) `advanceManifests` and (10c) `closeFreezeWindow`** — persist first, then propagate.
+  Here the shape rejected for volumes is the right one, because the failure is not per-volume: the
+  backoff is charged to the Backup, which *is* the object at fault, and `reconcile_errors_total`
+  keeps the observation;
+- **the terminal phase is now held while a freeze-window release is owed**, the way it was already
+  held while the manifest half was in flight. Without it, a run whose volumes all went `Skipped` or
+  `Failed` went terminal on the very pass the release fired, so a failed release got one attempt
+  where the product promises three — and the loud `UnfreezeFailed` Event, which only fires once the
+  attempts are gone, was unreachable. An application could be left quiesced with no loud signal;
+- **the four unbounded sites** gained a backstop: a new `status.volumes[].phaseEnteredAt`, a
+  *sibling* of `firstAttemptAt` rather than a generalisation of it, because a field re-stamped on
+  every transition cannot also be the once-on-first-contact clock `pendingResolveDeadline` needs —
+  merging them would have quietly turned that deadline into the enumeration clock its own comment
+  was written to avoid. `advanceRetryDeadline` is four hours, sized so it never pre-empts a bound
+  that can give a better answer: the longest sibling is two hours, and a test asserts the whole
+  ladder stays strictly under it so the safety argument cannot rot. It is consulted at exactly the
+  six sites where no per-object bound is reachable, and **never** at "still running; requeue" — a
+  mutation that added it there is one of the tests.
+
+### Two documented hook contracts the controller did not honour
+
+`onError: Continue` was documented in two places — the field's own comment says "records the failure
+and proceeds", and `Result.Aborts()` implements the rule — and the controller threw the distinction
+away: `recordHookResults` wrote `Failed` for every failure regardless of the policy, so the user's
+answer was erased at the moment it was written down, and the abort decision is taken on a later
+reconcile from status alone. A user who explicitly asked for the backup to proceed if the quiesce
+failed got a terminally `Failed` backup and no snapshot at all. Nothing tested it, which is how it
+shipped.
+
+The apparent conflict with R16 was not one. R16's argument — a snapshot that looks
+application-consistent and is not is worse than none — is already the stated reason `Fail` is the
+**default**, not a claim that `Continue` should not exist. Removing `Continue` was weighed and
+rejected: it would move the outage from a degraded backup to no backup, which is 0.6.4's lesson
+inverted.
+
+So `Continue` is honoured, and the policy is now recorded durably (`status.hooks[].onError`, empty
+read as `Fail` so an upgrade over a run mid-freeze-window is safe). A backup that proceeded past a
+failed quiesce carries a new **`ApplicationConsistent` condition**, written in the same status write
+as the hook entries so there is no window in which the run continues with nothing saying so. It is
+tri-state on purpose: absent when no pre hook ran (a `False` on every hookless run would be exactly
+the alert fatigue this release fights), `True`/`Quiesced`, or `False`/`CrashConsistent` naming the pod,
+container and error. Without that record the field would have been a way for users to silently
+downgrade their own restore points, which is worse than the bug. The phase stays `Completed`: nothing
+happened partially.
+
+The same erasure affected **post** hooks, where it was worse — a tolerated release failure spent all
+three retry attempts, held the terminal phase, and paged a human with "an application may remain
+quiesced" about a failure the user had said to tolerate. And a run declaring **only** post hooks ran
+none of them, because the release was gated on a pre phase having run; the field is "post-backup",
+not "unfreeze", and a thaw for an out-of-band quiesce or a "backup finished" command were both
+unreachable. Fixing that surfaced a third: hook resolution was gated on *any* hook being declared,
+so a post-only run listed pods for a pre phase it never declared — and in a namespace where that
+listing is refused, it died terminally complaining about a quiesce it had never asked for.
+
+**What this release does NOT close.** Two instances of the same family remain, both in the hook
+chain, and the first is the more serious: when a pre hook with `onError: Fail` fails, the chain stops
+— correctly — but the hooks that **already succeeded** have quiesced their applications, and the
+terminal `Failed` write means the release never runs. Nothing thaws them and nothing says so, which
+is R16's own priority inverted on the path where a human is least likely to be looking. Second, a
+`Fail`-policy post-hook failure marks the rest of the chain `Skipped` and a retry restarts it, so a
+permanently broken first hook means later pods are never thawed across all three attempts —
+`UnfreezeFailed` fires, but about the wrong pod. Both are recorded in the roadmap's backlog with the
+reasoning; both need structural changes to the path this release already rewrote twice, and neither
+belongs in a twelfth entry of an eleven-lot release. Separately, the errored-pass class was closed
+and verified **in the Backup controller only** — `clusterbackup_controller.go`,
+`restore_controller.go` and `restore_engine.go` share the same single-status-writer shape and were
+never swept. The honest statement is that nobody has looked, not that they are clean.
+
 ## 0.6.4 — The operator minted a key over the one that could open the repository (2026-08-07)
 
 **Validated on real infrastructure: 90 of 90 crucible checks, 0 failed, 0 skipped, in 2h44m1s**
