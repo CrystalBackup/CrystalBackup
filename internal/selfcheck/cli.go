@@ -51,8 +51,14 @@ const (
 // The collection flags are listed under `selfcheck` and referred to from `report` rather than
 // repeated, because they ARE the same flags — one registration, one meaning (see collectFlags).
 const Usage = `crystal-backup ` + CommandSelfcheck + ` [flags]
-        Reads the cluster with the operator's own RBAC and writes a JSON installation report.
+        Reads the cluster with the operator's own RBAC and reports on the installation: whether it
+        is healthy, what the CRs are going to do, and which PVCs will and will not be backed up.
 
+        --format json|text     json (the DEFAULT) is the exportable document, with every identifier
+                               redacted; text is the compact human summary for your own terminal,
+                               and it shows REAL names — it says so, every time.
+        --all                  text only: list every PVC instead of only the ones needing attention.
+                               A cluster with thousands of volumes is why this is not the default.
         --output <file>        write here instead of stdout
         --operator-namespace   where the operator and its mover Jobs live (default $POD_NAMESPACE)
         --mover-image          the configured mover image, recorded beside what is running
@@ -69,9 +75,11 @@ crystal-backup ` + CommandReport + ` [--from <file>] [--output <file>] [collecti
 
         WITHOUT --from it collects the self-check itself, for right now, and formats that. This is
         the command to type when you do not know whether the installation is healthy. It needs a
-        cluster — run it where the operator runs — and it takes every collection flag ` + CommandSelfcheck + `
-        takes above, with the same meaning and the same default: identifiers redacted with a fresh
-        random salt.
+        cluster — run it where the operator runs — and it takes every COLLECTION flag ` + CommandSelfcheck + `
+        takes above (--operator-namespace, --mover-image, --sync-image, --full,
+        --redaction-salt-file), with the same meaning and the same default: identifiers redacted
+        with a fresh random salt. It does NOT take --format or --all: this command has exactly one
+        output, an HTML page, and that page always carries every per-PVC row the report holds.
 
         WITH --from <file> it formats a self-check JSON that was collected somewhere else and needs
         NO cluster access at all: attach the JSON to an issue and a maintainer regenerates the page
@@ -95,10 +103,30 @@ func RunSelfcheck(ctx context.Context, args []string, stdout, stderr io.Writer) 
 func runSelfcheck(ctx context.Context, args []string, stdout, stderr io.Writer, connect clusterConnector) int {
 	fs := flag.NewFlagSet(CommandSelfcheck, flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	output := fs.String("output", "", "write the JSON report here instead of stdout")
+	output := fs.String("output", "", "write the report here instead of stdout")
+	format := fs.String("format", FormatJSON,
+		"json (the default, exportable and redacted) or text (the compact human summary)")
+	all := fs.Bool("all", false,
+		"text only: list every PVC instead of only the ones needing attention")
 	cf := registerCollectFlags(fs)
 	fs.Usage = func() { _, _ = fmt.Fprint(stderr, Usage) }
 	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *format != FormatJSON && *format != FormatText {
+		_, _ = fmt.Fprintf(stderr, "selfcheck: unknown --format %q; it is %s or %s\n\n%s",
+			*format, FormatJSON, FormatText, Usage)
+		return 2
+	}
+	// --all is refused rather than ignored on the JSON path, for the reason every other flag in this
+	// file is refused rather than ignored: the JSON carries every row it has and truncates by its own
+	// documented cap, so there is nothing for --all to change there. Accepting it silently would
+	// promise a reader that they asked for the complete list and got it.
+	if *all && *format != FormatText {
+		_, _ = fmt.Fprintf(stderr,
+			"selfcheck: --all only affects --format text. The JSON already carries every per-PVC row "+
+				"it has (capped at %d, attention first), so there is nothing for --all to widen. Drop "+
+				"the flag, or add --format text.\n\n%s", maxCoverageItems, Usage)
 		return 2
 	}
 
@@ -106,19 +134,42 @@ func runSelfcheck(ctx context.Context, args []string, stdout, stderr io.Writer, 
 	if rep == nil {
 		return code
 	}
-	body, err := json.MarshalIndent(rep, "", "  ")
-	if err != nil {
-		_, _ = fmt.Fprintf(stderr, "selfcheck: encode report: %v\n", err)
-		return 1
+	var body []byte
+	if *format == FormatText {
+		body = RenderText(rep, TextOptions{All: *all})
+	} else {
+		encoded, err := json.MarshalIndent(rep, "", "  ")
+		if err != nil {
+			_, _ = fmt.Fprintf(stderr, "selfcheck: encode report: %v\n", err)
+			return 1
+		}
+		body = append(encoded, '\n')
 	}
-	body = append(body, '\n')
 	if err := emit(*output, body, stdout); err != nil {
 		_, _ = fmt.Fprintf(stderr, "selfcheck: %v\n", err)
 		return 1
 	}
-	cf.announce(CommandSelfcheck, *output, stderr)
+	// Only the JSON path announces the redaction: it is the JSON's identifiers the message is about,
+	// and text mode has already said, in the body a reader is looking at, that its names are real.
+	if *format == FormatJSON {
+		cf.announce(CommandSelfcheck, *output, stderr)
+	}
 	return 0
 }
+
+// The --format values. JSON stays the DEFAULT, and that is a compatibility decision with a specific
+// victim in mind rather than a matter of taste.
+//
+// hack/soak/README.md, hack/soak/SPEC.md and the shipped
+// hack/soak/manifests/fallback-selfcheck-cronjob.yaml all redirect a bare `selfcheck`'s stdout into a
+// .json file, and that CronJob is designed to run unattended for months in somebody's cluster.
+// Flipping the default would make every one of those installations start writing prose into a file
+// named .json, silently, and the failure would surface weeks later as an unparseable soak series
+// nobody can reconstruct. The human view is worth a flag; it is not worth that.
+const (
+	FormatJSON = "json"
+	FormatText = "text"
+)
 
 // RunReport is `crystal-backup report [--from <file>]`.
 //

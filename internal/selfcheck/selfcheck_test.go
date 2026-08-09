@@ -34,6 +34,7 @@ import (
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -64,6 +65,7 @@ var secrets = []string{
 	"acme-dr-copy",
 	"acme-s3-credentials",
 	"acme-offsite",
+	"acme-ledger-archive",
 }
 
 const operatorNS = "crystal-backup-system"
@@ -576,7 +578,7 @@ func TestNotEvaluatedIsNeverReportedAsOK(t *testing.T) {
 		{Name: "b", Status: StatusNotEvaluated},
 		{Name: "c", Status: StatusError},
 	}
-	v := verdictOf(rules, noLeaks)
+	v := verdictOf(rules, noLeaks, nil)
 	if v.OK != 1 {
 		t.Errorf("OK = %d, want 1: only the evaluated pass counts", v.OK)
 	}
@@ -603,13 +605,121 @@ func TestNotEvaluatedIsNeverReportedAsOK(t *testing.T) {
 // TestCriticalBreachMakesTheVerdictUnhealthy: only a critical rule says the RESTORE PATH is
 // compromised, and only that should be able to produce the strongest word in the report.
 func TestCriticalBreachMakesTheVerdictUnhealthy(t *testing.T) {
-	warn := verdictOf([]RuleResult{{Status: StatusBreached, Severity: "warning"}}, noLeaks)
+	warn := verdictOf([]RuleResult{{Status: StatusBreached, Severity: "warning"}}, noLeaks, nil)
 	if warn.Status != "degraded" {
 		t.Errorf("a warning breach gave %q, want degraded", warn.Status)
 	}
-	crit := verdictOf([]RuleResult{{Status: StatusBreached, Severity: "critical"}}, noLeaks)
+	crit := verdictOf([]RuleResult{{Status: StatusBreached, Severity: "critical"}}, noLeaks, nil)
 	if crit.Status != "unhealthy" {
 		t.Errorf("a critical breach gave %q, want unhealthy", crit.Status)
+	}
+	// The SENTENCE, not only the status word. "none critical" is what the 2026-08-09 report said over
+	// a cluster with no backup for thirty-one hours (see TestMissedBackupsEscalateOutOfNoneCritical),
+	// and the sentence is the part a human quotes into a ticket.
+	if strings.Contains(crit.Summary, "none critical") {
+		t.Errorf("the summary says \"none critical\" over a critical breach: %q", crit.Summary)
+	}
+	if !strings.Contains(crit.Summary, "CRITICAL") {
+		t.Errorf("the summary of an unhealthy verdict does not use the word CRITICAL: %q", crit.Summary)
+	}
+}
+
+// TestMissedBackupsEscalateOutOfNoneCritical is the 2026-08-09 incident, end to end through the
+// real rule table.
+//
+// The self-check on a live cluster produced, verbatim:
+//
+//	verdict: degraded — "2 rule(s) breached, none critical." (breached 2, ok 10, critical 0)
+//
+// over an installation that had captured NOTHING for thirty-one hours. The words were accurate about
+// the rule tally and wrong as an answer: an administrator reading them learns that two warnings are
+// up, which is what they would have read if a nightly had been an hour late.
+//
+// This drives the WHOLE table over a fake cluster rather than hand-building RuleResults, because the
+// verdict arithmetic was never the bug — verdictOf has escalated on Critical > 0 since it was
+// written. The bug was that no rule in the table could ever be critical about missing backups, so
+// the escalation was unreachable. A test over synthetic RuleResults would have passed throughout the
+// incident, which is precisely why this one goes through alerts.Rules().
+func TestMissedBackupsEscalateOutOfNoneCritical(t *testing.T) {
+	now := fixtureNow()
+	// One namespace, one location, one active nightly schedule, and one successful Backup — the whole
+	// cluster, so that the ONLY rules that can breach are the two missed tiers. Anything else breaching
+	// here would make the assertion below true for the wrong reason.
+	cluster := func(lastSuccess time.Duration) client.Client {
+		at := metav1.NewTime(now.Add(-lastSuccess))
+		return snapshotScheme(t,
+			nsObj("acme-billing-prod", "acme-corp"),
+			&cbv1.ClusterBackupLocation{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "acme-offsite", CreationTimestamp: metav1.NewTime(now.Add(-90 * 24 * time.Hour)),
+				},
+				Spec: cbv1.ClusterBackupLocationSpec{Default: true, ClusterID: "acme-eu-west-cluster"},
+			},
+			&cbv1.BackupSchedule{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "acme-nightly", Namespace: "acme-billing-prod",
+					CreationTimestamp: metav1.NewTime(now.Add(-90 * 24 * time.Hour)),
+				},
+				Spec: cbv1.BackupScheduleSpec{
+					Schedule:    "0 2 * * *",
+					LocationRef: cbv1.LocalObjectReference{Name: "acme-offsite"},
+				},
+			},
+			backupObj("acme-billing-prod", "acme-nightly-last", "acme-nightly", "Completed", at),
+		)
+	}
+	verdict := func(t *testing.T, lastSuccess time.Duration) (Verdict, map[string]string) {
+		t.Helper()
+		rep, err := Collect(context.Background(), Options{
+			Reader:            cluster(lastSuccess),
+			OperatorNamespace: operatorNS,
+			Now:               now,
+			Discovery:         fakeDiscovery{},
+		})
+		if err != nil {
+			t.Fatalf("collect: %v", err)
+		}
+		byRule := map[string]string{}
+		for _, r := range rep.Rules {
+			byRule[r.Name] = r.Status
+		}
+		return rep.Verdict, byRule
+	}
+
+	// THE INCIDENT: 111735 seconds. One missed nightly period. Still degraded, still "none critical",
+	// and that is now the CORRECT answer for one missed run — the report is allowed to say it, and
+	// this case is here so the fix cannot be "call everything critical".
+	v, rules := verdict(t, 111735*time.Second)
+	if v.Status != verdictDegraded || v.Critical != 0 {
+		t.Errorf("one missed nightly period gave %q with critical=%d, want degraded/0: escalating "+
+			"here would make critical mean nothing", v.Status, v.Critical)
+	}
+	if rules["CrystalbackupBackupMissed"] != StatusBreached {
+		t.Fatalf("the warning tier did not breach at 31h (%q); the fixture, not the rule, is wrong",
+			rules["CrystalbackupBackupMissed"])
+	}
+
+	// FOUR DAYS: three of the schedule's own periods have gone by with nothing captured.
+	v, rules = verdict(t, 4*24*time.Hour)
+	if rules["CrystalbackupBackupMissedCritical"] != StatusBreached {
+		t.Fatalf("CrystalbackupBackupMissedCritical is %q after four days with no backup — the "+
+			"escalation is unreachable and the verdict can never leave degraded",
+			rules["CrystalbackupBackupMissedCritical"])
+	}
+	if v.Critical == 0 {
+		t.Errorf("critical=%d with a critical rule breached: the tally the reader judges severity by "+
+			"is the one that stayed at zero all through the incident", v.Critical)
+	}
+	if v.Status != verdictUnhealthy {
+		t.Errorf("status = %q, want %q: four days of nothing is not the same news as being an hour late",
+			v.Status, verdictUnhealthy)
+	}
+	if strings.Contains(v.Summary, "none critical") {
+		t.Errorf("the headline still reads \"none critical\" over four days with no backup — this is "+
+			"the exact sentence the incident produced: %q", v.Summary)
+	}
+	if !strings.Contains(v.Summary, "CRITICAL") {
+		t.Errorf("the headline does not say CRITICAL: %q", v.Summary)
 	}
 }
 
@@ -630,7 +740,7 @@ func TestResidualLeaksStopTheVerdictReadingHealthy(t *testing.T) {
 		Totals:       LeakSummary{Residual: 7},
 	}
 
-	v := verdictOf(clean, incident)
+	v := verdictOf(clean, incident, nil)
 	if v.Status == verdictHealthy {
 		t.Error(`status is the bare word "healthy" beside 7 residual objects — this is the exact ` +
 			"report that sent somebody looking for the real state by hand")
@@ -653,7 +763,7 @@ func TestResidualLeaksStopTheVerdictReadingHealthy(t *testing.T) {
 
 	// And with nothing residual, the plain word is still available: a report that could never say
 	// "healthy" would be as useless as one that always did.
-	quiet := verdictOf(clean, noLeaks)
+	quiet := verdictOf(clean, noLeaks, nil)
 	if quiet.Status != verdictHealthy {
 		t.Errorf("status = %q with a zero residual, want %q", quiet.Status, verdictHealthy)
 	}
@@ -682,8 +792,8 @@ func TestTheRuleTallyIgnoresTheLeakResidual(t *testing.T) {
 		Totals: LeakSummary{Residual: 5},
 	}
 
-	without := verdictOf(rules, noLeaks)
-	with := verdictOf(rules, leaky)
+	without := verdictOf(rules, noLeaks, nil)
+	with := verdictOf(rules, leaky, nil)
 	if with.OK != without.OK || with.Breached != without.Breached ||
 		with.Critical != without.Critical || with.NotEvaluated != without.NotEvaluated ||
 		with.Errored != without.Errored {
@@ -789,6 +899,15 @@ func TestRoundTripJSONToHTML(t *testing.T) {
 		"CrystalbackupBackupMissed",
 		"Rule verdicts",
 		"Leak indicators",
+		// The two sections this release added. They are asserted here, on the ROUND-TRIPPED report,
+		// because that is the only path that proves they survive the JSON: both are pointers, and a
+		// pointer section that failed to decode would render as absent rather than as an error.
+		//
+		// Matched WITH the opening <h2>, not on the words alone: the verdict block cross-references the
+		// census section by name, so a bare phrase match is satisfied by a page that has the reference
+		// and not the section — which is exactly the state a broken template would leave.
+		"<h2>What the CRs will do",
+		"<h2>What will and will not be backed up",
 		// ESCAPED, through the same function the renderer uses. The summary is data — it carries an
 		// apostrophe ("the reaper's grace") — and a page that contained it byte-for-byte would be a
 		// page that had not escaped it, which is the bug this assertion would otherwise hide.
@@ -1382,6 +1501,24 @@ func fixtureClient(t *testing.T) client.Client {
 		exposurePVC("crystal-clone-stranded", now.Add(-96*time.Hour)),
 	)
 
+	// The PVC census. Two tenant volumes, deliberately on opposite sides of the verdict: the ledger
+	// is selected by the nightly BackupSchedule and snapshots fine, the archive is in a namespace no
+	// schedule reaches and sits on storage that cannot snapshot at all. Both are here so the coverage
+	// section has content whose identifiers the redaction tests can hold to account — a PVC name and
+	// a namespace name appear in that section's rows AND inside a resolver sentence, which is the
+	// shape per-field redaction cannot reach.
+	objs = append(objs,
+		&storagev1.StorageClass{
+			ObjectMeta:  metav1.ObjectMeta{Name: "ceph-block"},
+			Provisioner: fixtureRBDDriver,
+		},
+		fixtureSnapClass("csi-rbdplugin-snapclass", fixtureRBDDriver),
+		tenantPVC("acme-billing-prod", "customer-ledger-db", "ceph-block", "pv-ledger"),
+		fixtureCSIPV("pv-ledger", fixtureRBDDriver, "ceph-block"),
+		tenantPVC("acme-analytics", "acme-ledger-archive", "local-path", "pv-archive"),
+		fixtureCSIPV("pv-archive", "rancher.io/local-path", "local-path"),
+	)
+
 	// A PVC piled high with snapshots, which is the one breach whose Detail names an object that
 	// appears nowhere else in the report.
 	bound := 21
@@ -1413,6 +1550,52 @@ func snapshotScheme(t *testing.T, objs ...client.Object) client.Client {
 func emptyClient(t *testing.T) client.Client {
 	t.Helper()
 	return snapshotScheme(t)
+}
+
+// fixtureRBDDriver is the CSI driver the fixture's healthy volume is served by. A real name, because
+// the coverage section quotes the resolver's own sentences and those name the driver.
+const fixtureRBDDriver = "rook-ceph.rbd.csi.ceph.com"
+
+// tenantPVC is one user volume, bound to volumeName and requesting a plausible size.
+func tenantPVC(namespace, name, storageClass, volumeName string) *corev1.PersistentVolumeClaim {
+	sc := storageClass
+	return &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			StorageClassName: &sc,
+			VolumeName:       volumeName,
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("20Gi")},
+			},
+		},
+	}
+}
+
+func fixtureCSIPV(name, driver, storageClass string) *corev1.PersistentVolume {
+	return &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Spec: corev1.PersistentVolumeSpec{
+			StorageClassName: storageClass,
+			PersistentVolumeSource: corev1.PersistentVolumeSource{
+				CSI: &corev1.CSIPersistentVolumeSource{Driver: driver},
+			},
+		},
+	}
+}
+
+// fixtureSnapClass declares no snapshotter Secret, which exposer.Precheck treats as a positive
+// statement that this driver authenticates some other way — an OK, not an unverified guess. That keeps
+// the fixture's healthy volume healthy without seeding a Secret this report must never read.
+func fixtureSnapClass(name, driver string) *unstructured.Unstructured {
+	u := &unstructured.Unstructured{}
+	u.SetGroupVersionKind(schema.GroupVersionKind{
+		Group: "snapshot.storage.k8s.io", Version: "v1", Kind: "VolumeSnapshotClass",
+	})
+	u.SetName(name)
+	if err := unstructured.SetNestedField(u.Object, driver, "driver"); err != nil {
+		panic(err)
+	}
+	return u
 }
 
 func nsObj(name, tenant string) *corev1.Namespace {

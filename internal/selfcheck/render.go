@@ -57,6 +57,8 @@ func Render(rep *Report) ([]byte, error) {
 		"days":       humanDays,
 		"statusWord": statusWord,
 		"statusRank": statusRank,
+		"covWord":    covWord,
+		"covRank":    covRank,
 		"sevClass":   sevClass,
 		"boolWord":   boolWord,
 		"labelList":  labelList,
@@ -153,15 +155,51 @@ func statusWord(s string) string {
 func statusRank(s string) string {
 	switch s {
 	case StatusOK:
-		return "ok"
+		return rankOK
 	case StatusBreached:
-		return "crit"
-	case StatusNotEvaluated:
-		return "warn"
-	case StatusError:
-		return "warn"
+		return rankCritical
+	case StatusNotEvaluated, StatusError:
+		return rankWarning
 	default:
 		return "low"
+	}
+}
+
+// The stylesheet's severity classes. Named because two mappers now emit them (statusRank for a rule
+// verdict, covRank for a coverage verdict) and a typo would style a critical finding as a pass.
+const (
+	rankOK       = "ok"
+	rankWarning  = "warn"
+	rankCritical = "crit"
+)
+
+// covWord and covRank map a coverage verdict onto the page's vocabulary and its stylesheet, exactly as
+// statusWord and statusRank do for a rule verdict.
+//
+// The "unknown" verdict gets the WARNING colour rather than the muted grey of a pass, for the same
+// reason a not-evaluated rule does: it is the value a reader is most tempted to skim past, and skimming
+// past it is how an unmeasured volume gets read as a protected one.
+func covWord(verdict string) string {
+	switch verdict {
+	case CoverageVerdictBackedUp:
+		return "BACKED UP"
+	case CoverageVerdictSkipped:
+		return "SKIPPED"
+	case CoverageVerdictFailed:
+		return "NOT BACKED UP"
+	default:
+		return "UNKNOWN"
+	}
+}
+
+func covRank(verdict string) string {
+	switch verdict {
+	case CoverageVerdictBackedUp:
+		return rankOK
+	case CoverageVerdictFailed:
+		return rankCritical
+	default:
+		return rankWarning
 	}
 }
 

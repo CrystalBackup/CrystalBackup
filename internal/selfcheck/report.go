@@ -79,9 +79,24 @@ type Report struct {
 	Images    Images       `json:"images"`
 	CRDs      CRDInventory `json:"crds"`
 	Inventory Inventory    `json:"inventory"`
-	Leaks     Leaks        `json:"leakIndicators"`
-	Rules     []RuleResult `json:"rules"`
-	Verdict   Verdict      `json:"verdict"`
+
+	// Plan is what the custom resources are going to DO, in sentences: what each schedule targets,
+	// when it next fires, how long the data is kept, when the next exclusive prune window is, and
+	// the validity problems that only show up when two objects are read against each other. See
+	// plan.go — it is not a second rendering of Inventory, it is the part a field dump cannot say.
+	//
+	// A POINTER, so that a report from a producer too old to have collected it renders as "not
+	// collected" rather than as an installation with no locations and no schedules. That distinction
+	// is the same one Diagnostics exists to preserve everywhere else in this document.
+	Plan *Plan `json:"plan,omitempty"`
+	// Coverage is the per-PVC census: what will and will not be backed up, with the treatment class,
+	// resolved by the operator's own exposer registry rather than by any copy of its routing rules.
+	// See coverage.go. A pointer for the same reason Plan is one.
+	Coverage *Coverage `json:"coverage,omitempty"`
+
+	Leaks   Leaks        `json:"leakIndicators"`
+	Rules   []RuleResult `json:"rules"`
+	Verdict Verdict      `json:"verdict"`
 
 	// Diagnostics record what could NOT be read, and why. An empty section elsewhere in this
 	// document means "nothing there"; a diagnostic is how the report distinguishes that from "the

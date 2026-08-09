@@ -111,6 +111,12 @@ func Collect(ctx context.Context, opts Options) (*Report, error) {
 	// Inventory first: it is what teaches the redactor the names that later sections' free text
 	// must have substituted out. Reordering these calls would leak a name into a breach Detail.
 	rep.Inventory = c.inventory(ctx)
+	// Plan and Coverage come straight after the inventory and before everything else, for the same
+	// reason the inventory comes first: they are the two sections that walk the most objects, so they
+	// are where the redactor learns the most names — every namespace, every schedule, and (only here)
+	// every PVC. A rule breach whose Detail names a PVC is redacted because this ran first.
+	rep.Plan = c.plan(ctx)
+	rep.Coverage = c.coverage(ctx)
 	rep.Operator, rep.Cluster = c.identity(ctx)
 	rep.Images = c.images(ctx)
 	rep.CRDs = c.crds(ctx)
@@ -118,7 +124,7 @@ func Collect(ctx context.Context, opts Options) (*Report, error) {
 	rep.Rules = c.rules(ctx)
 	// The leak census is passed to the verdict as well as reported in its own section: the headline
 	// has to account for a residual it is not allowed to call a breach. See verdictOf.
-	rep.Verdict = verdictOf(rep.Rules, rep.Leaks)
+	rep.Verdict = verdictOf(rep.Rules, rep.Leaks, rep.Coverage)
 	rep.Redaction = red.Describe()
 	rep.Diagnostics = c.diags
 	return rep, nil
@@ -199,9 +205,7 @@ func (c *collector) identity(ctx context.Context) (Operator, Cluster) {
 
 	// Whether the snapshot API exists at all, which decides whether a volume backup is possible.
 	list := &unstructured.UnstructuredList{}
-	list.SetGroupVersionKind(schema.GroupVersionKind{
-		Group: snapshotGroup, Version: "v1", Kind: "VolumeSnapshotClassList",
-	})
+	list.SetGroupVersionKind(volumeSnapshotClassListGVK())
 	switch err := c.Reader.List(ctx, list); {
 	case err != nil:
 		cl.SnapshotAPI = "absent or unreadable"
@@ -218,14 +222,20 @@ func (c *collector) identity(ctx context.Context) (Operator, Cluster) {
 // The chart's own labels, and the group the snapshot API lives in. Named once each because a
 // label key compared against a misspelled literal matches nothing and reports "no operator pod".
 const (
-	labelPartOf    = "app.kubernetes.io/part-of"
-	labelComponent = "app.kubernetes.io/component"
-	labelChart     = "helm.sh/chart"
-	labelVersion   = "app.kubernetes.io/version"
-	partOfValue    = "crystal-backup"
-	snapshotGroup  = "snapshot.storage.k8s.io"
-	kindSnapshot   = "VolumeSnapshot"
-	conditionReady = "Ready"
+	labelPartOf     = "app.kubernetes.io/part-of"
+	labelComponent  = "app.kubernetes.io/component"
+	labelChart      = "helm.sh/chart"
+	labelVersion    = "app.kubernetes.io/version"
+	partOfValue     = "crystal-backup"
+	snapshotGroup   = "snapshot.storage.k8s.io"
+	snapshotVersion = "v1"
+	kindSnapshot    = "VolumeSnapshot"
+	// kindSnapshotClass is the cluster-scoped class object BOTH the snapshot-API probe below and the
+	// coverage census's read-through reader ask for. One spelling, because a probe that reported the
+	// API "absent" while the census resolved every PVC against it (or the reverse) would be two
+	// sections of one document disagreeing about whether the cluster can snapshot at all.
+	kindSnapshotClass = "VolumeSnapshotClass"
+	conditionReady    = "Ready"
 )
 
 // The words the headline verdict can take. Named because they appear in the JSON, in the template's
@@ -538,7 +548,7 @@ func (c *collector) inventory(ctx context.Context) Inventory {
 				agreed = false
 			}
 			inv.Locations = append(inv.Locations, Location{
-				Scope:             "cluster",
+				Scope:             apiconst.OriginCluster,
 				Name:              c.red.Location(l.Name),
 				Mode:              string(l.Spec.Mode),
 				Default:           l.Spec.Default,
@@ -1043,7 +1053,7 @@ func thresholdView(t alerts.Threshold) ThresholdView {
 // breach in the report that the alerting side would never send. What changes is that the word
 // "healthy" is no longer available on its own when there is residue, and that the summary states
 // both facts in one sentence instead of leaving the second one four sections down.
-func verdictOf(rules []RuleResult, leaks Leaks) Verdict {
+func verdictOf(rules []RuleResult, leaks Leaks, cov *Coverage) Verdict {
 	v := Verdict{Status: verdictHealthy}
 	for _, r := range rules {
 		switch r.Status {
@@ -1066,7 +1076,17 @@ func verdictOf(rules []RuleResult, leaks Leaks) Verdict {
 	case v.Breached > 0:
 		v.Status = verdictDegraded
 	}
-	finding := leakClause(leaks)
+	// The findings the RULES do not measure, in the order a reader should meet them: data that will
+	// not be backed up first, because it is a statement about somebody's data, and the operator's own
+	// residue second, because it is a statement about the operator.
+	//
+	// Adding the census here is the same move, for the same reason, that leakIndicators already made:
+	// a headline reading "healthy" over a cluster where two PVCs are selected by nothing and one fails
+	// its snapshot pre-check is a headline that will be believed, and the reader who does not scroll is
+	// the reader this word was written for. The rule TALLY is still untouched — nothing below adds to
+	// Breached, Critical or OK, because no alert rule fires on the census and inventing one here would
+	// put a breach in this document that the alerting side would never send.
+	finding := joinFindings(coverageClause(cov), leakClause(leaks))
 	switch v.Status {
 	case verdictUnhealthy:
 		v.Summary = fmt.Sprintf("%d rule(s) breached, %d of them CRITICAL — restore capability is "+
@@ -1094,6 +1114,54 @@ func verdictOf(rules []RuleResult, leaks Leaks) Verdict {
 			v.NotEvaluated, v.Errored)
 	}
 	return v
+}
+
+// joinFindings assembles the non-empty clauses into one, dropping the empties so no caller has to
+// test for them. Semicolons rather than commas because each clause already contains commas.
+func joinFindings(clauses ...string) string {
+	kept := make([]string, 0, len(clauses))
+	for _, c := range clauses {
+		if c != "" {
+			kept = append(kept, c)
+		}
+	}
+	return strings.Join(kept, "; and ")
+}
+
+// coverageClause states the per-PVC census as a clause the verdict sentence can be built around, or ""
+// when the census found nothing an administrator has to act on.
+//
+// It counts two DIFFERENT kinds of bad news and keeps them apart, because they are two different jobs:
+// a volume nothing selects needs a schedule, and a volume in a non-success treatment class needs
+// either storage that can snapshot or a cluster that can serve a snapshot. It says, as leakClause
+// does, that this is not a breached rule — so the sentence cannot be quoted into a ticket as an alert
+// that fired.
+//
+// A class whose verdict is "backed up" contributes nothing, which is what keeps a healthy installation
+// reading as healthy: the clause is empty and the word "healthy" survives untouched.
+func coverageClause(cov *Coverage) string {
+	if cov == nil {
+		return ""
+	}
+	var parts []string
+	if cov.Unselected > 0 {
+		parts = append(parts, fmt.Sprintf("%d selected by NO schedule", cov.Unselected))
+	}
+	if cov.InertOnly > 0 {
+		parts = append(parts, fmt.Sprintf(
+			"%d selected only by a schedule that cannot fire", cov.InertOnly))
+	}
+	for _, t := range cov.Classes {
+		if t.Verdict == CoverageVerdictBackedUp {
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%d %s", t.Count, t.Class))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("the per-PVC census found volumes that will NOT be backed up (%s) — a finding "+
+		"from the coverage section below, not a breached rule", strings.Join(parts, ", "))
 }
 
 // leakClause states the residue census as a clause a verdict sentence can be built around, or "" when

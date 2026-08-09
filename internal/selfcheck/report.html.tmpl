@@ -32,12 +32,106 @@
       no rule fires on that, so it moves none of the numbers above, and it is the reason this verdict does not read as plainly healthy. See <b>Leak indicators</b> below.
     </p>
     {{ end }}
+    {{ with .Coverage }}{{ if or (has .Unselected) (has .InertOnly) }}
+    <p>
+      No alert rule fires on the PVC census either. <b>{{ .Unselected }} PVC(s) are selected by no schedule</b>{{ if has .InertOnly }} and <b>{{ .InertOnly }} only by one that cannot fire</b>{{ end }} —
+      healthy volumes on healthy storage that nothing will ever back up. See <b>What will and will not be backed up</b> below.
+    </p>
+    {{ end }}{{ end }}
   </section>
 
   {{ if eq .Redaction.Mode "hashed" }}
   <div class="note"><b>Identifiers are redacted{{ if eq .Redaction.SaltSource "caller-supplied" }} with a caller-supplied salt.</b> {{ else }}.</b> {{ end }}{{ .Redaction.Note }}</div>
   {{ else }}
   <div class="note"><b>This report is UNREDACTED.</b> {{ .Redaction.Note }}</div>
+  {{ end }}
+
+  {{ with .Plan }}
+  <h2>What the CRs will do<span class="n">derived from the specs, not a field dump</span></h2>
+  {{ with .Note }}<div class="note">{{ . }}</div>{{ end }}
+  {{ range .Locations }}
+  <div class="rule">
+    <div class="top">
+      <span class="chip low">{{ if eq .Scope "cluster" }}ClusterBackupLocation{{ else }}BackupLocation{{ end }}</span>
+      <span class="nm">{{ with .Namespace }}{{ . }}/{{ end }}{{ .Name }}</span>
+      {{ with .Mode }}<span class="sev h">{{ . }}</span>{{ end }}
+      {{ if .Default }}<span class="chip ok">default</span>{{ end }}
+      {{ with .Ready }}<span class="bound">Ready={{ . }}</span>{{ end }}
+    </div>
+    {{ range .Sentences }}<div class="why">{{ . }}</div>{{ end }}
+    {{ range .Maintenance }}
+    <div class="why">
+      <b>restic {{ .Operation }}</b>{{ if .Exclusive }} <span class="chip warn">cluster-wide exclusive window</span>{{ end }}
+      {{ with .InWords }}{{ . }}{{ else }}on cron <code>{{ .Cron }}</code>{{ end }}.
+      {{ with .Next }}Next {{ tsp . }}.{{ end }}
+      {{ with .Detail }}{{ . }}.{{ end }}
+    </div>
+    {{ end }}
+    {{ if .Problems }}<ul>{{ range .Problems }}<li>{{ . }}</li>{{ end }}</ul>{{ end }}
+  </div>
+  {{ end }}
+  {{ range .Schedules }}
+  <div class="rule">
+    <div class="top">
+      <span class="chip low">{{ if eq .Origin "cluster" }}ClusterBackupSchedule{{ else }}BackupSchedule{{ end }}</span>
+      <span class="nm">{{ with .Namespace }}{{ . }}/{{ end }}{{ .Name }}</span>
+      {{ if .Suspended }}<span class="chip warn">suspended</span>{{ end }}
+      {{ with .Ready }}<span class="bound">Ready={{ . }}</span>{{ end }}
+    </div>
+    {{ range .Sentences }}<div class="why">{{ . }}</div>{{ end }}
+    <div class="bound">{{ .Cron }}{{ with .Timezone }} ({{ . }}){{ end }}{{ if not .Suspended }}{{ with .Next }} · next {{ tsp . }}{{ end }}{{ end }}</div>
+    {{ if .Problems }}<ul>{{ range .Problems }}<li>{{ . }}</li>{{ end }}</ul>{{ end }}
+  </div>
+  {{ end }}
+  {{ end }}
+
+  {{ with .Coverage }}
+  <h2>What will and will not be backed up<span class="n">{{ .PVCs }} PVC(s) in {{ .Namespaces }} namespace(s), {{ bytes .CapacityBytes }} requested</span></h2>
+  <div class="scroll">
+  <table>
+    <thead><tr><th>Verdict</th><th>Class</th><th>PVCs</th><th>What happens</th><th>status.volumes[]</th></tr></thead>
+    <tbody>
+    {{ range .Classes }}
+      <tr>
+        <td><span class="chip {{ covRank .Verdict }}">{{ covWord .Verdict }}</span></td>
+        <td class="mono">{{ .Class }}</td>
+        <td class="mono">{{ .Count }}</td>
+        <td>{{ .Summary }}</td>
+        <td class="mono">{{ if .Phase }}{{ .Phase }}/{{ .Reason }}{{ else }}—{{ end }}</td>
+      </tr>
+    {{ end }}
+    </tbody>
+  </table>
+  </div>
+  {{ if or (has .Unselected) (has .InertOnly) }}
+  <div class="note">
+    {{ if has .Unselected }}<b>{{ .Unselected }} PVC(s) are selected by NO schedule.</b> Whatever their storage can do, nothing in this cluster will ever back them up.{{ end }}
+    {{ if has .InertOnly }} <b>{{ .InertOnly }} are selected only by a schedule that cannot fire</b> (suspended, or an unparseable cron) — covered on paper, unprotected in fact.{{ end }}
+  </div>
+  {{ end }}
+  {{ if .Items }}
+  <div class="scroll">
+  <table>
+    <thead><tr><th>Namespace</th><th>PVC</th><th>StorageClass</th><th>Verdict</th><th>Selected by</th><th>Detail</th></tr></thead>
+    <tbody>
+    {{ range .Items }}
+      <tr>
+        <td class="mono">{{ .Namespace }}</td>
+        <td class="mono">{{ .Name }}</td>
+        <td class="mono">{{ with .StorageClass }}{{ . }}{{ else }}—{{ end }}</td>
+        <td><span class="chip {{ covRank .Verdict }}">{{ covWord .Verdict }}</span> <span class="mono">{{ .Class }}</span></td>
+        <td class="mono">{{ if .Schedules }}{{ range .Schedules }}{{ . }} {{ end }}{{ else if .InertSchedules }}inert: {{ range .InertSchedules }}{{ . }} {{ end }}{{ else }}NOBODY{{ end }}</td>
+        <td>{{ .Detail }}</td>
+      </tr>
+    {{ end }}
+    </tbody>
+  </table>
+  </div>
+  {{ end }}
+  {{ if has .ItemsOmitted }}
+  <div class="note">{{ .ItemsOmitted }} further PVC(s) are counted in the totals above but carry no row: this document caps its per-PVC rows, keeping the ones that need attention.</div>
+  {{ end }}
+  <div class="note">{{ .Note }} The census cost {{ .APIReads }} API request(s), independent of the number of PVCs.</div>
   {{ end }}
 
   <h2>Installation</h2>
