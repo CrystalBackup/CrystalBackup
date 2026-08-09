@@ -231,7 +231,13 @@ spec:
   timezone: Europe/Paris
   paused: false
   jitter: true                       # deterministic per-namespace spread (anti thundering herd)
-  concurrencyPolicy: Forbid          # Forbid | Skip
+  concurrencyPolicy: Forbid          # Forbid | Skip. A tick overlapping a run that is still
+                                     # MAKING PROGRESS is skipped; one overlapping a run that has
+                                     # been ABANDONED (no volume in flight, no progress for hours)
+                                     # terminates that run and proceeds. A volume that is
+                                     # snapshotting or uploading is never abandoned, however long
+                                     # it takes — before this, one wedged PVC could skip every
+                                     # subsequent nightly forever.
   startingDeadlineSeconds: 3600      # bound catch-up after downtime to one run
   successfulRunsHistoryLimit: 10     # ClusterBackup run records kept (≠ snapshot retention)
   failedRunsHistoryLimit: 10
@@ -323,9 +329,11 @@ spec:
   # would mix two repository coordinates (or drift the labels of already-created objects).
   # confirmation and the selection lists stay mutable.
 status:
-  phase: Completed                             # Pending|AwaitingConfirmation|Running|Completed|PartiallyFailed|Failed
+  phase: PartiallyFailed                       # Pending|AwaitingConfirmation|Running|Completed|PartiallyFailed|Failed
   restoredResources: 148
-  restoredVolumes: 5
+  plannedVolumes: 5                            # the denominator; written from the FIRST pass
+  restoredVolumes: 4                           # written on EVERY pass, so progress is watchable
+  failedVolumes: 1                             # what did not come back
   restoredBytes: 10737418240
   conditions: [...]
 ```
@@ -343,7 +351,9 @@ spec:
   confirmation: "team-x"              # typed, must equal the target identity
 status:
   phase: Completed                    # Pending|AwaitingConfirmation|Running|Completed|Blocked|Failed
-  snapshotsForgotten: 92
+  snapshotsTargeted: 92               # the scope, measured BEFORE the forget
+  snapshotsForgotten: 92              # only ever what was ESTABLISHED to be gone
+  snapshotsRemaining: 0               # a failed erasure reports its residue here (4 of 10 ⇒ 4/6)
   reclaimedBytes: 5368709120
   blockedUntil: ""                    # set on Immutable locations (object-lock expiry)
   conditions: [...]
@@ -438,7 +448,9 @@ spec:
                                      # (M6; deleting the schedule was the only way before, and it
                                      # threw away the baseline every alert measures against)
   jitter: true
-  concurrencyPolicy: Forbid
+  concurrencyPolicy: Forbid          # same two-way decision as the cluster plane: skip a tick
+                                     # behind a run that is progressing, terminate one that has
+                                     # been abandoned so the schedule cannot wedge forever
   startingDeadlineSeconds: 3600
   pvcSelector: { matchLabels: {}, include: [], exclude: [] }   # default all
   includeManifests: true
@@ -538,6 +550,7 @@ status:
       container: postgres
       source: annotation                      # annotation | spec — which one won for this pod
       result: Succeeded                       # Succeeded | Failed | Skipped
+      onError: Fail                           # the policy IN EFFECT for this execution
       finishedAt: "2026-07-12T01:00:03Z"
     - phase: post
       pod: postgres-0
@@ -554,6 +567,25 @@ in memory, so a process that dies between the quiesce and the release rebuilds b
 here. A `pre` entry with no matching `post` entry therefore means *an application may still be
 quiesced* — which is why the release is retried and why `Skipped` is a distinct result from
 `Succeeded` (a partial list must never read as "the rest passed").
+
+`onError` records the policy **that was in effect for that execution** (from the spec, or from the
+pod's `on-error` annotation when annotations won for that pod). It is part of the record because the
+decision it drives is taken on a *later* reconcile, from status alone: a `Failed` `pre` entry means
+"the run was aborted, there is no snapshot" under `Fail` and "the run proceeded" under `Continue`,
+and a record that dropped the policy could only assume the first. An entry carrying **no** `onError`
+— written by an operator older than the field — is read as `Fail`.
+
+**`onError: Continue` and the consistency record.** A `pre` hook that fails under `Continue` does not
+fail the run: the snapshots are taken, the phase reaches `Completed`, and the restore point carries an
+`ApplicationConsistent=False` condition with reason `CrashConsistent` naming the hook that failed.
+The condition is tri-state on purpose — **absent** means no pre hooks resolved, so no consistency was
+ever claimed; `True`/`Quiesced` means the quiesce was asked for and happened. Without the condition,
+`Continue` would be a way to silently downgrade a restore point.
+
+**`post` hooks do not depend on `pre` hooks.** They fire once every snapshot is cut, whether or not
+this operator froze anything: a spec with `post` and no `pre` is legal and runs (a "backup finished"
+command, or a thaw for something quiesced out of band). Post hooks honour `onError` too — a tolerated
+release failure is recorded and owes no retry, so it does not spend the `postHookAttempts` budget.
 
 ### Restore (namespaced, user — self-service)
 
@@ -582,7 +614,9 @@ spec:
 status:
   phase: Completed                     # Pending|AwaitingConfirmation|Running|Completed|PartiallyFailed|Failed
   restoredResources: 0
-  restoredVolumes: 1
+  plannedVolumes: 1                    # VOLUMES only: the manifest half is counted in
+  restoredVolumes: 1                   # restoredResources / resources.failedCount, while the
+  failedVolumes: 0                     # phase rolls up BOTH halves
   restoredBytes: 734003200
   resources:                           # per-resource detail; shape + caps in 04 §5.4
     failedCount: 0

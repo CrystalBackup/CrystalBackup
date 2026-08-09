@@ -114,6 +114,13 @@ var (
 	// Update is performed for real, then reported to the reconciler as a transport error —
 	// exercising terminalPhaseCommitted's committed-despite-error path deterministically.
 	backupStatusFailer *statusUpdateFailer
+	// backupAPIFaults refuses specific apiserver calls the Backup reconciler makes, keyed by the
+	// tenant namespace they belong to (see backupFaults in backup_errored_pass_test.go). It is
+	// installed on the REGISTERED reconciler's client rather than on a copy, because the failures it
+	// stands in for — a narrowed pods-list RBAC, a webhook refusing Jobs — are properties of the
+	// cluster that every reconcile of that object must see, and a spec whose copy alone saw them
+	// would be racing the registered reconciler for the same Backup.
+	backupAPIFaults *backupFaults
 	// discoveryLister is the stub inventory the DiscoveryReconciler reads; the discovery specs feed
 	// it canned snapshots (mutex-guarded, since the manager reconciles on another goroutine).
 	discoveryLister *stubSnapshotLister
@@ -300,11 +307,17 @@ var _ = BeforeSuite(func() {
 		precheckArmed: true,
 	}
 	backupStatusFailer = &statusUpdateFailer{}
+	backupAPIFaults = &backupFaults{}
 	backupReconciler = NewBackupReconciler(
-		// The manager client, with ONE seam added: statusFailingClient lets a spec make a single
-		// Backup status Update commit server-side yet error client-side (the ambiguous write).
-		// Disarmed — the default — it is a pure passthrough.
-		&statusFailingClient{Client: mgr.GetClient(), failer: backupStatusFailer},
+		// The manager client, with TWO seams layered on it, both pure passthroughs until a spec arms
+		// them: statusFailingClient lets a spec make a single Backup status Update commit server-side
+		// yet error client-side (the ambiguous write), and faultInjectingClient refuses named
+		// apiserver calls per tenant namespace (a pods-list a narrowed RBAC would refuse, a manifest
+		// mover Job a webhook would refuse).
+		&faultInjectingClient{
+			Client: &statusFailingClient{Client: mgr.GetClient(), failer: backupStatusFailer},
+			faults: backupAPIFaults,
+		},
 		mgr.GetScheme(),
 		secrets.NewByNameReader(mgr.GetAPIReader()),
 		backupExposers,
@@ -351,6 +364,7 @@ var _ = BeforeSuite(func() {
 		mgr.GetClient(),
 		mgr.GetScheme(),
 		scheduleClock,
+		suiteOperatorNamespace,
 		mgr.GetEventRecorder("clusterbackupschedule"),
 	).SetupWithManager(mgr)).To(Succeed())
 

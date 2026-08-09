@@ -83,6 +83,12 @@ func NewBackupScheduleReconciler(
 // schedule fired before the stamp existed (the operator-upgrade adoption path in stampBackup). The
 // controller never otherwise mutates a Backup — it does not even own the ones it stamps.
 // +kubebuilder:rbac:groups=crystalbackup.io,resources=backups,verbs=get;list;watch;create;patch
+// backups/status is for the OTHER thing, and only for it: writing the terminal phase onto a backup
+// this schedule terminated as ABANDONED (schedule_abandonment.go), which is what lets the next tick
+// run instead of being skipped forever behind a wedged one. The Backup controller remains the single
+// writer of that subresource on every other path; see terminateAbandonedBackup for why this one
+// exception is a safe one-way latch.
+// +kubebuilder:rbac:groups=crystalbackup.io,resources=backups/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=crystalbackup.io,resources=backuplocations,verbs=get;list;watch
 
 // Reconcile stamps the due Backup (if any) and refreshes the schedule's status.
@@ -136,11 +142,15 @@ func (r *BackupScheduleReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 	stampedName := ""
 	if tick, due := cronSched.DueTick(r.baselineTick(&sched, backups), effectiveNow, deadline); due {
-		if active := activeBackup(backups); active != nil {
-			r.Recorder.Eventf(&sched, nil, corev1.EventTypeWarning, "ConcurrencySkip", "SkipRun",
-				"skipping run for tick %s: previous backup %q still active (concurrencyPolicy %s)",
-				tick.UTC().Format(time.RFC3339), active.Name, backupConcurrencyPolicyOf(&sched))
-		} else {
+		// The overlap gate, and it now asks TWO questions instead of one (see
+		// schedule_abandonment.go for the incident and the predicate). "Is a previous backup
+		// non-terminal?" is the right question only while that backup is genuinely working; a wedged
+		// one used to hold this gate shut for every night that followed, forever.
+		blocked, err := r.resolveOverlap(ctx, &sched, backups, tick, now)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if !blocked {
 			name, err := r.stampBackup(ctx, &sched, tick)
 			if c := asRunNameCollision(err); c != nil {
 				// The tick's name is already taken by a Backup this schedule did not stamp — almost
@@ -379,21 +389,87 @@ func mapBackupToSchedule(_ context.Context, obj client.Object) []reconcile.Reque
 	return []reconcile.Request{{NamespacedName: client.ObjectKey{Namespace: obj.GetNamespace(), Name: name}}}
 }
 
-// activeBackup returns the first non-terminal Backup in the snapshot, or nil if every one is
-// terminal. Discovery PROJECTIONS are skipped: they are materialized views of snapshots that
-// already exist, never executions, so one sitting at an empty phase must not be mistaken for a
-// run in flight and block every future tick forever.
-func activeBackup(backups []cbv1.Backup) *cbv1.Backup {
+// resolveOverlap is the namespace plane's two-way overlap decision for a due tick. It reports
+// whether the tick is BLOCKED (a previous backup is genuinely progressing, so skip exactly as
+// before) and, when it is not, may first have terminated the abandoned backups that were holding the
+// gate shut.
+//
+// The three outcomes:
+//
+//   - no active backup: not blocked, nothing to do. The overwhelmingly common path.
+//   - at least one active backup that is still in flight: BLOCKED. The skip Event now carries the
+//     EVIDENCE of progress ("PVC data-1 is Uploading"), which is the question an operator staring at
+//     a skipped tick actually has, and which used to be unanswerable without reading the run.
+//   - every active backup is abandoned: each is terminated (schedule_abandonment.go) and the tick
+//     proceeds. One in-flight backup among several vetoes the whole decision — the gate is about
+//     whether ANY previous work is live, and killing the dead ones while a live one still holds the
+//     gate would buy nothing and destroy a record.
+//
+// The decision is applied for EVERY concurrency policy value, not only Forbid. Forbid and Skip are
+// still handled identically in this build (see concurrencyPolicyForbid), so branching on the policy
+// here would only mean that setting the other value silently restores a defect that took a cluster
+// off backups for thirty-one hours.
+func (r *BackupScheduleReconciler) resolveOverlap(
+	ctx context.Context, sched *cbv1.BackupSchedule, backups []cbv1.Backup, tick, now time.Time,
+) (bool, error) {
+	active := activeBackups(backups)
+	if len(active) == 0 {
+		return false, nil
+	}
+
+	type verdict struct {
+		backup   *cbv1.Backup
+		evidence string
+	}
+	abandoned := make([]verdict, 0, len(active))
+	for _, b := range active {
+		evidence, isAbandoned := backupAbandonment(b, now, pendingResolveDeadline, scheduleAbandonmentGrace)
+		if !isAbandoned {
+			r.Recorder.Eventf(sched, nil, corev1.EventTypeWarning, eventReasonConcurrencySkip, "SkipRun",
+				"skipping run for tick %s: previous backup %q is still making progress — %s "+
+					"(concurrencyPolicy %s)",
+				tick.UTC().Format(time.RFC3339), b.Name, evidence, backupConcurrencyPolicyOf(sched))
+			return true, nil
+		}
+		abandoned = append(abandoned, verdict{backup: b, evidence: evidence})
+	}
+
+	for _, v := range abandoned {
+		b, evidence := v.backup, v.evidence
+		if err := terminateAbandonedBackup(ctx, r.Client, r.Recorder, b, evidence); err != nil {
+			return false, err
+		}
+		// Recorded on the SCHEDULE too, and this is the copy an administrator finds first: `kubectl
+		// describe backupschedule` is where they go to ask why last night has no backup, and the
+		// answer — that a wedged run was shot so this one could start — belongs there rather than only
+		// on an object that is now terminal history.
+		r.Recorder.Eventf(sched, nil, corev1.EventTypeWarning, eventReasonAbandonedRunTerminated, "TerminateAbandonedRun",
+			"tick %s: previous backup %q was TERMINATED as abandoned so this run could start — %s",
+			tick.UTC().Format(time.RFC3339), b.Name, evidence)
+	}
+	return false, nil
+}
+
+// activeBackups returns every non-terminal Backup in the snapshot. Discovery PROJECTIONS are
+// skipped: they are materialized views of snapshots that already exist, never executions, so one
+// sitting at an empty phase must not be mistaken for a run in flight and block every future tick
+// forever.
+//
+// The pointers alias backups, so a caller that mutates one (the abandoned-run kill does) is mutating
+// the snapshot the rest of the reconcile reads — which is what we want: applyBackupSummary then sees
+// the terminal phase it was just given.
+func activeBackups(backups []cbv1.Backup) []*cbv1.Backup {
+	var active []*cbv1.Backup
 	for i := range backups {
 		b := &backups[i]
 		if b.Annotations[apiconst.AnnotationProjected] == apiconst.AnnotationProjectedValue {
 			continue
 		}
 		if !isTerminalBackupPhase(b.Status.Phase) {
-			return b
+			active = append(active, b)
 		}
 	}
-	return nil
+	return active
 }
 
 // backupConcurrencyPolicyOf returns the schedule's concurrency policy, defaulting to Forbid (see

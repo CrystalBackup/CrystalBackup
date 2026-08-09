@@ -547,6 +547,7 @@ func main() {
 		mgr.GetClient(),
 		mgr.GetScheme(),
 		clock.RealClock{},
+		operatorNamespace,
 		mgr.GetEventRecorder("clusterbackupschedule"),
 	).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Unable to create controller", "controller", "ClusterBackupSchedule")
@@ -712,8 +713,16 @@ func main() {
 	// The orphan reaper is a periodic Runnable (not a reconciler): it sweeps the operator namespace
 	// for leftover native per-PVC exposure objects (temp clone PVCs, mover Jobs, creds Secrets) a
 	// crashed teardown left behind, backstopping the leak-check invariant.
+	//
+	// APIReader and Recorder are what make its reporting honest. The reaper confirms every deletion
+	// by reading the object back, and that read goes to the apiserver rather than the informer cache
+	// (a cache lags the delete it is confirming); a deletion that is blocked on somebody else's
+	// finalizer gets a Warning Event on the stuck object itself, which is where an administrator —
+	// the only party who can break a finalizer deadlock — will actually see it.
 	if err := mgr.Add(&controller.OrphanReaper{
 		Client:            mgr.GetClient(),
+		APIReader:         mgr.GetAPIReader(),
+		Recorder:          mgr.GetEventRecorder("orphan-reaper"),
 		OperatorNamespace: operatorNamespace,
 	}); err != nil {
 		setupLog.Error(err, "Unable to add the orphan reaper")

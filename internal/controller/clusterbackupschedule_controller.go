@@ -80,6 +80,11 @@ type ClusterBackupScheduleReconciler struct {
 	// Clock is the only source of "now": clock.RealClock in production, a fake clock in tests.
 	Clock    clock.PassiveClock
 	Recorder events.EventRecorder
+	// OperatorNamespace is where a run's cluster-manifests capture Job, its creds Secret and the
+	// mover Jobs live. This controller reads exactly one thing there — whether an abandonment
+	// candidate's capture Job is still in flight — and deletes exactly that Job's residue when it
+	// terminates the run (schedule_abandonment.go). It creates nothing in that namespace.
+	OperatorNamespace string
 }
 
 // NewClusterBackupScheduleReconciler builds the reconciler. Callers go through this constructor to
@@ -88,15 +93,34 @@ func NewClusterBackupScheduleReconciler(
 	c client.Client,
 	scheme *runtime.Scheme,
 	cl clock.PassiveClock,
+	operatorNamespace string,
 	recorder events.EventRecorder,
 ) *ClusterBackupScheduleReconciler {
-	return &ClusterBackupScheduleReconciler{Client: c, Scheme: scheme, Clock: cl, Recorder: recorder}
+	return &ClusterBackupScheduleReconciler{
+		Client:            c,
+		Scheme:            scheme,
+		Clock:             cl,
+		OperatorNamespace: operatorNamespace,
+		Recorder:          recorder,
+	}
 }
 
 // +kubebuilder:rbac:groups=crystalbackup.io,resources=clusterbackupschedules,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=crystalbackup.io,resources=clusterbackupschedules/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=crystalbackup.io,resources=clusterbackups,verbs=get;list;watch;create;delete
+// +kubebuilder:rbac:groups=crystalbackup.io,resources=clusterbackups/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=crystalbackup.io,resources=clusterbackuplocations,verbs=get;list;watch
+// The child-Backup reads and the backups/status write are the abandoned-run kill and nothing else
+// (schedule_abandonment.go): a run's children are what tell this controller whether any namespace is
+// still making progress, and terminating them is what lets each child's own controller tear its
+// exposures down. This controller never creates or deletes a Backup.
+// +kubebuilder:rbac:groups=crystalbackup.io,resources=backups,verbs=get;list;watch
+// +kubebuilder:rbac:groups=crystalbackup.io,resources=backups/status,verbs=get;update;patch
+// The run's own cluster-manifests capture residue, reclaimed with the same derive-only calls
+// teardownClusterManifests uses so a killed run leaves no live cluster-wide read grant behind.
+// +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;delete
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=delete
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterrolebindings,verbs=get;list;watch;delete
 
 // Reconcile stamps out the due run (if any), garbage-collects old run records, and refreshes the
 // schedule's status.
@@ -144,14 +168,15 @@ func (r *ClusterBackupScheduleReconciler) Reconcile(ctx context.Context, req ctr
 		deadline = &d
 	}
 
-	// Fire the single due tick, if any, unless a previous run is still active.
+	// Fire the single due tick, if any, unless a previous run is still active — where "active" now
+	// means "still making progress" rather than merely "not terminal" (schedule_abandonment.go).
 	stampedName := ""
 	if tick, due := cronSched.DueTick(r.baselineTick(&sched, runs), effectiveNow, deadline); due {
-		if active := activeRun(runs); active != nil {
-			r.Recorder.Eventf(&sched, nil, corev1.EventTypeWarning, "ConcurrencySkip", "SkipRun",
-				"skipping run for tick %s: previous run %q still active (concurrencyPolicy %s)",
-				tick.UTC().Format(time.RFC3339), active.Name, concurrencyPolicyOf(&sched))
-		} else {
+		blocked, err := r.resolveOverlap(ctx, &sched, runs, tick, now)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if !blocked {
 			name, err := r.stampRun(ctx, &sched, tick)
 			if err != nil {
 				return ctrl.Result{}, err
@@ -372,14 +397,65 @@ func parseRunTick(scheduleName, runName string) (time.Time, bool) {
 	return t, true
 }
 
-// activeRun returns the first non-terminal run in the snapshot, or nil if every run is terminal.
-func activeRun(runs []cbv1.ClusterBackup) *cbv1.ClusterBackup {
+// resolveOverlap is the cluster plane's two-way overlap decision for a due tick — the mirror of the
+// namespace plane's (BackupScheduleReconciler.resolveOverlap), differing only in what a "part" of a
+// run is: a ClusterBackup's parts are its per-namespace child Backups plus its own cluster-manifests
+// capture, so the predicate has to look one level down.
+//
+// Blocked means skip, exactly as before, and the Event now names the evidence of progress. Not
+// blocked means either there was no active run, or every active run has been terminated as abandoned
+// and the tick may proceed.
+func (r *ClusterBackupScheduleReconciler) resolveOverlap(
+	ctx context.Context, sched *cbv1.ClusterBackupSchedule, runs []cbv1.ClusterBackup, tick, now time.Time,
+) (bool, error) {
+	active := activeRuns(runs)
+	if len(active) == 0 {
+		return false, nil
+	}
+
+	type verdict struct {
+		run      *cbv1.ClusterBackup
+		evidence string
+	}
+	abandoned := make([]verdict, 0, len(active))
+	for _, run := range active {
+		evidence, isAbandoned, err := r.clusterRunAbandonment(ctx, run, now)
+		if err != nil {
+			return false, err
+		}
+		if !isAbandoned {
+			r.Recorder.Eventf(sched, nil, corev1.EventTypeWarning, eventReasonConcurrencySkip, "SkipRun",
+				"skipping run for tick %s: previous run %q is still making progress — %s "+
+					"(concurrencyPolicy %s)",
+				tick.UTC().Format(time.RFC3339), run.Name, evidence, concurrencyPolicyOf(sched))
+			return true, nil
+		}
+		abandoned = append(abandoned, verdict{run: run, evidence: evidence})
+	}
+
+	for _, v := range abandoned {
+		if err := r.terminateAbandonedRun(ctx, v.run, v.evidence); err != nil {
+			return false, err
+		}
+		// The copy an administrator finds first: `kubectl describe clusterbackupschedule` is where the
+		// question "why did last night produce nothing" gets asked.
+		r.Recorder.Eventf(sched, nil, corev1.EventTypeWarning, eventReasonAbandonedRunTerminated, "TerminateAbandonedRun",
+			"tick %s: previous run %q was TERMINATED as abandoned so this run could start — %s",
+			tick.UTC().Format(time.RFC3339), v.run.Name, v.evidence)
+	}
+	return false, nil
+}
+
+// activeRuns returns every non-terminal run in the snapshot. The pointers alias runs, so the
+// abandoned-run kill's mutations are visible to applyRunSummary and gcHistory later in the same pass.
+func activeRuns(runs []cbv1.ClusterBackup) []*cbv1.ClusterBackup {
+	var active []*cbv1.ClusterBackup
 	for i := range runs {
 		if !isTerminalClusterBackupPhase(runs[i].Status.Phase) {
-			return &runs[i]
+			active = append(active, &runs[i])
 		}
 	}
-	return nil
+	return active
 }
 
 // concurrencyPolicyOf returns the effective policy (defaulting to Forbid, the CRD default).
