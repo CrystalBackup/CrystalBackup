@@ -525,7 +525,7 @@ guard's refusal to overwrite the bucket object kept it recoverable.
 
 The fix is an invariant instead of a case list, and the lasting part is the test that guards the
 invariant rather than the cases: it reaches each branch, reads whichever reason it lands on, and
-fails on any reason outside a four-entry allow-list whose entries each argue why minting cannot fork
+fails on any reason outside a five-entry allow-list whose entries each argue why minting cannot fork
 the repository. **The escrow had no tests at all before this** — the code with the worst failure
 mode in the product, and the least visible when wrong.
 

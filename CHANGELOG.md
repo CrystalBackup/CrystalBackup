@@ -119,7 +119,7 @@ run, and this can lose the ability to read a repository.
 There are now fourteen cases pinning both halves of every outcome — the reason an administrator
 reads **and** whether the repository may be provisioned — because the incident was a correct reason
 beside a wrong decision. And above them, the guard that will outlive them: it enumerates inputs,
-reads whichever reason each one reaches, and fails on any reason outside a four-entry allow-list
+reads whichever reason each one reaches, and fails on any reason outside a five-entry allow-list
 where each entry argues why minting cannot fork the repository. A `return false` copy-pasted into a
 branch added in two years fails there without anybody having written a case for it.
 

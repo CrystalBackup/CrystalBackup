@@ -4,7 +4,7 @@ description: Mettre à niveau le chart, le problème des CRD que Helm ne résout
 sidebar:
   order: 10
 sourceFile: src/content/docs/guides/upgrading.md
-sourceHash: e26516a24ec11d23d9f3f6cccf5cd0c8a49cc4fe
+sourceHash: 2ce168bf10f8dc437db402d573884fc6a74a097c
 ---
 
 ## Ce que signifie un numéro de version ici
@@ -34,19 +34,57 @@ Appliquez les CRD vous-même, avant le chart :
 
 ```bash
 # Pull the chart and take its CRDs. Use the version you are upgrading *to*;
-# 0.6.3 is the current release.
-helm pull oci://ghcr.io/crystalbackup/charts/crystal-backup --version 0.6.3 --untar
+# 0.6.4 is the current release.
+helm pull oci://ghcr.io/crystalbackup/charts/crystal-backup --version 0.6.4 --untar
 kubectl apply -f crystal-backup/crds/
 
 # Then upgrade the operator.
 helm upgrade crystal-backup \
   oci://ghcr.io/crystalbackup/charts/crystal-backup \
-  --version 0.6.3 \
+  --version 0.6.4 \
   --namespace crystal-backup-system
 ```
 
 Un `kubectl apply` sur des CRD est additif et sûr : il ajoute les nouveaux champs et ne
 supprime jamais d'objets stockés.
+
+## 0.6.3 → 0.6.4 : une location qui rapportait Ready peut désormais rapporter Degraded
+
+Rien à faire avant la mise à niveau, et aucune donnée ne bouge — mais le nouvel operator peut
+rapporter une location comme non-Ready là où l'ancien la rapportait saine. Lisez ceci avant d'en
+conclure que la mise à niveau a cassé quelque chose.
+
+La `0.6.4` fait en sorte que la passe d'escrow de la DEK wrappée **bloque le provisioning du
+repository dans tout état qu'elle ne peut pas positivement prouver sûr**. Deux états sont sûrs :
+une DEK in-cluster existe déjà, donc rien ne peut être frappé ; ou il n'y a prouvablement aucune
+DEK nulle part, donc frapper une DEK est ce qui doit arriver. Tout le reste bloque désormais et
+pose `Ready=False` avec la raison `DEKEscrowUnresolved`, la phase `Degraded`, et la condition
+`DEKEscrowed` qui porte le cas exact :
+
+```bash
+kubectl get clusterbackuplocations
+kubectl get clusterbackuplocation <name> \
+  -o jsonpath='{range .status.conditions[?(@.type=="DEKEscrowed")]}{.reason}: {.message}{"\n"}{end}'
+```
+
+Si l'une passe en `Degraded` à la première réconciliation après la mise à niveau, **l'état
+qu'elle nomme était déjà vrai en `0.6.3`** — il ne bloquait simplement rien, ce qui est
+précisément le défaut que cette release corrige. Trois cas méritent d'être connus :
+
+- **`EscrowConflict`** — l'objet du bucket et la DEK in-cluster sont tous deux lisibles et sont
+  des clés différentes. Ce sont deux générations de repository, et la copie du bucket peut être
+  la seule clé de la plus ancienne. En `0.6.3`, une telle location rapportait `Ready` tout en
+  donnant une mauvaise clé à chaque mover. Ne supprimez rien : l'objet du bucket est une preuve.
+- **`EscrowUnreachable`** — le bucket n'a pas pu être lu et il n'y a pas de DEK locale, donc une
+  clé récupérable peut s'y trouver. En général des credentials ou un endpoint, et cela se résorbe
+  tout seul dès que le bucket redevient joignable. À distinguer de **`EscrowUnverifiable`**, qui
+  est la même panne d'E/S *avec* une DEK locale présente et qui, elle, ne bloque **pas**, puisque
+  il n'y a rien à frapper.
+- **`CredentialsUnavailable`** / **`KEKUnavailable`** — le Secret manque. Restaurez-le ; la
+  location se rétablit sans intervention.
+
+`EscrowWriteFailed` ne bloque toujours pas : la DEK in-cluster est connue bonne et seule la copie
+du bucket est en retard, ce qui dégrade la DR à froid plutôt que vos backups.
 
 ## 0.6.2 → 0.6.3 sous Argo CD : un objet cesse d'être rendu
 

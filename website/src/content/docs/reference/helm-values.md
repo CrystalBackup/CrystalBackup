@@ -7,7 +7,7 @@ Defaults are from the chart's own `values.yaml`. Only the values you are likely 
 are annotated; the rest are listed for completeness.
 
 ```bash
-helm show values oci://ghcr.io/crystalbackup/charts/crystal-backup --version 0.6.3
+helm show values oci://ghcr.io/crystalbackup/charts/crystal-backup --version 0.6.4
 ```
 
 ## Namespace and naming

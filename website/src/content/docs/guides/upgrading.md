@@ -31,19 +31,55 @@ Apply the CRDs yourself, before the chart:
 
 ```bash
 # Pull the chart and take its CRDs. Use the version you are upgrading *to*;
-# 0.6.3 is the current release.
-helm pull oci://ghcr.io/crystalbackup/charts/crystal-backup --version 0.6.3 --untar
+# 0.6.4 is the current release.
+helm pull oci://ghcr.io/crystalbackup/charts/crystal-backup --version 0.6.4 --untar
 kubectl apply -f crystal-backup/crds/
 
 # Then upgrade the operator.
 helm upgrade crystal-backup \
   oci://ghcr.io/crystalbackup/charts/crystal-backup \
-  --version 0.6.3 \
+  --version 0.6.4 \
   --namespace crystal-backup-system
 ```
 
 `kubectl apply` on CRDs is additive and safe: it adds new fields and never drops stored
 objects.
+
+## 0.6.3 → 0.6.4: a location that reported Ready can now report Degraded
+
+Nothing to do before the upgrade, and no data moves — but the new operator can report a
+location as not-Ready where the old one reported it healthy, so read this before you conclude
+the upgrade broke something.
+
+`0.6.4` makes the wrapped-DEK escrow pass **block repository provisioning in every state it
+cannot positively prove safe**. Two states are safe: an in-cluster DEK already exists, so
+nothing can be minted; or there is provably no DEK anywhere, so minting is what should happen.
+Everything else now blocks and sets `Ready=False` with reason `DEKEscrowUnresolved`, phase
+`Degraded`, and condition `DEKEscrowed` carrying which case it is:
+
+```bash
+kubectl get clusterbackuplocations
+kubectl get clusterbackuplocation <name> \
+  -o jsonpath='{range .status.conditions[?(@.type=="DEKEscrowed")]}{.reason}: {.message}{"\n"}{end}'
+```
+
+If one goes `Degraded` on the first reconcile after the upgrade, **the state it names was
+already true on `0.6.3`** — it was simply not blocking anything, which is the defect this
+release fixes. Three of them are worth knowing:
+
+- **`EscrowConflict`** — the bucket object and the in-cluster DEK are both readable and are
+  different keys. That is two repository generations, and the bucket copy may be the only key to
+  the older one. On `0.6.3` such a location reported `Ready` while handing a wrong key to every
+  mover. Do not delete anything; the bucket object is evidence.
+- **`EscrowUnreachable`** — the bucket could not be read and there is no local DEK, so a
+  recoverable key may be sitting in there. Usually credentials or endpoint, and it clears on its
+  own once the bucket is reachable. Distinct from **`EscrowUnverifiable`**, which is the same I/O
+  failure *with* a local DEK present and does **not** block, because there is nothing to mint.
+- **`CredentialsUnavailable`** / **`KEKUnavailable`** — the Secret is missing. Restore it; the
+  location recovers without intervention.
+
+`EscrowWriteFailed` still does not block: the in-cluster DEK is known-good and only the bucket
+copy is behind, which degrades bare-cluster DR rather than your backups.
 
 ## 0.6.2 → 0.6.3 under Argo CD: an object stops being rendered
 
