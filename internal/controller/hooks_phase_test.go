@@ -50,6 +50,14 @@ type stubHookExecutor struct {
 	calls []hookCall
 	// failPod makes that pod's hook fail, so a spec can drive the onError policies.
 	failPod map[string]error
+	// failCommand makes the hook whose argv[0] matches fail, keyed by that first word.
+	//
+	// It exists because failPod cannot express the case the pre/post asymmetry is made of: a run
+	// whose QUIESCE succeeded and whose RELEASE failed, in the same pod — which is every real
+	// unfreeze problem there is. Keyed on the command rather than the phase because that is what
+	// the executor can see, and because it reads like the workload it stands in for ("thaw" is
+	// broken, "freeze" is not).
+	failCommand map[string]error
 }
 
 func (s *stubHookExecutor) Exec(_ context.Context, pod types.NamespacedName, container string, command []string,
@@ -63,6 +71,11 @@ func (s *stubHookExecutor) Exec(_ context.Context, pod types.NamespacedName, con
 	if err, ok := s.failPod[pod.Name]; ok {
 		return "", "stub failure", err
 	}
+	if len(command) > 0 {
+		if err, ok := s.failCommand[command[0]]; ok {
+			return "", "stub failure", err
+		}
+	}
 	return "", "", nil
 }
 
@@ -71,6 +84,7 @@ func (s *stubHookExecutor) reset() {
 	defer s.mu.Unlock()
 	s.calls = nil
 	s.failPod = nil
+	s.failCommand = nil
 }
 
 func (s *stubHookExecutor) recorded() []hookCall {

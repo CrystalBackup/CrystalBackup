@@ -92,6 +92,22 @@ type stubExposerRegistry struct {
 	// global switch because the manager reconciles every Backup in the suite concurrently — a
 	// spec that flipped a shared flag would fail its neighbours' volumes.
 	precheckFailures map[string]error
+	// exposeFailures makes Expose itself fail for specific volumes, keyed "<namespace>/<pvc>" and
+	// DURABLY — the same error on every call, because the failure modes this stands in for (a
+	// ResourceQuota that will not admit the temp clone PVC, a validating webhook refusing
+	// VolumeSnapshot objects, the snapshot CRDs absent) are properties of the cluster, not of the
+	// attempt. Per-key for the same reason precheckFailures is: one shared manager reconciles every
+	// Backup in this suite. See the Expose specs in backup_pending_test.go.
+	exposeFailures map[string]error
+	// readyFailures makes the READINESS CHECK ITSELF fail for specific volumes, keyed
+	// "<namespace>/<pvc>" and durably — the shape of the snapshot CRDs being removed under a running
+	// operator, the VolumeSnapshot RBAC being narrowed, or an apiserver refusing that resource: the
+	// exposure exists, and we cannot find out whether it is usable. It is a DIFFERENT seam from
+	// `stalled`, which answers "not ready" cleanly; the whole point of the specs in
+	// backup_snapshotting_stall_test.go is that the controller must bound both, and it used to bound
+	// only the clean answer. Per-key, like every other verdict here, because one shared manager
+	// reconciles every Backup in this suite.
+	readyFailures map[string]error
 	// stalled holds volumes (keyed "<namespace>/<pvc>") whose exposure reports NOT ready, started
 	// at the recorded instant. The bool is whether the origin snapshot was ACKNOWLEDGED, and it
 	// selects which of the two Snapshotting deadlines the volume is a candidate for — false is a
@@ -114,6 +130,13 @@ func (s *stubExposerRegistry) For(_ context.Context, pvc *corev1.PersistentVolum
 	if pvc.Spec.StorageClassName != nil && *pvc.Spec.StorageClassName == stubUnsupportedStorageClass {
 		return nil, fmt.Errorf("stub: storage class %q has no snapshot support: %w",
 			stubUnsupportedStorageClass, exposer.ErrUnsupported)
+	}
+	// The THIRD resolution outcome, on the same magic-value convention as the one above: a class that
+	// is not there at all, which is neither "cannot snapshot" nor a refused pre-check. It is the shape
+	// of the head-of-line incident — see stubUnresolvableStorageClass and the specs in
+	// backup_pending_test.go, where both the magic name and the error it answers are defined.
+	if pvc.Spec.StorageClassName != nil && *pvc.Spec.StorageClassName == stubUnresolvableStorageClass {
+		return nil, stubUnresolvableExposerError()
 	}
 	// The exposer carries the PVC's identity so Precheck/Ready/Progress can be armed per volume;
 	// the real Registry.For likewise resolves per PVC.
@@ -147,6 +170,41 @@ func (s *stubExposerRegistry) failPrecheck(key string, err error) {
 	s.precheckFailures[key] = err
 }
 
+// failExpose arms a durable Expose failure for one volume.
+func (s *stubExposerRegistry) failExpose(key string, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.exposeFailures == nil {
+		s.exposeFailures = map[string]error{}
+	}
+	s.exposeFailures[key] = err
+}
+
+// exposeVerdict reports the armed Expose failure for a volume, if any.
+func (s *stubExposerRegistry) exposeVerdict(key string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.exposeFailures[key]
+}
+
+// failReady arms a durable readiness-check failure for one volume: Ready returns this error on every
+// call, rather than answering true or false.
+func (s *stubExposerRegistry) failReady(key string, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.readyFailures == nil {
+		s.readyFailures = map[string]error{}
+	}
+	s.readyFailures[key] = err
+}
+
+// readyVerdict reports the armed readiness-check failure for a volume, if any.
+func (s *stubExposerRegistry) readyVerdict(key string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.readyFailures[key]
+}
+
 // stallSnapshot makes one volume's exposure look abandoned: never ready, never acknowledged,
 // started at startedAt. A spec sets startedAt in the past to cross the controller's deadline
 // without waiting for it.
@@ -160,6 +218,18 @@ func (s *stubExposerRegistry) stallSnapshot(key string, startedAt time.Time) {
 // documents and declines to judge, and the one snapshotReadyDeadline exists for.
 func (s *stubExposerRegistry) stallSnapshotAcknowledged(key string, startedAt time.Time) {
 	s.armStall(key, stubStall{startedAt: startedAt, acknowledged: true})
+}
+
+// unstallSnapshot clears an armed stall, so the volume's exposure answers Ready again and the volume
+// proceeds. It is the seam a spec needs when the ORDER of two events is the thing under test: the
+// controller drives a healthy volume from Pending to Uploading inside a second (envtest's stub reports
+// Ready immediately, and each status write triggers a watch event), so a spec that wants to arm a
+// fault BETWEEN two phases cannot do it by racing the reconciler. It stalls the volume first, arms,
+// and only then lets go.
+func (s *stubExposerRegistry) unstallSnapshot(key string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.stalled, key)
 }
 
 func (s *stubExposerRegistry) armStall(key string, stall stubStall) {
@@ -268,6 +338,12 @@ func (e *stubExposer) Progress(_ context.Context, _ *exposer.Exposure) (exposer.
 func (e *stubExposer) Expose(ctx context.Context, req exposer.ExposeRequest) (*exposer.Exposure, error) {
 	if e.registry != nil {
 		e.registry.recordExpose(req.Namespace + "/" + req.PVCName)
+		// Armed failures are checked AFTER recording the call and BEFORE creating anything: the spec
+		// needs to prove Expose was really attempted (and attempted again on later passes), and a
+		// failure that left a clone PVC behind would be a leak the real one does not produce.
+		if err := e.registry.exposeVerdict(e.key); err != nil {
+			return nil, err
+		}
 	}
 	tempName := req.NamePrefix + "-clone"
 	capacity := req.Capacity
@@ -299,9 +375,17 @@ func (e *stubExposer) Expose(ctx context.Context, req exposer.ExposeRequest) (*e
 }
 
 // Ready is instantly true — except for a volume a spec has explicitly stalled, which stays
-// not-ready forever so the controller's progress deadline is the only thing that can move it.
+// not-ready forever so the controller's progress deadline is the only thing that can move it, and
+// except for a volume whose readiness check a spec has armed to FAIL, which never answers at all.
+//
+// The failure is checked first, and on purpose: a spec pinning the deadline-on-an-unanswerable-check
+// path arms BOTH (the failure, so the check errors; a stall, so Progress has an origin snapshot to
+// report a start time for), and the check erroring is what that spec is about.
 func (e *stubExposer) Ready(_ context.Context, _ *exposer.Exposure) (bool, error) {
 	if e.registry != nil {
+		if err := e.registry.readyVerdict(e.key); err != nil {
+			return false, err
+		}
 		if _, stalled := e.registry.stallStart(e.key); stalled {
 			return false, nil
 		}

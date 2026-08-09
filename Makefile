@@ -76,7 +76,18 @@ vet: ## Run go vet against code.
 # merely grew past it reports as a hang with no failing spec named, which is the least
 # actionable signal CI can give. Each spec's Eventually budget is 90s, so a handful of genuine
 # failures alone can spend most of this.
-TEST_TIMEOUT ?= 20m
+#
+# RAISED TO 30m IN 0.6.5, and the comment above predicted why. The controller suite entered this
+# release at 1087s (18m07s) against a 20m cap — 113 seconds of headroom for the whole release —
+# and lot 10's nine new envtest specs spent it: the first full run after them PANICKED at 20m0s
+# having completed 152 of 166 specs with no spec having failed. That is precisely the
+# least-actionable signal this variable exists to prevent, and it would have read as a flake.
+#
+# Sizing: the suite is ~20m of content, and one genuine failure costs up to its 90s Eventually
+# budget, so 30m leaves room for roughly six real failures to be NAMED rather than swallowed by a
+# panic. If it is ever wrong it should be wrong long, for the same reason every bound in this
+# project is: a slow gate costs minutes, a panicking gate costs an afternoon of misdiagnosis.
+TEST_TIMEOUT ?= 30m
 
 # E2E_TIMEOUT is the same guard for the e2e suite, which runs against a real Kind cluster and
 # so is far slower and far more variable than envtest. It had been sitting right at go test's

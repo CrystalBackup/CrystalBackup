@@ -21,7 +21,6 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
-	"path"
 	"slices"
 	"strings"
 	"time"
@@ -93,6 +92,64 @@ const (
 // (test/crucible/tests/m1_cascade_test.go, "A volume ... is Skipped, not Failed"), so the exact
 // string is a cross-repo contract.
 const backupReasonSkippedUnsupported = "CSISnapshotUnsupported"
+
+// backupReasonExposerUnresolvable is the reason for a volume whose exposer cannot be resolved for any
+// cause that is neither "this storage cannot snapshot" (ErrUnsupported -> Skipped) nor a refused
+// pre-check (ErrPrecheckFailed -> Failed): a StorageClass deleted out from under an unbound PVC that
+// still names it, a PersistentVolume that cannot be read, an API server having a bad minute.
+//
+// It exists because the alternative was a permanent block, and "permanent" is measured: on a real
+// cluster one PVC naming a StorageClass that had been deleted held its Backup at Pending for
+// THIRTY HOURS. Reconcile advances the FIRST non-terminal volume, so a volume that can never
+// become terminal is a head-of-line block; the Backup never went terminal, so its ClusterBackup
+// never did, so concurrencyPolicy: Forbid skipped every following nightly. One mis-referenced
+// class in one namespace stopped the entire cluster's backups, and the three volumes queued behind
+// it were never even looked at — which is exactly why they carried no reason and why neither
+// per-phase deadline could fire on them: a deadline needs a phase, and they had never left Pending.
+//
+// This reason does NOT decide the volume's fate, and that restraint is deliberate — it is the second
+// version of this fix. The first classified the error: a NotFound became an immediate Failed on the
+// grounds that a missing reference is a configuration fact no retry can change. That is wrong in both
+// directions. A StorageClass absent this second can be created the next, and a bound PVC whose
+// PersistentVolume reads NotFound may be looking at a cache that has not caught up — the operator has
+// been bitten by exactly that before — while conversely an error that looks transient can be
+// permanent. Guessing costs a backup somebody needed whenever the guess goes the harsh way.
+//
+// So a volume carrying this reason stays PENDING and is retried. What changes is that it no longer
+// blocks: firstNonTerminalVolume treats it as parked and prefers any volume that has not been tried
+// (see volumeIsParked), and pendingResolveDeadline eventually turns it into a Failed so the run can
+// reach a terminal phase. Nothing here judges whether the cause is permanent; the clock does, and it
+// is the only honest arbiter available.
+const backupReasonExposerUnresolvable = "ExposerUnresolvable"
+
+// backupReasonAdvanceRetrying is the VolumeStatus.reason a volume PAST Pending carries when the pass
+// could not advance it: the step for its current phase returned an error — reconstructing the
+// exposure, reading its readiness, the mover-admission gate, the per-Job creds Secret, creating the
+// mover Job, reading it back. It is the Snapshotting/Uploading sibling of
+// backupReasonExposerUnresolvable, and it shares that constant's restraint: it decides nothing about
+// the volume, it only records what stopped this pass.
+//
+// It exists because the head-of-line block the release is named for SURVIVED the fix that was
+// supposed to close it, one and two phases later, and mutation-testing that fix is what found it. The
+// Pending phase was converted to record-and-continue; Snapshotting and Uploading still returned bare
+// errors, and Reconcile returns a volume error at step (10) BEFORE writeStatus at step (11). So a
+// durable failure in any of those steps — the snapshot CRDs removed under a running operator, RBAC
+// narrowed, a webhook refusing Jobs — reproduced the incident in full through a different door: the
+// same volume re-driven every pass, every volume behind it in the namespace never attempted, and
+// NOTHING the pass computed persisted (the assertion that failed when the already-fixed Expose path
+// was mutated back was that `status.volumes` was nil — not that a timestamp was missing, but that
+// the enumeration itself never reached etcd).
+//
+// It is a DIFFERENT token from the parking one, and that is deliberate rather than tidy.
+// volumeIsParked requires the Pending phase and matches "ExposerUnresolvable:" exactly, because
+// parking means "defer this volume behind every volume that has not been tried". A volume in
+// Snapshotting or Uploading has an exposure, possibly a snapshot the storage system is already
+// holding, possibly a mover reading it — work in flight that must keep its turn. What such a volume
+// needs is not a place in the queue, it is a BOUND, and it already has one on a clock that survives a
+// crash because it hangs off the origin VolumeSnapshot rather than off status
+// (snapshotProgressDeadline / snapshotReadyDeadline / moverStartDeadline). This lot's job was to make
+// those bounds REACHABLE on the paths that error, not to give the volume a new field.
+const backupReasonAdvanceRetrying = "AdvanceRetrying"
 
 // backupReasonPrecheckFailed is the VolumeStatus.reason a volume carries when the exposure
 // pre-check refused it — today: the VolumeSnapshotClass names a snapshotter Secret that does not
@@ -237,6 +294,110 @@ const backupReasonMoverStartDeadline = "MoverStartDeadlineExceeded"
 // recoverable, a premature one is a backup somebody needed.
 const moverStartDeadline = 30 * time.Minute
 
+// backupReasonPendingDeadline is the VolumeStatus.reason a volume carries when it never left Pending
+// within pendingResolveDeadline and nothing more specific was ever recorded about why. It is the
+// fallback, not the usual outcome: a resolution that fails writes its own cause (see
+// backupReasonExposerUnresolvable), and that cause is kept in preference to this string because it
+// names the problem instead of naming the clock.
+const backupReasonPendingDeadline = "PendingDeadlineExceeded"
+
+// pendingResolveDeadline bounds how long a volume may sit in Pending — the phase BEFORE anything has
+// been created for it, where the only work is resolving which exposer serves its PVC.
+//
+// This is the fourth deadline, and it closes the hole the other three left. They each hang off an
+// object with its own creation time — the origin VolumeSnapshot, the mover Job — so a volume that
+// never got as far as creating anything was bounded by nothing at all. On a real cluster that hole
+// cost thirty hours: one PVC named a StorageClass that did not exist, resolution returned an error
+// every pass, the volume never left Pending, and because volumes advance one at a time it held five
+// others behind it. The Backup stayed non-terminal, so the schedule's Forbid policy skipped every
+// night that followed, and thirty-one hours of a nightly schedule produced nothing — over a defect
+// affecting ONE volume of thirty-three namespaces.
+//
+// ONE HOUR, and the reasoning is the mirror image of moverStartDeadline's. Nothing has been created,
+// so giving up costs nothing: no bytes uploaded, no snapshot consumed, no repository lock held.
+// Meanwhile the legitimate reasons resolution is slow are all short — an API server briefly
+// unreachable, a cache that has not caught up, a VolumeSnapshotClass being installed as the cluster
+// comes up. An hour covers every one of them several times over while still failing inside the first
+// night rather than on the second morning.
+//
+// It is deliberately LONGER than it strictly needs to be for a reason worth stating: a volume failed
+// here is a volume nobody backed up, and the fix for a premature failure is a phone call at 3am,
+// whereas the fix for a late one is a slightly longer report. When in doubt this number goes up.
+//
+// READ THIS AS A LOWER BOUND, NOT AN UPPER ONE. The clock only advances when the volume is actually
+// picked, and firstNonTerminalVolume defers a parked volume behind every volume that has not been
+// tried — so the real time to failure is this hour PLUS however long the others take to go terminal,
+// which for a volume of their own can be snapshotReadyDeadline's two hours each. That is the correct
+// ordering (a broken volume must never be served before a healthy one) and it means the guarantee
+// here is "eventually, and not before an hour of trying", not "within an hour of enumeration".
+// Anything that needs a true upper bound on a whole run belongs on the run, not on one volume.
+const pendingResolveDeadline = time.Hour
+
+// backupReasonAdvanceDeadline is the VolumeStatus.reason a volume PAST Pending carries when it spent
+// advanceRetryDeadline in one phase without a single pass managing to advance it AND without any of
+// the per-object bounds being able to judge it. It is the terminal sibling of
+// backupReasonAdvanceRetrying — that reason is what the volume wears while the retrying goes on, this
+// one is what ends it — and it carries the last observed cause after a colon, exactly as the other
+// deadline reasons carry the kubelet's or the storage system's own words.
+//
+// It is the LAST resort and its name says so. A volume that can be judged on its own merits is judged
+// on them: SnapshotProgressDeadlineExceeded means nothing ever picked its snapshot up,
+// SnapshotReadyDeadlineExceeded means something did and never finished, MoverStartDeadlineExceeded
+// means its pod never ran. Each of those sends an operator to a specific component. This one can only
+// say "no pass could get anywhere with this volume and we could not read the object that would have
+// told us why", which is a genuinely weaker diagnosis — hence the much longer bound, and hence the
+// cause being appended verbatim, because the cause is all the diagnosis there is.
+const backupReasonAdvanceDeadline = "AdvanceDeadlineExceeded"
+
+// advanceRetryDeadline is the OUTER bound on a volume past Pending: how long it may stay in one phase
+// while every pass fails to advance it.
+//
+// IT IS A BACKSTOP, NOT A DEADLINE, and reading it as the latter is how it would become dangerous.
+// The three per-phase bounds above hang off the object being waited on — the origin VolumeSnapshot's
+// creationTimestamp, the mover Job's — on purpose, because that object carries evidence a wall clock
+// cannot: whether anything ever ACKNOWLEDGED the snapshot request, whether a pod ever reached
+// Running. Those bounds are strictly better than this one and they must always win. This exists only
+// for the case they cannot reach at all:
+//
+//   - an exposure that cannot be RECONSTRUCTED, so there is no exposer and no derived origin
+//     snapshot name to read a clock through (the snapshot CRDs removed under a running operator, a
+//     ResourceQuota that will not re-admit the temp clone, RBAC narrowed);
+//   - a mover Job that cannot be read, or that is ABSENT — no Job, no creationTimestamp, and
+//     advanceUploading's own note recorded that this branch was bounded by nothing and that the only
+//     honest fix was a phase-entry timestamp on VolumeStatus;
+//   - an origin VolumeSnapshot whose progress is unreadable, so snapshotDeadlineExceeded correctly
+//     declines to draw any conclusion and the volume waits on a verdict that can never come.
+//
+// Each of those persists its cause since the previous lot, so nothing is invisible any more — but a
+// Snapshotting or Uploading volume is NOT deferred by firstNonTerminalVolume (correctly: it
+// legitimately holds work in flight), so it keeps the head of its namespace's queue with no clock
+// that can ever end it. That is the thirty-hour incident with the phase changed, and this is the only
+// clock left once the per-object ones are unreachable.
+//
+// FOUR HOURS, sized against the ladder it sits on top of — pendingResolveDeadline 1h,
+// moverStartDeadline 30m, snapshotReadyDeadline 2h — by one rule: a backstop must never pre-empt a
+// bound that can give a better answer. snapshotReadyDeadline is the longest of them at two hours and
+// its clock starts within seconds of the phase being entered (Expose creates the origin snapshot on
+// the pass that sets Snapshotting), so four hours gives the specific verdict a clear factor of two to
+// arrive in. Below that margin the two would race and the weaker diagnosis would sometimes win, which
+// is the one outcome that would make this constant a regression rather than a fix.
+//
+// It must also stay inside the window a nightly run is judged in, for the reason every bound here
+// gives: the failure has to be reported by THAT run, hours before the next one, instead of rolling
+// into the next night — which is what the incident did, thirty-one hours of it.
+//
+// WHAT IT MUST NEVER TOUCH, and the anti-regression that protects it: a mover pod that is RUNNING is
+// not bounded by anything, by design (see moverStartDeadline — a multi-terabyte volume legitimately
+// uploads for hours, and a wall-clock cap dressed up as a stall detector destroys the largest, most
+// valuable backups in the fleet first). Safety here comes from the PREDICATE, not the number: this
+// clock is consulted ONLY on a pass that could not advance the volume, never on the "still running;
+// requeue" and "not ready yet" answers that a healthy slow backup produces. Read the call sites
+// before changing the constant.
+//
+// Err long, always, like every other bound in this file. Four hours late is a slower report; four
+// hours early is a backup somebody needed.
+const advanceRetryDeadline = 4 * time.Hour
+
 // ExposerRegistry is the seam the Backup controller reaches internal/exposer.Registry through,
 // extracted as an interface so envtest — which has no external snapshot CRDs or CSI driver — can
 // inject a stub. Production wires in *exposer.Registry. Its two methods are the two halves of an
@@ -340,6 +501,26 @@ type BackupReconciler struct {
 	// only way to watch this decision happen is to wait out thirty real minutes, which means in
 	// practice that nobody ever watches it, which is how a timeout ships broken.
 	MoverStartDeadline time.Duration
+	// PendingResolveDeadline overrides pendingResolveDeadline, on exactly the terms above: zero in
+	// production, set only by tests, plumbed to no flag or chart value.
+	//
+	// This one is testable in envtest for a reason the mover deadline is not — its clock is
+	// status.volumes[].firstAttemptAt, a field this controller writes rather than one the apiserver
+	// owns, so a spec CAN backdate it. The override still exists because backdating a status field is
+	// a test reaching inside the mechanism it is checking: a spec that sets this instead observes the
+	// controller stamping its own clock and then honouring it, which is the behaviour that matters.
+	PendingResolveDeadline time.Duration
+	// AdvanceRetryDeadline overrides advanceRetryDeadline, on the same terms as the two above: zero in
+	// production, set only by tests, plumbed to no flag and no chart value.
+	//
+	// The reason it is not a knob is sharper here than for the others. This bound's safety comes
+	// entirely from WHERE it is consulted (only on a pass that could not advance the volume) and not
+	// from its value, so an administrator who lowered it because a run took too long would not get a
+	// faster diagnosis — they would get healthy volumes failed on whichever bad minute the cluster was
+	// having. Its clock is status.volumes[].phaseEnteredAt, which this controller writes, so a spec
+	// could backdate it instead; shortening the bound is still the better instrument, because it makes
+	// the controller stamp its own clock and then honour it.
+	AdvanceRetryDeadline time.Duration
 }
 
 // effectiveMoverStartDeadline is the bound moverStalled compares against: the injected one when a
@@ -349,6 +530,25 @@ func (r *BackupReconciler) effectiveMoverStartDeadline() time.Duration {
 		return r.MoverStartDeadline
 	}
 	return moverStartDeadline
+}
+
+// effectivePendingResolveDeadline is the bound advancePending compares firstAttemptAt against: the
+// injected one when a test set it, the constant otherwise.
+func (r *BackupReconciler) effectivePendingResolveDeadline() time.Duration {
+	if r.PendingResolveDeadline > 0 {
+		return r.PendingResolveDeadline
+	}
+	return pendingResolveDeadline
+}
+
+// effectiveAdvanceRetryDeadline is the outer bound failVolumeOnAdvanceBackstop compares
+// status.volumes[].phaseEnteredAt against: the injected one when a test set it, the constant
+// otherwise.
+func (r *BackupReconciler) effectiveAdvanceRetryDeadline() time.Duration {
+	if r.AdvanceRetryDeadline > 0 {
+		return r.AdvanceRetryDeadline
+	}
+	return advanceRetryDeadline
 }
 
 // NewBackupReconciler builds a BackupReconciler. Callers (main.go, the envtest suite) go through
@@ -551,33 +751,111 @@ func (r *BackupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 
 	// (10) Drive ONE non-terminal PVC forward this reconcile (sequential in M1; intra-Backup
 	// parallelism + the global maxConcurrentMovers semaphore are deferred to task #22).
+	//
+	// A FAILURE TO ADVANCE ONE VOLUME NEVER ABANDONS THE PASS. This is the structural half of the
+	// head-of-line fix, and it is written here — at the one call site of the whole per-PVC state
+	// machine — rather than at each step that can fail, because the per-call-site shape IS the defect:
+	// three separate lots have now found the same bug in this same function family (resolution, then
+	// Expose + the pre-check's transient branch + the unreadable-PVC read, then the whole of
+	// Snapshotting and Uploading), and each time the fix covered the doors that were known about and
+	// left the next one open. Anything advanceVolume grows in future inherits this by construction.
+	//
+	// What returning the error cost, precisely: this line is upstream of writeStatus at step (11), so
+	// an errored pass persists NOTHING it computed — not the volume's phase, not the recorded cause,
+	// not even the enumeration (mutating the already-fixed Expose path back to a bare return is
+	// caught by an assertion that `status.volumes` is NIL). The retry that controller-runtime then
+	// performs re-picks the SAME volume, because firstNonTerminalVolume reads the stored status and
+	// the stored status never changed — so the namespace's other volumes are not merely delayed, they
+	// are unreachable, and every per-phase deadline meant to end the hang is unreachable with them.
+	//
+	// Shape chosen: record the cause on the volume, continue the pass, return nil. Two alternatives
+	// were considered and rejected.
+	//
+	//   - Record, continue, then PROPAGATE the error after the status write so controller-runtime
+	//     still backs off. Rejected because the backoff is charged to the wrong object. It is the
+	//     BACKUP that is requeued, not the volume, so one volume erroring durably would stretch the
+	//     poll every OTHER volume of that namespace is driven by from backupPollInterval's 5s to the
+	//     rate limiter's ceiling — a head-of-line block in the time domain instead of the queue
+	//     domain, which is the same defect wearing a different hat.
+	//   - Convert every failing step inside advanceVolume the way advancePending was converted.
+	//     Rejected as the shape that has already failed three times, for the reason given above.
+	//
+	// Retrying is not lost: a non-terminal Backup requeues on backupPollInterval, exactly as a parked
+	// Pending volume does (see parkVolume, which made the same trade for the same reason).
+	//
+	// CONTINUING INTO STEPS (10b) AND (10c) IS SAFE, and the second one needed a real answer rather
+	// than a convention:
+	//
+	//   - (10b) advanceManifests is documented as deliberately independent of the volume half — the
+	//     two halves fail for unrelated reasons and coupling them loses one to the other's bad day —
+	//     so a volume that could not be advanced must not withhold a namespace's manifests either.
+	//   - (10c) closeFreezeWindow fires the post hooks, and a pass where a volume's snapshot could not
+	//     be cut is emphatically NOT a pass where a database should be thawed. It does not become one:
+	//     the release is already gated on snapshotsCut, which requires EVERY volume to have LEFT
+	//     Pending/Snapshotting, and "could not advance" means precisely that no phase transition
+	//     happened — the volume is still in one of those two phases, so the window stays open by the
+	//     guard that is already there. The invariant is "no volume is still in the snapshot phase",
+	//     never "this pass had no error", and the difference is not academic: a volume that goes
+	//     Skipped or Failed on the same pass DOES close the window today, correctly, because R16's
+	//     release is unconditional (01-architecture.md §5 — a failed snapshot leaves the application
+	//     just as quiesced, so gating the thaw on success strands exactly the workload whose backup
+	//     went wrong). Adding a "not on an errored pass" gate would invert that guarantee: for a
+	//     DURABLE error the window would then never close at all, and the workload would stay frozen
+	//     for as long as the cluster stayed broken. Which is also why the deadline reachability below
+	//     is load-bearing twice over — it is the only thing that ever ends such a volume's
+	//     Snapshotting, and therefore the only thing that ever releases the freeze window.
+	//
+	// STEPS (10b) AND (10c) NO LONGER DISCARD THIS PASS EITHER, and they close it the OTHER way — the
+	// way that was rejected for volumes. See their own note below the call sites.
 	teardownPVC := ""
 	if idx := firstNonTerminalVolume(backup.Status.Volumes); idx >= 0 {
-		tp, err := r.advanceVolume(ctx, &backup, &backup.Status.Volumes[idx], rc)
+		vol := &backup.Status.Volumes[idx]
+		tp, err := r.advanceVolume(ctx, &backup, vol, rc)
 		if err != nil {
-			return ctrl.Result{}, err
+			// No teardown: a step that errored did not make this volume terminal, so there is
+			// nothing whose result has just been persisted and whose objects may now be collected.
+			r.recordAdvanceFailure(ctx, vol, err)
+		} else {
+			teardownPVC = tp
 		}
-		teardownPVC = tp
 	}
 
 	// (10b) The manifest half, driven independently of the volumes. A PVC the CSI driver cannot
 	// snapshot is reported Skipped and the namespace still gets its manifests (02-api.md): the
 	// two halves fail for unrelated reasons, and coupling them would lose one to the other's bad
 	// day.
-	manifestsDone, teardownManifests, err := r.advanceManifests(ctx, &backup, rc,
-		includeManifests(run), run.ManifestOptions.ExcludeSecretData)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-
+	//
 	// (10c) The freeze window CLOSES here, on the snapshots being cut.
-	if err := r.closeFreezeWindow(ctx, &backup, hookSt, run.Hooks); err != nil {
-		return ctrl.Result{}, err
-	}
+	//
+	// NEITHER ERROR LEAVES THIS FUNCTION HERE. Both used to, and both sat between step (10) and the
+	// status write, so a manifest half that could not start its Job — or a release phase that could
+	// not list pods — threw away everything the volume half had just computed on the same pass. That
+	// is exactly the coupling (10b)'s own doc says must not exist, stated there about the volume half
+	// and violated in the other direction.
+	//
+	// PERSIST FIRST, THEN PROPAGATE — the shape that was REJECTED for a volume error at step (10) and
+	// is the right one here, for one reason: the failure is not per-volume. The objection at step (10)
+	// was that controller-runtime charges the backoff to the BACKUP, so one bad volume would stretch
+	// the poll driving every OTHER volume of that namespace from backupPollInterval's 5s to the rate
+	// limiter's ceiling — the same head-of-line block moved into the time domain. A manifest Job that
+	// cannot be created and a release that cannot be resolved are properties of the run as a whole, so
+	// the object being backed off IS the object at fault. The retry is charged correctly, and
+	// reconcile_errors_total keeps a failure that deserves to be counted.
+	//
+	// The deferred errors are returned after the status write, the teardowns and the retention
+	// enqueue, at the bottom of this function. Order matters there and is argued at that line.
+	//
+	// closeFreezeWindow also reports whether a release is still OWED, which writeStatus needs in order
+	// not to let the run reach a terminal phase over an application that may still be quiesced. It is
+	// threaded through as a value rather than re-derived from status because status cannot tell "a
+	// retry is owed" from "no post hooks were ever declared" — see closeFreezeWindow.
+	manifestsDone, teardownManifests, manifestsErr := r.advanceManifests(ctx, &backup, rc,
+		includeManifests(run), run.ManifestOptions.ExcludeSecretData)
+	releaseOwed, releaseErr := r.closeFreezeWindow(ctx, &backup, run.Hooks)
 
 	// (11) Single status writer: roll the per-volume phases up, record a terminal condition +
 	// backupTime once, and write status exactly once.
-	res, err := r.writeStatus(ctx, &backup, rc, manifestsDone)
+	res, err := r.writeStatus(ctx, &backup, rc, manifestsDone, releaseOwed)
 	if err != nil {
 		// A status-write ERROR is not proof the status was not WRITTEN. A clean Conflict is (the
 		// server rejected it), but a cancellation or connection reset in flight — SIGTERM cancels
@@ -620,6 +898,28 @@ func (r *BackupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	if backupSucceeded(backup.Status.Phase) {
 		r.maybeEnqueueRetentionForget(ctx, &backup, rc)
 	}
+
+	// The deferred propagation of steps (10b) and (10c), and it is LAST on purpose.
+	//
+	// Everything above it is work whose result is already decided and must not be skipped by an
+	// unrelated half's bad day: the status write that makes this pass durable, the teardown of a
+	// volume whose terminal result has just been persisted, the teardown of a finished manifest
+	// capture's grant, and the retention forget a successful run owes its repository. Returning the
+	// error before any of those would have reproduced the very defect being closed — a pass that
+	// computed a result and then dropped it — one step further down the function.
+	//
+	// ctrl.Result is deliberately zeroed rather than carried: controller-runtime ignores a result
+	// returned alongside an error (and logs a warning about it), so returning res here would only
+	// misstate the intent. The error IS the requeue: with backoff, which is the point of propagating
+	// at all.
+	//
+	// A FAILED STATUS WRITE SUPERSEDES THESE, by returning above, and that is right rather than a
+	// leak: the write error already requeues this pass, and a pass that could not persist anything
+	// will meet the same manifest or release failure again next time. Reporting both would only mean
+	// choosing which one controller-runtime logs.
+	if deferred := errors.Join(manifestsErr, releaseErr); deferred != nil {
+		return ctrl.Result{}, deferred
+	}
 	return res, nil
 }
 
@@ -641,7 +941,12 @@ func includeManifests(run *cbv1.BackupRunSpec) bool {
 // writeStatus rolls the per-volume phases up into the Backup phase, records the headline
 // condition (and backupTime on first reaching a terminal phase), writes status once, and returns
 // the requeue decision: none once terminal, a short poll while volumes are still in flight.
-func (r *BackupReconciler) writeStatus(ctx context.Context, backup *cbv1.Backup, rc *backupRunContext, manifestsDone bool) (ctrl.Result, error) {
+//
+// manifestsDone and releaseOwed are the two things a volume roll-up cannot see, and both HOLD the
+// terminal phase back for the same structural reason — see below.
+func (r *BackupReconciler) writeStatus(ctx context.Context, backup *cbv1.Backup, rc *backupRunContext,
+	manifestsDone, releaseOwed bool,
+) (ctrl.Result, error) {
 	phase := string(status.RollUpVolumePhases(backup.Status.Volumes))
 	// A Backup is not finished while its manifest half is still running, even when every volume
 	// is. Letting the roll-up go terminal here would trip the already-terminal short-circuit at
@@ -649,8 +954,24 @@ func (r *BackupReconciler) writeStatus(ctx context.Context, backup *cbv1.Backup,
 	// leaving a snapshot in the repository that no Backup object points at, which is exactly the
 	// kind of silent loss the discovery model cannot repair (the run tag would be orphaned).
 	//
-	// Uploading is the honest phase for it: bytes are still going to the repository.
-	if !manifestsDone && isTerminalBackupPhase(phase) {
+	// A Backup IS ALSO NOT FINISHED WHILE A FREEZE WINDOW IS STILL OPEN, and it is the same argument
+	// with a heavier consequence: what does not get recorded there is not a snapshot id, it is the
+	// UNFREEZE of somebody's database. The release fires on snapshotsCut, so on a run whose volumes
+	// all went Skipped or Failed it fires on the very pass the roll-up becomes terminal; a failed
+	// attempt on that pass is owed up to postHookMaxAttempts more, and the short-circuit at the top of
+	// Reconcile guaranteed none of them ever happened. See closeFreezeWindow for what "owed" means,
+	// why it cannot be derived from status (a run with no post hooks would be held forever), and why
+	// the hold is bounded by the attempt budget rather than by a clock.
+	//
+	// Uploading is the phase used for both, and for the manifest case it is literally true: bytes are
+	// still going to the repository. For the release case it is a small imprecision accepted
+	// deliberately. SnapshottingHooks was the accurate-sounding alternative and was rejected twice
+	// over: it would move a run whose volumes had already reached Uploading BACKWARDS through the
+	// phase enum, and it is the phase the pre-snapshot quiesce owns — reusing it would make "we are
+	// about to snapshot" and "we are trying to unfreeze" indistinguishable in every dashboard, alert
+	// rule and `kubectl get backup` that reads the phase. Uploading already means "in flight, not
+	// finished" to all of them, which is the fact that has to travel.
+	if isTerminalBackupPhase(phase) && (!manifestsDone || releaseOwed) {
 		phase = string(status.BackupPhaseUploading)
 	}
 	backup.Status.Phase = phase
@@ -1150,10 +1471,142 @@ func (r *BackupReconciler) ensureVolumes(ctx context.Context, backup *cbv1.Backu
 // persisted the terminal result, so a status-write conflict never leaves the result unrecorded
 // while its Job is already gone (the same "persist before delete" ordering the BackupRepository
 // controller uses for its init Job).
+//
+// It also owns two small pieces of status hygiene that only it is in a position to do, both keyed on
+// the phase the volume ENTERED the step with: a volume that MOVED has left whatever was blocking it
+// behind, so the recorded obstacle is dropped (clearStaleAdvanceReason), and the phase-entry clock is
+// stamped (stampVolumePhaseEntry). Both live here rather than in the steps because here is the one
+// place that can see the before and the after.
 func (r *BackupReconciler) advanceVolume(ctx context.Context, backup *cbv1.Backup, vol *cbv1.VolumeStatus, rc *backupRunContext) (string, error) {
+	entryPhase := vol.Phase
+	teardownPVC, err := r.advanceVolumePhase(ctx, backup, vol, rc)
+	// Unconditional, and BEFORE the error check: a phase change must be stamped whatever else the pass
+	// concluded. No step today changes the phase and errors in the same breath (recordAdvanceFailure's
+	// doc explains why that separation is load-bearing), but a clock that depended on that staying true
+	// would be a clock that silently stops the day it does not.
+	stampVolumePhaseEntry(vol, entryPhase)
+	if err == nil {
+		clearStaleAdvanceReason(vol, entryPhase)
+	}
+	return teardownPVC, err
+}
+
+// stampVolumePhaseEntry is the SINGLE writer of status.volumes[].phaseEnteredAt — the clock
+// advanceRetryDeadline is measured against.
+//
+// One writer, at the one call site of the whole per-PVC state machine, is the point rather than a
+// tidy-up. The alternative was a stamp inside each phase function, which is the per-call-site shape
+// that has now produced this release's defect three times over: a phase added later would simply not
+// stamp, its volume would carry no clock, and the outer bound would be silently unreachable for
+// exactly the newest and least-exercised path. Written this way a new phase inherits the clock by
+// construction, and forgetting it is not something a reflex can do — it would take editing this
+// function.
+//
+// Two rules, and the second is a migration:
+//
+//   - EVERY transition is stamped, terminal ones included. Not because a terminal volume needs a
+//     clock, but because "stamp on any change of phase" is a rule with no exceptions to get wrong,
+//     whereas "stamp on the phases that are bounded" is a list that would go stale the moment the set
+//     of bounded phases changed.
+//   - A volume that did NOT move is stamped only when it has no clock at all AND is in a phase the
+//     backstop bounds. That is the upgrade case: a volume already in Snapshotting or Uploading when
+//     the operator started writing this field has no transition left to observe, so it would be
+//     permanently unbounded. Stamping it on the first pass that touches it gives the bound a clock
+//     starting now, which can only make the backstop LATE — never early, which is the direction that
+//     costs a backup. It is deliberately not applied to Pending: that phase is bounded by
+//     firstAttemptAt, whose doc records at length why a clock started at enumeration is the wrong one,
+//     and giving a Pending volume a second, differently-meaning timestamp would re-open exactly that.
+func stampVolumePhaseEntry(vol *cbv1.VolumeStatus, entryPhase status.VolumePhase) {
+	if vol.Phase == entryPhase {
+		if vol.PhaseEnteredAt != nil || !advanceBackstopApplies(vol.Phase) {
+			return
+		}
+	}
+	now := metav1.NewTime(time.Now())
+	vol.PhaseEnteredAt = &now
+}
+
+// advanceBackstopApplies reports whether a phase is one the outer bound covers: the two that hold work
+// in flight and are therefore NOT deferred by firstNonTerminalVolume, so a volume stuck in one of them
+// keeps the head of its namespace's queue.
+//
+// Pending is excluded because it already has a better bound (pendingResolveDeadline, on a clock that
+// measures time spent TRYING rather than wall time) and because a parked Pending volume is deferred
+// behind its un-tried neighbours, so it starves nobody while it waits. The terminal phases are
+// excluded because there is nothing left to bound.
+func advanceBackstopApplies(phase status.VolumePhase) bool {
+	switch phase {
+	case status.VolumePhaseSnapshotting, status.VolumePhaseUploading:
+		return true
+	default:
+		return false
+	}
+}
+
+// failVolumeOnAdvanceBackstop is the outer bound's verdict, and it is called ONLY from a point where
+// this pass has established that it cannot advance the volume AND cannot reach a bound that would
+// judge it better. It returns the PVC name (to request teardown, exactly as the per-phase deadlines
+// do) and true when it took the verdict; ("", false) means the caller should carry on with whatever it
+// was going to do — record the cause and retry.
+//
+// READ THE CALL SITES, NOT THIS FUNCTION, TO JUDGE THE SAFETY. Every bound in this controller is safe
+// because of its predicate rather than its number, and this one's predicate is entirely in its
+// callers: an exposure that could not be reconstructed, a mover-admission gate that errored, a creds
+// Secret that could not be written, a mover Job that could not be created, read, or found at all, an
+// exposure whose readiness is unknown and whose origin snapshot cannot be judged. It is NOT called on
+// "not ready yet", not on "blocked waiting for a mover slot", and above all not on "the Job exists and
+// its pod is running": a mover that got off the ground has as long as it likes, and breaking that
+// turns this backstop into a wall-clock cap on the largest volumes in the fleet.
+//
+// No clock, no verdict — the same asymmetry snapshotDeadlineExceeded is built on. An absent
+// phaseEnteredAt is not evidence that a volume has been stuck a long time, and this branch terminates
+// somebody's backup, so the burden of proof sits on the evidence and never on its absence.
+func (r *BackupReconciler) failVolumeOnAdvanceBackstop(ctx context.Context, backup *cbv1.Backup,
+	vol *cbv1.VolumeStatus, cause error,
+) (string, bool) {
+	if vol.PhaseEnteredAt == nil {
+		return "", false
+	}
+	bound := r.effectiveAdvanceRetryDeadline()
+	if time.Since(vol.PhaseEnteredAt.Time) <= bound {
+		return "", false
+	}
+	stuckIn := string(vol.Phase)
+	vol.Phase = status.VolumePhaseFailed
+	// The cause travels into the reason, capped, for the same reason the mover-start deadline carries
+	// the kubelet's own sentence: a reason that names only our decision leaves the reader as blind as
+	// the hang did. Here it matters more than anywhere else, because this deadline's own diagnosis is
+	// the weakest of the four — the cause is the only actionable thing it has.
+	vol.Reason = deadlineReason(backupReasonAdvanceDeadline, cause.Error())
+	r.Recorder.Eventf(backup, nil, corev1.EventTypeWarning, "VolumeFailed", "AdvanceBackstop",
+		"backup of PVC %s gave up after %s in %s: every pass since then failed to advance it and none "+
+			"of the per-phase deadlines could judge it, because the object they measure — the origin "+
+			"VolumeSnapshot or the mover Job — could not be read at all. The volume is failed so the rest "+
+			"of this namespace can proceed. The last cause was: %v",
+		vol.Pvc, bound, stuckIn, cause)
+	// The per-pass log line the two retry paths already write (parkVolume, recordAdvanceFailure), at the
+	// point where the retrying finally stops. It records the phase the volume was stuck in, which the
+	// status no longer will once the phase is Failed — so the one fact this verdict destroys is the one
+	// fact an operator reconstructing the sequence needs.
+	logf.FromContext(ctx).Info("volume bounded by the outer advance deadline; its namespace's queue is released",
+		"pvc", vol.Pvc, "phase", stuckIn, "bound", bound.String(), "err", cause.Error())
+	return vol.Pvc, true
+}
+
+// advanceVolumePhase is advanceVolume's dispatch, split out so the wrapper can see the phase the
+// volume entered the step with.
+func (r *BackupReconciler) advanceVolumePhase(ctx context.Context, backup *cbv1.Backup, vol *cbv1.VolumeStatus, rc *backupRunContext) (string, error) {
 	switch vol.Phase {
 	case status.VolumePhasePending, "":
-		return "", r.advancePending(ctx, backup, vol)
+		// NO ERROR RESULT, and that absence is the invariant rather than a tidy-up. Every one of
+		// advancePending's outcomes is now a recorded verdict or a parked retry, so there is no error
+		// left for it to return — and a phase function that STRUCTURALLY cannot fail the pass documents
+		// "one volume may not stop the others" better than any comment could, because the next person
+		// cannot reintroduce the bug by writing `return err`: they would have to change the signature
+		// and this line with it, which is a decision rather than a reflex. `unparam` is what pointed at
+		// it (result 0 is always nil), and it was right.
+		r.advancePending(ctx, backup, vol)
+		return "", nil
 	case status.VolumePhaseSnapshotting:
 		return r.advanceSnapshotting(ctx, backup, vol, rc)
 	case status.VolumePhaseUploading:
@@ -1161,6 +1614,35 @@ func (r *BackupReconciler) advanceVolume(ctx context.Context, backup *cbv1.Backu
 	default:
 		return "", nil
 	}
+}
+
+// clearStaleAdvanceReason drops a recorded obstacle from a volume that has just CHANGED PHASE,
+// unless the new phase is one whose reason IS the verdict (Failed, Skipped).
+//
+// Both writers of a reason on a non-terminal volume — parkVolume and recordAdvanceFailure — describe
+// something that is in the way RIGHT NOW: "ExposerUnresolvable: storageclasses… not found",
+// "AdvanceRetrying: check exposure readiness…". Once the volume moves, that sentence has stopped
+// being true, and leaving it behind is not a cosmetic wart: a volume reported as Uploading while
+// carrying "ExposerUnresolvable" tells an operator (and the alert rules, and `kubectl get backup`)
+// that the operator cannot resolve an exposer it demonstrably just used. The parked-then-recovered
+// case is entirely realistic — a StorageClass created a minute after the run started, a quota
+// raised — and it was already possible before this lot; adding a second reason-writing path made it
+// worth closing rather than living with.
+//
+// Failed and Skipped are excluded because there the reason is the whole point (CSISnapshotUnsupported,
+// SnapshotPrecheckFailed, the deadline reasons, a mover's own failure) and every one of them is
+// written by the same step that set the phase. Completed is NOT excluded: a completed volume has
+// nothing left to explain, and a stale obstacle on a successful backup is the most misleading place
+// of all to leave one.
+func clearStaleAdvanceReason(vol *cbv1.VolumeStatus, entryPhase status.VolumePhase) {
+	if vol.Phase == entryPhase || vol.Reason == "" {
+		return
+	}
+	switch vol.Phase {
+	case status.VolumePhaseFailed, status.VolumePhaseSkipped:
+		return
+	}
+	vol.Reason = ""
 }
 
 // advancePending resolves the exposer for the source PVC and starts the exposure. A storage
@@ -1177,15 +1659,47 @@ func (r *BackupReconciler) advanceVolume(ctx context.Context, backup *cbv1.Backu
 // That verdict is Failed / SnapshotPrecheckFailed — NOT Skipped — because unlike "this CSI cannot
 // snapshot", it describes a cluster somebody broke and somebody can fix. See
 // backupReasonPrecheckFailed for why it fails rather than gates.
-func (r *BackupReconciler) advancePending(ctx context.Context, backup *cbv1.Backup, vol *cbv1.VolumeStatus) error {
+//
+// IT RETURNS NOTHING, and that is the strongest statement this file makes about the head-of-line
+// incident. Every outcome it can reach is either a verdict recorded on the volume (Skipped, Failed) or
+// a parked retry (parkVolume) — so there is no error to return, and no way for a Pending volume to
+// cost its namespace a status write or its neighbours their turn. The signature is the invariant: see
+// advanceVolume's Pending case for why it is better than the comment that used to stand in for it.
+func (r *BackupReconciler) advancePending(ctx context.Context, backup *cbv1.Backup, vol *cbv1.VolumeStatus) {
+	// The Pending clock starts on the first ATTEMPT, so it measures time spent trying rather than
+	// time spent queued behind other volumes.
+	if vol.FirstAttemptAt == nil {
+		now := metav1.NewTime(time.Now())
+		vol.FirstAttemptAt = &now
+	} else if elapsed := time.Since(vol.FirstAttemptAt.Time); elapsed > r.effectivePendingResolveDeadline() {
+		// Out of patience, and that is a feature. Everything below this line can fail in a way that
+		// looks transient forever; this is the one place that guarantees a volume eventually stops
+		// being the reason its namespace has no backup. The recorded reason is preserved when there
+		// is one, because it names the actual cause and is far more useful than the deadline itself.
+		vol.Phase = status.VolumePhaseFailed
+		if vol.Reason == "" {
+			vol.Reason = backupReasonPendingDeadline
+		}
+		r.Recorder.Eventf(backup, nil, corev1.EventTypeWarning, "VolumeFailed", "ExposeVolume",
+			"PVC %s never left Pending within %s and is failed so the rest of this namespace can proceed: %s",
+			vol.Pvc, r.effectivePendingResolveDeadline(), vol.Reason)
+		return
+	}
+
 	var pvc corev1.PersistentVolumeClaim
 	if err := r.Get(ctx, client.ObjectKey{Namespace: backup.Namespace, Name: vol.Pvc}, &pvc); err != nil {
 		if apierrors.IsNotFound(err) {
 			vol.Phase = status.VolumePhaseFailed
 			vol.Reason = "SourcePVCMissing"
-			return nil
+			return
 		}
-		return fmt.Errorf("get source PVC %s/%s: %w", backup.Namespace, vol.Pvc, err)
+		// A PVC that is there but unreadable — RBAC changed under a running operator, the apiserver
+		// having a bad minute. Parked, not errored: see parkVolume. This one is the least likely of the
+		// four to be durable and the most likely to be argued for as a plain requeue, which is exactly
+		// why it goes through the same door. The guarantee "one volume cannot stop the others" is worth
+		// nothing if it holds on three paths out of four.
+		r.parkVolume(ctx, vol, "get source PVC", err)
+		return
 	}
 
 	ex, err := r.Exposers.For(ctx, &pvc)
@@ -1195,9 +1709,23 @@ func (r *BackupReconciler) advancePending(ctx context.Context, backup *cbv1.Back
 			vol.Reason = backupReasonSkippedUnsupported
 			r.Recorder.Eventf(backup, nil, corev1.EventTypeNormal, "VolumeSkipped", "SkipVolume",
 				"PVC %s is on storage without CSI snapshot support; skipped", vol.Pvc)
-			return nil
+			return
 		}
-		return fmt.Errorf("resolve exposer for PVC %s/%s: %w", backup.Namespace, vol.Pvc, err)
+		// Resolution failed for a reason that is neither "this storage cannot snapshot" nor a refused
+		// pre-check. Deliberately NOT classified by error kind here: a missing StorageClass looks
+		// permanent and can be created a minute later, an unreadable PersistentVolume looks transient
+		// and can be gone for good, and a cached client answers NotFound for objects that exist. Every
+		// such guess is wrong in one direction, and the direction that hurts is failing a volume whose
+		// data was fine.
+		//
+		// So this does not decide. It records the cause on the volume, leaves it Pending, and returns
+		// WITHOUT an error to return — which is the whole fix. Returning an error re-drove this same
+		// volume forever and held every volume queued behind it in its namespace; the run stayed
+		// non-terminal, its schedule's Forbid policy skipped every subsequent night, and a cluster
+		// went thirty hours with no backups because one PVC named a StorageClass that did not exist.
+		// The bound on how long this may repeat is pendingResolveDeadline, applied above.
+		r.parkVolume(ctx, vol, "resolve exposer", err)
+		return
 	}
 
 	// The ACTIVE pre-check, and it runs HERE — before Expose, on the same pass, with nothing
@@ -1211,8 +1739,9 @@ func (r *BackupReconciler) advancePending(ctx context.Context, backup *cbv1.Back
 			// this branch is not reachable from the current implementation. It is not padding: it
 			// is the guard that keeps a FUTURE check whose failure is transient (one that should
 			// requeue, not fail the volume) from silently inheriting "fail this volume" simply by
-			// being added.
-			return fmt.Errorf("pre-check exposure for PVC %s/%s: %w", backup.Namespace, vol.Pvc, err)
+			// being added. Parked rather than errored, for the reason parkVolume gives.
+			r.parkVolume(ctx, vol, "pre-check exposure", err)
+			return
 		}
 		vol.Phase = status.VolumePhaseFailed
 		vol.Reason = backupReasonPrecheckFailed
@@ -1222,14 +1751,84 @@ func (r *BackupReconciler) advancePending(ctx context.Context, backup *cbv1.Back
 		// alert an operator can act on and one they have to go investigate.
 		r.Recorder.Eventf(backup, nil, corev1.EventTypeWarning, "VolumeFailed", "SnapshotPrecheck",
 			"backup of PVC %s cannot start: %v", vol.Pvc, err)
-		return nil
+		return
 	}
 
 	if _, err := ex.Expose(ctx, r.exposeRequest(backup, &pvc)); err != nil {
-		return fmt.Errorf("expose PVC %s/%s: %w", backup.Namespace, vol.Pvc, err)
+		// The path that made this whole helper necessary. Expose can fail durably for causes that have
+		// nothing to do with the volume's snapshot capability and everything to do with the cluster
+		// today: a ResourceQuota exhausted so the temp clone PVC cannot be created, a validating
+		// webhook refusing VolumeSnapshot objects, the snapshot CRDs absent. Each of those errored
+		// every pass, so the volume was re-picked forever and its neighbours never advanced — the
+		// thirty-hour incident exactly, reached by a different door.
+		r.parkVolume(ctx, vol, "expose", err)
+		return
 	}
 	vol.Phase = status.VolumePhaseSnapshotting
-	return nil
+}
+
+// parkVolume records why a volume could not be started, leaves it PENDING, and expects its caller to
+// return nil. It is the single shape every non-verdict failure in advancePending takes.
+//
+// Returning an error instead is what the incident was made of, and the damage is in two parts that
+// have to be fixed together. The obvious part: Reconcile advances one volume per pass, so an error
+// re-drives this same volume forever and the volumes queued behind it in the namespace are never
+// attempted. The part that is easy to miss, and that made the first version of this fix incomplete:
+// Reconcile returns the error BEFORE writeStatus, so nothing this function wrote is ever persisted —
+// including firstAttemptAt. The Pending deadline's clock never reaches etcd, and the deadline that
+// exists precisely to end this can never fire. An error here does not merely delay the queue; it
+// disables the mechanism meant to rescue it.
+//
+// Retrying is not lost. A non-terminal Backup requeues on backupPollInterval, so a parked volume is
+// re-attempted on a timer. What is lost is controller-runtime's exponential backoff, and that is an
+// acceptable trade: the interval is bounded and predictable, whereas the backoff was buying nothing
+// for a cause that is usually not transient.
+//
+// step names the phase of the attempt that failed ("resolve exposer", "pre-check exposure",
+// "expose") and goes into the log, not the reason. The reason stays one recognised token plus the
+// cause, because volumeIsParked matches on that token and status.volumes[].reason is read by
+// administrators and by the alert rules.
+func (r *BackupReconciler) parkVolume(ctx context.Context, vol *cbv1.VolumeStatus, step string, cause error) {
+	vol.Reason = clampMessage(backupReasonExposerUnresolvable + ": " + cause.Error())
+	logf.FromContext(ctx).Info("volume parked and retried, queue continues",
+		"pvc", vol.Pvc, "step", step, "deadline", r.effectivePendingResolveDeadline(), "err", cause.Error())
+}
+
+// recordAdvanceFailure turns a failed advance into RECORDED STATE, which is the whole of what step
+// (10) needs in order to keep going: see the long note there for why the error must not be returned
+// and what was rejected.
+//
+// It writes a reason and NOTHING ELSE. It does not touch the phase, because the phase is what the
+// next pass dispatches on and what the volume's own deadline is measured against — a volume in
+// Snapshotting whose readiness check errored still has an exposure, possibly a snapshot the storage
+// system is holding, and a clock running on the origin VolumeSnapshot's creationTimestamp. Demoting
+// it (to Pending, say, so parking applied) would re-drive Expose against a live exposure and throw
+// that clock away, which is a worse bug than the one being fixed. Promoting it (to Failed) would
+// terminate somebody's backup on a transient apiserver blip. Recording is the only honest move: the
+// verdict belongs to the deadlines, which are the only arbiter here with a durable clock.
+//
+// No Event, deliberately. This is reached once per backupPollInterval for as long as the cause
+// lasts, so an Event per pass would be a flood, and the volume's eventual deadline emits exactly one
+// Warning carrying the diagnosis. The log line is the per-pass record. parkVolume made the same
+// choice.
+func (r *BackupReconciler) recordAdvanceFailure(ctx context.Context, vol *cbv1.VolumeStatus, cause error) {
+	switch vol.Phase {
+	case status.VolumePhasePending, "":
+		// UNREACHABLE from today's dispatch, and provably so: advancePending has no error result at
+		// all (every one of its four failure paths parks or records a verdict), so advanceVolumePhase's
+		// Pending case cannot hand this function anything. It is here for the day somebody gives the
+		// Pending phase a step that CAN fail — a snapshotting hook, a quota pre-flight — because such a
+		// path must land on the PARKING door rather than this one:
+		// parking is what defers a volume behind its un-tried neighbours (volumeIsParked matches the
+		// parking token and the Pending phase, and nothing else), and a Pending volume that kept the
+		// head of its namespace's queue is the original thirty-hour defect verbatim. The dispatch in
+		// advanceVolume accepts "" as Pending, so this must too.
+		r.parkVolume(ctx, vol, "advance", cause)
+		return
+	}
+	vol.Reason = clampMessage(backupReasonAdvanceRetrying + ": " + cause.Error())
+	logf.FromContext(ctx).Info("volume advance failed and is retried; the pass continues and persists",
+		"pvc", vol.Pvc, "phase", string(vol.Phase), "err", cause.Error())
 }
 
 // advanceSnapshotting waits for the exposure to be ready, then creates the data-mover Job. The
@@ -1249,11 +1848,47 @@ func (r *BackupReconciler) advancePending(ctx context.Context, backup *cbv1.Back
 func (r *BackupReconciler) advanceSnapshotting(ctx context.Context, backup *cbv1.Backup, vol *cbv1.VolumeStatus, rc *backupRunContext) (string, error) {
 	ex, exposure, err := r.reconstructExposure(ctx, backup, vol.Pvc)
 	if err != nil {
-		return "", fmt.Errorf("reconstruct exposure for PVC %s/%s: %w", backup.Namespace, vol.Pvc, err)
+		// STILL A RETURN, and deliberately, unlike the readiness check below. Reconcile step (10) records
+		// this cause and persists the pass, so the error no longer costs the namespace its status write —
+		// but it cannot be turned into "not ready and let the deadline decide", because the deadline's
+		// clock is read THROUGH the exposure this call is what failed to produce (Progress needs both the
+		// exposer and the derived origin VolumeSnapshot name).
+		//
+		// So this is the first of the sites where NO per-object bound is reachable, and where the outer
+		// backstop is the only thing that can ever end the volume. Of the two ways out that were
+		// identified — deriving the origin snapshot's identity without calling Expose (a change inside
+		// internal/exposer) or a phase-entry timestamp on VolumeStatus — this lot took the timestamp,
+		// as a BACKSTOP and explicitly not as a replacement for the snapshot-derived bounds: those can
+		// tell "nobody picked it up" from "picked up and never finished" and a wall clock cannot.
+		cause := fmt.Errorf("reconstruct exposure for PVC %s/%s: %w", backup.Namespace, vol.Pvc, err)
+		if pvc, bounded := r.failVolumeOnAdvanceBackstop(ctx, backup, vol, cause); bounded {
+			return pvc, nil // request teardown once Reconcile has persisted this terminal result
+		}
+		return "", cause
 	}
 	ready, err := ex.Ready(ctx, exposure)
 	if err != nil {
-		return "", fmt.Errorf("check exposure readiness for PVC %s/%s: %w", backup.Namespace, vol.Pvc, err)
+		// A READINESS CHECK THAT FAILED IS NOT READY — it is NOT a reason to leave this function, and
+		// the difference is the one specific, checkable consequence this lot owes.
+		//
+		// The old shape returned the error here, which skipped the not-ready branch below — so
+		// snapshotProgressDeadline and snapshotReadyDeadline, the two bounds whose entire purpose is
+		// to end a volume that is stuck in Snapshotting, were consulted ONLY when Ready cleanly
+		// answered "no". On the path where Ready itself keeps failing — the snapshot CRDs removed
+		// under a running operator, the VolumeSnapshot RBAC narrowed, an apiserver refusing that
+		// resource — they were unreachable, and unreachable is worse than absent: an operator reads
+		// the deadline in the docs, sees the run hang past it, and concludes the deadline is a lie.
+		//
+		// Recording the cause and falling through is safe in the direction that matters. ready=false
+		// can only lead to the deadline evaluation and a requeue; the one thing a wrong answer here
+		// could do is create a mover Job against an exposure that is not actually mountable, and that
+		// needs ready=TRUE, which an error can never now produce. snapshotDeadlineExceeded is built
+		// for exactly this uncertainty (read its doc: every "I do not know" returns "", so a pass that
+		// cannot tell simply waits) — its verdict comes from Progress, an independent read of the
+		// origin VolumeSnapshot, so a broken Ready does not silently arm it either.
+		r.recordAdvanceFailure(ctx, vol,
+			fmt.Errorf("check exposure readiness for PVC %s/%s: %w", backup.Namespace, vol.Pvc, err))
+		ready = false
 	}
 	if !ready {
 		switch r.snapshotDeadlineExceeded(ctx, ex, exposure) {
@@ -1282,6 +1917,23 @@ func (r *BackupReconciler) advanceSnapshotting(ctx context.Context, backup *cbv1
 				vol.Pvc, snapshotReadyDeadline, exposure.OriginNamespace, exposure.OriginVSName,
 				eventSuffix(detail))
 			return vol.Pvc, nil // request teardown once Reconcile has persisted this terminal result
+		}
+		// THE OUTER BOUND ON THE WAIT ITSELF, and it closes the last way a Snapshotting volume could
+		// wait forever. snapshotDeadlineExceeded returns "" for two very different situations: the wait
+		// is still legitimate (a young snapshot), or nothing about the origin snapshot could be READ, so
+		// there is no evidence either way — and its doc is emphatic that the absence of evidence must
+		// never be a verdict. That restraint is right and stays; what it leaves behind is a volume whose
+		// clock is permanently unreadable, waiting on a judgement that can never arrive.
+		//
+		// The backstop can be applied here without weakening either specific bound, because it is longer
+		// than both: an origin snapshot that IS readable is judged at 15 minutes or 2 hours, hours before
+		// this can fire, so the better diagnosis always wins and this one is reached only when there was
+		// none to be had.
+		if pvc, bounded := r.failVolumeOnAdvanceBackstop(ctx, backup, vol,
+			fmt.Errorf("the exposure for PVC %s/%s never became ready and nothing could be read about "+
+				"its origin VolumeSnapshot, so neither snapshot deadline could judge it",
+				backup.Namespace, vol.Pvc)); bounded {
+			return pvc, nil // request teardown once Reconcile has persisted this terminal result
 		}
 		return "", nil // still binding the static re-bind / temp PVC; requeue
 	}
@@ -1316,13 +1968,27 @@ func (r *BackupReconciler) advanceSnapshotting(ctx context.Context, backup *cbv1
 	// cascade is already at maxConcurrentMovers, hold the volume in Snapshotting (its exposure stays
 	// ready) and requeue for a free slot. An already-existing Job means we are re-adopting after a
 	// restart, never blocking — so an in-flight mover is never counted out of its own slot.
+	//
+	// The ERROR path is backstopped and the BLOCKED path is not, which is the whole distinction this
+	// bound rests on. An errored gate is a pass that learned nothing and will keep learning nothing;
+	// a blocked gate is the mechanism working — the volume is waiting for a slot or for a stale-lock
+	// unlock to clear, both of which legitimately take as long as the cascade ahead of it does, and
+	// failing a volume for queueing politely would be a defect of its own.
 	if blocked, err := r.moverSlotBlocked(ctx, moverName, rc.repoName, rc.maxConcurrentMovers); err != nil {
+		if pvc, bounded := r.failVolumeOnAdvanceBackstop(ctx, backup, vol, err); bounded {
+			return pvc, nil // request teardown once Reconcile has persisted this terminal result
+		}
 		return "", err
 	} else if blocked {
 		return "", nil
 	}
 
 	if err := ensureMoverCredsSecret(ctx, r.maintenanceDeps(), moverName, rc.dek, rc.s3CredsSecret, rc.credsNamespace, labels); err != nil {
+		// No mover Job exists yet, so no clock exists yet either: nothing but the phase-entry timestamp
+		// can ever end a volume whose per-Job creds Secret the apiserver keeps refusing.
+		if pvc, bounded := r.failVolumeOnAdvanceBackstop(ctx, backup, vol, err); bounded {
+			return pvc, nil // request teardown once Reconcile has persisted this terminal result
+		}
 		return "", err
 	}
 
@@ -1359,7 +2025,15 @@ func (r *BackupReconciler) advanceSnapshotting(ctx context.Context, backup *cbv1
 	created := false
 	if err := r.Create(ctx, job); err != nil {
 		if !apierrors.IsAlreadyExists(err) {
-			return "", fmt.Errorf("create mover Job %s/%s: %w", r.OperatorNamespace, moverName, err)
+			// The same wall as the creds Secret above: moverStartDeadline is measured from the mover
+			// Job's own creationTimestamp, so a Job that cannot be created has no clock. A validating
+			// webhook refusing Jobs, or a narrowed RBAC, therefore used to hold the volume — and the
+			// namespace's queue behind it — with nothing that could end it.
+			cause := fmt.Errorf("create mover Job %s/%s: %w", r.OperatorNamespace, moverName, err)
+			if pvc, bounded := r.failVolumeOnAdvanceBackstop(ctx, backup, vol, cause); bounded {
+				return pvc, nil // request teardown once Reconcile has persisted this terminal result
+			}
+			return "", cause
 		}
 	} else {
 		created = true
@@ -1574,13 +2248,33 @@ func (r *BackupReconciler) advanceUploading(ctx context.Context, backup *cbv1.Ba
 			// against a durable clock that belongs to the object being waited on — the origin
 			// VolumeSnapshot's creationTimestamp, the mover Job's. When the Job is ABSENT there is no
 			// such clock, and the only candidates are the Backup's own creationTimestamp (which says
-			// nothing about this volume) or a new phase-entry timestamp on VolumeStatus (a CRD field,
-			// and a bigger change than this lot). A genuinely lost Job therefore still requeues
-			// forever, and the alert is what catches it — CrystalbackupBackupStalled reads a
-			// state-derived series precisely so it fires on the phases no in-controller clock can see.
+			// nothing about this volume) or a new phase-entry timestamp on VolumeStatus (a CRD field).
+			//
+			// THAT FIELD NOW EXISTS, and this branch is the clearest case for it: informer lag is
+			// seconds, our own teardown racing a stale reconcile is seconds, and a Job that is still
+			// missing four hours later is not lagging — it is gone, and the volume is waiting on an
+			// object that is never coming back. So the wait stays exactly as it was (never re-drive to
+			// Snapshotting, which would re-create the exposure and, mid-deletion, leak a clone; never
+			// false-fail on lag) and it is now bounded at the far end. The alert remains the faster
+			// signal — CrystalbackupBackupStalled reads a state-derived series precisely so it fires on
+			// the phases no in-controller clock can see — but the run no longer depends on somebody
+			// reading it in order to finish.
+			if pvc, bounded := r.failVolumeOnAdvanceBackstop(ctx, backup, vol,
+				fmt.Errorf("mover Job %s/%s does not exist, so there is nothing to poll and no clock to "+
+					"measure: it was never created, or it was deleted from under this run",
+					r.OperatorNamespace, moverName)); bounded {
+				return pvc, nil // request teardown once Reconcile has persisted this terminal result
+			}
 			return "", nil
 		}
-		return "", fmt.Errorf("get mover Job %s/%s: %w", r.OperatorNamespace, moverName, err)
+		// The Job may well be there; we cannot READ it, so moverStalled cannot run and moverStartDeadline
+		// is as unreachable as if the Job did not exist. Recorded and retried by Reconcile step (10),
+		// bounded here.
+		cause := fmt.Errorf("get mover Job %s/%s: %w", r.OperatorNamespace, moverName, err)
+		if pvc, bounded := r.failVolumeOnAdvanceBackstop(ctx, backup, vol, cause); bounded {
+			return pvc, nil // request teardown once Reconcile has persisted this terminal result
+		}
+		return "", cause
 	}
 
 	complete := job.Status.Succeeded >= 1 || jobConditionTrue(&job, batchv1.JobComplete)
@@ -1605,6 +2299,19 @@ func (r *BackupReconciler) advanceUploading(ctx context.Context, backup *cbv1.Ba
 			// healthy mover on it, to clear a lock that by construction does not exist.
 			return vol.Pvc, nil // request teardown once Reconcile has persisted this terminal result
 		}
+		// NO BACKSTOP HERE. THIS IS THE LINE THE WHOLE DESIGN OF advanceRetryDeadline PROTECTS.
+		//
+		// Reaching this return means the Job was read successfully and moverStalled said the mover is
+		// fine: a pod of it has reached Running, or it has not yet had moverStartDeadline to try. From
+		// here the mover has as long as it likes — a multi-terabyte volume legitimately uploads for many
+		// hours, and every other branch that ends a volume in this function is careful to cost nothing
+		// when it fires (no bytes uploaded, no repository lock taken).
+		//
+		// Applying the phase-entry clock here would convert it, in one line, from a backstop on volumes
+		// nothing can be learned about into a WALL-CLOCK CAP ON BACKUP DURATION. That would destroy the
+		// largest and most valuable volumes in the fleet first, on the nights they matter most, while
+		// looking like a working feature. The anti-regression spec that pins this is the most important
+		// test in this lot.
 		return "", nil // still running; requeue
 	}
 
@@ -2394,48 +3101,71 @@ func sanitizeDNSName(raw string, max int) string {
 	return strings.TrimRight(s[:keep], "-") + "-" + suffix
 }
 
-// matchPVC reports whether a PVC is selected by sel: every matchLabels pair must be present, the
-// name must match at least one include glob when include is non-empty, and it must match no
-// exclude glob. An empty selector matches every PVC.
+// matchPVC reports whether a PVC is selected by sel.
+//
+// The rule itself lives on the API type (cbv1.PVCSelector.Matches) rather than here, because it is
+// part of the API contract and more than one package needs to answer the same question — the
+// controller that acts on it, and `selfcheck` which tells an administrator which PVCs a schedule
+// covers. Two implementations of that question is a product that can say one thing and do another.
 func matchPVC(pvc *corev1.PersistentVolumeClaim, sel cbv1.PVCSelector) bool {
-	for k, v := range sel.MatchLabels {
-		if pvc.Labels[k] != v {
-			return false
-		}
-	}
-	if len(sel.Include) > 0 && !matchAnyGlob(pvc.Name, sel.Include) {
-		return false
-	}
-	if matchAnyGlob(pvc.Name, sel.Exclude) {
-		return false
-	}
-	return true
+	return sel.Matches(pvc.Name, pvc.Labels)
 }
 
-// matchAnyGlob reports whether name matches any of the shell globs (path.Match semantics; PVC
-// names carry no '/'). A malformed pattern is treated as no-match rather than an error, so a bad
-// glob can never crash a reconcile.
-func matchAnyGlob(name string, globs []string) bool {
-	for _, g := range globs {
-		if ok, err := path.Match(g, name); err == nil && ok {
-			return true
-		}
-	}
-	return false
-}
-
-// firstNonTerminalVolume returns the index of the first volume still in flight (phase not
-// Completed/Skipped/Failed), or -1 if every volume is terminal.
+// firstNonTerminalVolume returns the index of the volume to advance this reconcile, or -1 if every
+// volume is terminal.
+//
+// It is the first non-terminal volume (phase not Completed/Skipped/Failed) that is not PARKED — a
+// parked volume being one still in Pending with a resolution failure already recorded against it.
+// Parked volumes are returned only when there is nothing else left to do, so they are still retried,
+// just never at the expense of a volume that has not been tried yet.
+//
+// That preference is the fix for the way this went wrong in production, and it is worth stating
+// plainly because the naive reading of "advance one volume per reconcile" hides it. One PVC named a
+// StorageClass that did not exist. It sat at the head of its namespace's queue, and because the head
+// is chosen by position alone, the five volumes behind it were never even attempted — for thirty
+// hours. The product owner's rule is the one encoded here: blocking a backup that could have
+// succeeded because something scheduled ahead of it is broken is not acceptable.
+//
+// Parked volumes are not abandoned. They keep their turn once the queue drains, and
+// pendingResolveDeadline eventually fails them so the run can reach a terminal phase at all — the two
+// mechanisms are halves of one guarantee, and neither is sufficient alone: the preference stops a
+// broken volume from starving healthy ones, the deadline stops it from keeping the run alive forever.
 func firstNonTerminalVolume(vols []cbv1.VolumeStatus) int {
+	parked := -1
 	for i := range vols {
 		switch vols[i].Phase {
 		case status.VolumePhaseCompleted, status.VolumePhaseSkipped, status.VolumePhaseFailed:
 			continue
-		default:
-			return i
 		}
+		if volumeIsParked(&vols[i]) {
+			if parked < 0 {
+				parked = i
+			}
+			continue
+		}
+		return i
 	}
-	return -1
+	return parked
+}
+
+// volumeIsParked reports whether vol is a Pending volume whose exposer resolution has already failed
+// at least once. The recorded reason IS the state — no extra field — because advancePending is the
+// only writer that leaves a reason on a still-Pending volume, and it writes exactly this one.
+// The empty phase is accepted as Pending because advanceVolume's own dispatch does
+// (`case status.VolumePhasePending, ""`), and a predicate that disagreed with the dispatch would
+// leave exactly one shape of volume — one seeded before the phase was written — able to park itself
+// and then hold the head of the queue anyway, which is the entire bug this is here to prevent.
+func volumeIsParked(vol *cbv1.VolumeStatus) bool {
+	switch vol.Phase {
+	case status.VolumePhasePending, "":
+		// The separator is part of the match on purpose: parkVolume writes
+		// "ExposerUnresolvable: <cause>", and a bare prefix test would silently adopt any FUTURE reason
+		// that merely starts with the same word (an "ExposerUnresolvableAfterExpose", say) into a
+		// parking rule that was never reasoned about for it.
+		return strings.HasPrefix(vol.Reason, backupReasonExposerUnresolvable+":")
+	default:
+		return false
+	}
 }
 
 // isTerminalBackupPhase reports whether a Backup phase is one of the four terminal aggregates.
