@@ -508,6 +508,45 @@ PodSecurity review has moved from "answer known, review not done" to partly exec
 `crystal-backup-system` must carry is now enforced by the chart in three places and checked by the
 operator at startup — but the review as a document is still not written.
 
+**Status as of 0.6.4 (2026-08-07) — 0.6.3 created the trap it warned about, and the same evening
+walked into it.** 0.6.3 stopped rendering the chart's `Namespace` object, which is correct; under an
+Argo CD Application with automated prune, an object that stops being rendered is an object to
+delete. The operator namespace went, and with it the cluster KEK. `install-argocd.md` had warned in
+general terms since M3 that "a prune can delete the namespace holding your cluster KEK";
+`upgrading.md`, the page an upgrader actually reads, said nothing.
+
+What that exposed is the release's subject and is worth recording as a shape rather than a bug. The
+escrow reconcile knew the rule — its own comment said `EnsureDEK` must not mint over a recoverable
+DEK, and its caller already converted a block into `Ready: False` — and it returned "do not block"
+from all six branches that failed *before it could ask the question*. Uncertainty was encoded as
+safety. The operator minted a DEK four seconds after the KEK was restored, then reported `Ready` for
+an hour while every mover failed against 38 snapshots it could no longer open. Only the conflict
+guard's refusal to overwrite the bucket object kept it recoverable.
+
+The fix is an invariant instead of a case list, and the lasting part is the test that guards the
+invariant rather than the cases: it reaches each branch, reads whichever reason it lands on, and
+fails on any reason outside a four-entry allow-list whose entries each argue why minting cannot fork
+the repository. **The escrow had no tests at all before this** — the code with the worst failure
+mode in the product, and the least visible when wrong.
+
+**Validated: 90 of 90 crucible checks, 0 failed, 0 skipped, in 2h44m1s** — the whole suite
+unfiltered on a freshly provisioned six-node RKE2 v1.35.7 + Rook-Ceph cluster with real S3. It took
+three campaigns: the first was killed mid-run by a session interruption, the second found the
+over-blocking described above, and the third is this one. The check that decided it is
+`increments the failure counter and pages, with no hold to wait out` — 17m11s green, having timed
+out at 300s while the gate refused too much.
+
+Worth recording as a limit rather than a caveat: the suite has NO lane that drives the escrow into
+an unresolved state, so the campaign measures that the tightened gate did not break the working
+paths — the right risk after narrowing a guard — and says nothing about the behaviour under
+uncertainty, which lives in fourteen unit cases and the invariant guard against a stubbed S3.
+
+Deliberately NOT in 0.6.4, and both are named in the CHANGELOG so they are not mistaken for
+oversights: a chart-side guard that makes Argo CD refuse to prune the operator namespace (that is a
+change to how the chart is installed, not a patch), and any claim that the escrow is now
+bulletproof — an administrator who restores the wrong KEK still has an unreadable repository, and
+0.6.4's contribution is that it says so in a reason of its own.
+
 ## M7 — Reach: storage without snapshots, file-level restore, notifications (0.7)
 
 **Re-scoped 2026-08-02.** M7 previously stacked the CLI and the UI under one number; both now

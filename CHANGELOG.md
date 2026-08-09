@@ -6,8 +6,22 @@ major 0; `1.0.0` is a deliberate post-M9 API-stability decision.
 
 ## 0.6.4 — The operator minted a key over the one that could open the repository (2026-08-07)
 
-<!-- VALIDATION PLACEHOLDER — the 0.6.4 crucible campaign has NOT run. Replace with the check
-     count, failures, skips, wall clock, cluster, and the report link, in the shape 0.6.3 uses. -->
+**Validated on real infrastructure: 90 of 90 crucible checks, 0 failed, 0 skipped, in 2h44m1s**
+— the whole suite, M0 through M6, unfiltered, on a freshly provisioned six-node RKE2 v1.35.7 +
+Rook-Ceph cluster with real S3, against the exact operator digest this release ships. Report:
+[crucible-m6.4](https://crystalbackup.github.io/CrystalBackup/reports/crucible-m6-4.html).
+
+The check that matters is `increments the failure counter and pages, with no hold to wait out`,
+which passed in **17m11s** having timed out at 300s on the first attempt. That is the one that
+caught the over-blocking below, and it is the only evidence that separates a gate which refuses
+the right things from one which refuses too much.
+
+**What this campaign does NOT establish, stated because 90 green checks invite the opposite
+reading.** The release's central change is a *refusal to act*, and no lane in this suite puts the
+escrow into an unresolved state on purpose — nothing strips a location's S3 credentials out from
+under a live operator. So the campaign proves the gate did not break the working paths, which
+after tightening a guard is exactly the risk worth measuring. The behaviour under uncertainty is
+covered by fourteen unit cases and the invariant guard, against a stubbed S3.
 
 **0.6.3 shipped in the evening and this was found before midnight, on the same cluster, by the
 same person.** It is a patch release with one defect at its centre, and that defect could destroy

@@ -1,6 +1,6 @@
 # Crystal Backup
 
-> **Early, real code** — **M0 through M6 have shipped (v0.6.3)**: the core backup engine,
+> **Early, real code** — **M0 through M6 have shipped (v0.6.4)**: the core backup engine,
 > cluster disaster recovery, **restore**, **manifest & cluster-scoped DR**, the
 > **namespace plane** (a user's own repository under their own key), **external sync** and the
 > **right to erasure** are implemented, tested and released. Every milestone is accepted on a
@@ -30,7 +30,7 @@ is restorable, with no pre-existing custom resources and no surviving cluster re
 
 ## ⚠️ Project status & disclaimer
 
-**M0 through M6 have shipped (v0.6.3)** — the core engine, cluster disaster recovery, restore,
+**M0 through M6 have shipped (v0.6.4)** — the core engine, cluster disaster recovery, restore,
 manifest & cluster-scoped DR, the namespace plane, external sync and the right to erasure are
 real, tested code, and M6 has now put instrumentation in front of all of it: a metrics
 catalogue, twelve alert rules with unit tests, traces, an exportable self-check and a
@@ -38,7 +38,7 @@ restore-fidelity gate that compares a restore to its source file by file. The CR
 `v1alpha1` and **will still move** before `1.0.0`, and three milestones remain
 ([roadmap](#roadmap)).
 
-**0.6.3 is offered for testing in real conditions, not for production.** The difference is
+**0.6.4 is offered for testing in real conditions, not for production.** The difference is
 specific rather than rhetorical: the milestone's own exit criteria call for a two-week soak
 alongside Velero and a pilot rollout, and neither has happened yet. Run it on a cluster whose
 loss you can absorb, alongside — not instead of — whatever you back up with today. So:
@@ -63,6 +63,7 @@ The reports are published in full, per check, pass and skip:
 | 0.6.1 — mover sizing | [crucible-m6.1](https://crystalbackup.github.io/CrystalBackup/reports/crucible-m6-1.html) — the full 82-check suite again, on the sizing defaults |
 | 0.6.2 — the soak kit | [crucible-m6.2](https://crystalbackup.github.io/CrystalBackup/reports/crucible-m6-2.html) — the full 82-check suite a third time, on the release that makes the two-week soak runnable |
 | 0.6.3 — the first hour on somebody else's cluster | [crucible-m6.3](https://crystalbackup.github.io/CrystalBackup/reports/crucible-m6-3.html) — **90 checks**, and the first campaign installed the way the documentation tells a reader to install: the two overrides that had hidden four defects are gone |
+| 0.6.4 — the operator minted a key over the one that could open the repository | [crucible-m6.4](https://crystalbackup.github.io/CrystalBackup/reports/crucible-m6-4.html) — 90 checks again, on a freshly provisioned cluster, after a first cut of the fix refused too much and a lane caught it |
 
 The reports include the defects each round found — writing the M5 suite alone turned up three
 features that were documented and completely **inert** on real infrastructure. That is the point
@@ -172,7 +173,7 @@ Full requirements (R1–R28) and rationale: [spec/00-requirements.md](spec/00-re
 
 ## How it compares
 
-The Crystal Backup column is **v0.6.3 as shipped** — every ✅ below is code you can install
+The Crystal Backup column is **v0.6.4 as shipped** — every ✅ below is code you can install
 today, and each one is exercised by the published
 [acceptance reports](#-project-status--disclaimer). The other columns are those tools'
 **current** capabilities to the best of our knowledge. Capabilities evolve, these tools have
@@ -182,7 +183,7 @@ project's own docs.
 Legend: ✅ yes / core goal · 🟡 partial or possible with effort · ❌ no / not a goal ·
 🚧 **not shipped yet** (milestone in the cell).
 
-| Capability | Crystal Backup *(v0.6.3)* | Velero | K8up | VolSync | Kasten K10 |
+| Capability | Crystal Backup *(v0.6.4)* | Velero | K8up | VolSync | Kasten K10 |
 |---|:--:|:--:|:--:|:--:|:--:|
 | Open source | ✅ | ✅ | ✅ | ✅ | ❌ (commercial; limited free tier) |
 | Namespace-user **self-service** (own schedules/restores) | ✅ | ❌ (admin-oriented) | ✅ | 🟡 | 🟡 |
