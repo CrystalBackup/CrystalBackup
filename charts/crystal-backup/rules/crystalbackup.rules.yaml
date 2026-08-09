@@ -53,6 +53,63 @@ groups:
         annotations:
           summary: "No successful backup for {{ $labels.namespace }}/{{ $labels.schedule }} ({{ $labels.origin }}) within its schedule's deadline"
           description: "The schedule is active and its deadline has passed with no successful Backup. Check the namespace's Backup objects for a failed or stuck run, and the mover Jobs in the operator namespace."
+      # THE INCIDENT. On 2026-08-09 the operator's own self-check on a live cluster read:
+      # `degraded — 2 rule(s) breached, none critical` over a cluster that had produced no
+      # successful backup for THIRTY-ONE HOURS. Both breached rules were severity warning, so
+      # thirty-one hours of nothing was routed, coloured and worded exactly like being one hour
+      # late. Every number was right and the headline was the wrong answer to the question being
+      # asked. Severity now tracks magnitude.
+      # IT IS THE SAME CONDITION AS CrystalbackupBackupMissed, not a second rule: same series,
+      # same five join keys, same schedule_created fallback for a series that has never
+      # succeeded, same schedule_active guard, same 15m hold. The ONLY differences are the
+      # threshold and the severity — which is what makes this an escalation instead of a second
+      # copy of the logic to keep in sync.
+      # THE BOUND IS DERIVED, LIKE THE WARNING'S. Three x crystalbackup_schedule_period_seconds + 1h,
+      # per series. A fixed critical hour count would reintroduce, one severity up, the exact bug
+      # the derived warning was added to fix: at any flat number an hourly schedule is most of a
+      # day dead before the critical page arrives, and a weekly schedule is paged critical while
+      # it is entirely healthy. Three periods is 3h hourly, 73h nightly, three weeks weekly.
+      # BOTH TIERS FIRE. Crossing this bound does not resolve the warning, and that is on purpose:
+      # narrowing the warning so it stopped here would make an administrator's existing
+      # warning-severity routing go SILENT at the moment the situation got worse, on upgrade,
+      # without anyone asking for it. Deduplicate in Alertmanager with an inhibit_rule keyed on
+      # (namespace, schedule, origin, location, cluster) — the join keys are identical, so the two
+      # alert instances line up label for label.
+      # THE UNPARSEABLE-CRON FALLBACK is three of the assumed 24h periods plus the same 2h grace,
+      # 74h against the warning's 26h, from the same two constants so the pair cannot drift. That
+      # schedule will never run at all, so it earns the escalation more plainly than anything else
+      # here; it simply cannot be measured in periods it does not have.
+      - alert: CrystalbackupBackupMissedCritical
+        expr: |
+          (
+            (
+              (
+                (time() - crystalbackup_backup_last_success_timestamp_seconds)
+                or on (namespace, schedule, origin, location, cluster)
+                (time() - crystalbackup_schedule_created_timestamp_seconds)
+              )
+              > on (namespace, schedule, origin, location, cluster) group_left()
+                (crystalbackup_schedule_period_seconds * 3 + 3600)
+            )
+            or
+            (
+              ((
+                (time() - crystalbackup_backup_last_success_timestamp_seconds)
+                or on (namespace, schedule, origin, location, cluster)
+                (time() - crystalbackup_schedule_created_timestamp_seconds)
+              ) > 266400)
+              unless on (namespace, schedule, origin, location, cluster)
+                crystalbackup_schedule_period_seconds
+            )
+          )
+          and on (namespace, schedule, origin, location, cluster)
+            (crystalbackup_schedule_active == 1)
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: "NO BACKUP for {{ $labels.namespace }}/{{ $labels.schedule }} ({{ $labels.origin }}) in 3 of its schedule's own periods"
+          description: "This is CrystalbackupBackupMissed's condition at three times the magnitude: the schedule is active and has now missed three consecutive periods, so nothing has been captured since it broke and a restore would land on data that old. Treat it as data loss in progress, not as a late job. Same investigation as the warning — the namespace's Backup objects, then the mover Jobs in the operator namespace — with the addition that whatever is wrong has already survived three attempts, so a retry is not the fix."
       # Two disjuncts, because the counter alone was measured to be SILENT on a real failure.
       # The first is the ordinary reading, and increase() over an hour is also why there is no
       # `for` hold: the range IS the hold.
@@ -122,6 +179,16 @@ groups:
       # never ready at 2h) and end in a Failed volume that BackupFailed pages on. This rule catches
       # what those cannot prove, including a Backup gated Pending forever and a mover that is
       # running and wedged, and it accepts firing on a genuinely enormous first full to do it.
+      # WHY THERE IS NO CRITICAL TIER FOR THIS ONE, when CrystalbackupBackupMissed has one:
+      # a stall says a run has not finished, NOT that no run has finished. Under
+      # concurrencyPolicy: Allow a Backup can sit wedged forever while every subsequent night
+      # succeeds — restores work, and what is actually wrong is wreckage rather than data loss. In
+      # the case where a stall does mean nothing is landing, last_success stops advancing and
+      # CrystalbackupBackupMissedCritical is what pages, derived from that schedule's own period.
+      # There is also nothing honest to scale this bound by: how long a backup legitimately takes
+      # is a property of the VOLUME, not of the cron, so a critical tier here would be either a
+      # hardcoded multiple of 8h or a period multiple that sends a 3TB first full critical in
+      # twenty minutes on a five-minute schedule. See backupStalledThreshold for the full account.
       - alert: CrystalbackupBackupStalled
         expr: |
           time() - crystalbackup_backup_in_progress_since_timestamp_seconds > 28800
@@ -131,8 +198,13 @@ groups:
         annotations:
           summary: "Backup {{ $labels.namespace }}/{{ $labels.schedule }} has been running for over 8h without finishing"
           description: "A run that never ends is invisible to every other rule here: nothing failed, so BackupFailed is silent, and last_success has not gone stale yet so BackupMissed is too. kubectl get backup -n {{ $labels.namespace }} -o wide shows the per-volume phases; the reason on a volume names the cause, and for one stuck in Uploading, kubectl describe pod on its mover Job in the operator namespace has the kubelet's account."
-      # The only critical rule here, because it is the only one that says the RESTORE PATH is
-      # compromised rather than that a backup is late.
+      # Critical because it says the RESTORE PATH is compromised rather than that a backup is late,
+      # and it says so from the FIRST evaluation rather than after a magnitude has accumulated:
+      # repository damage does not get worse before it is worth paging about.
+      # It was the table's only critical rule until 0.6.5, when CrystalbackupBackupMissedCritical was
+      # added — that one reaches the same conclusion by a different road (nothing captured for three
+      # of a schedule's own periods is a restore landing on data that old), and it needs a magnitude
+      # to get there precisely because being one run late does not compromise anything.
       # A repository that has never been checked emits no series at all (spec §2.4), so this stays
       # silent on a fresh location instead of paging the moment one is created.
       - alert: CrystalbackupRepositoryCheckFailed

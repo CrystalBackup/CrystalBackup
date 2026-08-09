@@ -982,9 +982,21 @@
           "legendFormat": "failed — {{schedule}}",
           "instant": false,
           "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "crystalbackup_clusterbackup_namespaces_blocked",
+          "refId": "C",
+          "legendFormat": "blocked (never backed up) — {{schedule}}",
+          "instant": false,
+          "range": true
         }
       ],
-      "description": "Last-run gauges. matched dropping to 0 means the namespace selector stopped matching — a silent way to back up nothing while every run reports success.",
+      "description": "Last-run gauges. matched dropping to 0 means the namespace selector stopped matching — a silent way to back up nothing while every run reports success. failed counts namespaces whose child Backup ran and failed; blocked counts namespaces the run never backed up at all (occupied Backup coordinate, or the child could not be created). Both are shortfalls: read them together, never failed alone.",
       "options": {
         "legend": {
           "calcs": [],

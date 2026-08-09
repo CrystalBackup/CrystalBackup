@@ -17,6 +17,8 @@ limitations under the License.
 package v1alpha1
 
 import (
+	"path"
+
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -298,6 +300,52 @@ type PVCSelector struct {
 	Exclude []string `json:"exclude,omitempty"`
 }
 
+// Matches reports whether a PVC with this name and these labels is selected by s: every matchLabels
+// pair must be present, the name must match at least one include glob when include is non-empty, and
+// it must match no exclude glob. An empty selector matches every PVC.
+//
+// A malformed glob is treated as no-match rather than an error, so a bad pattern can never break a
+// reconcile — nor, therefore, a report about one.
+//
+// # Why this lives on the API type, and why it takes a name and labels rather than a PVC
+//
+// The selector's semantics are part of the API contract ([02-api.md]), not an implementation detail
+// of the controller that happens to read it first. Keeping the rule beside the type is what stops it
+// from being re-derived: 0.6.5 shipped a second copy of exactly these fourteen lines in
+// internal/selfcheck, because the controller's own predicate was unexported and the package that
+// needed it could not reach it. Two implementations of "which PVCs does this schedule cover" is a
+// product that can tell an administrator one thing and do another.
+//
+// The signature takes the name and the labels instead of a *corev1.PersistentVolumeClaim on purpose,
+// and it is not a stylistic preference. This package has NO dependency on k8s.io/api and must keep
+// it that way: it is destined to become its own Go module so the external CLI and UI can import the
+// object definitions without inheriting the operator's dependency graph (see the M7 entry in
+// 90-roadmap.md, which ships a test enforcing exactly this). Accepting a PVC would have added that
+// dependency to host a function whose entire input is two fields. Making the inputs explicit is the
+// honest signature anyway — this rule reads a name and a label set, and nothing else.
+func (s PVCSelector) Matches(name string, labels map[string]string) bool {
+	for k, v := range s.MatchLabels {
+		if labels[k] != v {
+			return false
+		}
+	}
+	if len(s.Include) > 0 && !matchesAnyGlob(name, s.Include) {
+		return false
+	}
+	return !matchesAnyGlob(name, s.Exclude)
+}
+
+// matchesAnyGlob reports whether name matches any of the shell globs (path.Match semantics; PVC names
+// carry no '/'). A malformed pattern is skipped rather than surfaced as an error — see Matches.
+func matchesAnyGlob(name string, globs []string) bool {
+	for _, g := range globs {
+		if ok, err := path.Match(g, name); err == nil && ok {
+			return true
+		}
+	}
+	return false
+}
+
 // NamespaceSelector selects namespaces for cluster-plane backup. At least one
 // positive form (matchNames/matchLabels/matchExpressions/regexp) must be set;
 // exclude is applied last (admission rule 8).
@@ -398,6 +446,28 @@ type HookStatus struct {
 	// result of the execution.
 	// +required
 	Result HookResult `json:"result"`
+	// onError is the failure policy that was IN EFFECT for this execution, resolved from the hook
+	// that produced it — the spec's onError, or the pod's `on-error` annotation when annotations
+	// won for that pod.
+	//
+	// It is recorded because it is what makes a `Failed` entry legible, to a reader and to the
+	// controller alike. The same result means two opposite things: under `Fail` the run was aborted
+	// and there is no snapshot, under `Continue` the run PROCEEDED and its restore point is
+	// crash-consistent only. Without the policy beside the result, a `Failed` pre entry on a
+	// `Completed` Backup is unexplainable in the one place an operator trusts to be literal.
+	//
+	// The controller needs it for a harder reason: nothing about the freeze window is kept in
+	// memory (see status.hooks' own doc), so the decision "abort, or proceed degraded" is taken on
+	// a LATER reconcile from this record alone. A status that dropped the policy — as 0.6.4's did —
+	// erases the user's answer at the moment it is written down, which is how `onError: Continue`
+	// came to fail the run it was asked to let through.
+	//
+	// EMPTY IS READ AS FAIL, matching HookErrorPolicy's own zero-value rule, and that is what makes
+	// an upgrade over a Backup already mid-freeze-window safe: entries written by an operator that
+	// did not record the policy abort exactly as they did before, rather than silently becoming
+	// tolerated by a newer binary.
+	// +optional
+	OnError HookErrorPolicy `json:"onError,omitempty"`
 	// message carries the failure, including the command's own stderr — usually the whole
 	// diagnosis. Empty on success.
 	// +optional
@@ -722,6 +792,49 @@ type VolumeStatus struct {
 	// reason explains a non-Completed phase (e.g. CSISnapshotUnsupported).
 	// +optional
 	Reason string `json:"reason,omitempty"`
+	// firstAttemptAt is when this volume was first ATTEMPTED — not when it was enumerated. Volumes
+	// are advanced one per reconcile, so a volume waits its turn before anything is tried on it, and
+	// a clock started at enumeration would run while the volume was merely queued.
+	//
+	// It exists to bound Pending. The three deadlines that bound the later phases each hang off an
+	// object that already carries its own creation time (the origin VolumeSnapshot, the mover Job); a
+	// volume stuck BEFORE exposure has created nothing, so there is no other clock to read. Without
+	// this field the only shared clock is the Backup's own start time, and using that would fail the
+	// next volume the instant it reached the head of the queue, having never been tried.
+	// +optional
+	FirstAttemptAt *metav1.Time `json:"firstAttemptAt,omitempty"`
+	// phaseEnteredAt is when this volume last CHANGED PHASE. It is stamped on every transition, in
+	// one place (the per-PVC state machine's single call site), so a phase added later cannot forget
+	// to set it.
+	//
+	// It is a BACKSTOP CLOCK, and the distinction from every other deadline in this controller is the
+	// reason it had to exist at all. The per-phase bounds hang off the object being waited on — the
+	// origin VolumeSnapshot's creationTimestamp, the mover Job's — precisely because that object
+	// carries evidence a wall clock cannot: whether anything ever picked the request up, whether a
+	// pod ever reached Running. Those bounds are better than this field and must always win. What was
+	// missing is a bound for the case where that object CANNOT BE REACHED at all: an exposure that
+	// cannot be reconstructed, a mover Job that cannot be read or is absent, an origin snapshot whose
+	// progress is unreadable. A volume in Snapshotting or Uploading is not deferred by the queue
+	// discipline (correctly — it legitimately holds work in flight), so with no clock it kept the head
+	// of its namespace's queue with nothing that could ever end it. That is the thirty-hour incident
+	// one and two phases later, and this field is the only clock left once the per-object ones are
+	// unreachable.
+	//
+	// It is a SIBLING of firstAttemptAt rather than a generalisation of it, and merging the two would
+	// be a silent regression. firstAttemptAt deliberately means "first ATTEMPT", not "entered
+	// Pending": volumes are advanced one per reconcile, so a Pending volume waits its turn before
+	// anything is tried on it, and its own doc records why a clock started at enumeration is wrong
+	// (it would fail the next volume the instant it reached the head of the queue, having never been
+	// tried). A field re-stamped on every transition cannot also be a field stamped once on first
+	// contact, and one field meaning both would have quietly converted the Pending bound into the
+	// enumeration bound it was written to avoid.
+	//
+	// Absent means NO CLOCK, and therefore no verdict — never "long ago". A volume already in flight
+	// when the operator was upgraded to a version that writes this field has no transition to read,
+	// so it is stamped on the first pass that touches it and bounded from there: the backstop can be
+	// late, never early.
+	// +optional
+	PhaseEnteredAt *metav1.Time `json:"phaseEnteredAt,omitempty"`
 }
 
 // ManifestsStatus records the namespace-manifests snapshot within a Backup.

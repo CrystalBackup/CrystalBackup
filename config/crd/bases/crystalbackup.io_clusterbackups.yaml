@@ -29,6 +29,9 @@ spec:
     - jsonPath: .status.namespacesFailed
       name: Failed
       type: integer
+    - jsonPath: .status.namespacesBlocked
+      name: Blocked
+      type: integer
     - jsonPath: .metadata.creationTimestamp
       name: Age
       type: date
@@ -572,8 +575,33 @@ spec:
                       type: string
                   type: object
                 type: array
+              namespacesBlocked:
+                description: |-
+                  namespacesBlocked is the number of matched namespaces this run did NOT back up at all: the
+                  Backup coordinate was already occupied by an object the run did not create (a previous run's
+                  terminal record, a discovery projection, another plane's Backup), or the child could not be
+                  created. status.failures carries the per-namespace reason.
+
+                  It is not a milder failure — nothing protected those namespaces this run, and they degrade
+                  the phase exactly as namespacesFailed does. It is a DIFFERENT one: there is no child of this
+                  run there whose status could be read, so the run reports that it did not act rather than
+                  passing a verdict on an object that is not its own. Alerting on "namespaces this run did not
+                  protect" must watch namespacesFailed + namespacesBlocked.
+
+                  namespacesSucceeded + namespacesFailed + namespacesBlocked, plus the namespaces still in
+                  flight, account for every namespace the run is answerable for.
+                format: int32
+                type: integer
               namespacesFailed:
-                description: namespacesFailed at least one PVC.
+                description: |-
+                  namespacesFailed is the number of namespaces whose child Backup RAN and did not fully
+                  succeed (phase Failed or PartiallyFailed). It is derived from nothing but those children's
+                  own phases, so it can always be reconciled against them.
+
+                  It deliberately does NOT include namespaces this run never backed up — those are
+                  namespacesBlocked. Merging the two is the defect this split closes: a run once reported 32
+                  failed namespaces over children that read Completed, because a namespace whose coordinate was
+                  occupied incremented the same field a genuinely failed backup did.
                 format: int32
                 type: integer
               namespacesMatched:

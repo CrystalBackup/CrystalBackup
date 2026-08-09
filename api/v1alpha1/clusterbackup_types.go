@@ -54,9 +54,31 @@ type ClusterBackupStatus struct {
 	// namespacesSucceeded fully.
 	// +optional
 	NamespacesSucceeded int32 `json:"namespacesSucceeded,omitempty"`
-	// namespacesFailed at least one PVC.
+	// namespacesFailed is the number of namespaces whose child Backup RAN and did not fully
+	// succeed (phase Failed or PartiallyFailed). It is derived from nothing but those children's
+	// own phases, so it can always be reconciled against them.
+	//
+	// It deliberately does NOT include namespaces this run never backed up — those are
+	// namespacesBlocked. Merging the two is the defect this split closes: a run once reported 32
+	// failed namespaces over children that read Completed, because a namespace whose coordinate was
+	// occupied incremented the same field a genuinely failed backup did.
 	// +optional
 	NamespacesFailed int32 `json:"namespacesFailed,omitempty"`
+	// namespacesBlocked is the number of matched namespaces this run did NOT back up at all: the
+	// Backup coordinate was already occupied by an object the run did not create (a previous run's
+	// terminal record, a discovery projection, another plane's Backup), or the child could not be
+	// created. status.failures carries the per-namespace reason.
+	//
+	// It is not a milder failure — nothing protected those namespaces this run, and they degrade
+	// the phase exactly as namespacesFailed does. It is a DIFFERENT one: there is no child of this
+	// run there whose status could be read, so the run reports that it did not act rather than
+	// passing a verdict on an object that is not its own. Alerting on "namespaces this run did not
+	// protect" must watch namespacesFailed + namespacesBlocked.
+	//
+	// namespacesSucceeded + namespacesFailed + namespacesBlocked, plus the namespaces still in
+	// flight, account for every namespace the run is answerable for.
+	// +optional
+	NamespacesBlocked int32 `json:"namespacesBlocked,omitempty"`
 	// pvcsSucceeded across all namespaces.
 	// +optional
 	PVCsSucceeded int32 `json:"pvcsSucceeded,omitempty"`
@@ -94,6 +116,7 @@ type ClusterBackupStatus struct {
 // +kubebuilder:printcolumn:name="Matched",type=integer,JSONPath=`.status.namespacesMatched`
 // +kubebuilder:printcolumn:name="Succeeded",type=integer,JSONPath=`.status.namespacesSucceeded`
 // +kubebuilder:printcolumn:name="Failed",type=integer,JSONPath=`.status.namespacesFailed`
+// +kubebuilder:printcolumn:name="Blocked",type=integer,JSONPath=`.status.namespacesBlocked`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
 // ClusterBackup is one DR run that fans out Backup objects into selected namespaces.

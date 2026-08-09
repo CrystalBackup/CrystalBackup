@@ -99,9 +99,36 @@ type ClusterRestoreStatus struct {
 	// Under dryRun it holds the PLAN rather than an observed outcome.
 	// +optional
 	Resources *RestoreResourcesStatus `json:"resources,omitempty"`
-	// restoredVolumes count.
+	// plannedVolumes is how many volumes this restore's plan covers: the denominator of the two
+	// counters below. Written on every pass, so restoredVolumes/plannedVolumes answers "how far
+	// along" while the restore is still running.
+	//
+	// It is the intersection of spec.volumes with what the repository coordinate actually holds, so it
+	// can be smaller than either — and it is 0 for a volumes-free restore (resources[] or
+	// clusterResources only), which is a valid restore, not an empty one.
+	// +optional
+	PlannedVolumes int32 `json:"plannedVolumes,omitempty"`
+	// restoredVolumes is how many planned volumes have their data back. It is written on EVERY pass,
+	// not only the terminal one: a ClusterRestore is what runs during a disaster recovery, and a
+	// counter that reads 0 until the whole run finishes cannot answer "is it moving".
+	//
+	// VOLUMES ONLY. The manifest halves of a restore — resources[] and clusterResources — are counted
+	// in restoredResources and resources.failedCount, and the terminal PHASE rolls up ALL of them, so
+	// a restore whose every volume landed can still read Failed or PartiallyFailed because
+	// cluster-scoped resources failed to apply, with failedVolumes at 0. That asymmetry is deliberate
+	// (the halves fail for unrelated reasons and are driven independently) and is spelled out here
+	// because this is where a reader meets it.
 	// +optional
 	RestoredVolumes int32 `json:"restoredVolumes,omitempty"`
+	// failedVolumes is how many planned volumes settled WITHOUT their data — a failed mover, an
+	// exposure that never became mountable, an unsupported target, or a volume whose error budget ran
+	// out. It is the answer to "what did not come back", and it is written on every pass.
+	//
+	// plannedVolumes - restoredVolumes - failedVolumes is what is still in flight. On a terminal
+	// restore that difference is 0 by construction: the restore does not go terminal until every
+	// planned volume has settled.
+	// +optional
+	FailedVolumes int32 `json:"failedVolumes,omitempty"`
 	// restoredBytes total.
 	// +optional
 	RestoredBytes int64 `json:"restoredBytes,omitempty"`
@@ -117,6 +144,9 @@ type ClusterRestoreStatus struct {
 // +kubebuilder:resource:scope=Cluster,shortName=crst
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
 // +kubebuilder:printcolumn:name="Target",type=string,JSONPath=`.spec.target.namespace`
+// +kubebuilder:printcolumn:name="Restored",type=integer,JSONPath=`.status.restoredVolumes`
+// +kubebuilder:printcolumn:name="Failed",type=integer,JSONPath=`.status.failedVolumes`
+// +kubebuilder:printcolumn:name="Volumes",type=integer,JSONPath=`.status.plannedVolumes`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
 // ClusterRestore restores a namespace from a repository coordinate (admin, R14).

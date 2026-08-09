@@ -50,9 +50,37 @@ type ClusterErasureStatus struct {
 	// +optional
 	// +kubebuilder:validation:Enum=Pending;AwaitingConfirmation;Running;Completed;Blocked;Failed
 	Phase string `json:"phase,omitempty"`
-	// snapshotsForgotten count.
+	// snapshotsTargeted is how many snapshots matched this erasure's filter when its scope was
+	// measured, BEFORE anything was removed. It is the denominator of the record: the erasure has to
+	// count what it is about to destroy while the evidence still exists, and this field is where that
+	// count lives. It never changes once written.
+	// +optional
+	SnapshotsTargeted int32 `json:"snapshotsTargeted,omitempty"`
+	// snapshotsForgotten is how many snapshots this erasure is ESTABLISHED to have removed — never how
+	// many it intended to remove. It stays 0 while the erasure is running, and on a terminal object it
+	// is either the whole scope (the forget+prune reported success) or the scope minus what a
+	// post-failure listing still found.
+	//
+	// This field is a compliance attestation, not a progress counter: it is what somebody points at to
+	// assert that a GDPR erasure, a contractual deletion or a tenant offboarding was carried out. It
+	// previously held the PRE-erasure count, so a failed erasure published a failed phase beside
+	// "snapshotsForgotten: 10" — a record claiming a destruction that had not happened. Read it
+	// together with snapshotsRemaining, which says what is left.
 	// +optional
 	SnapshotsForgotten int32 `json:"snapshotsForgotten,omitempty"`
+	// snapshotsRemaining is how many snapshots matching this erasure's filter are still in the
+	// repository. Zero on a completed erasure; on a failed one it is the work left to do, and it is
+	// what makes a partial erasure legible (4 of 10 removed reads forgotten 4, remaining 6).
+	//
+	// When the erasure failed AND the verification listing could not be read either, this field holds
+	// the whole targeted scope: an outcome nobody could establish is reported as an erasure that
+	// destroyed nothing, never as an empty repository.
+	//
+	// snapshotsForgotten + snapshotsRemaining == snapshotsTargeted, except when snapshots matching the
+	// target were written AFTER the scope was measured, in which case remaining can exceed the scope
+	// and the operator says so in a Warning event rather than adjusting a number to make it balance.
+	// +optional
+	SnapshotsRemaining int32 `json:"snapshotsRemaining,omitempty"`
 	// reclaimedBytes after prune.
 	// +optional
 	ReclaimedBytes int64 `json:"reclaimedBytes,omitempty"`
@@ -70,7 +98,9 @@ type ClusterErasureStatus struct {
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Cluster,shortName=cer
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
+// +kubebuilder:printcolumn:name="Targeted",type=integer,JSONPath=`.status.snapshotsTargeted`
 // +kubebuilder:printcolumn:name="Forgotten",type=integer,JSONPath=`.status.snapshotsForgotten`
+// +kubebuilder:printcolumn:name="Remaining",type=integer,JSONPath=`.status.snapshotsRemaining`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
 // ClusterErasure erases a tenant/namespace/PVC from a location (right-to-erasure, R21).
