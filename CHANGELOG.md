@@ -4,11 +4,30 @@ All notable changes to Crystal Backup. Versioning follows
 [adr/0014](spec/adr/0014-versioning-and-release.md): milestone `Mn` → minor `0.n.z` on
 major 0; `1.0.0` is a deliberate post-M9 API-stability decision.
 
-## 0.6.5 — One volume held the queue, and every night after it was skipped (unreleased)
+## 0.6.5 — One volume held the queue, and every night after it was skipped (2026-08-10)
 
-> **Campaign not yet run.** This section is written as the lots land; the crucible verdict and the
-> report link go in when the campaign has actually passed, not before. A release note that describes
-> a campaign it has not seen is the exact habit this project spent M6 removing.
+**Validated on real infrastructure: 93 of 93 crucible checks, 0 failed, 0 skipped, in 2h48m54s** —
+the whole suite, M0 through M6, unfiltered, against the exact digests this release ships. Report:
+[crucible-m6.5](https://crystalbackup.github.io/CrystalBackup/reports/crucible-m6-5.html). It is the
+first 93-check run: the three new ones reproduce this release's incident, and the one that matters
+most puts the neighbouring volumes' **actual bytes** in the repository and reads them back while the
+unsnapshottable volume sits first in the queue.
+
+**It took two attempts, and the first one failed.** Run 1 on this same tree: 62 passed, 7 failed, 24
+skipped, and **21 of 93 checks never ran** because the suite hit its four-hour timeout. Five of the
+seven failures were one leaked `VolumeSnapshotContent`, each sitting out a full 600-second deadline —
+about 95 minutes of budget spent watching a single object not disappear. That leak was a real defect
+and it is fixed below; the two checks that had timed out now pass in 50.9s and 15.8s. The two
+failures nobody could attribute in run 1 — the M3 DR bootstrap and the M4 maintenance retry — passed
+in run 2, which identifies them as collateral of the deadline burn rather than defects.
+
+**What this campaign does NOT establish.** The release's central guarantee is that no single volume
+can hold its namespace's queue, and the suite proves that for the shapes it injects: an
+unsnapshottable static volume, a missing snapshotter Secret, a snapshot nobody picks up, a mover pod
+that never starts. It does not inject a durably failing `Expose`, an unreadable source PVC, or a
+hooks-resolution failure — those three paths are covered by envtest and by mutation testing against a
+stub, not by real storage. And the two hook-chain defects named at the end of this entry are not
+covered anywhere: they are open.
 
 A nightly schedule on a live cluster produced nothing for **thirty-one hours**. Nothing crashed,
 nothing alerted above `warning`, and the operator's own dashboard read *0% backup success* — which
@@ -132,18 +151,30 @@ defect be re-armed by choosing the other value.
 
 The same run reported 32 failed namespaces. Not one of those 32 had failed.
 
-The children had been fanned out before `crystalbackup.io/parent-uid` existed, and the operator was
-upgraded while the run was in flight. `classifyCoordinate` admits into its adoption window only a
-child holding no result of any kind, so every one of the run's 32 **terminal** children was
-classified a foreign occupant of its coordinate — and each collision incremented
-`NamespacesFailed`, a field that a second, independent site also fed from the child phases. "This
-run never backed up this namespace" and "it tried and failed" were the same number.
+The defect is that **one field had two sources of truth**: the child phases, and the fan-out's
+coordinate-collision map. "This run never backed up this namespace" and "it tried and failed" were
+the same number, so neither could be believed.
+
+The collision path is reachable because `classifyCoordinate` admits into its adoption window only a
+child holding no result of any kind, so a run's own **terminal** children can be classified as
+foreign occupants of their coordinate. A child fanned out before `crystalbackup.io/parent-uid`
+existed, by an operator upgraded mid-run, is one way to get there, and it is the way first
+reproduced in a test.
+
+**It is not the only way, and saying so is the point.** The same disagreement was afterwards observed
+live on a *fresh* run whose children carried the correct parent-uid stamp, matching the run's UID
+exactly — 31 children reading `Completed` beside `namespacesFailed: 31`. So the trigger is broader
+than the first reproduction suggested, and this note makes no claim to have enumerated it.
+
+Which is exactly why the fix is structural rather than a repair to the classifier.
 
 Every namespace count now comes from **one** classification, in one pass, with a total the
 controller checks on every write (and an `AggregateInconsistent` Warning if it ever fails to add
-up). `namespacesBlocked` is a new, separate counter, with its own metric — because
-`namespaces_failed` alone would now read 0 over 32 unprotected namespaces. `Skipped` stays neutral
-end to end.
+up). A collision therefore cannot contribute to `namespacesFailed` whatever decides it, and a
+`Completed` child maps to succeeded unconditionally — so the counters stopped depending on an answer
+nobody has finished working out. `namespacesBlocked` is a new, separate counter with its own metric,
+because `namespaces_failed` alone would now read 0 over 32 unprotected namespaces. `Skipped` stays
+neutral end to end. Cataloguing every path into the collision branch is open in the roadmap backlog.
 
 **A sum invariant would not have caught this, and that is the lesson worth keeping.** The published
 numbers *did* add up: 0 + 32 + 1 = 33. Only reading the counters back **against the children they
@@ -300,6 +331,51 @@ guarantee that holds on three paths out of four is not a guarantee:
   ladder stays strictly under it so the safety argument cannot rot. It is consulted at exactly the
   six sites where no per-object bound is reachable, and **never** at "still running; requeue" — a
   mutation that added it there is one of the tests.
+
+### The teardown's own verification could not fail, on a whole plane
+
+Found by the campaign, which is the only thing that could have found it: one leaked
+`VolumeSnapshotContent` from the namespace-plane lane failed **five** leak checks across **four**
+unrelated milestones, each sitting out its full 600s deadline, which pushed the run into its suite
+timeout and left 21 of 93 specs unrun. It was still there three hours later, so it was a permanent
+leak, not a slow one.
+
+Three code paths were blind to the same single object class, all for one reason. Exposure objects are
+selected by `(managed-by, cluster-backup, namespace)`, and on the **namespace plane** there is no
+run — a `Backup` there is not a fan-out child — so that middle value was the empty string:
+
+- **`exposureResidueRemains`**, the sweep's own verification read, the thing that decides whether the
+  "exposures cleaned" marker may be stamped. Its selector matched the wrong set, it answered "no
+  residue", and the sweep declared itself finished without having looked at the objects it exists to
+  check. Its own comment already said *never let an unreadable cluster read as a clean one*; that
+  principle had not been extended to a selector that **cannot** match.
+- **`OrphanReaper.orphaned`**, the backstop, short-circuited on `run == ""`. The branch immediately
+  below it — owning Backup gone, therefore reap — was the exact verdict this object needed.
+- **`reclaimOrphanOriginVSC`**, the crash-window reclaim for precisely this situation (the origin
+  snapshot already gone), for a subtler reason worth recording: `mergeLabels` skips a write when the
+  value already matches, and an empty desired value compares equal to a **missing** key. So objects
+  that were *created* carried the empty label while the *patched* origin content — the cluster-scoped,
+  expensive one — never carried the key at all. That asymmetry is why the deleting path, the verifying
+  path and the backstop all missed the same object.
+
+The one honest reader was `selfcheck`, which selects on managed-by plus the PVC label and resolves no
+owner — the same pattern as the reaper defect above: the component that only observes was right, and
+the components that act were wrong.
+
+Fixed structurally rather than by widening a selector. A new `crystalbackup.io/backup` label carries
+the owning Backup's name, stamped unconditionally on **both** planes — the name is the identity both
+planes share, which `cluster-backup`'s own value contract already implied — and **no key is ever
+stamped with an empty value again**, which removes the trap at its source. Widening the selector to
+`(managed-by, namespace, pvc)` was rejected: it matches a concurrent run's origin content for the same
+PVC, and that function's reaction to a match is restore-then-delete. Pre-upgrade residue, which has
+neither label, is resolved by exclusion — reap only when no Backup in that namespace could still want
+an exposure of that PVC, refuse on an unreadable list — because without it an upgrade would have
+converted already-leaked residue into permanently-leaked residue, including the object this campaign
+found. And the residue read now **validates its own selector** and reports "unresolvable" like an
+errored list rather than like a clean cluster.
+
+The same empty key also meant no mover Job on the namespace plane was ever mapped back to its Backup.
+That was found by fixing this, not by anything watching it.
 
 ### Two documented hook contracts the controller did not honour
 

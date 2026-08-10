@@ -1,6 +1,17 @@
 ---
+import { readdirSync } from 'node:fs';
 import Crystal from '../components/Crystal.astro';
 import '../styles/site.css';
+
+// adrCount is COUNTED at build time, not typed. It was typed, and it said 18 while spec/adr/ held
+// 20 — stale from the moment 0019 landed, on the page that invites a reader to "read every decision
+// record". A number a human maintains is a number that goes wrong silently, which is the whole
+// subject of the 0.6.5 release notes; the same fix was applied to the generated metrics reference,
+// whose "the twelve rules built on these series" became a computed RuleCount(). If spec/adr/ ever
+// becomes unreadable this throws and the build fails, which is the correct outcome: a broken build
+// is louder than a wrong count.
+const adrCount = readdirSync(new URL('../../../spec/adr', import.meta.url))
+  .filter((f) => /^\d{4}-.*\.md$/.test(f)).length;
 
 const base = import.meta.env.BASE_URL.replace(/\/$/, '');
 const gh = 'https://github.com/CrystalBackup/CrystalBackup';
@@ -80,7 +91,8 @@ const milestones = [
   // mark and which reads as "this is shipped" to anyone who does not already know the roadmap.
   ['0.6.2', 'Soak kit — the instrument for M6’s two-week soak', 'patch', [['Crucible 0.6.2', `${base}/reports/crucible-m6-2.html`]]],
   ['0.6.3', 'The first hour on somebody else’s cluster — install path, stall deadlines, mover placement', 'patch', [['Crucible 0.6.3', `${base}/reports/crucible-m6-3.html`]]],
-  ['0.6.4', 'Escrow safety — the operator refuses to provision while it cannot prove no recoverable key exists', 'patch here', [['Crucible 0.6.4', `${base}/reports/crucible-m6-4.html`]]],
+  ['0.6.4', 'Escrow safety — the operator refuses to provision while it cannot prove no recoverable key exists', 'patch', [['Crucible 0.6.4', `${base}/reports/crucible-m6-4.html`]]],
+  ['0.6.5', 'No single volume holds its namespace’s queue — and every report that summarises children now agrees with them', 'patch here', [['Crucible 0.6.5', `${base}/reports/crucible-m6-5.html`]]],
   // These three carried their PRE-arbitration names until 0.6.2. The M7–M9 re-scope landed in
   // spec/90-roadmap.md and in the docs, and this array was missed — so the landing page was
   // still promising a CLI and a browse UI as the next milestone while the specs had moved them
@@ -138,7 +150,7 @@ const description =
       <section class="hero">
         <div class="hero-copy">
           <span class="pill">
-            <span class="dot"></span> M6 shipped (v0.6.4) · M7 up next
+            <span class="dot"></span> M6 shipped (v0.6.5) · M7 up next
           </span>
           <h1>
             Every namespace gets <span class="grad">its own backups.</span>
@@ -280,7 +292,7 @@ const description =
         <p class="eyebrow">How it compares</p>
         <h2>Where Crystal Backup stands</h2>
         <p class="section-lead">
-          Our column is <strong>v0.6.4 as shipped</strong> — every “yes” below is code you can
+          Our column is <strong>v0.6.5 as shipped</strong> — every “yes” below is code you can
           install today, exercised by the <a href={links.quality}>published acceptance reports</a>.
           The other columns are those tools’ <strong>current</strong> capabilities, to our
           knowledge — different projects, different goals, not a benchmark.
@@ -343,7 +355,7 @@ const description =
           CI, the core engine, cluster disaster recovery, self-service &amp; admin restore,
           manifest &amp; cluster-scoped DR, consistency hooks, repository maintenance, the
           namespace plane, external sync, the right to erasure and now the observability layer in
-          front of all of it are live (v0.6.4); up next is
+          front of all of it are live (v0.6.5); up next is
           <strong>M7 — reach</strong>: storage without snapshots, file-level restore and
           notifications. Each shipped milestone links its acceptance report below — the checks it
           had to pass on a real cluster, in full. Every report from M6 onward is unfiltered — the
@@ -395,7 +407,7 @@ const description =
           <aside class="note">
             <h3>You’re early — and that’s the point</h3>
             <p>
-              M0 through M6 have shipped (v0.6.4) — real, tested code, accepted on a real
+              M0 through M6 have shipped (v0.6.5) — real, tested code, accepted on a real
               RKE2/Ceph cluster with <a href={links.quality}>the reports published</a>. It is
               still early: four milestones are ahead, the CRD API is <code>v1alpha1</code> and
               will still move, and the production-hardening pass is M6. So try it in a sandbox,
@@ -412,7 +424,7 @@ const description =
       <section class="cta">
         <h2>Try it, or read every decision</h2>
         <p>
-          M0–M6 are installable today (v0.6.4); the specifications, the 18 decision records and
+          M0–M6 are installable today (v0.6.5); the specifications, the {adrCount} decision records and
           every acceptance report are public. Observability hardening &amp; production readiness
           (M6) are next.
         </p>

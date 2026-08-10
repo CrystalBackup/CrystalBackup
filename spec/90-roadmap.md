@@ -755,8 +755,18 @@ Recorded in [00-requirements.md §6](00-requirements.md); no milestone yet.
   and failed". That is the whole of the fix, and it is deliberately partial — 32 namespaces that were
   in fact protected still read as blocked.
 
-  Not fixed in 0.6.5 for two reasons. It is a **migration artefact that self-heals**: every run fanned
-  out by a stamping build is stamped, so the condition cannot recur once the in-flight run drains. And
+  **The unstamped child is not the only way in, and the belief that it was is now falsified.** After
+  0.6.5's counters were rewritten, the same disagreement was observed live on a FRESH run whose
+  children carried the correct stamp, matching the run's UID exactly: 31 children reading `Completed`
+  beside `namespacesFailed: 31`. So this entry is not "one upgrade path" — it is an unenumerated set,
+  and the first task of the lot that takes it is to find the other paths rather than to fix the one
+  that is written down.
+
+  Not fixed in 0.6.5 for two reasons. The first is now WEAKER than it looked: an unstamped child is a
+  **migration artefact that self-heals** once the in-flight run drains, but the live observation above
+  shows the classifier can misjudge a correctly stamped child too, so self-healing does not cover the
+  whole entry. What still holds is that 0.6.5's counters no longer depend on the answer — a collision
+  cannot reach `namespacesFailed`, and a `Completed` child counts as succeeded unconditionally. And
   the plausible fix — widening the window to also accept a child whose `creationTimestamp` is at or
   after the run object's — reopens the guard installed by commit `d3d2659` against *a run reporting
   success for data it never wrote*. That discriminator looks sound (run names carry a timestamp, so a
