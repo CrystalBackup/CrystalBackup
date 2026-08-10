@@ -2,14 +2,14 @@
 title: Values Helm
 description: Les values configurables du chart, groupées par ce qu'elles affectent réellement.
 sourceFile: src/content/docs/reference/helm-values.md
-sourceHash: 8d944a82250be3d02cf413bff907959c2847f5cd
+sourceHash: a393a5438fc98dae6d9e22b296a21cad043d0476
 ---
 
 Les défauts viennent du `values.yaml` du chart lui-même. Seules les values que vous avez des
 chances de changer sont annotées ; les autres sont listées par souci d'exhaustivité.
 
 ```bash
-helm show values oci://ghcr.io/crystalbackup/charts/crystal-backup --version 0.6.5
+helm show values oci://ghcr.io/crystalbackup/charts/crystal-backup --version 0.6.6
 ```
 
 ## Namespace et nommage
@@ -157,6 +157,8 @@ Le protocole, et ce qu'il faut vérifier dès le premier jour, sont dans
 | `soak.saltMethod` | `auto` | `auto` dérive le sel de rédaction de l'UID du namespace de l'operator et ne crée aucun Secret ; `fromSecret` utilise celui que vous avez créé. Les deux produisent des archives aux **garanties de réversibilité différentes** — lisez le bloc `redaction` de l'archive avant de l'envoyer où que ce soit. |
 | `soak.saltSecret` | `""` | Exigé par `saltMethod: fromSecret`, et par lui seul. Régler les deux, ou aucun, est refusé au rendu du template plutôt qu'en CrashLoopBackOff. |
 | `soak.storage` | `1Gi` | La demande du PVC. Si votre StorageClass par défaut est adossée au nœud (local-path), ce PVC **est** du disque de nœud. |
+| `soak.accessModes` | `["ReadWriteOnce"]` | RWO doit rester le défaut : c'est ce que fournit la StorageClass par défaut de presque tous les clusters, et un kit qui exigerait du RWX serait ininstallable précisément sur les petits clusters où il est le plus utile. Ce que cela vous coûte : chaque remplacement du pod du collecteur — une montée de version du chart, un drain de nœud, un reconciler en autosync qui rafraîchit le Deployment — fait passer un attachement de volume exclusif d'un nœud à un autre, et cette étape peut échouer. C'est arrivé sur un vrai cluster, au pire moment possible : le pod de remplacement n'a pas réussi à mapper le volume, l'export a donc répondu `NOT COLLECTED` avec une archive de quinze jours intacte et inatteignable, sur le disque même dont elle allait être extraite. `["ReadWriteMany"]` supprime entièrement la passation — un montage de système de fichiers partagé n'a pas de verrou exclusif à déplacer — et **exige que `soak.storageClassName` nomme une classe qui fournit réellement du RWX ; sans elle le PVC reste `Pending` pour toujours et vous êtes plus mal qu'au départ.** `ReadWriteOnce` et `ReadWriteMany` sont les seules valeurs acceptées ; toute autre est refusée au rendu du template. |
+| `soak.storageClassName` | `""` | Vide signifie la classe par défaut du cluster, ce que toutes les installations ont eu jusqu'ici et ce que le défaut vous donne toujours — nommer une classe est faux sur tous les clusters sauf celui où on l'a nommée. Cette value existe pour un seul cas : `accessModes: ["ReadWriteMany"]`, qu'aucune classe par défaut ne satisfait, si bien que régler le mode sans la classe donne un PVC qui ne se lie jamais. |
 | `soak.maxBytes` | `512Mi` | Le plafond dur que le collecteur respecte : il fait tourner les données les plus anciennes plutôt que de grossir. Volontairement sous la taille du PVC. |
 | `soak.kubeletStats` | `false` | Lie le ClusterRole `nodes/proxy`, seule source du high-water du cache restic. Le rôle est rendu dans tous les cas, et laissé non lié tant que vous ne réglez pas ceci. |
 | `soak.metricsInterval` | `60s` | Cadence de scrape de l'operator. |
@@ -164,6 +166,17 @@ Le protocole, et ce qu'il faut vérifier dès le premier jour, sont dans
 | `soak.moverSampleInterval` | `15s` | Fréquence d'**échantillonnage** des pods movers (metrics.k8s.io, stats de cache du kubelet). Cela ne décide pas si un mover est vu : les chiffres exacts par mover arrivent par un watch, car un Job mover vit dix à vingt secondes et aucun intervalle de sondage ne l'attrape de façon fiable. |
 | `soak.selfcheckInterval` | `24h` | Le self-check quotidien d'installation. |
 | `soak.stateInterval` | `1h` | Instantanés du statut des CR. |
+
+:::caution[Changer la forme du volume ne migre pas le volume]
+`soak.accessModes` et `soak.storageClassName` sont lues à la **création** du PVC. Changer l'une ou
+l'autre sur une installation existante laisse la claim déjà liée exactement telle quelle — ses
+access modes ne sont pas modifiables et sa classe n'est pas réassignable — donc les nouvelles values
+ne prennent effet que sur une nouvelle claim, et en obtenir une veut dire supprimer l'ancien PVC et
+la série qu'il contient. **Exportez l'archive d'abord**, puis suivez
+[Ending a series and starting another](https://github.com/CrystalBackup/CrystalBackup/blob/main/hack/soak/README.md#ending-a-series-and-starting-another) :
+sur un cluster piloté par un reconciler, `kubectl delete pvc` est défait en quelques minutes, et la
+course qu'il perd est celle qui a rendu ces deux values nécessaires.
+:::
 
 Vérifiez qu'il collecte **au jour 1 et au jour 2**, pas au jour 14 :
 

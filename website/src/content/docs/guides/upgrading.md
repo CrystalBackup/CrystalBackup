@@ -31,19 +31,95 @@ Apply the CRDs yourself, before the chart:
 
 ```bash
 # Pull the chart and take its CRDs. Use the version you are upgrading *to*;
-# 0.6.5 is the current release.
-helm pull oci://ghcr.io/crystalbackup/charts/crystal-backup --version 0.6.5 --untar
+# 0.6.6 is the current release.
+helm pull oci://ghcr.io/crystalbackup/charts/crystal-backup --version 0.6.6 --untar
 kubectl apply -f crystal-backup/crds/
 
 # Then upgrade the operator.
 helm upgrade crystal-backup \
   oci://ghcr.io/crystalbackup/charts/crystal-backup \
-  --version 0.6.5 \
+  --version 0.6.6 \
   --namespace crystal-backup-system
 ```
 
 `kubectl apply` on CRDs is additive and safe: it adds new fields and never drops stored
 objects.
+
+## 0.6.5 → 0.6.6: nothing to apply, but a failing backup now takes longer to say it failed
+
+**There is no CRD or API change in this release.** No field was added, renamed or removed on any
+type, so unlike every section below this one, this hop has **no schema step**. Run the `kubectl
+apply` above anyway if it is already in your procedure — applying an unchanged CRD changes
+nothing — but do not go looking for the new fields; there are none. What changes is behaviour,
+in five places, and two of them change an **outcome** a dashboard or a script can be watching.
+
+**An aborted quiesce now releases the applications it froze before it reports `Failed`.** On
+`0.6.5`, a pre hook failing under `onError: Fail` stopped the chain — correctly — and wrote the
+terminal `Failed` immediately. The hooks that had **already succeeded** had frozen their
+applications, and the already-terminal short-circuit meant nothing ever thawed them: the run
+reported *the quiesce did not work* while part of it had worked and was still in effect. `0.6.6`
+runs the release **first** and holds the terminal write while a thaw is owed. The verdict is
+unchanged — the terminal reason is still `PreHookFailed` — but **the Backup now stays
+non-terminal while the thaw retries**, within the same three-attempt budget the unfreeze path
+already had, carrying a `Ready` reason of `ReleasingAfterAbortedQuiesce` that names the abort and
+the attempt. A thaw that keeps failing still ends at the existing `UnfreezeFailed` Warning Event
+and only then reports `Failed`. **So if you alert on the terminal phase, that alert now arrives
+later** — seconds to a couple of reconciles, not minutes — and the intervening state is the
+retry, not a stall:
+
+```bash
+kubectl get backup <name> -o \
+  jsonpath='{.status.phase}{"\t"}{range .status.conditions[?(@.type=="Ready")]}{.reason}{end}{"\n"}'
+```
+
+Only `Succeeded` pre entries are thawed. A `Skipped` hook never ran, and a thaw against a pod
+nothing froze is a command its owner never asked for.
+
+**A `Fail`-policy failure in a *post* hook no longer skips the rest of the chain.** Stopping at
+the first failure is right for the pre phase and wrong for the post phase, where every entry is a
+thaw owed to a **different** application: a permanently broken first post hook meant the later
+pods were never thawed at all, across all three attempts. Loud — `UnfreezeFailed` did fire — but
+about the wrong pod. The remaining post hooks are now attempted regardless.
+
+**A clean restore can no longer be re-reported as maybe-broken, and its counters can no longer
+drop to 0.** Two passes in the restore controllers discarded work on an error return. One
+re-derived the manifest apply's verdict from a mover pod that was already gone, turning a clean
+apply of a whole namespace into *"did not report a result … some resources may have been
+applied"* with `failedCount 1`. The other published an empty volume tally when it could not read
+the mover census, overwriting a real four-of-six with `plannedVolumes: 0`. **Both were wrong
+answers rather than missing ones**, in front of somebody deciding whether to abandon a restore.
+`plannedVolumes` and `failedVolumes` now hold their last published values when a pass cannot
+recount them, and the condition says why — so a panel keyed on them stops flickering to zero
+mid-restore.
+
+**A `ClusterErasure` waiting out an object lock stops emitting four Warnings a minute.** The
+`ErasureBlocked` Warning fired on every pass of a 15-second recheck — for weeks, on the most
+sensitive compliance path there is, drowning the record somebody points at to assert data was
+destroyed. It now fires on the **transition**, and the recheck cadence is the hourly one that was
+always configured and never once used. Nothing about the erasure's decision changed; if you built
+anything on the Event's *rate*, it is now one Event per transition.
+
+**`selfcheck` and `preflight.sh` gain one new observation, and it is purely additive.**
+VolumeSnapshots that are **bound** to a content and still not ready after an hour are now
+reported: a `stuckSnapshots` object beside `leakIndicators` in the JSON, a
+`stuckSnapshotsOnStorageClass` qualification on `0.6.5`'s per-PVC coverage census, and the same
+finding in the preflight script. This exists because a cluster was found that had **never once**
+backed up a CephFS volume — the product's verdict was right every night and no artefact said it
+had never worked, while `preflight.sh` called the class perfectly usable. It is deliberately an
+**observation, not a verdict**: nothing becomes `Skipped` or `Failed`, no phase moves, and a
+StorageClass with no snapshots at all is not maligned. The only thing to check on upgrade is a
+parser that rejects unknown JSON keys.
+
+**Two new `soak` values, both defaulting to exactly today's behaviour.** `soak.accessModes`
+(default `[ReadWriteOnce]`) and `soak.storageClassName` (default `""`, the cluster default). They
+exist together for one case: an RWX class removes the exclusive-volume handover that lost a
+fortnight's archive when an autosync replaced the collector pod — the chart's
+`strategy: Recreate` did what it promises and the archive was unreachable anyway. Setting the mode without a class
+that provides it is a PVC that never binds. The collector also now writes its per-class
+high-water table to its **own stderr** on `SIGTERM`, which is the one channel a terminating pod
+has that is not the volume it is about to release. If `soak.enabled` is `false`, none of this
+concerns you; if it is `true`, read `hack/soak/README.md`'s reset procedure before you replace
+that pod on purpose, and export the archive first.
 
 ## 0.6.4 → 0.6.5: a panel that read a number can now read 0, and a backup that failed can now complete
 

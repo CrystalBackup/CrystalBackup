@@ -31,7 +31,7 @@ The chart is published as an OCI artifact on GHCR.
 ```bash
 helm install crystal-backup \
   oci://ghcr.io/crystalbackup/charts/crystal-backup \
-  --version 0.6.5 \
+  --version 0.6.6 \
   --namespace crystal-backup-system
 ```
 
@@ -189,8 +189,8 @@ networkPolicy:
 one is a metrics outage that looks exactly like a working install. Read the rules first:
 
 ```bash
-helm show readme oci://ghcr.io/crystalbackup/charts/crystal-backup --version 0.6.5
-helm pull oci://ghcr.io/crystalbackup/charts/crystal-backup --version 0.6.5 --untar
+helm show readme oci://ghcr.io/crystalbackup/charts/crystal-backup --version 0.6.6
+helm pull oci://ghcr.io/crystalbackup/charts/crystal-backup --version 0.6.6 --untar
 less crystal-backup/rules/crystalbackup.rules.yaml
 ```
 
@@ -207,7 +207,7 @@ actually cost, on my data, over two weeks" without a Prometheus anywhere.
 ```bash
 helm upgrade crystal-backup \
   oci://ghcr.io/crystalbackup/charts/crystal-backup \
-  --version 0.6.5 -n crystal-backup-system \
+  --version 0.6.6 -n crystal-backup-system \
   --reuse-values --set soak.enabled=true
 ```
 

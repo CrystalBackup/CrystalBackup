@@ -4,7 +4,7 @@ description: Mettre à niveau le chart, le problème des CRD que Helm ne résout
 sidebar:
   order: 10
 sourceFile: src/content/docs/guides/upgrading.md
-sourceHash: b5f86c6a88ff8d840e969c6697c1316efbed2caf
+sourceHash: 58ef3baf9da44296552a764415a19b8376da9e0c
 ---
 
 ## Ce que signifie un numéro de version ici
@@ -34,19 +34,102 @@ Appliquez les CRD vous-même, avant le chart :
 
 ```bash
 # Pull the chart and take its CRDs. Use the version you are upgrading *to*;
-# 0.6.5 is the current release.
-helm pull oci://ghcr.io/crystalbackup/charts/crystal-backup --version 0.6.5 --untar
+# 0.6.6 is the current release.
+helm pull oci://ghcr.io/crystalbackup/charts/crystal-backup --version 0.6.6 --untar
 kubectl apply -f crystal-backup/crds/
 
 # Then upgrade the operator.
 helm upgrade crystal-backup \
   oci://ghcr.io/crystalbackup/charts/crystal-backup \
-  --version 0.6.5 \
+  --version 0.6.6 \
   --namespace crystal-backup-system
 ```
 
 Un `kubectl apply` sur des CRD est additif et sûr : il ajoute les nouveaux champs et ne
 supprime jamais d'objets stockés.
+
+## 0.6.5 → 0.6.6 : rien à appliquer, mais un backup en échec met désormais plus de temps à le dire
+
+**Cette release ne change ni les CRD ni l'API.** Aucun champ n'a été ajouté, renommé ou supprimé
+sur quelque type que ce soit : contrairement à toutes les sections ci-dessous, ce saut n'a
+**aucune étape de schéma**. Lancez tout de même le `kubectl apply` ci-dessus s'il fait déjà partie
+de votre procédure — appliquer une CRD inchangée ne change rien — mais n'allez pas chercher les
+nouveaux champs : il n'y en a pas. Ce qui change, c'est le comportement, en cinq endroits, dont
+deux changent un **résultat** qu'un dashboard ou un script peut être en train de surveiller.
+
+**Un quiesce avorté libère désormais les applications qu'il a gelées avant de rapporter `Failed`.**
+En `0.6.5`, un hook pre en échec sous `onError: Fail` arrêtait la chaîne — correctement — et
+écrivait immédiatement le `Failed` terminal. Or les hooks qui avaient **déjà réussi** avaient gelé
+leurs applications, et le court-circuit « déjà terminal » faisait que rien ne les dégelait jamais :
+le run rapportait *le quiesce n'a pas marché* alors qu'une partie avait marché et était toujours en
+vigueur. La `0.6.6` exécute la libération **d'abord** et retient l'écriture terminale tant qu'un
+dégel est dû. Le verdict est inchangé — la raison terminale reste `PreHookFailed` — mais **le
+Backup reste désormais non terminal pendant que le dégel réessaie**, dans le même budget de trois
+tentatives dont disposait déjà le chemin d'unfreeze, en portant une raison `Ready` à
+`ReleasingAfterAbortedQuiesce` qui nomme l'abandon et la tentative en cours. Un dégel qui continue
+d'échouer finit toujours sur l'Event Warning `UnfreezeFailed` existant, et ne rapporte `Failed`
+qu'ensuite. **Donc si vous alertez sur la phase terminale, cette alerte arrive désormais plus
+tard** — quelques secondes à deux réconciliations, pas des minutes — et l'état intermédiaire est le
+retry, pas un blocage :
+
+```bash
+kubectl get backup <name> -o \
+  jsonpath='{.status.phase}{"\t"}{range .status.conditions[?(@.type=="Ready")]}{.reason}{end}{"\n"}'
+```
+
+Seules les entrées pre `Succeeded` sont dégelées. Un hook `Skipped` n'a jamais tourné, et un dégel
+contre un pod que rien n'a gelé est une commande que son propriétaire n'a jamais demandée.
+
+**Un échec sous politique `Fail` dans un hook *post* ne saute plus le reste de la chaîne.**
+S'arrêter au premier échec est juste pour la phase pre et faux pour la phase post, où chaque entrée
+est un dégel dû à une application **différente** : un premier hook post définitivement cassé
+signifiait que les pods suivants n'étaient jamais dégelés du tout, sur les trois tentatives.
+Bruyant — `UnfreezeFailed` se déclenchait bien — mais à propos du mauvais pod. Les hooks post
+restants sont désormais tentés quoi qu'il arrive.
+
+**Un restore propre ne peut plus être re-rapporté comme peut-être cassé, et ses compteurs ne
+peuvent plus retomber à 0.** Deux passes des contrôleurs de restore jetaient leur travail sur un
+retour d'erreur. L'une re-dérivait le verdict de l'apply des manifests depuis un pod mover déjà
+disparu, transformant l'apply propre d'un namespace entier en *« did not report a result … some
+resources may have been applied »* avec `failedCount 1`. L'autre publiait un décompte de volumes
+vide quand elle ne pouvait pas lire le recensement du mover, écrasant un vrai quatre-sur-six par
+`plannedVolumes: 0`. **Les deux étaient de mauvaises réponses, pas des réponses manquantes**,
+devant quelqu'un en train de décider s'il abandonne un restore. `plannedVolumes` et `failedVolumes`
+conservent désormais leurs dernières valeurs publiées quand une passe ne peut pas les recompter, et
+la condition dit pourquoi — un panneau qui s'appuie sur eux cesse donc de retomber à zéro en pleine
+restauration.
+
+**Un `ClusterErasure` qui attend la levée d'un object lock cesse d'émettre quatre Warnings par
+minute.** L'Event `ErasureBlocked` se déclenchait à chaque passe d'un recheck de 15 secondes —
+pendant des semaines, sur le chemin de conformité le plus sensible qui existe, noyant le dossier
+même que l'on montre pour affirmer que des données ont été détruites. Il se déclenche désormais sur
+la **transition**, et la cadence du recheck est celle d'une heure, configurée depuis toujours et
+jamais utilisée une seule fois. La décision de l'erasure n'a pas changé ; si vous avez bâti quoi que
+ce soit sur le *rythme* de cet Event, c'est désormais un Event par transition.
+
+**`selfcheck` et `preflight.sh` gagnent une observation, purement additive.** Les VolumeSnapshots
+**bound** à un content et toujours pas ready au bout d'une heure sont désormais rapportés : un
+objet `stuckSnapshots` à côté de `leakIndicators` dans le JSON, une qualification
+`stuckSnapshotsOnStorageClass` sur le recensement de couverture par PVC apparu en `0.6.5`, et la
+même constatation dans le script de preflight. Cela existe parce qu'un cluster a été trouvé qui
+n'avait **jamais** sauvegardé un seul volume CephFS — le verdict du produit était juste chaque
+nuit et aucun artefact ne disait que cela n'avait jamais marché, tandis que `preflight.sh`
+déclarait la classe parfaitement utilisable. C'est délibérément une **observation, pas un
+verdict** : rien ne devient `Skipped` ni `Failed`, aucune phase ne bouge, et une StorageClass sans
+aucun snapshot n'est pas mise en cause. La seule chose à vérifier à la mise à niveau est un parser
+qui rejetterait les clés JSON inconnues.
+
+**Deux nouvelles valeurs `soak`, toutes deux réglées par défaut sur le comportement actuel.**
+`soak.accessModes` (défaut `[ReadWriteOnce]`) et `soak.storageClassName` (défaut `""`, la classe
+par défaut du cluster). Elles existent ensemble pour un seul cas : une classe RWX supprime le
+transfert de volume exclusif qui a fait perdre l'archive d'une quinzaine lorsqu'un autosync a
+remplacé le pod du collecteur — le `strategy: Recreate` du chart a fait ce qu'il promet et
+l'archive est restée inatteignable quand même. Poser le mode sans une classe qui le fournit donne
+un PVC qui ne se lie jamais. Le collecteur écrit également désormais sa table de high-water par
+classe sur **sa propre stderr** au `SIGTERM`, seul canal dont dispose un pod en train de se
+terminer et qui n'est pas le volume qu'il est sur le point de relâcher. Si `soak.enabled` vaut
+`false`, rien de tout cela ne vous concerne ; s'il vaut `true`, lisez la procédure de remise à
+zéro de `hack/soak/README.md` avant de remplacer ce pod exprès, et exportez l'archive d'abord.
 
 ## 0.6.4 → 0.6.5 : un panneau qui affichait un nombre peut désormais afficher 0, et un backup qui échouait peut désormais aboutir
 

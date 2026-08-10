@@ -7,7 +7,7 @@ Defaults are from the chart's own `values.yaml`. Only the values you are likely 
 are annotated; the rest are listed for completeness.
 
 ```bash
-helm show values oci://ghcr.io/crystalbackup/charts/crystal-backup --version 0.6.5
+helm show values oci://ghcr.io/crystalbackup/charts/crystal-backup --version 0.6.6
 ```
 
 ## Namespace and naming
@@ -151,6 +151,8 @@ The protocol, and what to check on day one, is in
 | `soak.saltMethod` | `auto` | `auto` derives the redaction salt from the operator namespace's UID and creates no Secret; `fromSecret` uses one you created. The two produce archives with **different reversibility guarantees** — read the archive's own redaction block before sending it anywhere. |
 | `soak.saltSecret` | `""` | Required by, and only by, `saltMethod: fromSecret`. Setting both, or neither, is refused at template time rather than in a CrashLoopBackOff. |
 | `soak.storage` | `1Gi` | The PVC request. If your default StorageClass is node-backed (local-path), this **is** node disk. |
+| `soak.accessModes` | `["ReadWriteOnce"]` | RWO has to stay the default: it is what nearly every cluster's default StorageClass provides, and a kit that required RWX would be uninstallable on exactly the small clusters it is most useful on. What it costs you: every replacement of the collector pod — a chart upgrade, a node drain, an autosync reconciler refreshing the Deployment — hands an exclusive volume attachment from one node to another, and that step can fail. It did on a real cluster, at the worst possible moment: the replacement pod could not map the volume, so the export answered `NOT COLLECTED` with a fortnight's archive intact and unreachable on the very disk it was about to be exported from. `["ReadWriteMany"]` removes the handover entirely — a shared filesystem mount has no exclusive lock to move — and **needs `soak.storageClassName` to name a class that actually provides RWX; without one the PVC stays `Pending` forever and you are worse off than you started.** `ReadWriteOnce` and `ReadWriteMany` are the only accepted values; anything else is refused at template time. |
+| `soak.storageClassName` | `""` | Empty means the cluster default, which is what every install has had and what the default still gives you — naming a class is wrong on every cluster but the one it was named on. It exists for one case only: `accessModes: ["ReadWriteMany"]`, which no cluster's default class satisfies, so setting the mode without the class is a PVC that never binds. |
 | `soak.maxBytes` | `512Mi` | The hard cap the collector honours, rotating the oldest data away rather than growing. Deliberately below the PVC size. |
 | `soak.kubeletStats` | `false` | Binds the `nodes/proxy` ClusterRole, the only source for the restic cache high-water. The role is rendered either way, and left unbound until you set this. |
 | `soak.metricsInterval` | `60s` | Operator scrape cadence. |
@@ -158,6 +160,17 @@ The protocol, and what to check on day one, is in
 | `soak.moverSampleInterval` | `15s` | How often mover pods are **sampled** (metrics.k8s.io, kubelet cache stats). It does not decide whether a mover is seen at all: the exact per-mover figures arrive on a watch, because a mover Job lives ten to twenty seconds and no poll interval catches that reliably. |
 | `soak.selfcheckInterval` | `24h` | The daily installation self-check. |
 | `soak.stateInterval` | `1h` | CR-status snapshots. |
+
+:::caution[Changing the volume's shape does not migrate the volume]
+`soak.accessModes` and `soak.storageClassName` are read when the PVC is **created**. Changing
+either on an existing installation leaves the claim that is already bound exactly as it is — its
+access modes cannot be edited and its class cannot be reassigned — so the new values take effect
+only on a new claim, and getting one means deleting the old PVC and the series it holds. **Export
+the archive first**, then follow
+[Ending a series and starting another](https://github.com/CrystalBackup/CrystalBackup/blob/main/hack/soak/README.md#ending-a-series-and-starting-another):
+on a cluster with a reconciler, `kubectl delete pvc` is undone within minutes, and the race it
+loses is the one that made these two values necessary.
+:::
 
 Check it is working on **day one and day two**, not on day fourteen:
 

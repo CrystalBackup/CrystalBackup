@@ -5,7 +5,7 @@ description: What has shipped, what has not, how the project is versioned, and h
 
 ## Where the project is
 
-The current release is **`v0.6.5`**. Milestones M0 through M6 have shipped: the core
+The current release is **`v0.6.6`**. Milestones M0 through M6 have shipped: the core
 backup engine, cluster disaster recovery, restore, manifest and cluster-scoped DR,
 consistency hooks, repository maintenance and verification, the namespace plane, external
 sync, the right to erasure, and the observability layer in front of all of it.
@@ -13,7 +13,7 @@ sync, the right to erasure, and the observability layer in front of all of it.
 Three milestones remain. The CRD API is `v1alpha1` and **will still change** before
 `1.0.0`. M6 was the production-hardening pass and it has shipped, but two of its own exit
 criteria have not been met: a two-week soak alongside an incumbent tool, and a pilot
-rollout. That is why **0.6.5 is offered for testing in real conditions, not for
+rollout. That is why **0.6.6 is offered for testing in real conditions, not for
 production** — a narrower claim than "not hardened", and a more useful one. The honest
 summary is: **early, but no longer hypothetical.** The shipped paths
 are tested against real infrastructure; that is not the same as asking you to trust it
