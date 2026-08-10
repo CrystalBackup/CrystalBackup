@@ -94,6 +94,16 @@ type Report struct {
 	// See coverage.go. A pointer for the same reason Plan is one.
 	Coverage *Coverage `json:"coverage,omitempty"`
 
+	// StuckSnapshots is the OBSERVATION that stands beside Coverage's prediction: how many
+	// VolumeSnapshots in this cluster are bound to a VolumeSnapshotContent and still not readyToUse
+	// past a grace period. See stuckSnapshots in collect.go for why that one shape is the whole check.
+	//
+	// NOT a pointer, unlike Plan and Coverage. Those two are whole sections a producer might not have
+	// collected at all; this one is a small census whose zero value — nothing seen, nothing stuck — is
+	// the honest reading of a report from a producer too old to have collected it, and its Unreadable
+	// and GraceMinutes fields are what distinguish "looked and saw nothing" from "never looked".
+	StuckSnapshots StuckSnapshots `json:"stuckSnapshots"`
+
 	Leaks   Leaks        `json:"leakIndicators"`
 	Rules   []RuleResult `json:"rules"`
 	Verdict Verdict      `json:"verdict"`
@@ -413,6 +423,121 @@ type LeakSummary struct {
 	Residual int `json:"residual"`
 }
 
+// StuckSnapshots is the census of VolumeSnapshots that are BOUND to a VolumeSnapshotContent and
+// still not readyToUse past snapshotStallGrace — the one shape that is visible in a single LIST and
+// that means "something acknowledged this request and is not finishing it".
+//
+// # Why this section exists at all
+//
+// On a production cluster, no CephFS volume had ever been backed up successfully — eight volumes
+// across four namespaces, every one ending SnapshotReadyDeadlineExceeded, for as long as the cluster
+// had existed. The cause was outside this product: the CephFS csi-snapshotter sidecar was started
+// with a feature gate whose CRDs served an older version than it demanded, so its informer cache
+// never synced and it never processed a single VolumeSnapshotContent.
+//
+// The verdict the operator gave was exactly right, and no artefact said the thing that mattered:
+// that this had NEVER worked. preflight.sh reported the CephFS StorageClass as usable, because a
+// VolumeSnapshotClass for that driver exists — a static predictor, predicting the wrong thing
+// confidently. This report did not say it either, and neither did the per-PVC coverage census, which
+// classified all eight `ok`.
+//
+// # The symptom, deliberately not the causes
+//
+// This census enumerates NO causes. It does not compare the sidecar's image to the CRD's served
+// versions, it reads no Deployment, it names no driver's bug. A version-comparison check was
+// considered and rejected: it would mean carrying a third-party version catalogue and going stale on
+// every ceph-csi release, and — much worse — it would only ever find the causes somebody had already
+// thought of. Bound-and-not-ready-past-a-grace is the FINGERPRINT of a snapshotter that is not
+// advancing whatever the reason, so it also catches the reason nobody predicted.
+//
+// # It changes nothing the operator does
+//
+// Not a verdict, not a phase, not a reason. Nothing here fails a volume, skips a volume or moves a
+// rule tally, because diagnosing somebody else's controller from a symptom is precisely the mistake
+// this is meant to avoid. What it does is refuse to let the prediction stand alone and unqualified.
+type StuckSnapshots struct {
+	// GraceMinutes is snapshotStallGrace, stated so a reader knows what "stuck" means here. It is also
+	// how a reader tells a report that LOOKED and found nothing from one produced by a version that
+	// never looked: this field is zero only in the second case.
+	GraceMinutes int `json:"graceMinutes"`
+
+	// Total is every VolumeSnapshot in the cluster, in every namespace — not only the ones this
+	// operator created. A stalled snapshotter stalls for everybody, so a stuck snapshot cut by another
+	// tool is evidence of exactly the same thing, and excluding it would throw away the strongest
+	// evidence available on a cluster where CrystalBackup has only just been installed.
+	Total int `json:"total"`
+	// Bound is those carrying status.boundVolumeSnapshotContentName: the cluster-wide
+	// snapshot-controller saw the request and bound a content to it. Unbound is the rest, and it is
+	// counted apart rather than folded in because the two send a reader to different components — an
+	// unbound snapshot means nothing is listening to that VolumeSnapshotClass, a bound one means
+	// something is listening and the copy is not arriving.
+	Bound   int `json:"bound"`
+	Unbound int `json:"unbound"`
+	// Ready is those with status.readyToUse true, counted off that flag ALONE and not gated on the
+	// content name. It is the evidence in the other direction — this cluster's storage has produced a
+	// usable snapshot — and it is what keeps a class with no stuck snapshots from being maligned.
+	Ready int `json:"ready"`
+	// Stuck is the finding: bound, not ready, and older than the grace. WithinGrace is the same shape
+	// young enough to still be plausible work in flight, reported so that a zero Stuck over a non-zero
+	// WithinGrace reads as "nothing has been waiting long enough to judge" rather than as "all clear".
+	Stuck       int `json:"stuck"`
+	WithinGrace int `json:"boundNotReadyWithinGrace"`
+	// OldestStuckHours is the age of the oldest stuck one. It is the number that decides whether this
+	// is a snapshot that lost a race or a snapshotter that has never worked: two hours is one, nine
+	// hundred is the other.
+	OldestStuckHours int `json:"oldestStuckHours,omitempty"`
+
+	// Classes splits the census by spec.volumeSnapshotClassName, which is the closest thing to naming
+	// the driver that a VolumeSnapshot carries. A class with stuck snapshots and none ready is the
+	// CephFS incident's exact signature.
+	Classes []StuckSnapshotClass `json:"byVolumeSnapshotClass,omitempty"`
+	// WithoutSourcePVC counts snapshots whose source is a VolumeSnapshotContent rather than a PVC.
+	// They still count in every total above; they are named here because they cannot be attributed to
+	// any PVC's StorageClass, which is why the coverage census's per-class evidence can be smaller
+	// than Total without anything being wrong.
+	WithoutSourcePVC int `json:"withoutSourcePVC,omitempty"`
+
+	// Samples names the stuck ones, oldest first, bounded — enough to go and look, not a listing of
+	// somebody's cluster.
+	Samples []StuckSnapshotItem `json:"samples,omitempty"`
+	// Unreadable records a LIST that was refused. Non-empty here means every count above is a floor
+	// and not an answer, and it is what stops an RBAC refusal from rendering as a clean cluster.
+	Unreadable []string `json:"unreadable,omitempty"`
+	Note       string   `json:"note,omitempty"`
+}
+
+// StuckSnapshotClass is one VolumeSnapshotClass's census.
+type StuckSnapshotClass struct {
+	// Class is spec.volumeSnapshotClassName. NOT redacted: a VolumeSnapshotClass name is
+	// platform-chosen ("csi-rbdplugin-snapclass"), it is the single most useful field for reading this
+	// section, and it survives redaction for the same reason a StorageClass name and an image tag do.
+	Class string `json:"volumeSnapshotClass"`
+	Total int    `json:"total"`
+	Ready int    `json:"ready"`
+	Stuck int    `json:"stuck"`
+	// OldestStuckHours is this class's own oldest stuck snapshot.
+	OldestStuckHours int `json:"oldestStuckHours,omitempty"`
+}
+
+// StuckSnapshotItem names one stuck VolumeSnapshot so an operator can go and describe it.
+type StuckSnapshotItem struct {
+	Namespace string `json:"namespace,omitempty"`
+	Name      string `json:"name"`
+	// SourcePVC is spec.source.persistentVolumeClaimName, redacted like any other PVC name.
+	SourcePVC string `json:"sourcePVC,omitempty"`
+	// Class is spec.volumeSnapshotClassName, in clear (see StuckSnapshotClass.Class).
+	Class string `json:"volumeSnapshotClass,omitempty"`
+	// Content is status.boundVolumeSnapshotContentName — the object whose absence of progress IS the
+	// finding, and the one an operator will run `kubectl describe` against next.
+	Content  string `json:"boundContent,omitempty"`
+	AgeHours int    `json:"ageHours"`
+	// Error is status.error.message when the snapshot carries one. Free text from a driver, so it goes
+	// through Redactor.Detail: it routinely quotes object names, which is the one shape per-field
+	// redaction cannot reach. Usually empty — a snapshotter that is not running records nothing at all,
+	// which is exactly why an age-based observation was needed to see it.
+	Error string `json:"error,omitempty"`
+}
+
 // RuleResult is one alert rule's state verdict — the half of this report that gives an opinion.
 type RuleResult struct {
 	Name     string `json:"name"`
@@ -468,8 +593,9 @@ type Verdict struct {
 	// that says the restore path itself is compromised.
 	//
 	// "healthyWithFindings" is not a fourth severity: it is the same clean rule tally as "healthy",
-	// over an installation that is also carrying something the rules do not measure — today, a
-	// non-zero leakIndicators residual. It exists because "healthy" was being read as a verdict on
+	// over an installation that is also carrying something the rules do not measure — a non-zero
+	// leakIndicators residual, a coverage census with volumes nothing will back up, or a VolumeSnapshot
+	// that has been bound and not ready past its grace. It exists because "healthy" was being read as a verdict on
 	// the whole installation rather than on the rules, which is what a reader who does not scroll
 	// will always read it as. Anything comparing this field for equality with "healthy" and meaning
 	// "is everything fine" wants to compare against that constant and then read the summary.

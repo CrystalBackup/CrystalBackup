@@ -73,6 +73,11 @@ func (c *collector) coverage(ctx context.Context) *Coverage {
 
 	registry := exposer.NewRegistry(readOnlyClient{Reader: reader, scheme: buildScheme()}, c.OperatorNamespace)
 
+	// The observation that qualifies this section's predictions, aggregated over the very PVCs this
+	// section is about to classify. Costs no API request: stuckSnapshots already listed the snapshots,
+	// and the PVC list is the one above.
+	scEvidence := c.snapshotEvidenceByStorageClass(pvcs.Items)
+
 	counts := map[string]int{}
 	namespaces := map[string]bool{}
 	for i := range pvcs.Items {
@@ -91,11 +96,18 @@ func (c *collector) coverage(ctx context.Context) *Coverage {
 		namespaces[pvc.Namespace] = true
 
 		row := c.coverPVC(ctx, registry, pvc, sel, apiAbsent)
+		// AFTER the resolution and never inside it. coverPVC's whole discipline is that it re-implements
+		// nothing about routing; this is a separate statement about the same volume, applied on top, and
+		// keeping it outside is what stops an observation from ever being mistaken for a resolution rule.
+		qualifyWithSnapshotEvidence(&row, scEvidence[storageClassKey(pvc)])
 		counts[row.Class]++
 		cov.PVCs++
 		cov.CapacityBytes += row.CapacityBytes
 		if row.Verdict == CoverageVerdictBackedUp {
 			cov.BackedUpBytes += row.CapacityBytes
+		}
+		if row.SnapshotEvidence != "" {
+			cov.StalledStorage++
 		}
 		switch {
 		case len(row.Schedules) > 0:
@@ -165,10 +177,17 @@ func sortCoverageItems(items []CoveredPVC) {
 }
 
 // coverageNeedsAttention is 0 for a row somebody must act on and 1 for one that is simply working. The
-// two axes are OR-ed because they are independent: a volume is a problem if its treatment is not a
-// clean success, and equally if nothing that can fire selects it.
+// three axes are OR-ed because they are independent: a volume is a problem if its treatment is not a
+// clean success, equally if nothing that can fire selects it, and equally if the storage under it is
+// observed not to be finishing the snapshots its treatment depends on.
+//
+// The third axis is what makes maxCoverageItems safe for the new finding. Without it, a perfectly
+// resolved, perfectly selected row on a StorageClass that has never produced a ready snapshot sorts
+// with the healthy majority and falls straight off the end of the cap on any cluster with more than
+// five hundred volumes — silently, with every count above still saying it was there. That is the same
+// truncation trap the attention-first ordering was introduced to close.
 func coverageNeedsAttention(p CoveredPVC) int {
-	if p.Verdict != CoverageVerdictBackedUp || !p.Selected {
+	if p.Verdict != CoverageVerdictBackedUp || !p.Selected || p.SnapshotEvidence != "" {
 		return 0
 	}
 	return 1
@@ -264,6 +283,118 @@ func (c *collector) coverPVC(
 	}
 	row.Verdict = coverageVerdict(row.Class)
 	return row
+}
+
+// storageClassKey is the grouping key the snapshot evidence is aggregated under: the PVC's own
+// spec.storageClassName, or "" for a PVC that names none.
+//
+// It is the NAME and not the object, which is deliberate: a statically bound PVC may name a
+// StorageClass that does not exist, and grouping two volumes under a string they both name is a fact
+// about those two volumes whether or not the object behind the name is there.
+func storageClassKey(pvc *corev1.PersistentVolumeClaim) string {
+	if pvc.Spec.StorageClassName == nil {
+		return ""
+	}
+	return *pvc.Spec.StorageClassName
+}
+
+// snapshotEvidenceByStorageClass aggregates what the cluster's VolumeSnapshots say, per StorageClass,
+// over the PVCs this census is scanning.
+//
+// # Why the StorageClass and not the driver
+//
+// The driver is the real unit — a stalled csi-snapshotter is stalled for every class its driver serves
+// — and this section deliberately does not know it (see CoveredPVC.StorageClass: learning the driver
+// means re-implementing the resolver's migration rules, which this section re-implements nothing of).
+// Grouping by StorageClass therefore UNDER-claims: two classes on the same broken driver do not inform
+// each other, so a volume can be reported unqualified when a driver-level view would have qualified it.
+// That is the correct direction to be wrong in. The alternative — grouping by a driver this section
+// derived for itself — buys a wider net at the price of the one rule that keeps the whole census
+// trustworthy.
+//
+// # Why the PVCs and not the snapshots
+//
+// A VolumeSnapshot names its source PVC; it does not name a StorageClass. The PVC list is where the two
+// meet, and it is already in hand. A snapshot whose source PVC no longer exists, or which was restored
+// from a content rather than a claim, contributes to no class — it is counted in the top-level census
+// and simply cannot be attributed here, which StuckSnapshots.WithoutSourcePVC says out loud.
+//
+// A nil c.snapEvidence — the snapshot LIST was refused — yields an empty map, so every row goes
+// unqualified. That is degradation and not a clean bill of health: the refusal is a Diagnostic, which is
+// this report's only mechanism for "the operator was not allowed to look".
+func (c *collector) snapshotEvidenceByStorageClass(
+	pvcs []corev1.PersistentVolumeClaim,
+) map[string]snapshotEvidence {
+	out := map[string]snapshotEvidence{}
+	if len(c.snapEvidence) == 0 {
+		return out
+	}
+	for i := range pvcs {
+		pvc := &pvcs[i]
+		// The operator's own temporary exposure PVCs are excluded here for the same reason they are
+		// excluded from the census itself, and there is a second reason: an exposure clone is provisioned
+		// FROM a snapshot, so counting the snapshots that name it would fold the operator's own working
+		// set back into evidence about the user's storage.
+		if pvc.Labels[apiconst.LabelManagedBy] == apiconst.ManagedByValue {
+			continue
+		}
+		sc := storageClassKey(pvc)
+		if sc == "" {
+			// A PVC naming no StorageClass at all. It is NOT grouped under "": that bucket would lump
+			// together every hand-bound volume in the cluster, which have nothing in common but the
+			// absence of a name, and one stalled snapshot would then qualify all of them.
+			continue
+		}
+		ev, ok := c.snapEvidence[pvc.Namespace+"/"+pvc.Name]
+		if !ok {
+			continue
+		}
+		out[sc] = out[sc].add(ev)
+	}
+	return out
+}
+
+// qualifyWithSnapshotEvidence attaches the observation to a row whose prediction it qualifies, and to
+// no other row.
+//
+// THREE gates, and each one is a way this could have gone wrong:
+//
+//   - Only a row the census calls BACKED UP. A skipped or failed row already says it is not backed up;
+//     adding "and the snapshotter is stuck" to it is noise on a line that is already actionable.
+//   - Only where a snapshot is actually STUCK. A class with no snapshots at all, or with none older
+//     than the grace, is left alone — absence of evidence is not evidence of failure, and a fresh
+//     installation has no snapshots anywhere.
+//   - The Verdict and Class are left EXACTLY as the resolver set them. The row still says what the
+//     operator will do, because that has not changed; what is added is what the cluster is observed to
+//     be doing about it. Turning this into Skipped or Failed would be diagnosing somebody else's
+//     controller from a symptom, and it would move a phase that real automation reacts to.
+//
+// The two sentences are different because the remedies are. "None of the snapshots that exist on this
+// class is ready" is the CephFS incident — a snapshotter that has never worked, and the reader needs to
+// go and look at that driver's sidecar. "Some are ready and some are stuck" is a working class with
+// something wrong in it, which is a much smaller claim and is worded like one.
+func qualifyWithSnapshotEvidence(row *CoveredPVC, ev snapshotEvidence) {
+	if row.Verdict != CoverageVerdictBackedUp || ev.stuck == 0 {
+		return
+	}
+	row.StuckOnStorageClass = ev.stuck
+	row.ReadyOnStorageClass = ev.ready
+	grace := int(snapshotStallGrace.Minutes())
+	if ev.ready == 0 {
+		row.SnapshotEvidence = fmt.Sprintf(
+			"OBSERVED, not predicted: of the %d VolumeSnapshot(s) that exist on StorageClass %q, NONE is "+
+				"readyToUse and %d have been bound to a VolumeSnapshotContent for more than %d minutes "+
+				"(oldest %d h). The treatment above is what the operator WILL attempt; on the evidence in "+
+				"this cluster it has not yet completed once on this class. Check the csi-snapshotter "+
+				"sidecar of the driver behind it. This changes no verdict here.",
+			ev.total, row.StorageClass, ev.stuck, grace, ev.oldestStuckHours)
+		return
+	}
+	row.SnapshotEvidence = fmt.Sprintf(
+		"OBSERVED, not predicted: StorageClass %q has %d readyToUse VolumeSnapshot(s) and %d that have "+
+			"been bound to a VolumeSnapshotContent for more than %d minutes without becoming ready "+
+			"(oldest %d h). The class works; something on it is not advancing. This changes no verdict here.",
+		row.StorageClass, ev.ready, ev.stuck, grace, ev.oldestStuckHours)
 }
 
 // appendCapped adds an identity to a row's schedule list, keeping it to maxCoveredSchedules and

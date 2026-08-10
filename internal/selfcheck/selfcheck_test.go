@@ -578,7 +578,7 @@ func TestNotEvaluatedIsNeverReportedAsOK(t *testing.T) {
 		{Name: "b", Status: StatusNotEvaluated},
 		{Name: "c", Status: StatusError},
 	}
-	v := verdictOf(rules, noLeaks, nil)
+	v := verdictOf(rules, noLeaks, nil, noStuckSnapshots)
 	if v.OK != 1 {
 		t.Errorf("OK = %d, want 1: only the evaluated pass counts", v.OK)
 	}
@@ -605,11 +605,11 @@ func TestNotEvaluatedIsNeverReportedAsOK(t *testing.T) {
 // TestCriticalBreachMakesTheVerdictUnhealthy: only a critical rule says the RESTORE PATH is
 // compromised, and only that should be able to produce the strongest word in the report.
 func TestCriticalBreachMakesTheVerdictUnhealthy(t *testing.T) {
-	warn := verdictOf([]RuleResult{{Status: StatusBreached, Severity: "warning"}}, noLeaks, nil)
+	warn := verdictOf([]RuleResult{{Status: StatusBreached, Severity: "warning"}}, noLeaks, nil, noStuckSnapshots)
 	if warn.Status != "degraded" {
 		t.Errorf("a warning breach gave %q, want degraded", warn.Status)
 	}
-	crit := verdictOf([]RuleResult{{Status: StatusBreached, Severity: "critical"}}, noLeaks, nil)
+	crit := verdictOf([]RuleResult{{Status: StatusBreached, Severity: "critical"}}, noLeaks, nil, noStuckSnapshots)
 	if crit.Status != "unhealthy" {
 		t.Errorf("a critical breach gave %q, want unhealthy", crit.Status)
 	}
@@ -740,7 +740,7 @@ func TestResidualLeaksStopTheVerdictReadingHealthy(t *testing.T) {
 		Totals:       LeakSummary{Residual: 7},
 	}
 
-	v := verdictOf(clean, incident, nil)
+	v := verdictOf(clean, incident, nil, noStuckSnapshots)
 	if v.Status == verdictHealthy {
 		t.Error(`status is the bare word "healthy" beside 7 residual objects — this is the exact ` +
 			"report that sent somebody looking for the real state by hand")
@@ -763,7 +763,7 @@ func TestResidualLeaksStopTheVerdictReadingHealthy(t *testing.T) {
 
 	// And with nothing residual, the plain word is still available: a report that could never say
 	// "healthy" would be as useless as one that always did.
-	quiet := verdictOf(clean, noLeaks, nil)
+	quiet := verdictOf(clean, noLeaks, nil, noStuckSnapshots)
 	if quiet.Status != verdictHealthy {
 		t.Errorf("status = %q with a zero residual, want %q", quiet.Status, verdictHealthy)
 	}
@@ -792,8 +792,8 @@ func TestTheRuleTallyIgnoresTheLeakResidual(t *testing.T) {
 		Totals: LeakSummary{Residual: 5},
 	}
 
-	without := verdictOf(rules, noLeaks, nil)
-	with := verdictOf(rules, leaky, nil)
+	without := verdictOf(rules, noLeaks, nil, noStuckSnapshots)
+	with := verdictOf(rules, leaky, nil, noStuckSnapshots)
 	if with.OK != without.OK || with.Breached != without.Breached ||
 		with.Critical != without.Critical || with.NotEvaluated != without.NotEvaluated ||
 		with.Errored != without.Errored {
@@ -1312,6 +1312,15 @@ func fixtureNow() time.Time { return time.Date(2026, 7, 30, 12, 0, 0, 0, time.UT
 // allowed to say the bare word "healthy". Named because most verdict tests are about the rules and
 // should not have to construct one.
 var noLeaks = Leaks{GraceMinutes: 30}
+
+// noStuckSnapshots is the snapshot observation of a cluster where nothing is stalled — the other
+// half of the state in which the verdict is allowed to say the bare word "healthy". Named for the same
+// reason noLeaks is: most verdict tests are about the rules and should not have to build one.
+//
+// GraceMinutes is set, and Total is not. That pair is the honest shape of "the observation ran and saw
+// no VolumeSnapshot at all", which is what a fresh cluster looks like and must never read as a pass on
+// whether snapshots work.
+var noStuckSnapshots = StuckSnapshots{GraceMinutes: 60}
 
 // fixtureConnector hands the collecting paths the fixture cluster instead of a real one, which is
 // what lets `report` with no --from be tested at all.

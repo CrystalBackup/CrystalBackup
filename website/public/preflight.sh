@@ -34,6 +34,18 @@
 #   requires the object to exist. So this script reads your PersistentVolumes too, and names the
 #   PVCs the table does not describe rather than letting the table stand for them.
 #
+#   ONE CHECK OBSERVES INSTEAD OF PREDICTING. Everything above reads static objects and says what
+#   should happen. If this cluster already holds VolumeSnapshots, the script also asks whether any of
+#   them is BOUND to a VolumeSnapshotContent — the cluster-wide snapshot controller saw the request —
+#   and STILL not readyToUse an hour later. That single shape is the fingerprint of a per-driver
+#   csi-snapshotter that is not advancing, and it is how a cluster on which no volume of one driver
+#   had EVER been backed up successfully would have been caught before installing anything: every
+#   predictive check passed on that cluster, because the VolumeSnapshotClass existed. It reports the
+#   counts and the ages and blames nobody: a stuck snapshot is somebody else's controller failing,
+#   and a genuinely slow snapshot of a multi-terabyte volume looks the same for the first hour.
+#   Where there are no VolumeSnapshots at all, it says so and reports UNKNOWN — nothing observed is
+#   not the same as snapshots observed to work.
+#
 # WHAT IT CANNOT ANSWER, AND WILL NOT PRETEND TO
 #
 #   Half of that question. A VolumeSnapshotClass whose .driver matches your StorageClass proves
@@ -97,7 +109,7 @@
 # variable here would be a bug in the script, not a fact about the cluster.
 set -u
 
-SCRIPT_VERSION='2.1.0'
+SCRIPT_VERSION='2.2.0'
 
 # The companion that answers the half of the headline question this script deliberately cannot.
 # Named here once, printed wherever the answer is missing.
@@ -169,6 +181,18 @@ cb_pick_vsclass() {
 CB_MIN_K8S_MINOR=30
 CB_MIN_K8S='1.30'
 CB_SKIP_REASON='CSISnapshotUnsupported'
+
+# CB_SNAPSHOT_STALL_GRACE_MIN — how long a VolumeSnapshot may be BOUND to a VolumeSnapshotContent
+# and still not readyToUse before check_stuck_snapshots reports it. See that function for the whole
+# reasoning; the two bounds in short are: an hour is an order of magnitude past the slowest ordinary
+# snapshot this project has measured (just over five minutes, for the external snapshot-controller to
+# collect a content), and it is comfortably below the two hours at which the operator gives up on such
+# a snapshot AND DELETES IT — a grace near two hours would observe an empty window.
+#
+# It is the same number as internal/selfcheck's snapshotStallGrace, stated in each place rather than
+# shared, exactly as that constant explains. Nothing acts on it here either: this check reports, and
+# reports as a reservation.
+CB_SNAPSHOT_STALL_GRACE_MIN=60
 
 # --- output plumbing --------------------------------------------------------------------------
 
@@ -462,6 +486,157 @@ check_snapshot_classes() {
 		record snapshot-classes UNKNOWN "VolumeSnapshotClasses" \
 			"could not list them ($(clean "$K_ERR")); no StorageClass verdict below can be trusted."
 	fi
+}
+
+# --- is anything in this cluster actually finishing a snapshot? -----------------------------------
+#
+# WHY THIS CHECK EXISTS. Every check above this one is a PREDICTOR. It reads static objects and says
+# what should happen. On a production cluster all of them passed, and no CephFS volume had ever been
+# backed up successfully — eight volumes across four namespaces, every one timing out, for as long as
+# the cluster had existed. The reason was outside CrystalBackup entirely: the CephFS csi-snapshotter
+# sidecar was started demanding a feature whose CRDs served an older version than it wanted, so its
+# informer cache never synced and it never processed a single VolumeSnapshotContent.
+#
+# The check above would have said — and did say — that the CephFS StorageClass was perfectly usable,
+# because a VolumeSnapshotClass with that driver EXISTS. Every word of that was true and it was the
+# wrong answer to the question the administrator was asking.
+#
+# WHAT IT LOOKS AT. One extra LIST, no write, no permission this script did not already need: every
+# VolumeSnapshot in the cluster, and of those, the ones that are BOUND to a VolumeSnapshotContent —
+# the cluster-wide snapshot controller saw the request and bound one, which it does within seconds —
+# and are STILL not readyToUse after CB_SNAPSHOT_STALL_GRACE_MIN. That single shape is the fingerprint
+# of a per-driver snapshotter that is not advancing.
+#
+# THE SYMPTOM AND NOT THE CAUSES, DELIBERATELY. The obvious alternative was to compare each driver's
+# csi-snapshotter image and feature gates against the group snapshot CRDs' served versions. It was
+# rejected: it would mean shipping a third-party version catalogue inside this script, it would go
+# stale on every ceph-csi release, and — far worse — it could only ever find the causes somebody had
+# already thought of. An age-based observation of the symptom catches the cause nobody predicted,
+# which is the only kind that produces an incident like the one above.
+#
+# WHAT IT DOES NOT DO. It does not blame a driver, does not name a cause, and never returns BLOCKING.
+# A stuck VolumeSnapshot is somebody else's controller failing, observed from the outside, and one
+# genuinely slow multi-terabyte cloud-disk snapshot has the same shape. So it is a RESERVATION with
+# the counts and the ages printed, and the reader is trusted with the difference between a snapshot
+# that is 65 minutes old and one that is 900 hours old.
+#
+# AND IT NEVER READS AS A PASS ON AN ABSENCE. A cluster with no VolumeSnapshot at all — which is the
+# normal state of the cluster this script is usually run against, before anything is installed — is
+# reported UNKNOWN, not PASS. Nothing was observed; that is not the same as snapshots having been
+# observed to work, and this script has already learned once what it costs to conflate those.
+check_stuck_snapshots() {
+	_title='Snapshots that are not advancing'
+	# creationTimestamp / namespace/name / class / bound content / readyToUse. One LIST, and the fields
+	# are exactly the five the classification needs — nothing here reads a VolumeSnapshotContent, a
+	# Deployment or an image.
+	if ! k_get volumesnapshot -A -o jsonpath='{range .items[*]}{.metadata.creationTimestamp}{"	"}{.metadata.namespace}{"/"}{.metadata.name}{"	"}{.spec.volumeSnapshotClassName}{"	"}{.status.boundVolumeSnapshotContentName}{"	"}{.status.readyToUse}{"\n"}{end}'; then
+		record stuck-snapshots UNKNOWN "$_title" \
+			"could not list VolumeSnapshots ($(clean "$K_ERR")); whether any snapshot in this cluster is bound to a VolumeSnapshotContent and failing to become ready was NOT established. Every StorageClass verdict above remains a prediction with nothing observed behind it."
+		unset _title
+		return
+	fi
+	_rows=$(printf '%s\n' "$K_OUT" | tr '\t' "$US")
+
+	# `date +%s` is not in POSIX but is universally implemented (GNU, BSD, busybox). A shell whose date
+	# will not answer is a check that cannot be made, which is UNKNOWN — never a pass.
+	_now=$(date +%s 2>/dev/null)
+	case $_now in
+	'' | *[!0-9]*)
+		record stuck-snapshots UNKNOWN "$_title" \
+			"the local clock would not report an epoch time ('date +%s'), so no snapshot's age could be computed and this check was NOT made."
+		unset _title _rows _now
+		return
+		;;
+	esac
+
+	# The age arithmetic is done in awk, from first principles, because there is no portable way to
+	# parse an RFC 3339 timestamp with a shell: GNU `date -d` and BSD `date -j -f` disagree, mktime()
+	# is a GNU awk extension, and this script runs wherever the administrator happens to be. The
+	# days_from_civil conversion below is exact for every date in range and needs nothing but integer
+	# arithmetic. Kubernetes writes creationTimestamp in UTC with a 'Z', which is the one assumption
+	# it makes; a timestamp it cannot parse is COUNTED as unparsed and reported, never treated as young.
+	_sum=$(printf '%s\n' "$_rows" | awk -F"$US" -v SEP="$US" -v now="$_now" \
+		-v grace="$((CB_SNAPSHOT_STALL_GRACE_MIN * 60))" '
+		function days_from_civil(y, m, d,    era, yoe, doy, doe) {
+			if (m <= 2) { y = y - 1 }
+			era = int((y >= 0 ? y : y - 399) / 400)
+			yoe = y - era * 400
+			doy = int((153 * (m + (m > 2 ? -3 : 9)) + 2) / 5) + d - 1
+			doe = yoe * 365 + int(yoe / 4) - int(yoe / 100) + doy
+			return era * 146097 + doe - 719468
+		}
+		function epoch(ts,    y, mo, d, H, M, S) {
+			if (ts !~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]/) { return -1 }
+			y = substr(ts, 1, 4) + 0; mo = substr(ts, 6, 2) + 0; d = substr(ts, 9, 2) + 0
+			H = substr(ts, 12, 2) + 0; M = substr(ts, 15, 2) + 0; S = substr(ts, 18, 2) + 0
+			return days_from_civil(y, mo, d) * 86400 + H * 3600 + M * 60 + S
+		}
+		$2 == "" { next }
+		{
+			total++
+			cls = ($3 == "" ? "(none named)" : $3)
+			seen[cls] = 1
+			if ($5 == "true") { readyn++; rdy[cls]++ }
+			if ($4 == "") { unbound++; next }
+			bound++
+			if ($5 == "true") { next }
+			e = epoch($1)
+			if (e < 0) { unparsed++; next }
+			age = now - e
+			if (age < grace) { young++; next }
+			stuck++
+			stk[cls]++
+			h = int(age / 3600)
+			if (h > oldest) { oldest = h }
+			if (nex < 4) { ex = ex (nex ? "; " : "") $2 " (" cls ", " h " h)"; nex++ }
+			else { more++ }
+		}
+		END {
+			# Sorted, so two runs over an unchanged cluster print the same sentence. awk iterates an
+			# associative array in an unspecified order and a detail line that reshuffles itself between
+			# runs is a detail line nobody trusts.
+			n = 0
+			for (c in stk) { keys[++n] = c }
+			for (i = 2; i <= n; i++) {
+				k = keys[i]; j = i - 1
+				while (j > 0 && keys[j] > k) { keys[j + 1] = keys[j]; j-- }
+				keys[j + 1] = k
+			}
+			cs = ""
+			for (i = 1; i <= n; i++) {
+				c = keys[i]
+				cs = cs (i > 1 ? "; " : "") c ": " stk[c] " stuck, " (rdy[c] + 0) " readyToUse"
+			}
+			if (more > 0) { ex = ex "; and " more " more" }
+			printf "%d%s%d%s%d%s%d%s%d%s%d%s%d%s%s%s%s\n", \
+				total + 0, SEP, readyn + 0, SEP, bound + 0, SEP, stuck + 0, SEP, young + 0, SEP, \
+				oldest + 0, SEP, unparsed + 0, SEP, cs, SEP, ex
+		}')
+
+	IFS="$US" read -r _n_total _n_ready _n_bound _n_stuck _n_young _oldest _n_unparsed _classes _examples <<EOF
+$_sum
+EOF
+	_unbound=$((_n_total - _n_bound))
+	_caveat=''
+	if [ "$_n_unparsed" -gt 0 ]; then
+		_caveat=" $_n_unparsed VolumeSnapshot(s) carried a creationTimestamp this script could not parse and were NOT judged either way."
+	fi
+
+	if [ "$_n_total" -eq 0 ]; then
+		record stuck-snapshots UNKNOWN "$_title" \
+			"this cluster holds no VolumeSnapshot at all, so nothing was observed. That is the normal state before anything that snapshots has run, and it is NOT evidence that snapshots work here — the StorageClass table above is still only a prediction. The probe is what turns it into an observation: $CB_PROBE_URL"
+	elif [ "$_n_stuck" -gt 0 ] && [ "$_n_ready" -eq 0 ]; then
+		record stuck-snapshots WARN "$_title" \
+			"of the $_n_total VolumeSnapshot(s) in this cluster, NONE is readyToUse and $_n_stuck have been bound to a VolumeSnapshotContent for more than $CB_SNAPSHOT_STALL_GRACE_MIN minutes (oldest $_oldest h). Bound means the cluster-wide snapshot controller saw the request; still-not-ready means the per-driver csi-snapshotter is not finishing it. On the evidence in this cluster, snapshot-based backup has not completed once. Check the csi-snapshotter sidecar of the driver behind those classes — its logs, its --feature-gates, and whether the CRD versions it demands are the ones served here. By class: $_classes. Examples: $_examples.$_caveat"
+	elif [ "$_n_stuck" -gt 0 ]; then
+		record stuck-snapshots WARN "$_title" \
+			"$_n_stuck of $_n_total VolumeSnapshot(s) have been bound to a VolumeSnapshotContent for more than $CB_SNAPSHOT_STALL_GRACE_MIN minutes without becoming readyToUse (oldest $_oldest h), alongside $_n_ready that ARE ready. Snapshots do complete here, and something is not advancing. A genuinely slow snapshot on a very large volume has the same shape, so read the ages: an hour is plausible, days are not. By class: $_classes. Examples: $_examples.$_caveat"
+	else
+		record stuck-snapshots PASS "$_title" \
+			"no VolumeSnapshot is bound to a VolumeSnapshotContent and stalled past $CB_SNAPSHOT_STALL_GRACE_MIN minutes ($_n_total exist, $_n_ready readyToUse, $_n_young bound and still inside the grace, $_unbound not bound to a content at all). This says the snapshotters serving the existing snapshots are advancing; it says nothing about a StorageClass no snapshot has ever been taken on.$_caveat"
+	fi
+	unset _title _rows _now _sum _n_total _n_ready _n_bound _n_stuck _n_young _oldest _n_unparsed \
+		_classes _examples _unbound _caveat
 }
 
 # --- the volume inventory the checks below share -------------------------------------------------
@@ -1273,6 +1448,9 @@ check_vap
 check_snapshot_crds
 check_snapshot_controller
 check_snapshot_classes
+# After the three predictors above, and deliberately: this is the one check that OBSERVES rather than
+# predicts, and it is the answer to "and does any of that actually work here?".
+check_stuck_snapshots
 collect_volume_inventory
 check_storage_classes
 check_bound_volume_drivers

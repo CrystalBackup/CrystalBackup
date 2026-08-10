@@ -38,6 +38,14 @@
       healthy volumes on healthy storage that nothing will ever back up. See <b>What will and will not be backed up</b> below.
     </p>
     {{ end }}{{ end }}
+    {{ if has .StuckSnapshots.Stuck }}
+    <p>
+      <b>{{ .StuckSnapshots.Stuck }} VolumeSnapshot(s)</b> in this cluster are bound to a VolumeSnapshotContent and still not <code>readyToUse</code> after {{ .StuckSnapshots.GraceMinutes }} minutes (oldest {{ .StuckSnapshots.OldestStuckHours }} h) —
+      the fingerprint of a snapshotter that is not advancing.
+      {{ with .Coverage }}{{ if has .StalledStorage }}<b>{{ .StalledStorage }} PVC(s) this report predicts as BACKED UP sit on a StorageClass carrying one.</b>{{ end }}{{ end }}
+      This is an OBSERVATION and not a diagnosis: no rule fires on it, no verdict above moves because of it, and nothing the operator does changes. See <b>Snapshots that are not advancing</b> below.
+    </p>
+    {{ end }}
   </section>
 
   {{ if eq .Redaction.Mode "hashed" }}
@@ -109,6 +117,12 @@
     {{ if has .InertOnly }} <b>{{ .InertOnly }} are selected only by a schedule that cannot fire</b> (suspended, or an unparseable cron) — covered on paper, unprotected in fact.{{ end }}
   </div>
   {{ end }}
+  {{ if has .StalledStorage }}
+  <div class="caveat">
+    <b>{{ .StalledStorage }} PVC(s) counted as BACKED UP above are on a StorageClass this cluster is OBSERVED not to be finishing snapshots on.</b>
+    The table above is a prediction — the treatment the operator will attempt. The rows below carry what was actually seen, and it does not change any verdict here.
+  </div>
+  {{ end }}
   {{ if .Items }}
   <div class="scroll">
   <table>
@@ -121,7 +135,7 @@
         <td class="mono">{{ with .StorageClass }}{{ . }}{{ else }}—{{ end }}</td>
         <td><span class="chip {{ covRank .Verdict }}">{{ covWord .Verdict }}</span> <span class="mono">{{ .Class }}</span></td>
         <td class="mono">{{ if .Schedules }}{{ range .Schedules }}{{ . }} {{ end }}{{ else if .InertSchedules }}inert: {{ range .InertSchedules }}{{ . }} {{ end }}{{ else }}NOBODY{{ end }}</td>
-        <td>{{ .Detail }}</td>
+        <td>{{ .Detail }}{{ with .SnapshotEvidence }}<div class="caveat">{{ . }}</div>{{ end }}</td>
       </tr>
     {{ end }}
     </tbody>
@@ -140,6 +154,7 @@
     <div class="axis"><div class="name">Chart / appVersion</div><div class="v">{{ with .Operator.AppVersion }}{{ . }}{{ else }}—{{ end }}</div></div>
     <div class="axis"><div class="name">Backups retained</div><div class="v">{{ .Inventory.Backups.Total }}</div></div>
     <div class="axis"><div class="name">Residual objects</div><div class="v {{ if has .Leaks.Totals.Residual }}crit{{ else }}ok{{ end }}">{{ .Leaks.Totals.Residual }}</div></div>
+    <div class="axis"><div class="name">Snapshots not advancing</div><div class="v {{ if has .StuckSnapshots.Stuck }}crit{{ else }}ok{{ end }}">{{ .StuckSnapshots.Stuck }}</div></div>
   </div>
   {{ with .Operator.VersionNote }}<p class="faint">{{ . }}</p>{{ end }}
   <p class="faint">
@@ -322,6 +337,60 @@
   </div>
   <p class="faint">Oldest retained success {{ tsp .Inventory.Backups.OldestSuccess }} · newest {{ tsp .Inventory.Backups.NewestSuccess }}</p>
   {{ else }}<p class="muted">No Backup object exists. Nothing has been captured, or nothing has been retained.</p>{{ end }}
+
+  <h2>Snapshots that are not advancing<span class="n">grace {{ .StuckSnapshots.GraceMinutes }} min</span></h2>
+  <p class="muted">{{ .StuckSnapshots.Note }}</p>
+  <div class="axes">
+    <div class="axis"><div class="name">VolumeSnapshots</div><div class="v">{{ .StuckSnapshots.Total }}</div></div>
+    <div class="axis"><div class="name">readyToUse</div><div class="v">{{ .StuckSnapshots.Ready }}</div></div>
+    <div class="axis"><div class="name">Bound, not ready, past grace</div><div class="v {{ if has .StuckSnapshots.Stuck }}crit{{ else }}ok{{ end }}">{{ .StuckSnapshots.Stuck }}</div></div>
+    <div class="axis"><div class="name">Bound, not ready, within grace</div><div class="v">{{ .StuckSnapshots.WithinGrace }}</div></div>
+    <div class="axis"><div class="name">Not bound to a content</div><div class="v">{{ .StuckSnapshots.Unbound }}</div></div>
+  </div>
+  {{ if .StuckSnapshots.Classes }}
+  <div class="scroll">
+  <table>
+    <thead><tr><th>VolumeSnapshotClass</th><th>Total</th><th>readyToUse</th><th>Stuck</th><th>Oldest stuck</th></tr></thead>
+    <tbody>
+    {{ range .StuckSnapshots.Classes }}
+      <tr>
+        <td class="mono">{{ .Class }}</td>
+        <td class="mono">{{ .Total }}</td>
+        <td class="mono">{{ .Ready }}</td>
+        <td class="mono">{{ if has .Stuck }}<span class="chip crit">{{ .Stuck }}</span>{{ else }}0{{ end }}</td>
+        <td class="mono">{{ if has .Stuck }}{{ .OldestStuckHours }} h{{ else }}—{{ end }}</td>
+      </tr>
+    {{ end }}
+    </tbody>
+  </table>
+  </div>
+  {{ else }}<p class="muted">No VolumeSnapshot exists in this cluster. Nothing was observed — which is not the same as snapshots having been observed to work, and this section claims neither.</p>{{ end }}
+  {{ if .StuckSnapshots.Samples }}
+  <div class="scroll">
+  <table>
+    <thead><tr><th>Namespace</th><th>VolumeSnapshot</th><th>Class</th><th>Source PVC</th><th>Bound content</th><th>Age</th><th>Recorded error</th></tr></thead>
+    <tbody>
+    {{ range .StuckSnapshots.Samples }}
+      <tr>
+        <td class="mono">{{ with .Namespace }}{{ . }}{{ else }}—{{ end }}</td>
+        <td class="mono">{{ .Name }}</td>
+        <td class="mono">{{ with .Class }}{{ . }}{{ else }}—{{ end }}</td>
+        <td class="mono">{{ with .SourcePVC }}{{ . }}{{ else }}—{{ end }}</td>
+        <td class="mono">{{ with .Content }}{{ . }}{{ else }}—{{ end }}</td>
+        <td class="mono">{{ .AgeHours }} h</td>
+        <td>{{ with .Error }}{{ . }}{{ else }}<span class="faint">none recorded — a snapshotter that is not running records nothing, which is why the age is the evidence</span>{{ end }}</td>
+      </tr>
+    {{ end }}
+    </tbody>
+  </table>
+  </div>
+  {{ end }}
+  {{ if has .StuckSnapshots.WithoutSourcePVC }}
+  <p class="faint">{{ .StuckSnapshots.WithoutSourcePVC }} of these are sourced from a VolumeSnapshotContent rather than a PVC, so they count in the totals here and cannot be attributed to any PVC's StorageClass in the census above.</p>
+  {{ end }}
+  {{ if .StuckSnapshots.Unreadable }}
+  <p class="faint">Not readable: {{ range .StuckSnapshots.Unreadable }}{{ . }}; {{ end }}Every count in this section is therefore a floor and not an answer, and the census above qualified nothing.</p>
+  {{ end }}
 
   <h2>Leak indicators<span class="n">grace {{ .Leaks.GraceMinutes }} min</span></h2>
   <p class="muted">{{ .Leaks.Note }}</p>

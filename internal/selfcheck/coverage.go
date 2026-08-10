@@ -149,6 +149,15 @@ type Coverage struct {
 	// cron expression that does not parse. Not merged into Unselected, because the remedy is
 	// different and much smaller — there IS a schedule, it is just switched off.
 	InertOnly int `json:"selectedOnlyByInertSchedules"`
+	// StalledStorage counts PVCs whose treatment class says BACKED UP and whose StorageClass is
+	// carrying a VolumeSnapshot that has been bound and not ready past the grace period — a prediction
+	// this section can no longer make on its own. See qualifyWithSnapshotEvidence.
+	//
+	// Its own number, like Unselected, and for the same reason: it is ORTHOGONAL to the treatment. The
+	// class is still the class the resolver chose and the row's Verdict is untouched; what has changed
+	// is that the cluster is being observed not to complete that treatment, and collapsing the two
+	// would let one hide the other.
+	StalledStorage int `json:"backedUpOnStorageNotAdvancing,omitempty"`
 
 	// Items are the per-PVC rows, attention-first (see maxCoverageItems). Redacted like every other
 	// identifier in this document.
@@ -235,6 +244,26 @@ type CoveredPVC struct {
 	// it is free text containing object names, which is the one shape per-field redaction cannot
 	// reach.
 	Detail string `json:"detail,omitempty"`
+
+	// SnapshotEvidence is where a PREDICTION becomes qualified by an OBSERVATION, and it is the only
+	// field in this row that is not a statement about resolution.
+	//
+	// Empty on all but one shape of row: a row whose Verdict is backedUp, sitting on a StorageClass this
+	// cluster is observed to be failing to snapshot. Empty on a class with no snapshots at all — absence
+	// of evidence is not evidence of failure, and a section that maligned every StorageClass nobody has
+	// backed up yet would be worthless on the fresh installation it is written for.
+	//
+	// The row's Verdict and Class are NOT touched by it. What the operator will do to this volume is
+	// still what the resolver says; what this sentence adds is that the cluster is not currently
+	// finishing that job, which is a fact about the storage's behaviour and not a verdict this report is
+	// entitled to reach.
+	SnapshotEvidence string `json:"snapshotEvidence,omitempty"`
+	// StuckOnStorageClass and ReadyOnStorageClass are the counts behind that sentence, over every
+	// VolumeSnapshot in the cluster whose source PVC names this row's StorageClass. Carried as numbers
+	// as well as prose because a machine reading this document should not have to parse English to find
+	// out that the evidence was thin (one stuck snapshot) or overwhelming (eight stuck, none ready).
+	StuckOnStorageClass int `json:"stuckSnapshotsOnStorageClass,omitempty"`
+	ReadyOnStorageClass int `json:"readySnapshotsOnStorageClass,omitempty"`
 }
 
 // maxCoveredSchedules caps the schedule list on one row. Two is enough to answer "is anything

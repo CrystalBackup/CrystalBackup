@@ -86,6 +86,40 @@ type Options struct {
 // only job here is to LABEL a count, and leakGraceNote says so in the report.
 const reaperGrace = 30 * time.Minute
 
+// snapshotStallGrace bounds how long a VolumeSnapshot may be BOUND to a VolumeSnapshotContent and
+// still not readyToUse before this report reports it as stuck.
+//
+// It is NOT a deadline. Nothing acts on it: it fails no volume, moves no rule tally and changes
+// nothing the operator does. Being wrong here costs a sentence in a document, which is why the number
+// can be chosen far more freely than internal/controller's snapshotReadyDeadline — and why it is
+// chosen differently.
+//
+// ONE HOUR, and the two bounds that fix it come from opposite directions:
+//
+//   - The FLOOR is the slowest legitimate advance this project has evidence of. A CSI snapshot is
+//     usually metadata and answers in seconds; the crucible measured the external snapshot-controller
+//     taking just over five minutes to collect a content whose teardown was already complete, which is
+//     the slowest ordinary case on record. An hour is an order of magnitude past it.
+//   - The CEILING is snapshotReadyDeadline (two hours), and it is the binding one. When that deadline
+//     fires the controller fails the volume and TEARS THE ORIGIN VOLUMESNAPSHOT DOWN — so a grace set
+//     at or near two hours would observe an empty window: by the time an object qualified, it would
+//     already have been deleted, and this whole census would be structurally blind to the operator's
+//     own stalled snapshots. One hour leaves a full hour in which the symptom is present in a LIST.
+//
+// The residual risk is a genuinely slow multi-terabyte cloud-disk snapshot, which the controller's own
+// comment allows may legitimately take "tens of minutes and occasionally more". Such a snapshot is
+// reported here — once — with its AGE stated beside it, and that is the mitigation: a reader can tell
+// a sixty-five-minute snapshot from a nine-hundred-hour one at a glance, and the transient one is gone
+// by the next run while the standing failure this exists for is there every single time. Erring long
+// instead would have bought silence on the one defect the section was built for, since the incident's
+// snapshots were stuck for the entire life of the cluster.
+//
+// It is duplicated in website/public/preflight.sh (CB_SNAPSHOT_STALL_GRACE_MIN) rather than shared,
+// for the reason reaperGrace is duplicated from the controller: the number's only job on either side
+// is to LABEL a count, both sides state it in their own output, and the alternative is teaching a
+// generator that reads internal/exposer to reach into this package as well.
+const snapshotStallGrace = time.Hour
+
 // Collect builds the report. It never fails on a partial read: anything unreadable becomes a
 // Diagnostic and leaves its section empty, because "the operator was not allowed to look" and
 // "there is nothing there" must not render the same way.
@@ -116,6 +150,11 @@ func Collect(ctx context.Context, opts Options) (*Report, error) {
 	// are where the redactor learns the most names — every namespace, every schedule, and (only here)
 	// every PVC. A rule breach whose Detail names a PVC is redacted because this ran first.
 	rep.Plan = c.plan(ctx)
+	// BEFORE the census, and the order is load-bearing rather than incidental: the census qualifies its
+	// own predictions with this observation (see qualifyWithSnapshotEvidence), so the observation has to
+	// exist by the time the first PVC is classified. Collected in one LIST that neither section pays for
+	// twice.
+	rep.StuckSnapshots = c.stuckSnapshots(ctx)
 	rep.Coverage = c.coverage(ctx)
 	rep.Operator, rep.Cluster = c.identity(ctx)
 	rep.Images = c.images(ctx)
@@ -124,7 +163,7 @@ func Collect(ctx context.Context, opts Options) (*Report, error) {
 	rep.Rules = c.rules(ctx)
 	// The leak census is passed to the verdict as well as reported in its own section: the headline
 	// has to account for a residual it is not allowed to call a breach. See verdictOf.
-	rep.Verdict = verdictOf(rep.Rules, rep.Leaks, rep.Coverage)
+	rep.Verdict = verdictOf(rep.Rules, rep.Leaks, rep.Coverage, rep.StuckSnapshots)
 	rep.Redaction = red.Describe()
 	rep.Diagnostics = c.diags
 	return rep, nil
@@ -137,6 +176,16 @@ type collector struct {
 
 	// clusterID is resolved once from the locations and reused by the sections that carry it.
 	clusterID string
+
+	// snapEvidence is what the cluster's VolumeSnapshots say about each PVC, keyed "namespace/pvc".
+	// Filled by stuckSnapshots and read by the coverage census, which aggregates it per StorageClass
+	// and uses it to qualify a prediction it can no longer make alone.
+	//
+	// It is passed on the collector rather than returned, because it is NOT part of the document: it is
+	// an intermediate join key between two sections that each report their own half. Nil until
+	// stuckSnapshots has run, and STILL nil (not empty-and-authoritative) when the snapshot LIST was
+	// refused — which is what makes the census qualify nothing rather than qualify everything as fine.
+	snapEvidence map[string]snapshotEvidence
 }
 
 func (c *collector) diag(area, impact string, err error) {
@@ -799,6 +848,207 @@ func (c *collector) backups(ctx context.Context) BackupCensus {
 	return census
 }
 
+// --- stuck snapshots ------------------------------------------------------------------------
+
+// stuckSnapshotNote is the sentence that travels with the counts, in the JSON as well as on the page.
+// It states what the finding is and — just as important — what it is not, because a count of stuck
+// snapshots read as a verdict about somebody's storage is a count that gets this section deleted.
+const stuckSnapshotNote = "`stuck` counts VolumeSnapshots that are BOUND to a VolumeSnapshotContent " +
+	"— the cluster-wide snapshot-controller saw the request — and are still not readyToUse after the " +
+	"grace period. That is the fingerprint of a per-driver csi-snapshotter that is not advancing, and " +
+	"it is reported as an OBSERVATION: it fails nothing, skips nothing and breaches no rule. Every " +
+	"VolumeSnapshot in the cluster is counted, not only the ones this operator created, because a " +
+	"stalled snapshotter stalls for everybody. A non-zero `ready` on the same VolumeSnapshotClass is " +
+	"evidence in the other direction; no snapshot at all on a class is evidence of nothing."
+
+// maxSnapshotSamples bounds the named stuck snapshots, exactly as maxSamples bounds the leak samples
+// and for the same reason: enough to go and look at, not a listing of somebody's cluster.
+const maxSnapshotSamples = 10
+
+// snapshotClassUnnamed stands in for a VolumeSnapshot whose spec.volumeSnapshotClassName is empty —
+// it asked for the default class and the controller has not written the resolved name back yet. It is
+// a distinct bucket rather than being merged into any real class, because attributing a stall to a
+// class the object does not name would be inventing the one fact the reader needs.
+const snapshotClassUnnamed = "(none named)"
+
+// snapshotEvidence is what the cluster's own VolumeSnapshots say about one PVC — or, once the coverage
+// census has merged them, about one StorageClass.
+//
+// Four counters and no verdict. Whether these numbers qualify a prediction is the census's decision
+// (qualifyWithSnapshotEvidence), and keeping it out of here is what stops "no snapshots at all" from
+// quietly acquiring a meaning on the way between the two sections.
+type snapshotEvidence struct {
+	total       int
+	ready       int
+	stuck       int
+	withinGrace int
+	// oldestStuckHours is the age of the oldest stuck snapshot behind these counts.
+	oldestStuckHours int
+}
+
+// add folds another PVC's evidence into this one. Used by the census to aggregate per StorageClass.
+func (e snapshotEvidence) add(o snapshotEvidence) snapshotEvidence {
+	e.total += o.total
+	e.ready += o.ready
+	e.stuck += o.stuck
+	e.withinGrace += o.withinGrace
+	if o.oldestStuckHours > e.oldestStuckHours {
+		e.oldestStuckHours = o.oldestStuckHours
+	}
+	return e
+}
+
+// stuckSnapshots is the observation this lot exists for: one cluster-wide LIST of VolumeSnapshots,
+// split by whether they are bound, ready, and how long they have been neither.
+//
+// It is deliberately built in the shape of leaks() — a census with a grace period, a per-kind split, a
+// bounded sample and an explicit record of what could not be read — because leaks() is the same kind
+// of statement: a count of objects the age of which is the whole measurement, that no alert rule fires
+// on, and that must reach the headline without being called a breach.
+//
+// It also fills c.snapEvidence, which is the join the coverage census uses. See StuckSnapshots for why
+// this observation exists and why it enumerates no causes.
+func (c *collector) stuckSnapshots(ctx context.Context) StuckSnapshots {
+	out := StuckSnapshots{
+		GraceMinutes: int(snapshotStallGrace.Minutes()),
+		Note:         stuckSnapshotNote,
+	}
+	cutoff := c.Now.Add(-snapshotStallGrace)
+
+	list := &unstructured.UnstructuredList{}
+	list.SetGroupVersionKind(schema.GroupVersionKind{
+		Group: snapshotGroup, Version: snapshotVersion, Kind: kindSnapshot + "List",
+	})
+	// Cluster-wide and unfiltered. No label selector, because a stuck snapshot cut by another backup
+	// tool is evidence about the same snapshotter, and on a cluster where CrystalBackup was installed
+	// this morning it may be the ONLY evidence there is.
+	if err := c.Reader.List(ctx, list); err != nil {
+		out.Unreadable = append(out.Unreadable, kindSnapshot+": "+err.Error())
+		// A diagnostic as well, and this is the difference between degrading and lying. With the list
+		// refused, c.snapEvidence stays nil, so the coverage census qualifies nothing — which is right,
+		// but from the outside it is indistinguishable from a cluster where every snapshot is healthy.
+		// The diagnostics section is the only thing that keeps those two apart.
+		c.diag("stuckSnapshots",
+			"whether any VolumeSnapshot in this cluster is bound and failing to become ready was NOT "+
+				"established, and the per-PVC census's 'backed up' predictions are therefore unqualified",
+			err)
+		return out
+	}
+	// Only now, on a list that was actually read: an empty map is an authoritative "nothing seen",
+	// which is exactly what a nil map must not be mistaken for.
+	c.snapEvidence = map[string]snapshotEvidence{}
+
+	type candidate struct {
+		item    StuckSnapshotItem
+		created time.Time
+	}
+	var found []candidate
+	tally := map[string]*StuckSnapshotClass{}
+
+	for i := range list.Items {
+		it := &list.Items[i]
+		created := it.GetCreationTimestamp().Time
+		class, _, _ := unstructured.NestedString(it.Object, "spec", "volumeSnapshotClassName")
+		if class == "" {
+			class = snapshotClassUnnamed
+		}
+		source, _, _ := unstructured.NestedString(it.Object, "spec", "source", "persistentVolumeClaimName")
+		content, _, _ := unstructured.NestedString(it.Object, "status", "boundVolumeSnapshotContentName")
+		// The errors from NestedBool and NestedString are dropped on purpose: a status field of an
+		// unexpected TYPE is not a readyToUse of true, and the honest reading of "this object does not
+		// say it is ready" is the same whether the field is absent or malformed.
+		ready, _, _ := unstructured.NestedBool(it.Object, "status", "readyToUse")
+		errMsg, _, _ := unstructured.NestedString(it.Object, "status", "error", "message")
+
+		k := tally[class]
+		if k == nil {
+			k = &StuckSnapshotClass{Class: class}
+			tally[class] = k
+		}
+		out.Total++
+		k.Total++
+		ev := snapshotEvidence{total: 1}
+
+		if ready {
+			out.Ready++
+			k.Ready++
+			ev.ready = 1
+		}
+		switch {
+		case content == "":
+			out.Unbound++
+		case ready:
+			out.Bound++
+		case created.Before(cutoff):
+			out.Bound++
+			out.Stuck++
+			k.Stuck++
+			age := int(c.Now.Sub(created).Hours())
+			ev.stuck = 1
+			ev.oldestStuckHours = age
+			if age > out.OldestStuckHours {
+				out.OldestStuckHours = age
+			}
+			if age > k.OldestStuckHours {
+				k.OldestStuckHours = age
+			}
+			// The two Learns are REDUNDANT TODAY and stay anyway, which is worth recording because a
+			// reviewer will want to delete them and a mutation test cannot defend them.
+			//
+			// Error goes through Redactor.Detail, and Detail can only substitute names the redactor has
+			// already seen. The field calls below happen to register both of them — c.red.PVC and
+			// c.red.Namespace tokenise as a side effect — and a composite literal's fields are evaluated
+			// left to right, so SourcePVC is registered before Error is redacted. That is the whole
+			// protection, and it is invisible: reordering two lines in the literal below would silently
+			// leak a PVC name into a driver's error message, with every test still green. Registering
+			// explicitly, before the literal, makes the dependency a statement instead of an accident.
+			c.red.Learn(kindNamespace, it.GetNamespace())
+			c.red.Learn(kindPVC, source)
+			found = append(found, candidate{created: created, item: StuckSnapshotItem{
+				Namespace: c.red.Namespace(it.GetNamespace()),
+				Name:      c.red.Object(it.GetName()),
+				SourcePVC: c.red.PVC(source),
+				Class:     class,
+				Content:   c.red.Object(content),
+				AgeHours:  age,
+				Error:     c.red.Detail(errMsg),
+			}})
+		default:
+			out.Bound++
+			out.WithinGrace++
+			ev.withinGrace = 1
+		}
+
+		if source == "" {
+			out.WithoutSourcePVC++
+			continue
+		}
+		key := it.GetNamespace() + "/" + source
+		c.snapEvidence[key] = c.snapEvidence[key].add(ev)
+	}
+
+	for _, k := range tally {
+		out.Classes = append(out.Classes, *k)
+	}
+	// Stuck first, then by name: the class a reader has to act on is the first row, and two runs over
+	// unchanged state render identically.
+	slices.SortFunc(out.Classes, func(a, b StuckSnapshotClass) int {
+		if d := cmp.Compare(b.Stuck, a.Stuck); d != 0 {
+			return d
+		}
+		return cmp.Compare(a.Class, b.Class)
+	})
+
+	slices.SortFunc(found, func(a, b candidate) int { return a.created.Compare(b.created) })
+	for i, f := range found {
+		if i >= maxSnapshotSamples {
+			break
+		}
+		out.Samples = append(out.Samples, f.item)
+	}
+	return out
+}
+
 // --- leaks ----------------------------------------------------------------------------------
 
 // leaks counts the residue a crashed teardown leaves behind: the object classes M4's leak audit
@@ -1053,7 +1303,7 @@ func thresholdView(t alerts.Threshold) ThresholdView {
 // breach in the report that the alerting side would never send. What changes is that the word
 // "healthy" is no longer available on its own when there is residue, and that the summary states
 // both facts in one sentence instead of leaving the second one four sections down.
-func verdictOf(rules []RuleResult, leaks Leaks, cov *Coverage) Verdict {
+func verdictOf(rules []RuleResult, leaks Leaks, cov *Coverage, stuck StuckSnapshots) Verdict {
 	v := Verdict{Status: verdictHealthy}
 	for _, r := range rules {
 		switch r.Status {
@@ -1086,7 +1336,11 @@ func verdictOf(rules []RuleResult, leaks Leaks, cov *Coverage) Verdict {
 	// the reader this word was written for. The rule TALLY is still untouched — nothing below adds to
 	// Breached, Critical or OK, because no alert rule fires on the census and inventing one here would
 	// put a breach in this document that the alerting side would never send.
-	finding := joinFindings(coverageClause(cov), leakClause(leaks))
+	// Order: what will not be backed up, then what the cluster is OBSERVED to be failing to snapshot,
+	// then the operator's own residue. The observation sits next to the census on purpose — it is the
+	// sentence that qualifies the census's prediction, and separating them by a paragraph is how the
+	// same pair of facts stayed unconnected through a whole incident.
+	finding := joinFindings(coverageClause(cov), stuckSnapshotClause(stuck, cov), leakClause(leaks))
 	switch v.Status {
 	case verdictUnhealthy:
 		v.Summary = fmt.Sprintf("%d rule(s) breached, %d of them CRITICAL — restore capability is "+
@@ -1162,6 +1416,33 @@ func coverageClause(cov *Coverage) string {
 	}
 	return fmt.Sprintf("the per-PVC census found volumes that will NOT be backed up (%s) — a finding "+
 		"from the coverage section below, not a breached rule", strings.Join(parts, ", "))
+}
+
+// stuckSnapshotClause states the snapshot observation as a clause the verdict sentence can be built
+// around, or "" when nothing has been bound-and-not-ready long enough to say anything about.
+//
+// It is in the HEADLINE for the reason leakClause and coverageClause are: a reader who sees "healthy"
+// at the top does not scroll, and this is the one finding a whole incident proved nobody scrolls to. It
+// moves no count — no rule fires on it, and inventing a breach here would claim an alert the alerting
+// side would never send — and it says so in the same breath, so it cannot be quoted into a ticket as an
+// alert that fired.
+//
+// It names the number of census rows it QUALIFIES, when there are any. That clause is the whole point
+// of the lot: "eight volumes this report predicts as backed up sit on storage that is not finishing a
+// snapshot" is the sentence that was missing, and it is worth more than either half alone.
+func stuckSnapshotClause(s StuckSnapshots, cov *Coverage) string {
+	if s.Stuck == 0 {
+		return ""
+	}
+	clause := fmt.Sprintf("%d VolumeSnapshot(s) are bound to a VolumeSnapshotContent and still not "+
+		"readyToUse after %d minutes (oldest %d h) — the fingerprint of a snapshotter that is not "+
+		"advancing, OBSERVED and not diagnosed here",
+		s.Stuck, s.GraceMinutes, s.OldestStuckHours)
+	if cov != nil && cov.StalledStorage > 0 {
+		clause += fmt.Sprintf(", and %d PVC(s) this report predicts as backed up sit on a StorageClass "+
+			"carrying one", cov.StalledStorage)
+	}
+	return clause + " — a finding from the snapshot observation below, not a breached rule"
 }
 
 // leakClause states the residue census as a clause a verdict sentence can be built around, or "" when

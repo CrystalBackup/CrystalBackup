@@ -266,6 +266,16 @@ func textCoverage(w *textWriter, cov *Coverage, all bool) {
 				"so %s covered on paper and unprotected in fact.",
 			cov.InertOnly, isAre(cov.InertOnly), itTheyAre(cov.InertOnly)))
 	}
+	// The observation, immediately under the prediction it qualifies rather than in a section of its
+	// own. The whole defect this closes was these two facts living far enough apart that nobody joined
+	// them, and the tally above is exactly where a reader forms the belief this line has to interrupt.
+	if cov.StalledStorage > 0 {
+		w.wrap("  ! ", fmt.Sprintf(
+			"%s counted as BACKED UP above %s on a StorageClass this cluster is OBSERVED not to be "+
+				"finishing snapshots on — bound to a VolumeSnapshotContent and never ready. The treatment "+
+				"is still what the operator will attempt; the rows below say what was seen.",
+			plural(cov.StalledStorage, "PVC"), isAre(cov.StalledStorage)))
+	}
 
 	hidden := textCoverageRows(w, cov, all)
 	if hidden > 0 && !all {
@@ -316,12 +326,20 @@ func textCoverageRows(w *textWriter, cov *Coverage, all bool) (hidden int) {
 				strings.Join(it.InertSchedules, ", "))
 		}
 		w.wrap("        ", it.Detail)
+		// Marked with the same "!" the unselected and inert findings carry, because it is the same kind
+		// of thing: a row whose columns all read as fine, next to a reason to doubt them.
+		w.wrap("        ! ", it.SnapshotEvidence)
 	}
 	return hidden
 }
 
+// textNeedsAttention mirrors coverageNeedsAttention — see its doc for why the snapshot observation is
+// one of the axes. The two are separate functions because one decides an ORDER over the whole census
+// and the other decides what a compact terminal prints, but they must agree on which rows matter: a row
+// the sort called healthy and the renderer called interesting would be a row nobody ever sees, because
+// the sort put it past the cap first.
 func textNeedsAttention(it CoveredPVC) bool {
-	return it.Verdict != CoverageVerdictBackedUp || !it.Selected
+	return it.Verdict != CoverageVerdictBackedUp || !it.Selected || it.SnapshotEvidence != ""
 }
 
 // textRowVerdict is the per-row verdict, and the unselected case leads.
@@ -404,12 +422,29 @@ func textFindings(w *textWriter, rep *Report) {
 	// Sorted by the rendered status word so breaches group together and the order is stable between
 	// two runs over unchanged state — the same property the HTML renderer's sorts give.
 	slices.Sort(lines)
-	if len(lines) == 0 && rep.Leaks.Totals.Residual == 0 {
+	if len(lines) == 0 && rep.Leaks.Totals.Residual == 0 && rep.StuckSnapshots.Stuck == 0 {
 		return
 	}
 	w.section("FINDINGS")
 	for _, l := range lines {
 		w.line(l)
+	}
+	// The snapshot observation is a finding for the same reason the leak residual is: no alert rule
+	// fires on it, so this section is the only place in the terminal output where a reader who is
+	// skimming meets it at all.
+	if rep.StuckSnapshots.Stuck > 0 {
+		w.wrap("  ", fmt.Sprintf(
+			"%d VolumeSnapshot(s) in this cluster are bound to a VolumeSnapshotContent and still not "+
+				"readyToUse after %d minutes (oldest %d h) — the fingerprint of a snapshotter that is not "+
+				"advancing. Nothing here diagnoses it and no verdict above changes because of it. No alert "+
+				"rule fires on this; see stuckSnapshots.",
+			rep.StuckSnapshots.Stuck, rep.StuckSnapshots.GraceMinutes,
+			rep.StuckSnapshots.OldestStuckHours))
+		for _, s := range rep.StuckSnapshots.Samples {
+			w.wrap("      ", fmt.Sprintf("%s/%s on %s, %d h, source PVC %s, content %s%s",
+				s.Namespace, s.Name, orDash(s.Class), s.AgeHours, orDash(s.SourcePVC),
+				orDash(s.Content), errSuffix(s.Error)))
+		}
 	}
 	if rep.Leaks.Totals.Residual > 0 {
 		w.wrap("  ", fmt.Sprintf(
@@ -502,6 +537,17 @@ func orDash(s string) string {
 		return "—"
 	}
 	return s
+}
+
+// errSuffix appends a stuck snapshot's own error message when it has one, and nothing at all when it
+// does not. The distinction is worth the helper: a stalled snapshotter records NO error — that silence
+// is why an age-based observation was needed — so an empty parenthesis on every sample line would be a
+// column of noise around the one case that matters.
+func errSuffix(msg string) string {
+	if msg == "" {
+		return ""
+	}
+	return " — " + msg
 }
 
 // truncate keeps a column a column. It cuts from the LEFT for over-long identifiers, keeping an
