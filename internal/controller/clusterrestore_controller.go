@@ -35,6 +35,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	cbv1 "github.com/CrystalBackup/CrystalBackup/api/v1alpha1"
@@ -139,6 +140,16 @@ func (r *ClusterRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	if cr.Spec.Confirmation != cr.Spec.Target.Namespace {
 		return r.awaitConfirmation(ctx, &cr)
 	}
+	// THE PASS'S FIRST IN-MEMORY STATUS MUTATION, and therefore the line the errored-pass audit measures
+	// from: every error returned below it and above a status write discards it.
+	//
+	// Three such returns remain — an unreadable target Namespace, a failed Namespace create, and an
+	// unreadable location or repository inside prepare — and they are DELIBERATELY LEFT, on the same
+	// terms as the namespaced twin: no volume was driven and no apply report was read on such a pass, so
+	// the only casualty is a condition that is a pure function of spec.confirmation and
+	// spec.target.namespace, which the next successful pass re-derives identically. What is NOT left is
+	// anything downstream of the cluster-scoped half, because that half reads a report that exists in
+	// exactly one place — see step (3b).
 	if !status.IsConditionTrue(cr.Status.Conditions, ConditionConfirmed) {
 		status.SetCondition(&cr.Status.Conditions, ConditionConfirmed, metav1.ConditionTrue,
 			"ConfirmationAccepted", "spec.confirmation matches the target namespace", cr.Generation)
@@ -173,42 +184,48 @@ func (r *ClusterRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	// StorageClasses (and its objects reference CRDs) this half brings back, so they must exist
 	// first. teardownCluster is the Job name to reclaim once the cluster status write is durable —
 	// its grant is a live cluster-wide write until then.
-	clusterDone, teardownCluster, err := r.advanceClusterRestore(ctx, &cr, rc, clusterPlan)
-	if err != nil {
-		return ctrl.Result{}, err
+	// ITS ERROR NO LONGER LEAVES THIS FUNCTION HERE. It used to, one line below the call and upstream of
+	// every status write in this function, so a cluster-scoped half that could not start — or whose Job
+	// could not be read — discarded the pass. On the first failing pass AFTER the apply finished, what
+	// that discarded was the apply's own report: advanceClusterRestore reads the mover's verdict from the
+	// pod's termination message, readMoverResult reads the POD, and once that pod is gone the re-derived
+	// verdict is "the cluster-scoped restore did not report a result … some resources may have been
+	// applied", failedCount 1. A clean recreation of forty CRDs and cluster RoleBindings, re-read as a
+	// possible failure and folded into the run's phase as one.
+	//
+	// PERSIST FIRST, THEN PROPAGATE — the failing unit is the cluster-scoped half, one Job for the whole
+	// restore, so the backoff belongs to this object. The volumes are still NOT driven, and that is not
+	// the coupling the namespaced twin removes: here the ordering is a real dependency, argued below.
+	clusterDone, teardownCluster, clusterErr := r.advanceClusterRestore(ctx, &cr, rc, clusterPlan)
+	if clusterErr != nil {
+		// A half whose state could not be established is not a settled half. Forcing this rather than
+		// trusting the return keeps a future error path that forgot to answer done=false from handing the
+		// volumes a cluster whose StorageClasses may not be there yet.
+		clusterDone = false
 	}
 	if !clusterDone {
-		// Hold the volumes back — and hold the run non-terminal — until the cluster-scoped restore
-		// settles. Driving volumes now could provision PVCs against StorageClasses that are still
-		// being applied. Teardown-after-write still applies if the cluster half settled this pass.
-		cr.Status.Phase = string(status.RestorePhaseRunning)
-		status.SetCondition(&cr.Status.Conditions, ConditionReady, metav1.ConditionFalse, "InProgress",
-			"restoring cluster-scoped resources before volumes", cr.Generation)
-		if err := r.Status().Update(ctx, &cr); err != nil {
-			return ctrl.Result{}, fmt.Errorf("update status for ClusterRestore %s: %w", cr.Name, err)
-		}
-		if teardownCluster != "" {
-			r.teardownClusterRestore(ctx, teardownCluster)
-		}
-		return ctrl.Result{RequeueAfter: restorePollInterval}, nil
+		return r.holdForClusterResources(ctx, &cr, teardownCluster, clusterErr)
 	}
 
 	// (4) Drive the volumes; (5) single status write; (6) teardown after terminal. The
 	// shared engine loop budgets errors per volume, so one flaky volume never stalls the rest.
 	drive := r.Engine.driveVolumes(ctx, rc, plans)
-	if drive.err != nil {
-		return ctrl.Result{}, drive.err
-	}
 
-	if drive.settled() < len(plans) {
+	// !drive.tallied() is the pass that could not read the mover census: no volume has a verdict, so it
+	// may neither publish counters nor conclude that everything settled — see the namespaced twin, and
+	// note that without it an EMPTY plan list would take the terminal roll-up on such a pass.
+	if !drive.tallied() || drive.settled() < len(plans) {
 		cr.Status.Phase = string(status.RestorePhaseRunning)
 		// Progress, published while it can still be acted on: these counters move on every pass, so a
 		// DR in progress answers "how far along, and what has already failed" from the object itself.
-		stampVolumeCounts(ctx, r.Recorder, &cr, drive.tally,
-			&cr.Status.PlannedVolumes, &cr.Status.RestoredVolumes, &cr.Status.FailedVolumes)
+		// Guarded on tallied() for the reason the namespaced twin gives at length: zeroing a DR's
+		// counters mid-flight reports a regression that did not happen.
+		if drive.tallied() {
+			stampVolumeCounts(ctx, r.Recorder, &cr, drive.tally,
+				&cr.Status.PlannedVolumes, &cr.Status.RestoredVolumes, &cr.Status.FailedVolumes)
+		}
 		status.SetCondition(&cr.Status.Conditions, ConditionReady, metav1.ConditionFalse, "InProgress",
-			fmt.Sprintf("restoring: %d/%d volumes restored, %d failed",
-				drive.tally.Restored, drive.tally.Planned, drive.tally.Failed), cr.Generation)
+			restoreProgressMessage(drive, ""), cr.Generation)
 		if err := r.Status().Update(ctx, &cr); err != nil {
 			return ctrl.Result{}, fmt.Errorf("update status for ClusterRestore %s: %w", cr.Name, err)
 		}
@@ -216,6 +233,16 @@ func (r *ClusterRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		// cr.Status): reclaim its Job and cluster-wide grant now, after the write.
 		if teardownCluster != "" {
 			r.teardownClusterRestore(ctx, teardownCluster)
+		}
+		// A per-volume transient error is RECORDED (in the condition above) and not returned: propagating
+		// it would charge the backoff to the whole ClusterRestore and stretch the poll driving every
+		// other volume of the DR. Its bound is maxVolumeAdviseErrors, counted inside driveVolumes.
+		if drive.volumeErr != nil {
+			logf.FromContext(ctx).Info("restore volume advance failed and is retried; the pass continues and persists",
+				"clusterrestore", cr.Name, "err", drive.volumeErr.Error())
+		}
+		if drive.passErr != nil {
+			return ctrl.Result{}, drive.passErr
 		}
 		return ctrl.Result{RequeueAfter: restorePollInterval}, nil
 	}
@@ -266,6 +293,45 @@ func (r *ClusterRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 			"restore ended %s: %s", string(phase), clampMessage(joinFailures(drive.failures)))
 	}
 	return ctrl.Result{}, nil
+}
+
+// holdForClusterResources is the pass where the cluster-scoped half has not settled: it writes the
+// run's status, reclaims the half's residue if it DID settle this pass, and only then propagates
+// whatever went wrong.
+//
+// Split out of Reconcile as a named step rather than left inline, because inline it was one of the
+// branches that pushed that function past the cyclomatic bound — and because the ORDER inside it is
+// the whole of the fix and deserves to be readable in one screen: write, then teardown, then
+// propagate. Every earlier version returned first and lost the write.
+//
+// The volumes are deliberately not driven on this path; see the call site for why that ordering is a
+// real dependency rather than the coupling this sweep removes elsewhere.
+func (r *ClusterRestoreReconciler) holdForClusterResources(
+	ctx context.Context, cr *cbv1.ClusterRestore, teardownCluster string, clusterErr error,
+) (ctrl.Result, error) {
+	cr.Status.Phase = string(status.RestorePhaseRunning)
+	msg := "restoring cluster-scoped resources before volumes"
+	if clusterErr != nil {
+		// The cause travels into the condition, because this is the one branch where the object would
+		// otherwise say "restoring cluster-scoped resources" indefinitely with nothing anywhere saying
+		// that the attempt is failing every pass. It is what `kubectl describe clusterrestore` shows.
+		msg = clampMessage(msg + "; the last attempt failed and is being retried: " + clusterErr.Error())
+	}
+	status.SetCondition(&cr.Status.Conditions, ConditionReady, metav1.ConditionFalse, "InProgress",
+		msg, cr.Generation)
+	if err := r.Status().Update(ctx, cr); err != nil {
+		return ctrl.Result{}, fmt.Errorf("update status for ClusterRestore %s: %w", cr.Name, err)
+	}
+	// The cluster-scoped result (when there is one) is now durable, so its Job and its cluster-wide
+	// create/update/delete grant may be reclaimed — never before the write.
+	if teardownCluster != "" {
+		r.teardownClusterRestore(ctx, teardownCluster)
+	}
+	// LAST, after the write and the reclamation of a cluster-wide write grant.
+	if clusterErr != nil {
+		return ctrl.Result{}, clusterErr
+	}
+	return ctrl.Result{RequeueAfter: restorePollInterval}, nil
 }
 
 // ensureTargetNamespace creates (createNamespace) or requires the target namespace.

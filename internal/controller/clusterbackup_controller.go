@@ -200,23 +200,56 @@ func (r *ClusterBackupReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// a misaimed selector terminates the run fast (below), and starting a capture Job we would
 	// then strand mid-flight is exactly the orphaned-snapshot loss the namespaced half taught us
 	// to avoid. Disabled, or its repository not yet ready, leaves captureDone at a safe value.
+	//
+	// NEITHER ERROR LEAVES THIS FUNCTION HERE, and both used to. Both sat between the fan-out at step
+	// (3) and the single status write at step (4), so a capture whose repository could not be READ — or
+	// whose Job could not be created — threw away everything this pass had just established about the
+	// NAMESPACES: which of them were fanned out, which coordinates were occupied by a stranger's Backup,
+	// and the whole aggregate of the children that were already finished. That is exactly the coupling
+	// this block's own first sentence says must not exist, stated there about the children and violated
+	// in the other direction — the same defect the Backup controller's steps (10b)/(10c) carried until
+	// 0.6.5, one level up.
+	//
+	// What returning here cost, precisely. The run's status is written in ONE place (aggregateAndWrite),
+	// so on a durable capture fault NOTHING about the run ever reached etcd: namespacesMatched stayed 0,
+	// namespacesSucceeded stayed 0 over children that had genuinely completed, status.failures never
+	// listed the collisions the fan-out had just detected, and the phase never moved — while the
+	// children's snapshots were sitting in the repository with nothing pointing at them. A run held
+	// non-terminal is also a run that a Forbid schedule counts as still working, which is the thirty-one
+	// hour incident's mechanism verbatim (see schedule_abandonment.go).
+	//
+	// PERSIST FIRST, THEN PROPAGATE — the shape chosen for the Backup controller's manifest half and
+	// rejected for its per-volume failures, and the reason it is right here is the same: the failing
+	// unit is not a namespace. A capture Job that cannot be created, and a BackupRepository that cannot
+	// be read, are properties of the RUN as a whole, so the object controller-runtime charges the
+	// backoff to IS the object at fault. No namespace's poll is stretched by another namespace's bad
+	// day, because the thing that failed belongs to all of them.
+	//
+	// captureErr is returned at the very bottom of this function, after the status write and the
+	// teardown. captureDone is FORCED false alongside it: an unresolvable or unadvanceable capture must
+	// never let the run reach a terminal phase, or the already-terminal guard at the top would stop the
+	// pass that would finally record the capture's snapshot.
 	captureDone := true
 	teardownCluster := ""
+	var captureErr error
 	if len(matched) > 0 && captureClusterManifests(&cb) && r.ClusterManifestReaderClusterRole != "" {
 		cc, ready, err := r.resolveClusterCaptureContext(ctx, &cb, &loc)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		if !ready {
+		switch {
+		case err != nil:
+			captureDone, captureErr = false, err
+		case !ready:
 			// The shared repository is not initialized yet, or its DEK is not resolvable. Hold
 			// the run non-terminal and retry; the children gate on the same repository anyway.
 			captureDone = false
-		} else {
-			done, teardownJob, err := r.advanceClusterManifests(ctx, &cb, cc)
-			if err != nil {
-				return ctrl.Result{}, err
+		default:
+			done, teardownJob, advErr := r.advanceClusterManifests(ctx, &cb, cc)
+			captureDone, teardownCluster, captureErr = done, teardownJob, advErr
+			if advErr != nil {
+				// Belt and braces: every error path in advanceClusterManifests already answers
+				// done=false, but a future one that forgot to would silently hand a terminal phase to a
+				// run whose capture never happened — and the guard is one line.
+				captureDone = false
 			}
-			captureDone, teardownCluster = done, teardownJob
 		}
 	}
 
@@ -226,6 +259,10 @@ func (r *ClusterBackupReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// stop the pass that records the capture's snapshot.
 	res, err := r.aggregateAndWrite(ctx, &cb, &loc, matched, fanoutFailures, collided, captureDone)
 	if err != nil {
+		// A FAILED STATUS WRITE SUPERSEDES captureErr, and that is right rather than a loss: the write
+		// error already requeues this pass, and a pass that could not persist anything will meet the same
+		// capture failure again next time. Reporting both would only mean choosing which one
+		// controller-runtime logs.
 		return res, err
 	}
 	// The terminal result is durable: only now reclaim the capture's residue (its cluster-scoped
@@ -235,6 +272,18 @@ func (r *ClusterBackupReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 	if !captureDone && res.IsZero() {
 		res = ctrl.Result{RequeueAfter: clusterBackupPollInterval}
+	}
+	// The deferred propagation of step (3.5), and it is LAST on purpose — everything above it is work
+	// whose result is already decided and must not be skipped by the capture half's bad day: the status
+	// write that makes this pass durable, and the reclamation of a finished capture's cluster-wide read
+	// grant. Returning the error before either would have reproduced the very defect being closed, one
+	// step further down the function.
+	//
+	// ctrl.Result is deliberately zeroed rather than carried: controller-runtime ignores a result
+	// returned alongside an error (and logs a warning about it), so returning res here would only
+	// misstate the intent. The error IS the requeue — with backoff, which is the point of propagating.
+	if captureErr != nil {
+		return ctrl.Result{}, captureErr
 	}
 	return res, nil
 }
@@ -542,6 +591,14 @@ func (r *ClusterBackupReconciler) aggregateAndWrite(
 
 	var children cbv1.BackupList
 	if err := r.List(ctx, &children, client.MatchingLabels{apiconst.LabelClusterBackup: cb.Name}); err != nil {
+		// THE ONE ERROR RETURN LEFT UPSTREAM OF THE WRITE, and it is not the errored-pass class: this
+		// List is the status write's own INPUT, not an unrelated half's failure. Every counter below is
+		// recomputed from scratch from these children precisely so the aggregate is a pure function of
+		// the current children with no drift from a partial prior write — so a pass that cannot see them
+		// has nothing it could honestly publish. Writing the fan-out's failures alone against the
+		// PREVIOUS pass's counters was considered and rejected: it would produce exactly the
+		// half-updated status this function is built to make impossible, and the counters are what an
+		// administrator acts on.
 		return ctrl.Result{}, fmt.Errorf("list child Backups for run %s: %w", cb.Name, err)
 	}
 

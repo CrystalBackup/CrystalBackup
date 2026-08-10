@@ -443,11 +443,30 @@ type volumeDrive struct {
 	tally         status.RestoreTally
 	restoredBytes int64
 	failures      []string
-	// err is the first TRANSIENT advise error of the pass (budget not yet exhausted),
+	// volumeErr is the first TRANSIENT advise error of the pass (budget not yet exhausted),
 	// surfaced after every volume has been driven so one flaky volume never stalls its
 	// siblings' progress.
-	err error
+	//
+	// IT IS NOT FOR RETURNING. The caller records it (in the in-progress condition, and in its log) and
+	// persists the pass; see the note at its read site in restore_controller.go for the argument, which
+	// is the Backup controller's per-volume one: controller-runtime charges the backoff to the RESTORE,
+	// so propagating one flaky volume's error would stretch the poll driving every OTHER volume of the
+	// same restore from restorePollInterval's 5s to the rate limiter's ceiling — the head-of-line block
+	// moved into the time domain. The volume's own bound is maxVolumeAdviseErrors, which is counted in
+	// this loop and therefore advances whether or not the error travels.
+	volumeErr error
+	// passErr is a failure that stopped this pass from driving ANY volume, so no volume has a
+	// verdict and the tally is EMPTY rather than complete. It is categorically different from
+	// volumeErr and the caller must treat it differently: publishing this tally would overwrite
+	// a restore's real counters with plannedVolumes 0, which is not a missing answer but a wrong
+	// one. tallied() is the predicate; the caller persists everything else it computed, leaves
+	// the volume counters alone, and propagates.
+	passErr error
 }
+
+// tallied reports whether this pass classified every planned volume, and therefore whether tally may
+// be published. False only when passErr stopped the drive before the first volume.
+func (d volumeDrive) tallied() bool { return d.passErr == nil }
 
 // settled is how many planned volumes need no further driving (restored or failed).
 func (d volumeDrive) settled() int { return int(d.tally.Settled()) }
@@ -480,8 +499,8 @@ func (e *restoreEngine) ownerRunningMovers(ctx context.Context, rc *restoreExecC
 
 // driveVolumes advances every plan one step and aggregates the outcomes — the shared drive
 // loop of both restore controllers. An advise error settles the volume as failed once its
-// per-volume budget is exhausted; before that it is only remembered (drive.err) for the
-// caller's usual backoff, and the remaining volumes still advance this pass.
+// per-volume budget is exhausted; before that it is only remembered (drive.volumeErr) for the
+// caller to RECORD, and the remaining volumes still advance this pass.
 //
 // Every branch below appends EXACTLY ONE outcome per plan, which is what makes the tally's total
 // equal to len(plans) by construction rather than by convention — including the branch that only
@@ -491,9 +510,11 @@ func (e *restoreEngine) driveVolumes(ctx context.Context, rc *restoreExecContext
 	running, err := e.ownerRunningMovers(ctx, rc)
 	if err != nil {
 		// No volume was driven, so no volume has a verdict. The tally stays empty rather than
-		// reporting len(plans) volumes in flight for a pass that never looked at them: the caller
-		// returns on d.err without writing status.
-		d.err = err
+		// reporting len(plans) volumes in flight for a pass that never looked at them — and it is
+		// reported as passErr rather than volumeErr precisely so the caller can tell "I have no answer
+		// about the volumes" from "one volume is retrying", and leave the published counters untouched
+		// instead of resetting them to zero.
+		d.passErr = err
 		return d
 	}
 	rc.startBudget = restoreOwnerMoverCap - running
@@ -512,9 +533,9 @@ func (e *restoreEngine) driveVolumes(ctx context.Context, rc *restoreExecContext
 			d.failures = append(d.failures, plans[i].pvc+": gave up after repeated errors, last: "+err.Error())
 		case err != nil:
 			// The budget is not exhausted, so the volume keeps its place in flight; the error is only
-			// remembered for the caller's backoff and the siblings still advance this pass.
-			if d.err == nil {
-				d.err = err
+			// remembered for the caller to RECORD, and the siblings still advance this pass.
+			if d.volumeErr == nil {
+				d.volumeErr = err
 			}
 		case verdict == status.VolumeRestoreFailed:
 			d.failures = append(d.failures, plans[i].pvc+": "+outcome.reason)

@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -25,10 +26,12 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/clock"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	cbv1 "github.com/CrystalBackup/CrystalBackup/api/v1alpha1"
 	"github.com/CrystalBackup/CrystalBackup/internal/apiconst"
@@ -549,6 +552,113 @@ func applySyncProgress(v syncStatusView, progress syncProgress, now metav1.Time,
 func setSyncCondition(v syncStatusView, s metav1.ConditionStatus, reason, message string) {
 	status.SetCondition(v.Conditions, ConditionReady, s, reason, message, v.Generation)
 	status.SetCondition(v.Conditions, conditionSyncComplete, s, reason, message, v.Generation)
+}
+
+// commitSyncStatus is the single point an external-sync reconcile leaves through, on EITHER plane: it
+// persists the status the pass built, then returns the pass's result or its error. Both controllers
+// funnel every `return` of Reconcile into it, and that one-pass-one-write discipline is the reason it
+// exists at all.
+//
+// It is shared rather than written once per plane deliberately. The two status types are different Go
+// types and nothing but a generic could hold them both, but the DECISION below is identical on both
+// planes, and a correction applied to one plane and not the other is precisely how this project once
+// grew a namespace plane that its own teardown verification could not see.
+//
+// # Why an errored pass writes, and why only sometimes
+//
+// This used to be a per-plane method named `write`, documented as "persists status once per
+// reconcile", whose first statement was `if err != nil { return ctrl.Result{}, err }`. The name and
+// the doc promised a write the first branch did not perform.
+//
+// That was NOT a live defect, and the audit that found it verified so rather than assuming: the only
+// non-nil errors that reach here are the two apiserver reads inside each plane's endpoint() — a
+// location or a BackupRepository answering something other than NotFound — and both sit upstream of
+// every mutation of the syncStatusView. drive, finish and settle never return a non-nil error at all:
+// every accounting failure there goes through syncDriver.partial, which records the cause on the view
+// and returns nil. That is the right shape and it is left exactly as it is.
+//
+// It was closed anyway because of WHERE this function sits. The view ALIASES the CR's own status
+// fields — Phase, LastSuccessTime, SnapshotsCopied, BytesCopied, LagSnapshots, Conditions — and this
+// is a single funnel for every exit, so its error branch is downstream-capable of everything either
+// plane will ever do. The day somebody adds an error return below applySyncProgress, a completed
+// copy's snapshot count and lag vanish on that pass, and nothing in the code, the doc or the tests
+// said they must not.
+//
+// # The two shapes that were rejected
+//
+//   - PERSIST-THEN-PROPAGATE, UNCONDITIONALLY. Rejected: it spends a status write on a pass whose only
+//     news is "the apiserver would not answer" — a write on exactly the path where writes are already
+//     failing, to persist something the next pass recomputes for free. That trade is already argued and
+//     rejected in restore_controller.go, at the comment beginning "THIS IS THE PASS'S FIRST IN-MEMORY
+//     STATUS MUTATION". This function must not quietly overrule it.
+//   - KEEP THE SKIP, RENAME IT HONESTLY, AND PIN THE REACHABLE ERROR PATHS WITH A TEST. Rejected as
+//     insufficient, and the asymmetry with Restore is the whole point. Restore's skip is safe because
+//     of WHERE its error returns are: structurally upstream of anything expensive, discarding only a
+//     condition that is a pure function of spec and metadata and costs nothing to recompute. No such
+//     structural argument exists here, because a funnel has no "upstream". A test asserting "these are
+//     the paths allowed to reach the error branch" guards a CONVENTION, and guards on conventions rot:
+//     the next author adding an error return downstream has no reason to go looking for that test.
+//
+// # Comparing before writing is the synthesis
+//
+// Persist on an errored pass ONLY IF the pass actually changed the status. A future mutation upstream
+// of a future error return WILL be persisted without anybody having to remember a rule, and it costs
+// no write on either of today's two paths — on those, nothing has changed — so Restore's argument
+// keeps holding rather than being overridden.
+//
+// equality.Semantic.DeepEqual is the comparison, and it is safe against reading as different on every
+// errored pass, which would have silently implemented option 1 wearing a comparison. status.SetCondition
+// hands meta.SetStatusCondition a ZERO LastTransitionTime, and that function stamps a fresh one only
+// when the condition's Status actually transitions — verified in apimachinery's source, not taken from
+// its doc comment. Re-asserting an identical condition therefore compares equal. Semantic rather than
+// reflect DeepEqual buys two more things worth having: metav1.Time compares by instant, so a
+// LastSuccessTime that round-tripped through the apiserver does not read as changed, and a nil slice
+// equals an empty one, so a Conditions field that materialised without gaining a condition is not news.
+//
+// The comparison governs the ERROR BRANCH ONLY, and that limit is deliberate rather than an oversight
+// waiting to be tidied up. A pass that did not error writes unconditionally, even when it recomputed
+// the same answer as last time: that is the pass whose result somebody is waiting on, its cost is
+// bounded to one write per reconcile, and hoisting the comparison over it would trade a known-cheap
+// write for a class of "the object never updated and nobody knows why" that is far harder to diagnose
+// than the write is to pay for.
+func commitSyncStatus[S any](ctx context.Context, sw client.StatusWriter, obj client.Object,
+	before, after *S, res ctrl.Result, err error, describe string,
+) (ctrl.Result, error) {
+	if err != nil {
+		// before != after guards against the ONE way a caller can silently disable everything below:
+		// handing over the LIVE status (`before := &cs.Status`) instead of a snapshot of it. That line
+		// compiles, type-checks and reads plausibly, and it makes every comparison report "unchanged" —
+		// because the syncStatusView mutates through exactly that pointer, and meta.SetStatusCondition
+		// edits an existing condition IN PLACE, so even a shallow struct copy would not be enough
+		// (Conditions would share its backing array). The plane that got it wrong would quietly keep the
+		// defect this function was rewritten to close, on a path no behavioural test can reach today:
+		// neither plane has a route that mutates the view and then errors.
+		//
+		// It fails toward PERSISTING rather than toward skipping, which is the safe direction — a
+		// mis-snapshotted plane degrades to the unconditional persist-then-propagate that was rejected
+		// as wasteful, not to the silent loss that was rejected as wrong. And unlike a convention, it is
+		// observable: a spec can hand this an aliased snapshot and watch the write happen.
+		if before != after && equality.Semantic.DeepEqual(before, after) {
+			// Nothing this pass computed is at stake; the error is the entire news, and the next pass
+			// recomputes the rest. No write.
+			return ctrl.Result{}, err
+		}
+		if uErr := sw.Update(ctx, obj); uErr != nil {
+			// Both causes travel. The pass's own error is what an operator needs to act on; the failed
+			// write is why the object does not show it. Dropping either would leave a silent gap on the
+			// one path where the apiserver is already unhappy.
+			return ctrl.Result{}, errors.Join(err,
+				fmt.Errorf("persist status for %s on an errored pass: %w", describe, uErr))
+		}
+		// res is deliberately dropped: controller-runtime backs off a pass that returned an error, and
+		// honouring a RequeueAfter computed before the failure would replace that exponential backoff
+		// with a fixed poll.
+		return ctrl.Result{}, err
+	}
+	if uErr := sw.Update(ctx, obj); uErr != nil {
+		return ctrl.Result{}, fmt.Errorf("update status for %s: %w", describe, uErr)
+	}
+	return res, nil
 }
 
 // syncDriver is the execution half both ExternalSync controllers share: cron activation, the

@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -171,12 +172,30 @@ type faultInjectingClient struct {
 }
 
 func (c *faultInjectingClient) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
-	if _, isPods := list.(*corev1.PodList); isPods {
+	if pods, isPods := list.(*corev1.PodList); isPods {
 		var lo client.ListOptions
 		lo.ApplyOptions(opts)
 		if err := c.faults.podListVerdict(lo.Namespace); err != nil {
 			return err
 		}
+		if err := c.Client.List(ctx, list, opts...); err != nil {
+			return err
+		}
+		// POD ORDER IS MADE DETERMINISTIC HERE, and it is the instrument rather than the behaviour.
+		//
+		// hooks.Resolve preserves the caller's pod order, and the caller's order comes from a
+		// controller-runtime cache List — which walks a map, so it is unspecified and in practice
+		// varies run to run. Production does not care: every resolved hook runs, and the two orders
+		// differ only in which application is quiesced a few milliseconds before the other.
+		//
+		// A SPEC ABOUT AN ABORTED CHAIN DOES care, because the whole scenario is "an earlier hook
+		// succeeded and a later one aborted": with an arbitrary order, the aborting pod lands first half
+		// the time, nothing is ever successfully quiesced, and the spec passes for the wrong reason
+		// roughly every other run. Sorting by name buys that determinism without any production code
+		// learning about it, and it cannot mask a defect — a suite whose specs depended on a particular
+		// unspecified order was already testing the coin toss.
+		slices.SortFunc(pods.Items, func(a, b corev1.Pod) int { return strings.Compare(a.Name, b.Name) })
+		return nil
 	}
 	return c.Client.List(ctx, list, opts...)
 }

@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -183,6 +184,18 @@ func (r *RestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return r.gate(ctx, &restore, "SourceBackupNotFound",
 			"no Backup in this namespace matches spec.source (it may not be projected yet)")
 	}
+	// THIS IS THE PASS'S FIRST IN-MEMORY STATUS MUTATION, which makes it the line the errored-pass
+	// audit measures from: every error returned below it and above the write at step (5) discards it.
+	//
+	// Two such returns remain, both inside prepare (a ClusterBackupLocation or a BackupRepository that
+	// answers something other than NotFound), and they are DELIBERATELY LEFT. Nothing about the
+	// restore's WORK is lost there: no volume was driven, no manifest report was read, no plan even
+	// existed. The only casualty is this condition, which the next successful pass re-derives
+	// identically — it is a pure function of spec.confirmation and metadata.namespace — plus one
+	// re-emitted Normal Event, which the event recorder aggregates. Adding a status write on a pass
+	// whose only news is "the apiserver would not answer" would spend a write on exactly the path where
+	// writes are already failing, to persist something that costs nothing to recompute. If a future
+	// edit gives prepare real work to lose, this note is where the trade has to be re-argued.
 	if !status.IsConditionTrue(restore.Status.Conditions, ConditionConfirmed) {
 		status.SetCondition(&restore.Status.Conditions, ConditionConfirmed, metav1.ConditionTrue,
 			"ConfirmationAccepted", "spec.confirmation matches the target namespace", restore.Generation)
@@ -198,41 +211,90 @@ func (r *RestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	// (3b) The manifest half, driven independently of the volumes — the two fail for unrelated
 	// reasons, and coupling them would lose one to the other's bad day.
-	resourcesDone, teardownResources, err := r.advanceResources(ctx, &restore, rc, resources)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
+	//
+	// ITS ERROR NO LONGER LEAVES THIS FUNCTION HERE, and it used to — one line below this call, upstream
+	// of the volume drive AND of the single status write. Two things were lost by that, and the second
+	// is the worse one:
+	//
+	//   - the volumes were not driven AT ALL on such a pass. A manifest Job that cannot be created (a
+	//     webhook refusing it, the transient RoleBinding refused, batch RBAC narrowed) therefore held
+	//     every volume of the restore back for as long as the cause lasted — the head-of-line block, on
+	//     the operation people run on their worst day, in flat contradiction of the sentence directly
+	//     above this one.
+	//   - nothing this pass computed was persisted, which on the FIRST failing pass after the apply
+	//     finished means the manifest report itself: advanceResources reads the mover's verdict out of
+	//     the pod's termination message, and readMoverResult reads the POD (there is no annotation
+	//     fallback on this half). Once that pod is gone — evicted, node drained, GC'd — the re-derived
+	//     verdict is "the manifest restore did not report a result … some resources may have been
+	//     applied", failedCount 1. A clean apply of a whole namespace, re-read as a possible failure,
+	//     because of something that had nothing to do with it.
+	//
+	// PERSIST FIRST, THEN PROPAGATE: resourcesErr is returned at the bottom of the non-terminal branch,
+	// after the write and the teardown. The failing unit is the manifest half — one Job for the whole
+	// restore, not a per-volume fault — so the object controller-runtime charges the backoff to IS the
+	// object at fault, and no volume's poll is stretched by another unit's bad day.
+	resourcesDone, teardownResources, resourcesErr := r.advanceResources(ctx, &restore, rc, resources)
 
 	// (4) Drive every planned volume one step; collect outcomes (shared engine loop with a
 	// per-volume error budget — a transient error on one volume never stalls its siblings).
 	drive := r.Engine.driveVolumes(ctx, rc, plans)
-	if drive.err != nil {
-		return ctrl.Result{}, drive.err
-	}
 
 	// (5) Single status write; terminal only when EVERY volume settled.
 	// A restore is not finished while EITHER half is running. Letting the volume roll-up go
 	// terminal here would trip the already-terminal short-circuit at the top of Reconcile, and
 	// the apply in flight would never have its report recorded — leaving a namespace that was
 	// written to and a Restore object that never says what happened to it.
-	if drive.settled() < len(plans) || !resourcesDone {
+	//
+	// !drive.tallied() joins the two: a pass that could not read the mover census has no verdict for any
+	// volume, so it can neither publish counters nor conclude that everything settled. Without it, a
+	// restore with an EMPTY plan list (a valid, immediately-terminal selection) would reach the terminal
+	// roll-up on a pass that failed before looking at anything.
+	if !drive.tallied() || drive.settled() < len(plans) || !resourcesDone {
 		restore.Status.Phase = string(status.RestorePhaseRunning)
 		// Progress, published while it can still be acted on: the counters below move on every pass,
 		// so `kubectl get restore` answers "how far along" during the restore and not only after it.
-		stampVolumeCounts(ctx, r.Recorder, &restore, drive.tally,
-			&restore.Status.PlannedVolumes, &restore.Status.RestoredVolumes, &restore.Status.FailedVolumes)
+		//
+		// Guarded on tallied(), and that guard is the difference between a missing answer and a wrong
+		// one: an untallied pass's counters are all zero, and stamping them over a restore that has 4
+		// of 6 volumes back would report a regression that did not happen, mid-disaster, to the person
+		// deciding whether to intervene. Leaving them at their last published values is honest — the
+		// condition message says the assessment failed and why.
+		if drive.tallied() {
+			stampVolumeCounts(ctx, r.Recorder, &restore, drive.tally,
+				&restore.Status.PlannedVolumes, &restore.Status.RestoredVolumes, &restore.Status.FailedVolumes)
+		}
 		status.SetCondition(&restore.Status.Conditions, ConditionReady, metav1.ConditionFalse, "InProgress",
-			fmt.Sprintf("restoring: %d/%d volumes restored, %d failed, manifests %s",
-				drive.tally.Restored, drive.tally.Planned, drive.tally.Failed, doneWord(resourcesDone)), restore.Generation)
+			restoreProgressMessage(drive, ", manifests "+doneWord(resourcesDone)), restore.Generation)
 		if err := r.Status().Update(ctx, &restore); err != nil {
 			return ctrl.Result{}, fmt.Errorf("update status for Restore %s/%s: %w", restore.Namespace, restore.Name, err)
 		}
 		if teardownResources != "" {
 			r.teardownResources(ctx, rc, teardownResources)
 		}
+		// The deferred propagation, LAST: after the write that made this pass durable and after the
+		// reclamation of a finished apply's write grant in a tenant namespace. Returning either error
+		// before those would have reproduced the very defect being closed, one step further down.
+		//
+		// drive.volumeErr is deliberately NOT joined in. It is per-volume, so propagating it would charge
+		// the backoff to the whole restore and slow every sibling — the trade the Backup controller's
+		// step (10) argues at length. It is recorded in the condition message above and in the log line
+		// below, and bounded by maxVolumeAdviseErrors, which counts inside driveVolumes and so advances
+		// on exactly these passes.
+		if drive.volumeErr != nil {
+			logf.FromContext(ctx).Info("restore volume advance failed and is retried; the pass continues and persists",
+				"restore", restore.Name, "namespace", restore.Namespace, "err", drive.volumeErr.Error())
+		}
+		if deferred := errors.Join(resourcesErr, drive.passErr); deferred != nil {
+			return ctrl.Result{}, deferred
+		}
 		return ctrl.Result{RequeueAfter: restorePollInterval}, nil
 	}
 
+	// FROM HERE THE PASS IS TERMINAL, and neither deferred error can be live: advanceResources answers
+	// done=false on every error path it has, and a passErr leaves tallied() false — both of which the
+	// branch above catches. So the terminal write does not need to re-join them, and a future edit that
+	// made either of those two things untrue would have to come back through this comment.
+	//
 	// The roll-up is over UNITS OF WORK, and a resource is one just as a volume is. Both counts
 	// have to include both halves or the phase misreports: feeding in resource failures while
 	// `completed` still counted volumes alone turned a restore that applied 138 objects and
@@ -816,6 +878,40 @@ func stampVolumeCounts(ctx context.Context, rec events.EventRecorder, obj client
 	rec.Eventf(obj, nil, corev1.EventTypeWarning, "VolumeCountsInconsistent", "Restore",
 		"volume counters do not add up: %d volumes planned, %d counted (restored %d, failed %d, in flight %d)",
 		t.Planned, t.Counted(), t.Restored, t.Failed, t.InFlight)
+}
+
+// restoreProgressMessage renders one drive pass's in-progress condition message, shared by both
+// restore kinds because both publish the same three facts and must not describe them differently.
+//
+// It has TWO shapes, and the split is the point rather than tidiness:
+//
+//   - a tallied pass reports the counts, because they are real: every planned volume was classified
+//     exactly once this pass.
+//   - an UNTALLIED pass reports that it could not assess the volumes, and why. The counts are not
+//     rendered at all there — a message reading "0/0 volumes restored" over a restore that has four of
+//     six back is not a gap in the report, it is a false one, and this string is what somebody
+//     mid-disaster reads before deciding whether to intervene. The published counters are left alone
+//     for the same reason (see the call site).
+//
+// A per-volume transient error is appended in both shapes. It is the one cause that is otherwise
+// invisible: the volume is neither restored nor failed (it is retrying inside its budget), so no
+// counter moves for it, and the error is no longer returned for controller-runtime to log.
+//
+// extra carries whatever the caller's own half adds (", manifests applying"); the whole thing is
+// clamped, because a mover error can be arbitrarily long and this lands in etcd.
+func restoreProgressMessage(d volumeDrive, extra string) string {
+	var msg string
+	if d.tallied() {
+		msg = fmt.Sprintf("restoring: %d/%d volumes restored, %d failed", d.tally.Restored, d.tally.Planned, d.tally.Failed)
+	} else {
+		msg = "restoring: this pass could not assess the volumes, so the published counts are the " +
+			"previous pass's: " + d.passErr.Error()
+	}
+	msg += extra
+	if d.volumeErr != nil {
+		msg += "; one volume is retrying after an error: " + d.volumeErr.Error()
+	}
+	return clampMessage(msg)
 }
 
 // setRestoreTerminalCondition records the headline Ready condition of a terminal restore.

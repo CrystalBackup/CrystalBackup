@@ -99,6 +99,12 @@ func (r *ClusterBackupExternalSyncReconciler) Reconcile(ctx context.Context, req
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
+	// The status as the apiserver has it, snapshotted before anything below can reach it — the view
+	// built on the next line ALIASES cs.Status, so this has to be taken now or not at all.
+	// persistStatus compares against it to decide whether an errored pass has anything worth writing;
+	// see commitSyncStatus for why that comparison is the fix and not merely an optimisation.
+	before := cs.Status.DeepCopy()
+
 	view := syncStatusView{
 		Phase:           &cs.Status.Phase,
 		LastSuccessTime: &cs.Status.LastSuccessTime,
@@ -120,18 +126,18 @@ func (r *ClusterBackupExternalSyncReconciler) Reconcile(ctx context.Context, req
 
 	if r.driver.hasInflight(key) {
 		res, err := r.driver.drive(ctx, key, nil, view, syncJobPrefixCluster, cs.Name, rec, ident)
-		return r.write(ctx, &cs, res, err)
+		return r.persistStatus(ctx, &cs, before, res, err)
 	}
 
 	if cs.Spec.Paused {
 		*view.Phase = syncPhasePending
 		setSyncCondition(view, metav1.ConditionFalse, "Paused", "sync is paused; no new copy is started")
-		return r.write(ctx, &cs, ctrl.Result{}, nil)
+		return r.persistStatus(ctx, &cs, before, ctrl.Result{}, nil)
 	}
 
 	run, res, done, err := r.resolveRun(ctx, &cs, view, rec)
 	if done {
-		return r.write(ctx, &cs, res, err)
+		return r.persistStatus(ctx, &cs, before, res, err)
 	}
 
 	act := syncSchedule(cs.Spec.Schedule, cs.Spec.Timezone, cs.Status.LastSuccessTime, r.driver.Clock.Now())
@@ -141,13 +147,13 @@ func (r *ClusterBackupExternalSyncReconciler) Reconcile(ctx context.Context, req
 		// that will never parse.
 		*view.Phase = syncPhaseFailed
 		setSyncCondition(view, metav1.ConditionFalse, "InvalidSchedule", act.Err.Error())
-		return r.write(ctx, &cs, ctrl.Result{}, nil)
+		return r.persistStatus(ctx, &cs, before, ctrl.Result{}, nil)
 	case !act.Due:
-		return r.write(ctx, &cs, idleSyncResult(view, act, cs.Spec.Schedule), nil)
+		return r.persistStatus(ctx, &cs, before, idleSyncResult(view, act, cs.Spec.Schedule), nil)
 	}
 
 	res, err = r.driver.drive(ctx, key, run, view, syncJobPrefixCluster, cs.Name, rec, ident)
-	return r.write(ctx, &cs, res, err)
+	return r.persistStatus(ctx, &cs, before, res, err)
 }
 
 // resolveRun resolves both endpoints. done=true means the caller should write status and stop —
@@ -259,17 +265,18 @@ func (r *ClusterBackupExternalSyncReconciler) park(view syncStatusView, reason, 
 	return ctrl.Result{RequeueAfter: syncRequeueInterval}
 }
 
-// write persists status once per reconcile.
-func (r *ClusterBackupExternalSyncReconciler) write(ctx context.Context, cs *cbv1.ClusterBackupExternalSync,
+// persistStatus is this plane's single status writer: every exit of Reconcile returns through it, and
+// that discipline is what keeps one pass to one write.
+//
+// before is the status as it stood when this pass read the object. The contract — in particular when
+// an errored pass writes and when it does not, and why that is the synthesis of two shapes that were
+// each rejected alone — lives on commitSyncStatus, which both planes share so the two cannot drift.
+func (r *ClusterBackupExternalSyncReconciler) persistStatus(ctx context.Context,
+	cs *cbv1.ClusterBackupExternalSync, before *cbv1.ClusterBackupExternalSyncStatus,
 	res ctrl.Result, err error,
 ) (ctrl.Result, error) {
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-	if uErr := r.Status().Update(ctx, cs); uErr != nil {
-		return ctrl.Result{}, fmt.Errorf("update status for ClusterBackupExternalSync %s: %w", cs.Name, uErr)
-	}
-	return res, nil
+	return commitSyncStatus(ctx, r.Status(), cs, before, &cs.Status, res, err,
+		"ClusterBackupExternalSync "+cs.Name)
 }
 
 // SetupWithManager registers this reconciler.
