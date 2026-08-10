@@ -166,14 +166,24 @@ func (r *ClusterErasureReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	// bookkeeping, which lands with M8 — until then the field says "unknown" by being empty, which
 	// is honest, where a fabricated date would not be.
 	if loc.Spec.Mode == cbv1.LocationModeImmutable {
-		r.Recorder.Eventf(&er, nil, corev1.EventTypeWarning, "ErasureBlocked", "Erase",
-			"location %q is Immutable; erasure is blocked until object-lock expiry (adr/0005)", loc.Name)
-		res, err := r.park(ctx, &er, erasurePhaseBlocked, "ImmutableLocation",
-			"the location is Immutable: object lock forbids deletion until expiry, so nothing has been erased")
-		if err != nil || !res.IsZero() {
-			return res, err
+		// The Event fires on the TRANSITION into Blocked, not on every pass. It used to fire on every
+		// one — see below for why that was every fifteen seconds — and an erasure blocked until an
+		// object-lock expiry stays blocked for as long as the bucket policy says, which is weeks. A
+		// Warning repeated four times a minute for weeks is not a louder warning, it is a flooded event
+		// stream that buries the ones somebody can act on.
+		if er.Status.Phase != erasurePhaseBlocked {
+			r.Recorder.Eventf(&er, nil, corev1.EventTypeWarning, "ErasureBlocked", "Erase",
+				"location %q is Immutable; erasure is blocked until object-lock expiry (adr/0005)", loc.Name)
 		}
-		return ctrl.Result{RequeueAfter: erasureBlockedRecheck}, nil
+		// parkAt, not park, and erasureBlockedRecheck was UNREACHABLE before it. park always answers
+		// {RequeueAfter: erasureRequeueInterval} — never a zero Result — so the `!res.IsZero()` guard
+		// that used to stand here returned park's fifteen seconds on every pass and the hour below it
+		// was dead code. A bound that is written down, documented, and cannot be reached is worse than
+		// an absent one: it makes the next reader believe the re-check cadence is an hour when the
+		// operator is really re-listing the location four times a minute.
+		return r.parkAt(ctx, &er, erasurePhaseBlocked, "ImmutableLocation",
+			"the location is Immutable: object lock forbids deletion until expiry, so nothing has been erased",
+			erasureBlockedRecheck)
 	}
 
 	var repo cbv1.BackupRepository
@@ -400,17 +410,29 @@ func (r *ClusterErasureReconciler) observeErasureResidue(ctx context.Context, er
 		rec.Forgotten, targeted, rec.Remaining)
 }
 
-// park records a non-terminal phase and requeues. It is the shape every "not yet" answer takes,
-// so the object always says what it is waiting for.
+// park records a non-terminal phase and requeues on the working cadence. It is the shape every "not
+// yet" answer takes, so the object always says what it is waiting for.
 func (r *ClusterErasureReconciler) park(ctx context.Context, er *cbv1.ClusterErasure,
 	phase, reason, message string,
+) (ctrl.Result, error) {
+	return r.parkAt(ctx, er, phase, reason, message, erasureRequeueInterval)
+}
+
+// parkAt is park with a caller-chosen cadence, for a blocker whose re-check is expensive or whose
+// clearing is measured in weeks rather than seconds (the Immutable object-lock wait).
+//
+// It exists because the alternative did not work: the Immutable branch used to call park and then
+// override its Result, which park's non-zero return silently prevented. The cadence has to be decided
+// by the ONE function that returns it.
+func (r *ClusterErasureReconciler) parkAt(ctx context.Context, er *cbv1.ClusterErasure,
+	phase, reason, message string, after time.Duration,
 ) (ctrl.Result, error) {
 	er.Status.Phase = phase
 	status.SetCondition(&er.Status.Conditions, ConditionReady, metav1.ConditionFalse, reason, message, er.Generation)
 	if err := r.Status().Update(ctx, er); err != nil {
 		return ctrl.Result{}, fmt.Errorf("update status for ClusterErasure %s: %w", er.Name, err)
 	}
-	return ctrl.Result{RequeueAfter: erasureRequeueInterval}, nil
+	return ctrl.Result{RequeueAfter: after}, nil
 }
 
 // fail records a terminal failure. Reached only for faults no requeue can fix.
