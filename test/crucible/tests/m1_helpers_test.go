@@ -305,6 +305,34 @@ func m1AssertNoResidualSnapshotObjects(namespaces ...string) {
 		checkSet[ns] = true
 	}
 
+	// enteredAt bounds the BLAST RADIUS of somebody else's leak, and it exists because the 0.6.5
+	// campaign lost a whole suite to one object.
+	//
+	// The detection below is deliberately broad: an object carrying the operator's labels is residue
+	// no matter which namespace it sits in, because narrowing it per-spec is how a leak hides. That
+	// breadth is right and stays. What was wrong is the WAITING. One leaked VolumeSnapshotContent
+	// from the m5 lane failed five leak checks in four unrelated milestones, and each of them sat out
+	// its full 600s Eventually before saying so — about 95 minutes, which is what pushed the run into
+	// the 240m suite timeout and left 21 of 93 specs unrun. A truncated suite is worse than a failed
+	// one: those 21 are not passes, they are unknowns.
+	//
+	// So residue that PREDATES this check is reported immediately, via StopTrying: no teardown this
+	// spec is waiting on can remove an object that already existed before the spec looked, so the
+	// wait cannot change the verdict and only spends the budget of every spec after it. Residue
+	// created DURING the window is still polled normally — that is the real race this helper is for.
+	enteredAt := time.Now()
+	failFastIfOlder := func(g Gomega, created time.Time, format string, args ...any) {
+		if created.Before(enteredAt) {
+			StopTrying(fmt.Sprintf("residue PREDATES this leak check (created %s, check entered %s) — it "+
+				"leaked in an earlier lane, so waiting here cannot clear it and only burns this run's "+
+				"budget; fix the leak its own lane reported:\n  "+format,
+				append([]any{created.Format(time.RFC3339), enteredAt.Format(time.RFC3339)}, args...)...)).Now()
+		}
+		// Gomega's optional description is variadic ...any, so a format plus its arguments has to be
+		// assembled into one slice rather than passed as two.
+		g.Expect(false).To(BeTrue(), append([]any{format}, args...)...)
+	}
+
 	Eventually(func(g Gomega) {
 		// (1) No CrystalBackup-labelled VolumeSnapshots left in any checked namespace: neither the
 		//     dynamic origin VS (tenant ns) nor the static re-bound VS (operator ns).
@@ -315,8 +343,10 @@ func m1AssertNoResidualSnapshotObjects(namespaces ...string) {
 			})
 			g.Expect(k8s.List(ctx, vs, client.InNamespace(ns))).To(Succeed())
 			for i := range vs.Items {
-				g.Expect(m1IsExposureResidue(vs.Items[i].GetLabels())).To(BeFalse(),
-					"residual VolumeSnapshot %s/%s (labels %v)", ns, vs.Items[i].GetName(), vs.Items[i].GetLabels())
+				if m1IsExposureResidue(vs.Items[i].GetLabels()) {
+					failFastIfOlder(g, vs.Items[i].GetCreationTimestamp().Time,
+						"residual VolumeSnapshot %s/%s (labels %v)", ns, vs.Items[i].GetName(), vs.Items[i].GetLabels())
+				}
 			}
 		}
 
@@ -339,11 +369,13 @@ func m1AssertNoResidualSnapshotObjects(namespaces ...string) {
 			// our static <prefix>-vsc = which cleanup step was missed) without another run.
 			policy, _, _ := unstructured.NestedString(item.Object, "spec", "deletionPolicy")
 			refName, _, _ := unstructured.NestedString(item.Object, "spec", "volumeSnapshotRef", "name")
-			g.Expect(labelled || checkSet[refNS]).To(BeFalse(),
-				"residual VolumeSnapshotContent %s (labels %v, refNS %s/%s, deletionPolicy %s, created %s, deletionTimestamp %v, ownerRefs %v, operator restarts: %s)",
-				item.GetName(), item.GetLabels(), refNS, refName, policy,
-				item.GetCreationTimestamp().Format(time.RFC3339), item.GetDeletionTimestamp(),
-				item.GetOwnerReferences(), m1OperatorRestartSummary())
+			if labelled || checkSet[refNS] {
+				failFastIfOlder(g, item.GetCreationTimestamp().Time,
+					"residual VolumeSnapshotContent %s (labels %v, refNS %s/%s, deletionPolicy %s, created %s, deletionTimestamp %v, ownerRefs %v, operator restarts: %s)",
+					item.GetName(), item.GetLabels(), refNS, refName, policy,
+					item.GetCreationTimestamp().Format(time.RFC3339), item.GetDeletionTimestamp(),
+					item.GetOwnerReferences(), m1OperatorRestartSummary())
+			}
 		}
 
 		// (3) No temporary clone PVCs (a crystalbackup.io/* label, but not a seed PVC) in any checked
@@ -353,9 +385,10 @@ func m1AssertNoResidualSnapshotObjects(namespaces ...string) {
 			g.Expect(k8s.List(ctx, &pvcs, client.InNamespace(ns))).To(Succeed())
 			for i := range pvcs.Items {
 				p := &pvcs.Items[i]
-				residual := m1IsExposureResidue(p.Labels) && p.Labels[m1SeedLabel] == ""
-				g.Expect(residual).To(BeFalse(),
-					"residual temporary clone PVC %s/%s (labels %v)", ns, p.Name, p.Labels)
+				if m1IsExposureResidue(p.Labels) && p.Labels[m1SeedLabel] == "" {
+					failFastIfOlder(g, p.CreationTimestamp.Time,
+						"residual temporary clone PVC %s/%s (labels %v)", ns, p.Name, p.Labels)
+				}
 			}
 		}
 		// 10 min (was 5, was 2): finalizer teardown of VolumeSnapshots/VSContents/clone PVCs on

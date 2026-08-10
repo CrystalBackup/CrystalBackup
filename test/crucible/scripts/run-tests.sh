@@ -66,8 +66,24 @@ fi
 # 30-minute mover-start deadline plus a recovery run — call it 50 minutes — and the new placement
 # lane restarts the operator twice around a real backup. 180m would have been the budget for a
 # suite that no longer exists.
-#   CRUCIBLE_TIMEOUT=5h mise run test
-CRUCIBLE_TIMEOUT="${CRUCIBLE_TIMEOUT:-240m}"
+# 0.6.5 made it 330m, measured rather than guessed, and the measurement is the interesting part.
+# The 0.6.5 campaign ran 69 of 93 specs and was CUT at 240m. But it was not merely a bigger suite:
+# ONE leaked VolumeSnapshotContent failed five leak checks in four different milestones, and each
+# of those failures sat out a 600s Eventually deadline — one sat out 2700s — so roughly 1h35m of
+# that budget was spent watching the same object not disappear. Raising the timeout alone would
+# NOT have made that run green; the leak had to be fixed too (namespace-plane residue was invisible
+# to both the sweep's verification read and the orphan reaper).
+#
+# So the arithmetic is: the 69 specs that ran, minus the ~95 minutes of failure deadlines, is about
+# 2h25m of real work; the 24 that did not run are mostly the m4 maintenance and m6 fidelity lanes,
+# which are among the slowest. 330m leaves a full hour of headroom over the projected ~4h30m.
+#
+# The rule this keeps obeying: this bound exists ONLY so a slow run is not TRUNCATED, because a
+# truncated run is worse than no run — 21 unrun specs are not 21 passes. The suite's own Eventually
+# deadlines are what should fail a spec. If this number is ever wrong it should be wrong LONG.
+# Override for a long debugging run:
+#   CRUCIBLE_TIMEOUT=6h mise run test
+CRUCIBLE_TIMEOUT="${CRUCIBLE_TIMEOUT:-330m}"
 
 # BOTH timeouts, and the Ginkgo one is the load-bearing fix: Ginkgo enforces its OWN suite
 # timeout (default 1h) independently of `go test -timeout`. Passing only the go-test budget let a
