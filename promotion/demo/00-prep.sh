@@ -62,7 +62,7 @@ fi
 # Le Secret ne contient QUE la ligne AGE-SECRET-KEY- : les releases ≤ 0.6.1 rejettent le
 # fichier age-keygen complet, ses lignes de commentaires cassant le parse bech32
 # (« malformed secret key: mixed case »). Corrigé à partir de 0.6.2 (internal/keys accepte
-# le fichier entier), donc sur la release que cette démo installe — 0.6.5 — le grep est
+# le fichier entier), donc sur la release que cette démo installe — 0.6.6 — le grep est
 # FACULTATIF. Il reste en place parce qu'il est correct partout et que la démo doit pouvoir
 # se rejouer contre une release plus ancienne sans être retouchée.
 # Le fichier complet reste dans .kek/ : il sert tel quel à `age -d -i` pour la démo.
