@@ -547,6 +547,135 @@ change to how the chart is installed, not a patch), and any claim that the escro
 bulletproof — an administrator who restores the wrong KEK still has an unreadable repository, and
 0.6.4's contribution is that it says so in a reason of its own.
 
+**Status as of 0.6.5 (2026-08-10) — one unanswerable question about one volume became its whole
+namespace's verdict, and every number around it was confident.** A nightly schedule on a live
+cluster produced nothing for **thirty-one hours** behind a dashboard reading *0% backup success*.
+The cause was one `PersistentVolumeClaim` out of thirty-three: a hand-made NFS volume naming
+`storageClassName: slow`, a class that exists as no object. That is legal — for a static binding the
+class name is only a matching label between claim and volume — so the administrator had done nothing
+wrong. The operator resolved snapshot capability **through the class**, errored, and because
+`Reconcile` advances one volume per pass by position it re-drove that same volume forever: the five
+volumes behind it were never attempted at all, which is why none of 0.6.3's three phase deadlines
+could fire on them. A deadline needs a phase, and they had never left `Pending`. The run never went
+terminal, so `concurrencyPolicy: Forbid` skipped every following night.
+
+The fix is that the question was being asked of the wrong object — the CSI driver now comes from the
+bound PVC's `PersistentVolume`, and the StorageClass is consulted only for a claim bound to nothing
+— and nothing judges permanence any more: an unresolvable volume records its cause, stays `Pending`,
+loses its turn to volumes never tried, and is bounded by a fourth deadline
+(`pendingResolveDeadline`, 1 h) whose clock lives on the volume rather than on the run. `Forbid`
+gained a predicate that distinguishes a run that is working from one that is wedged, derived from
+the deadline ladder rather than picked.
+
+What makes this an M6 release rather than a bug fix is the class underneath, found **three times in
+three lots** in the same family of functions: **a pass that computed everything and persisted
+nothing**, because the error returned upstream of the single status write — so the enumeration never
+reached etcd and the bounds that exist to end exactly this were unreachable. `advancePending` no
+longer has an `error` result at all, which makes the signature the invariant. Eleven lots then
+closed the reporting half, and the numbers are the point: `namespacesFailed: 32` for a run whose
+children were 29 `Completed` and 3 `PartiallyFailed`, now one classification with a total checked on
+every write; a reaper that logged "reaped" **186 times** for three objects it never deleted, now
+allowed to call only a confirmed absence a reap; `snapshotsForgotten` asserting destroyed data after
+a failed erasure, now measured after the work or claiming nothing; thirty-one hours without a backup
+rated `warning`, now escalating on a bound derived per schedule; and `selfcheck --format text`
+answering the question a fresh installer actually asks, per PVC, in `5 + k` requests at any estate
+size. The recurring shape across all of them: the components that only **observe** were right, and
+the components that **act** were wrong.
+
+**Validated: 93 of 93 crucible checks, 0 failed, 0 skipped, in 2h48m54s** — the whole suite
+unfiltered, three checks more than 0.6.4, the new ones reproducing this incident against real bytes
+in the repository while the unsnapshottable volume sits first in the queue. **It took two attempts,
+and the first was red.** Run 1 on this same tree: 62 passed, 7 failed, 24 skipped, and **21 of 93
+checks never ran** because the suite hit its four-hour timeout — five of the seven failures were the
+**same** leaked `VolumeSnapshotContent`, one object sitting out five 600-second deadlines across
+four milestones, about 95 minutes of budget spent watching it not disappear. That leak was a real
+defect found only by the campaign: three code paths were blind to the same object class because
+`mergeLabels` treats an empty desired value as equal to a missing key, so on the namespace plane —
+where there is no run — the deleting path, the verifying path and the backstop all missed it. Fixed
+at the source: no key is ever stamped with an empty value again. The two timed-out checks now pass
+in 50.9s and 15.8s.
+
+What the campaign does **not** establish: it injects an unsnapshottable static volume, a missing
+snapshotter Secret, an unclaimed snapshot and a mover that never starts, but not a durably failing
+`Expose`, an unreadable source PVC or a hooks-resolution failure — those live in envtest and
+mutation testing against a stub. Deliberately not closed, and named so they are not read as
+oversights: two hook-chain defects (an aborted quiesce leaves applications frozen and says nothing;
+a `Fail`-policy post-hook failure thaws the wrong pod), the collision trigger behind the miscounted
+namespaces, and the errored-pass sweep, which was verified **in the Backup controller only** — the
+honest statement about the rest is that nobody has looked, not that they are clean. The two
+unmet exit criteria are unchanged: the two-week soak and the pilot rollout.
+
+**Status as of 0.6.6 (2026-08-10) — a check that cannot fail is not a check, and the tree was full
+of them.** The release started as one complaint about CI mail and the search for the cause became
+its subject. Measured before touching anything, because "CI is flaky" is a claim and 9-of-10 is a
+fact: on `main`, **Lint had failed 9 of its last 10 runs and Unit tests 9 of 10**, red on **every
+push since 2026-08-03** while Security, E2E, vex-refresh and the site deploy stayed green. Three
+findings, always the same three, and each of them **cannot fail on the maintainer's machine**: a
+`unix.Statfs_t.Bsize` cast that is redundant on linux and required on darwin inside one `//go:build
+unix` file; the last user of a deprecated events API; and a test that passed only because the
+machine has a kubeconfig, so `soak-collect` exited about the cluster instead of about the path the
+operator typo'd. And the reason all three hid: `rm -f bin/golangci-lint` rebuilds the linter but
+does not clear `~/.cache/golangci-lint`, so a local `make lint` can report zero issues from stale
+results while CI, cold, rejects the same tree. `lint` now purges that cache by default and gained a
+`GOOS=linux` pass, because a darwin-only run structurally cannot see a linux-only finding in a
+build-constrained file. Eighteen failures over eight days is not a signal, it is furniture — the
+same defect as a counter nobody can believe.
+
+That shape then appeared five more times. The errored-pass class was swept through the four
+controllers 0.6.5 admitted nobody had looked at, by both methods again — control flow from each
+`Reconcile`'s first status mutation, and a mechanical classification of every error-carrying
+`return` — and the two agreed everywhere: `ClusterErasure` has **zero** instances, shown rather than
+asserted, and the other three had **seven**. Two of the seven cost real answers: a clean
+namespace-wide manifest apply re-read as *"may have been applied"* with `failedCount 1` once the
+mover pod was gone, and a counter that would have published `plannedVolumes: 0` over a real
+four-of-six in front of somebody deciding whether to abandon a restore. The sweep settled a rule —
+per-item failures are recorded and the pass continues, whole-object failures persist then propagate.
+Two dead protections fell out on the way: `ClusterErasure`'s one-hour Immutable recheck was **never
+once used** (`park` always answers a non-zero `RequeueAfter`, so the guard returned 15 s every pass)
+and its Warning sat before the park, emitting **four Warnings a minute for weeks** on the most
+sensitive compliance path there is; and the external-sync controllers' single `write` helper
+returned without writing whenever an error was present, under a comment promising it persists once
+per reconcile. No live defect today, verified — but it is the funnel every exit passes through, and
+it aliases figures that are not recomputable, so it now persists whenever the pass actually changed
+the status. The two hook-chain defects 0.6.5 left open are closed here: the release runs before the
+termination and the terminal write is held while a thaw is owed, and only `Succeeded` pre entries
+are thawed, because a thaw against a pod nothing froze is a command its owner never asked for.
+
+The other half of the release is prediction. A production cluster had **never once** backed up a
+CephFS volume — eight volumes across four namespaces, every one `SnapshotReadyDeadlineExceeded`, for
+as long as the cluster had existed. The cause was outside the product and the operator's verdict was
+exactly right, but `preflight.sh`, whose whole job is to tell an administrator before installing
+what will and will not be backed up, called that class perfectly usable, because a
+`VolumeSnapshotClass` for the driver exists. A static predictor, confidently predicting the wrong
+thing. The symptom needs one `LIST` and no new permission — VolumeSnapshots **bound** to a content
+and still not ready past a one-hour grace — and it now appears on the three surfaces that had the
+information and were silent: the preflight script, `selfcheck`, and 0.6.5's per-PVC census.
+Deliberately an **observation, not a verdict**: no phase moves, and a class with no snapshots at all
+is not maligned.
+
+**The soak has started.** The last lot of this release is what made that safe: a GitOps autosync had
+replaced the collector's pod at the moment the fortnight's archive was to be exported, the archive
+sat on a ReadWriteOnce volume the new pod could not map, and only a figure somebody had transcribed
+by hand minutes earlier survived. `strategy: Recreate` did what it promises and the archive was lost
+anyway — the comment claiming it prevents this is corrected rather than deleted, because a
+protection that was believed in is worth recording as one that was not. The collector now writes its
+own per-class high-water table to **stderr** on `SIGTERM`, the one channel a terminating pod has
+that is not the volume it is about to release, and `hack/soak/` gained the reset procedure it had
+never had. With that in place, the soak is now **running on a real build cluster on 0.6.5, for a
+15-day window** — started, not completed, and it is the first time either of M6's two remaining exit
+criteria has moved from calendar work not yet begun to calendar work in progress. The pilot rollout
+has not started. The PodSecurity review as a written document is still not written.
+
+**Validated: 93 of 93 crucible checks, 0 failed, 0 skipped, in 2h50m16s** — the whole suite
+unfiltered on a six-node RKE2 v1.35.7 + Rook-Ceph v1.19.0 cluster with real S3. The same 93 as
+0.6.5, and that is measured rather than assumed: exactly one file under `test/crucible/` changed
+since the tag — a wait bound in an M1 helper — and no check was added or removed. It took two
+attempts, and the first was red **on the harness**: that helper timed out at 300.001s against a
+repository the operator had initialised in the same second, its own measurement being 462ms. A bound
+with no margin for a cold first pass is a bound that fires again, so it is ten minutes now. The red
+attempt is published anyway, which is the rule these reports follow whether the failure lands on the
+product or on the instrument.
+
 ## M7 — Reach: storage without snapshots, file-level restore, notifications (0.7)
 
 **Re-scoped 2026-08-02.** M7 previously stacked the CLI and the UI under one number; both now
@@ -712,30 +841,6 @@ therefore a harness/ops activity rather than a product feature.
 
 Recorded in [00-requirements.md §6](00-requirements.md); no milestone yet.
 
-- **An aborted pre phase never releases what it already froze** (found 0.6.5, not fixed there; the
-  top candidate for the next release). `hooks.Run` stops the chain at the first `onError: Fail`
-  failure — correctly — but the hooks that ALREADY SUCCEEDED have quiesced their applications.
-  `failHooks` then writes a terminal `Failed`, and the already-terminal short-circuit at the top of
-  `Reconcile` means `closeFreezeWindow` never runs. Nothing thaws them, and nothing says so.
-
-  That is R16's own priority — the release matters more than the backup — inverted on the single path
-  where a human is least likely to be looking, because the Backup reports `Failed` for a reason that
-  reads as "the quiesce did not work" when part of it worked and is still in effect. Fixing it means
-  running the release from a terminal writer, with the attempt budget, which is a structural change
-  to the path 0.6.5 rewrote twice; it needs its own lot and its own campaign rather than a twelfth
-  entry in a release already carrying eleven.
-- **A `Fail`-policy post-hook failure blocks the release of every later pod** (found 0.6.5, not fixed
-  there). `hooks.Run` marks the rest of the chain `Skipped`, and a retry re-runs it from the start, so
-  a permanently broken first hook means the later pods are never successfully thawed across all three
-  attempts. `UnfreezeFailed` does fire, so it is loud — but it is loud about the wrong pod. Stopping
-  the chain is right for the pre phase and wrong for the post phase, where every entry is a thaw owed
-  to a different application; separating them needs a per-phase rule inside `hooks.Run`.
-- **The errored-pass class beyond the Backup controller** (raised 0.6.5, not audited).
-  `clusterbackup_controller.go`, `restore_controller.go` and `restore_engine.go` share the
-  single-status-writer shape that produced the class in `backup_controller.go` — an error returned
-  upstream of the one status write discards the pass. 0.6.5 closed it in the Backup controller and
-  convinced itself by two independent methods that none remains THERE; the other three were never
-  swept, and the honest statement is that nobody has looked rather than that they are clean.
 - **`PVCSelector.matchLabels` with an empty value diverges from Kubernetes semantics** (found 0.6.5
   while consolidating the predicate; pinned as the behaviour that ships, not corrected). Kubernetes
   reads `matchLabels: {key: ""}` as *the label must be present and empty*; this rule compares

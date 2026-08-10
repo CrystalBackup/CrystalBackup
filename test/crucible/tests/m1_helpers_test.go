@@ -211,8 +211,27 @@ func m1FindRepository(locationName string) (cbv1.BackupRepository, bool) {
 	return cbv1.BackupRepository{}, false
 }
 
-// m1WaitRepositoryInitialized waits (up to 5 min) for the BackupRepository backing
+// m1WaitRepositoryInitialized waits (up to 10 min) for the BackupRepository backing
 // locationName to report status.initialized==true, and returns it.
+//
+// 10 min, was 5, and the measurement is worth writing down because the previous number lost a whole
+// campaign by 462 milliseconds. In the 0.6.6 run this helper's Eventually gave up at 16:05:59.462
+// and the BackupRepository's creationTimestamp is 16:05:59 — the same second. 92 of 93 checks had
+// passed; the one red check was this precondition, in a [BeforeAll], reported as a placement failure
+// on a spec that had not yet done anything about placement.
+//
+// Why provisioning can genuinely take that long HERE, when it takes seconds at the start of a run:
+// the caller (m6_placement_test.go) runs m1EnsurePlatformSecrets() immediately before, so on a
+// campaign where an earlier lane removed a platform Secret the operator has to provision from
+// nothing — a `restic init` against Hetzner object storage plus the wrapped-DEK escrow write —
+// two and a half hours into a full suite, against a cluster that is still finishing other work.
+// Five minutes was not a wrong estimate of provisioning; it was an estimate with no headroom left
+// for the state the suite is in by then.
+//
+// This bound exists so a slow answer is not read as a missing one. It is not a claim about how fast
+// provisioning should be: if the operator ever takes ten minutes there IS a defect, and the failure
+// message names the location and the URL so the next reader starts from the object store rather than
+// from here.
 func m1WaitRepositoryInitialized(locationName string) *cbv1.BackupRepository {
 	GinkgoHelper()
 	var repo cbv1.BackupRepository
@@ -223,7 +242,7 @@ func m1WaitRepositoryInitialized(locationName string) *cbv1.BackupRepository {
 			"BackupRepository %s (location %q) not Initialized yet (url=%q)",
 			found.Name, locationName, found.Status.RepositoryURL)
 		repo = found
-	}, 5*time.Minute, 5*time.Second).Should(Succeed())
+	}, 10*time.Minute, 5*time.Second).Should(Succeed())
 	return &repo
 }
 

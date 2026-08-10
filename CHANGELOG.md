@@ -4,6 +4,203 @@ All notable changes to Crystal Backup. Versioning follows
 [adr/0014](spec/adr/0014-versioning-and-release.md): milestone `Mn` → minor `0.n.z` on
 major 0; `1.0.0` is a deliberate post-M9 API-stability decision.
 
+## 0.6.6 — CI had been red for eight days, and looking for why found seven more (2026-08-10)
+
+**Validated on real infrastructure: 93 of 93 crucible checks, 0 failed, 0 skipped, in 2h50m16s** —
+the whole suite unfiltered on a six-node RKE2 v1.35.7 + Rook-Ceph v1.19.0 cluster with real S3,
+against the operator digest this release ships. Full report:
+[crucible-m6.6](https://crystalbackup.github.io/CrystalBackup/reports/crucible-m6-6.html).
+
+**It took two attempts, and the first was red — on the harness, not the product.** Run 1 ran all 93
+checks and came back 92 passed · 1 failed in 3h10m55s. The one failure was a test helper,
+`m1WaitRepositoryInitialized`, timing out at **300.001s** on a repository the operator had in fact
+initialised in the same second: its own measurement was **462ms**. A five-minute bound with no
+margin for a cold first pass on a freshly seeded cluster is a bound that fires again, so it is now
+ten minutes — and that raise is the **only** change to `test/crucible/` in this release. No check
+was added or removed, which the verdict's own total confirms: the same 93 as 0.6.5.
+
+The red attempt is published rather than replaced, which is the standing rule for these reports even
+when — as here — the failure measures the instrument instead of the product.
+
+This release started as one request — *"I get an error mail every time CI runs, even when every gate
+is green locally. For 0.6.6 I want it all clean."* — and the search for the cause turned into the
+release's subject: **a check that cannot fail is not a check**, and the tree was full of them.
+
+### The eighteen red builds
+
+Measured before touching anything, because "CI is flaky" is a claim and 9-of-10 is a fact: on `main`,
+**Lint had failed 9 of its last 10 runs and Unit tests 9 of 10**, while Security, E2E, vex-refresh and
+the site deploy were all green. Both had failed on **every push since 2026-08-03**; the 08-02 run was
+the last green one. Three findings, always the same three, and every one of them **cannot fail on the
+maintainer's machine**:
+
+- `internal/soak/freespace_unix.go`: `unconvert`. One `//go:build unix` file serves linux and darwin,
+  and `unix.Statfs_t.Bsize` is `int64` on the first and `uint32` on the second — so the conversion is
+  redundant on the runner and **required** locally. Kept, with a `nolint` that says why, because the
+  next reader deleting a "pointless" cast breaks the darwin build.
+- `cmd/main.go`: `SA1019`, the last user of the old events API. Its ten siblings had already moved and
+  this one was missed, so the field type and the `Eventf` signature moved with it rather than being
+  suppressed — a deprecation that says *will be removed* is debt with a deadline.
+- `TestSoakCollectRefusesToStartBlind`: it passed locally **only because the machine has a
+  kubeconfig**. `soak-collect` validated the cluster connection before reading
+  `--redaction-salt-file`, so on a runner it exits 1 about `KUBERNETES_MASTER` instead of 2 about the
+  path the operator typo'd. A usage error must not depend on whether a cluster happens to answer.
+
+And the reason all three hid: `rm -f bin/golangci-lint` rebuilds the linter but does **not** clear
+`~/.cache/golangci-lint`, so a local `make lint` can report zero issues from stale cached results
+while CI, cold, rejects the same tree. `lint` now purges the analysis cache by default
+(`LINT_CACHE=keep` opts out and its comment says what that costs) and gained a `GOOS=linux` pass,
+because a darwin-only run structurally cannot see a linux-only finding in a build-constrained file.
+
+Eighteen failures over eight days is not a signal, it is furniture. Everybody had learned to ignore
+it, which is the same defect as a counter nobody can believe — and this release found that same shape
+five more times.
+
+### An aborted quiesce left applications frozen, and said nothing
+
+`hooks.Run` stops the chain at the first `onError: Fail` failure, correctly. But the hooks that
+**already succeeded** have quiesced their applications, and `failHooks` then wrote a terminal `Failed`
+— which the already-terminal short-circuit turns into "`closeFreezeWindow` never runs". Nothing
+thawed them and nothing said so, with the run reporting a reason that reads *the quiesce did not
+work* when part of it worked and was still in effect. R16's own priority — the release matters more
+than the backup — inverted on the one path where nobody is looking.
+
+The release now runs **before** the termination, and the terminal write is held while a thaw is owed.
+Only `Succeeded` pre entries are thawed: a `Skipped` never ran, and a thaw against a pod nothing
+froze is a command its owner never asked for. It reuses the existing attempt budget and ends at the
+existing `UnfreezeFailed` Event rather than inventing a second one, and a new `Ready` reason names
+the abort and the attempt while it retries — the "nothing said so" half.
+
+Two alternatives are rejected in comments. Thawing *then* writing terminal in one pass would bar
+every retry, giving one attempt of three exactly where an application is most likely stuck. Thawing
+from `ensureTerminalTeardown` conflates two owed-things: that sweep's subject is *storage* residue,
+verified by reading the cluster and safe to repeat forever, whereas a thaw is an exec that must be
+attempt-bounded — and it would report `Failed` and thaw afterwards, which is the dishonesty the hold
+exists to prevent.
+
+The same lot fixed its mirror: a `Fail`-policy **post**-hook failure marked the rest of the chain
+`Skipped`, so a permanently broken first hook meant the later pods were never thawed across all three
+attempts — loud, via `UnfreezeFailed`, but about the wrong pod. Stopping the chain is right for the
+pre phase and wrong for the post phase, where every entry is a thaw owed to a different application.
+The rule is written `phase != PhasePost` so an unstamped or future phase fails closed.
+
+### The errored-pass class, in the four controllers 0.6.5 never swept
+
+0.6.5 closed this class in the Backup controller and verified by two independent methods that none
+remained **there**. Four other controllers shared the shape and nobody had looked. The audit ran both
+methods again — control flow from each `Reconcile`'s first in-memory status mutation, and a mechanical
+classification of every error-carrying `return` — and **the two agreed everywhere**. `ClusterErasure`
+has **zero** instances, shown by classification rather than asserted. The other three had seven.
+
+Two are worth naming because of what they cost:
+
+- **A clean restore, re-read as a possible failure.** On the pass that reads the manifest apply's
+  report out of the mover pod's termination message, that report was discarded — and `readMoverResult`
+  reads the **pod**, with no annotation fallback, so once the pod is gone the re-derived verdict is
+  *"did not report a result … some resources may have been applied"* with `failedCount 1`. A clean
+  apply of an entire namespace, reported as maybe-broken, on the operation people run on their worst
+  day. The manifest half now persists before propagating, and the volumes are driven on that pass
+  instead of being held behind it.
+- **A counter that would have said 0 instead of 4 of 6.** When the pass cannot read the mover census
+  no volume has a verdict, so the tally is empty — and publishing it would overwrite a real
+  four-of-six with `plannedVolumes: 0`. Not a missing answer but a wrong one, in front of somebody
+  deciding whether to abandon a restore. That pass now persists everything else, leaves the counters
+  at their last published values, and says why in the condition.
+
+The shape chosen differs by what the failing **unit** is, and that is the rule the sweep settled:
+per-item failures are recorded and the pass continues, whole-object failures persist then propagate.
+The `Confirmed`-condition sites are deliberately left, because nothing about the restore's *work* is
+lost there and the condition is a pure function of spec — the trade is argued in code, at the line
+where it would have to be re-argued.
+
+### Two dead protections found on the way
+
+**A one-hour recheck that was never once used.** `ClusterErasure`'s Immutable branch called `park`
+and then tried to override its `Result`, but `park` always answers a non-zero `RequeueAfter`, so the
+`!res.IsZero()` guard returned park's **15 seconds** every pass and `erasureBlockedRecheck` was dead
+code. Worse, the `ErasureBlocked` Warning sat *before* the park, so an erasure waiting out an
+object-lock emitted **four Warnings a minute for weeks** — on the most sensitive compliance path there
+is. An erasure record is the artefact somebody points at to assert data was destroyed; drowning it in
+its own noise is the surest way to hide the one that matters. One function now decides the cadence,
+and the Event fires on the transition.
+
+**A `write` that did not write.** The external-sync controllers route every exit of `Reconcile`
+through one `write` helper — excellent single-writer discipline — whose first branch returned without
+writing whenever an error was present, under a doc comment promising *"persists status once per
+reconcile"*. No live defect today, verified: the only non-nil errors reaching it come from two
+apiserver reads, both upstream of any status mutation. But it is a funnel for every exit, so its error
+branch is downstream-capable of everything, and the view aliases `SnapshotsCopied`, `BytesCopied` and
+`LastSuccessTime` — figures that are the result of work already done and are not recomputable.
+
+Neither obvious fix was taken. Inverting to persist-then-propagate would spend a write on a pass whose
+only news is *the apiserver would not answer*, on exactly the path where writes are already failing —
+a trade the Restore controller argues against explicitly, and this release did not want to contradict
+its own reasoning one directory over. Keeping the skip behind a test that pins which paths may reach
+it guards a convention, and the next author adding an error return has no reason to read that test. So
+it persists **only when the pass actually changed the status**: structurally immune, and no write on
+today's two paths, so the Restore argument keeps holding instead of being overridden. It fails toward
+persisting if a plane is ever mis-snapshotted, degrading to the merely-wasteful option rather than to
+silent loss.
+
+### Seeing the snapshot that never became ready
+
+A production cluster had **never once** backed up a CephFS volume — not "stopped working", never
+worked. Eight volumes across four namespaces, every one `SnapshotReadyDeadlineExceeded`, for as long
+as the cluster had existed. The cause was outside this product: the CephFS `csi-snapshotter` ran with
+a group-snapshot feature gate while the cluster's CRDs served only the older API version, so its
+informer cache never synced and it never processed a single `VolumeSnapshotContent`.
+
+The product's verdict was exactly right and its Event said precisely where to look. What no artefact
+said was that this had **never** worked. `preflight.sh`, whose entire job is to tell an administrator
+before installing what will and will not be backed up, called that class perfectly usable — because a
+`VolumeSnapshotClass` for the driver exists. A static predictor, predicting the wrong thing
+confidently.
+
+The symptom needs one `LIST` and no new permission: VolumeSnapshots **bound** to a content and still
+not ready past a grace period. It now appears on all three surfaces that had the information and were
+silent — the preflight script, `selfcheck` beside `leakIndicators` whose shape it mirrors, and as a
+qualification on 0.6.5's per-PVC census, where a class of `ok` on a StorageClass that has never
+produced a ready snapshot is a prediction too confident to leave alone.
+
+Deliberately an **observation, not a verdict**: nothing becomes `Skipped` or `Failed`, no phase moves,
+and a class with no snapshots at all is not maligned — absence of evidence is not evidence of failure.
+A version-comparison check was rejected: it would need a third-party version catalogue and would go
+stale on every ceph-csi release, whereas the symptom catches causes nobody predicted.
+
+The grace is **one hour**, and the binding bound is the ceiling rather than the floor: at
+`snapshotReadyDeadline` (2h) the controller fails the volume **and tears the origin VolumeSnapshot
+down**, so a grace near two hours would observe an empty window and be structurally blind to the
+operator's own stalled snapshots. Being wrong here costs a sentence rather than a volume, so unlike
+every other bound in this codebase, erring **long** is the dangerous direction.
+
+### The instrument had to survive its own upgrade
+
+A GitOps autosync replaced the soak collector's pod at the moment the fortnight's archive was to be
+exported. The archive sat on a ReadWriteOnce volume the new pod could not map, so `collect.sh`
+answered `NOT COLLECTED` — with the data unreachable, on the volume the operator was about to delete.
+What saved the measurements was that somebody had read `soak-export --status` minutes earlier and
+transcribed its figures by hand.
+
+The chart already carried `strategy: Recreate`, with a comment claiming it prevents exactly this. **It
+does not**, and it had never been tested: Recreate did what it promises and the archive was lost
+anyway. The comment is corrected rather than deleted, because a protection that was believed in is
+worth recording as one that was not.
+
+So the collector now transcribes its own irreplaceable figures **on the way out**: on `SIGTERM`, after
+flushing its open window, the per-class high-water table goes to its own stderr — the one channel a
+terminating pod has that is not the volume it is about to release, and precisely the table a human
+copied by hand. `soak.accessModes` and `soak.storageClassName` are new and default to today's
+behaviour, so an administrator with an RWX class can remove the handover entirely while nobody is
+required to have one. Rejected in comments: RWX as the default (uninstallable on the clusters the kit
+is most useful on), a `preStop` hook (its output goes nowhere the kubelet keeps), writing the report to
+the volume (the thing that may be unreachable), and a ConfigMap or Event (a write verb held open for a
+fortnight).
+
+And the gap nobody had written down: `hack/soak/` had **no reset procedure at all** — it was written
+for one campaign, and the improvisation it invites is undone within minutes by an autosync
+reconciler. It is documented now, in order, including which zeros a freshly started collector
+legitimately reports so that nobody restarts it in a panic and loses the session.
+
 ## 0.6.5 — One volume held the queue, and every night after it was skipped (2026-08-10)
 
 **Validated on real infrastructure: 93 of 93 crucible checks, 0 failed, 0 skipped, in 2h48m54s** —
