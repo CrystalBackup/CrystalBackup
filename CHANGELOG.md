@@ -15,11 +15,16 @@ unsnapshottable volume sits first in the queue.
 
 **It took two attempts, and the first one failed.** Run 1 on this same tree: 62 passed, 7 failed, 24
 skipped, and **21 of 93 checks never ran** because the suite hit its four-hour timeout. Five of the
-seven failures were one leaked `VolumeSnapshotContent`, each sitting out a full 600-second deadline —
-about 95 minutes of budget spent watching a single object not disappear. That leak was a real defect
-and it is fixed below; the two checks that had timed out now pass in 50.9s and 15.8s. The two
-failures nobody could attribute in run 1 — the M3 DR bootstrap and the M4 maintenance retry — passed
-in run 2, which identifies them as collateral of the deadline burn rather than defects.
+seven failures were **the same** leaked `VolumeSnapshotContent` — counted in the log, not inferred:
+five specs across four milestones (M1, M3, M5, M6) each sat out a full 600-second deadline on that
+one object, about 95 minutes of budget spent watching it not disappear. One of the five is the M3 DR
+bootstrap, which failed in its `AfterAll` residue check rather than on anything about DR — worth
+naming because the first reading of that run called it an unattributed failure, and it was not.
+
+That leak was a real defect and it is fixed below; the checks that had timed out now pass in 50.9s
+and 15.8s. Of the remaining two failures, the M4 maintenance retry was the one genuinely nobody could
+attribute, and the M6 fidelity check never got to run at all — both pass in run 2, which places them
+as collateral of the deadline burn rather than defects.
 
 **What this campaign does NOT establish.** The release's central guarantee is that no single volume
 can hold its namespace's queue, and the suite proves that for the shapes it injects: an
