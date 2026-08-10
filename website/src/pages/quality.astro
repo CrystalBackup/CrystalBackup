@@ -88,6 +88,11 @@ const reports = [
     covered: 'A campaign about a fix that was wrong twice before it was right. An Argo CD prune deleted the operator namespace on a real cluster, the credentials came back two minutes after the key, and the operator minted a fresh DEK over the only one that could open a repository holding 38 snapshots. It took three campaigns: one killed mid-run with no verdict, one that went <strong>87 passed / 1 failed / 2 skipped</strong> because the first cut of the guard blocked provisioning even where an in-cluster key already existed — <code>m6/alerts</code> caught it, by making a backup fail so early that the alert about failing backups could no longer see one. The suite itself did not change a line. <strong>90 of 90, nothing failed and nothing skipped</strong>, in 2h44m',
     links: [['Crucible 0.6.4', 'crucible-m6-4.html']],
   },
+  {
+    milestone: '0.6.5',
+    covered: 'A campaign that failed first, and the failure is where the value was. One PVC on a real cluster named a StorageClass that did not exist — legal, for a statically provisioned volume — and it held the head of its namespace’s queue for <strong>thirty-one hours</strong>, during which a <code>Forbid</code> schedule skipped every night and the dashboard read 0% success while every counter around it was either silent or wrong. Twelve lots. Run 1 of the campaign then went <strong>62 passed / 7 failed / 21 never reached</strong>: one leaked <code>VolumeSnapshotContent</code> failed five specs in four milestones, each sitting out a 600-second deadline, and the suite hit its four-hour timeout. Three code paths — the one that deletes, the one that verifies, the one that catches what the others miss — were blind to the same object because a label had been stamped with an empty value. The component that only <em>observes</em> had been right all along. <strong>93 of 93, nothing failed and nothing skipped</strong>, in 2h48m, on the second attempt',
+    links: [['Crucible 0.6.5', 'crucible-m6-5.html']],
+  },
 ];
 
 const gates = [

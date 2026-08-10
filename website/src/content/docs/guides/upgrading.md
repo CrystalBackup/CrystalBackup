@@ -31,19 +31,96 @@ Apply the CRDs yourself, before the chart:
 
 ```bash
 # Pull the chart and take its CRDs. Use the version you are upgrading *to*;
-# 0.6.4 is the current release.
-helm pull oci://ghcr.io/crystalbackup/charts/crystal-backup --version 0.6.4 --untar
+# 0.6.5 is the current release.
+helm pull oci://ghcr.io/crystalbackup/charts/crystal-backup --version 0.6.5 --untar
 kubectl apply -f crystal-backup/crds/
 
 # Then upgrade the operator.
 helm upgrade crystal-backup \
   oci://ghcr.io/crystalbackup/charts/crystal-backup \
-  --version 0.6.4 \
+  --version 0.6.5 \
   --namespace crystal-backup-system
 ```
 
 `kubectl apply` on CRDs is additive and safe: it adds new fields and never drops stored
 objects.
+
+## 0.6.4 → 0.6.5: a panel that read a number can now read 0, and a backup that failed can now complete
+
+Nothing to do before the upgrade beyond applying the CRDs, and no data moves. But two things
+change an **outcome** rather than a wording, and one of them will make an existing dashboard go
+quiet about namespaces that are still unprotected. Read this before you conclude the upgrade
+fixed something it did not.
+
+**A counter that was one field is now two.** On `0.6.4` a namespace whose fan-out coordinate
+collided was counted as *failed* — the same field used for a namespace that was attempted and
+failed, so neither number could be believed. `0.6.5` gives the collision its own counter,
+`status.namespacesBlocked`, with its own metric
+`crystalbackup_clusterbackup_namespaces_blocked`, and `namespacesFailed` now counts only
+children that really failed. **A dashboard or alert keyed on
+`crystalbackup_clusterbackup_namespaces_failed` alone will therefore read 0 where it used to
+read a number** — the namespaces are just as unprotected, and the panel that said so has stopped
+saying it. Add the blocked series beside the failed one, ideally before you upgrade:
+
+```bash
+kubectl get clusterbackup <name> -o \
+  jsonpath='{.status.namespacesSucceeded}/{.status.namespacesFailed}/{.status.namespacesBlocked}{"\n"}'
+```
+
+**`onError: Continue` on a pre hook is now honoured, and that is a change in outcome.** `0.6.4`
+recorded `Failed` for every hook failure regardless of the policy, so a user who had explicitly
+asked for the backup to proceed past a failed quiesce got a terminally failed backup and no
+snapshot at all. The same run on `0.6.5` **completes, with a snapshot**, and carries a new
+`ApplicationConsistent` condition set `False` with reason `CrashConsistent`, naming the pod,
+container and error. That is the documented contract and it is what the field was always for —
+but if you set `onError: Continue` and have been treating the hard failure as your signal, the
+signal is now a condition on a `Completed` Backup, and the restore point it describes is
+crash-consistent:
+
+```bash
+kubectl get backup <name> \
+  -o jsonpath='{range .status.conditions[?(@.type=="ApplicationConsistent")]}{.status} {.reason}: {.message}{"\n"}{end}'
+```
+
+The condition is deliberately tri-state: **absent** when no pre hook ran, so a hookless backup
+does not acquire a `False` it cannot act on.
+
+**A new `critical` alert can fire.** `CrystalbackupBackupMissedCritical` escalates on magnitude,
+bounded at three times the schedule's own period plus an hour — 4 h for an hourly schedule, 73 h
+for a nightly one. **No existing threshold moved**, and the warning tier is unchanged and fires
+alongside it, so nothing you already route is narrowed. But if your Alertmanager treats
+`critical` differently from `warning` — a page rather than a ticket — a cluster that has produced
+nothing for three schedule periods will now page. There is also a new
+`crystalbackup_restore_volumes_failed`.
+
+**New status fields, all additive and all optional.** Nothing is renamed and nothing is removed:
+
+- `status.volumes[]` gains `firstAttemptAt` and `phaseEnteredAt`;
+- `status.hooks[]` gains `onError` — the policy that was in effect for that execution. Empty is
+  read as `Fail`, which is what makes upgrading over a Backup already inside its freeze window
+  safe: entries written by the old operator abort exactly as they did before rather than becoming
+  tolerated by a newer binary;
+- `Restore` and `ClusterRestore` gain `plannedVolumes` and `failedVolumes`, stamped on
+  non-terminal passes too, so a long restore visibly progresses;
+- `ClusterErasure` gains `snapshotsTargeted` and `snapshotsRemaining`;
+- `ClusterBackup` gains `namespacesBlocked`.
+
+Apply the CRDs before the chart, as above. Skip that and the API server prunes every one of them
+and the new operator reconciles as though you never had them.
+
+**Exposure objects gain a `crystalbackup.io/backup` label, and pre-upgrade residue does not have
+it.** Any leaked snapshot or content left behind by `0.6.4` or earlier carries no such label, so
+the inline teardown does not match it; it is collected by the **orphan reaper** instead, on its
+own sweep, by exclusion — it reaps only when no Backup in that namespace could still want an
+exposure of that PVC, and refuses on a list it cannot read. So expect old leftovers to clear
+within a sweep or two rather than at the next backup's teardown, and expect the reaper to say so.
+Nothing force-removes another controller's finalizer; an object genuinely stuck is now reported as
+stuck, with the finalizers named, rather than logged as reaped.
+
+**`selfcheck` gains `--format text`** — a compact plain-language report including a per-PVC
+coverage census, which is the first time the product can answer *what will and will not be backed
+up*, including PVCs that no schedule selects at all. **JSON remains the default**, so anything
+that parses `selfcheck` output — the soak kit's unattended CronJob included — is unaffected.
 
 ## 0.6.3 → 0.6.4: a location that reported Ready can now report Degraded
 

@@ -4,7 +4,7 @@ description: ClusterErasure — supprimer physiquement un tenant, un namespace o
 sidebar:
   order: 6
 sourceFile: src/content/docs/guides/erasure.md
-sourceHash: c27db3a6e828a23e8ec185c9cfe1553359999917
+sourceHash: 1d194e32b5d58dfcb809e1727ff2f12604a1f236
 ---
 
 `ClusterErasure` supprime physiquement des données d'un repository : un `restic forget`

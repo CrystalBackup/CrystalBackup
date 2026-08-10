@@ -2,7 +2,7 @@
 title: Labels et annotations
 description: Chaque label, annotation et finalizer crystalbackup.io/*, ce qui le pose, et ceux que vous posez vous-même.
 sourceFile: src/content/docs/reference/labels.md
-sourceHash: 85ab34e0b0e851bf45fc2d92b61f40ae3bb8e480
+sourceHash: 58efe3b773289dc7a62f60d1aaab851a3f235e1d
 ---
 
 Tout ce qui suit est sous le domaine `crystalbackup.io`, qui est aussi le groupe d'API. La

@@ -4,7 +4,7 @@ description: Les modes Recreate et Overwrite, le modèle de sélection, le garde
 sidebar:
   order: 3
 sourceFile: src/content/docs/guides/restore.md
-sourceHash: 9ef4cabd0b6d5c34a64ca45cf0cba9981bc32f9f
+sourceHash: bc412c26727739f0d3ac869a77cdc7db505e50b1
 ---
 
 Un restore a deux axes orthogonaux : le **mode** — comment les objets existants sont
