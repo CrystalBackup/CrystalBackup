@@ -40,6 +40,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -181,6 +182,15 @@ func (e *eventCapture) Eventf(regarding runtime.Object, _ runtime.Object, eventt
 		note:    fmt.Sprintf(note, args...),
 		objName: name,
 	})
+}
+
+// all is every captured Event, unfiltered. A test asserting that NOTHING was emitted has to look at
+// the whole slice: warnings(reason) would report "no events" for an Event that was emitted with the
+// wrong reason or the wrong type, which is the case such a test most wants to catch.
+func (e *eventCapture) all() []capturedEvent {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return slices.Clone(e.events)
 }
 
 func (e *eventCapture) warnings(reason string) []capturedEvent {

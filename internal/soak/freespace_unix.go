@@ -30,5 +30,28 @@ func freeBytes(dir string) (int64, error) {
 	if err := unix.Statfs(dir, &st); err != nil {
 		return 0, err
 	}
-	return int64(st.Bavail) * int64(st.Bsize), nil //nolint:gosec // block counts do not overflow int64
+	// DO NOT delete the int64(st.Bsize) conversion because a linter calls it unnecessary. It is
+	// unnecessary on ONE of the two platforms this file is built for, and required on the other.
+	//
+	// This file is `//go:build unix`, so it serves linux (the operator's actual runtime) and darwin
+	// (where it is developed) from one body. unix.Statfs_t.Bsize is declared per-platform:
+	//
+	//   linux:  Bsize int64   -> int64(st.Bsize) is a no-op, and `unconvert` reports it
+	//   darwin: Bsize uint32  -> int64(st.Bsize) is REQUIRED; without it this does not compile
+	//           (invalid operation: mismatched types int64 and uint32)
+	//
+	// No single expression satisfies both, so the redundancy is suppressed instead of removed. The
+	// alternative — splitting this into freespace_linux.go and freespace_darwin.go — would duplicate
+	// the Bavail-not-Bfree reasoning above, which is the part worth keeping in one place, and would
+	// drop the other unixes `//go:build unix` currently covers for free.
+	//
+	// This is also why a macOS `make lint` cannot see the finding at all: the linter only ever
+	// analyses the file under the local GOOS, so the redundancy exists exclusively in CI's view. That
+	// blind spot is the reason `make lint` now ends with a GOOS=linux pass (`make lint-linux` alone);
+	// without it, this suppression is unverifiable from the machine it was written on.
+	//
+	// gosec: Bavail is a block count and Bsize a block size; no filesystem this runs on brings
+	// either near 2^63, so the signed conversions cannot overflow.
+	//nolint:gosec,unconvert // int64(Bsize): required on darwin (uint32), redundant on linux (int64)
+	return int64(st.Bavail) * int64(st.Bsize), nil
 }

@@ -192,8 +192,48 @@ e2e: test-e2e ## Alias for test-e2e (spec/90-roadmap.md M0 exit criteria).
 cleanup-test-e2e: ## Tear down the Kind cluster used for e2e tests
 	@$(KIND) delete cluster --name $(KIND_CLUSTER)
 
+# LINT_CACHE=keep opts out of the cache purge in `lint` for a tight edit-lint loop. Read the comment
+# on the lint target before you reach for it: a kept cache can report 0 issues on code CI rejects.
+LINT_CACHE ?= purge
+
+# The GOOS=linux pass, in a variable so `lint` and `lint-linux` cannot drift apart.
+LINT_LINUX = GOOS=linux "$(GOLANGCI_LINT)" run
+
+.PHONY: lint-cache-purge
+lint-cache-purge: golangci-lint ## Purge golangci-lint's analysis cache (skipped by LINT_CACHE=keep).
+	@if [ "$(LINT_CACHE)" = "keep" ]; then \
+		printf '%s\n' \
+			"lint: KEEPING the analysis cache (LINT_CACHE=keep)." \
+			"lint: a kept cache does NOT report deprecation findings (SA1019) — this run can say" \
+			"lint: '0 issues' about code CI rejects. Do not trust it as a gate."; \
+	else \
+		"$(GOLANGCI_LINT)" cache clean; \
+	fi
+
 .PHONY: lint
-lint: golangci-lint ## Run golangci-lint over the whole tree, INCLUDING the build-tagged crucible suite.
+lint: lint-cache-purge ## Run golangci-lint over the whole tree: cache purged, crucible tag, GOOS=linux.
+	# WHY THE CACHE IS PURGED FIRST, and why `rm -f bin/golangci-lint` is not a substitute.
+	#
+	# golangci-lint's analysis cache (~/Library/Caches/golangci-lint on macOS) is separate from the
+	# binary and survives rebuilding it. Deleting bin/golangci-lint rebuilds the LINTER and reuses
+	# the CACHED ANALYSIS, so a local run stays green on stale results while CI, which always starts
+	# cold, is red. That is not a theory; it was measured on this tree at 0.6.5:
+	#
+	#   warm cache, `golangci-lint run ./cmd/...`  -> 0 issues
+	#   `cache clean`, same binary, same second    -> SA1019: mgr.GetEventRecorderFor is deprecated
+	#
+	# The class matters: SA1019 is FACT-BASED — the deprecation is a fact exported by the analysis of
+	# a DEPENDENCY, and a cache hit on that dependency serves the facts without re-deriving the
+	# diagnostics that depend on them. So a warm cache does not merely go stale, it silently drops a
+	# whole category of finding. That is a verification that cannot fail, which is the exact defect
+	# class 0.6.x spent twelve lots removing from the product; a release gate is a poor place to keep
+	# a copy of it.
+	#
+	# The cost is real and was measured, not assumed: warm ~7s, purged ~26s for the pass below.
+	# 19 seconds is not a reason to keep a gate that can lie, so the purge is the DEFAULT. The escape
+	# hatch for the edit-lint loop is `make lint LINT_CACHE=keep`, which says on stdout what it is
+	# giving up. There is no `--no-cache` flag to use instead — v2.12.2 has none; `cache clean` is
+	# the mechanism this version offers (checked with `golangci-lint run --help`).
 	"$(GOLANGCI_LINT)" run
 	# The crucible suite is behind `//go:build crucible`, so the run above cannot see it: an
 	# entire test package went unlinted until M6, and a dead variable silently made the report's
@@ -204,6 +244,24 @@ lint: golangci-lint ## Run golangci-lint over the whole tree, INCLUDING the buil
 	# precisely so it runs in the ORDINARY suite while inspecting the tagged one — enabling the
 	# tag globally would hide the very guard that keeps the tagged suite honest.
 	"$(GOLANGCI_LINT)" run --build-tags crucible ./test/crucible/tests/...
+	# And the GOOS=linux pass, because the two passes above analyse only the files the LOCAL GOOS
+	# builds. That is a structural blind spot on a macOS workstation, not a stale-cache one: no
+	# amount of cache clearing makes a darwin run look inside `//go:build linux`, and a file built
+	# for BOTH can hold a finding that exists on one of them only. Measured on this tree:
+	#
+	#   internal/soak/freespace_unix.go is //go:build unix and serves both. unix.Statfs_t.Bsize is
+	#   int64 on linux and uint32 on darwin, so `int64(st.Bsize)` is redundant on linux and REQUIRED
+	#   on darwin. A darwin run reports 0 issues; the GOOS=linux run reports `unnecessary conversion`
+	#   — CI's finding, reproduced locally, by this line.
+	#
+	# GOOS only. GOARCH is deliberately not varied: it would multiply the runs, and the type
+	# differences that produce findings like the one above are per-OS, not per-word-size.
+	$(LINT_LINUX)
+
+.PHONY: lint-linux
+lint-linux: lint-cache-purge ## Lint as CI sees it: GOOS=linux, so linux-only findings are visible.
+	# Standalone version of the last pass in `lint`, for when that is the pass you are iterating on.
+	$(LINT_LINUX)
 
 .PHONY: lint-fix
 lint-fix: golangci-lint ## Run golangci-lint linter and perform fixes

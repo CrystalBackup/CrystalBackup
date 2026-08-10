@@ -701,10 +701,16 @@ func main() {
 	// (--create-namespace), and both of those produce an unlabelled namespace whose only symptom
 	// is a mover refused by admission, later, during a backup or a restore. See
 	// internal/controller/namespace_posture.go. It never fails startup.
+	//
+	// GetEventRecorder (events.k8s.io/v1), like every other recorder wired in this file. This was
+	// the last GetEventRecorderFor call in the tree — missed by the migration that moved the other
+	// ten — and its reportingController said "crystal-backup", which named the whole operator for a
+	// check that is one Runnable. It now names the Runnable, matching the "orphan-reaper" below and
+	// the logger name inside the check itself.
 	if err := mgr.Add(&controller.NamespacePostureCheck{
 		Reader:    mgr.GetAPIReader(),
 		Namespace: operatorNamespace,
-		Recorder:  mgr.GetEventRecorderFor("crystal-backup"),
+		Recorder:  mgr.GetEventRecorder("namespace-posture"),
 	}); err != nil {
 		setupLog.Error(err, "Unable to add the namespace posture check")
 		os.Exit(1)

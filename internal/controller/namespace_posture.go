@@ -21,7 +21,7 @@ import (
 	"fmt"
 
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
@@ -75,7 +75,14 @@ type NamespacePostureCheck struct {
 	Namespace string
 	// Recorder emits the finding where `kubectl get events` will show it. Optional: a nil
 	// recorder logs and nothing more, which is what the unit tests use.
-	Recorder record.EventRecorder
+	//
+	// events.EventRecorder (events.k8s.io/v1) and not record.EventRecorder (the core/v1 events API):
+	// every other Event emitter in this package is on the new API, and this field was the last
+	// holdout of the old one — which is the only reason anybody had to keep two events APIs in
+	// their head when reading this package. The deprecation says record.EventRecorder "will be
+	// removed in a future release", so suppressing the warning would have been debt with somebody
+	// else's deadline on it.
+	Recorder events.EventRecorder
 }
 
 // NeedLeaderElection is false: this is a read and a log line, it costs nothing, and a standby
@@ -106,7 +113,12 @@ func (c *NamespacePostureCheck) Start(ctx context.Context) error {
 	detail := PostureProblem(c.Namespace, got)
 	log.Error(nil, detail)
 	if c.Recorder != nil {
-		c.Recorder.Event(&ns, corev1.EventTypeWarning, "PodSecurityPostureWrong", detail)
+		// `nil` is the `related` object: the finding is about this namespace and nothing else, so
+		// there is no secondary object to point at. `detail` goes through as an ARGUMENT under a bare
+		// %s rather than as the note format itself — it is a built sentence, and a format string
+		// assembled elsewhere is one stray %s away from an Event that reads `%!s(MISSING)`.
+		c.Recorder.Eventf(&ns, nil, corev1.EventTypeWarning, "PodSecurityPostureWrong",
+			"CheckNamespacePosture", "%s", detail)
 	}
 	return nil
 }

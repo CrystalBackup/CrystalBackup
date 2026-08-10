@@ -24,7 +24,6 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -52,21 +51,36 @@ func namespaceWith(labels map[string]string) *corev1.Namespace {
 }
 
 // runPosture executes the check and returns the events it emitted.
-func runPosture(t *testing.T, r client.Reader) []string {
+//
+// The recorder is eventCapture (reaper_honesty_test.go), this package's fake for the events.k8s.io
+// API. It replaced record.NewFakeRecorder, which belongs to the core/v1 events API the check no
+// longer uses — and it is an improvement rather than a translation: the fake recorder rendered each
+// Event into one string, so these tests could only assert substrings of it and could not tell the
+// reason from the note. The assertions below are now on the fields they were always aiming at.
+func runPosture(t *testing.T, r client.Reader) []capturedEvent {
 	t.Helper()
-	rec := record.NewFakeRecorder(4)
+	rec := &eventCapture{}
 	c := &NamespacePostureCheck{Reader: r, Namespace: "crystal-backup-system", Recorder: rec}
 	if err := c.Start(t.Context()); err != nil {
 		t.Fatalf("the posture check returned an error (%v). It must never be able to take the "+
 			"operator down: an operator that exits on an upgrade of a cluster that has been "+
 			"running without the labels turns a latent problem into an outage", err)
 	}
-	close(rec.Events)
-	var out []string
-	for e := range rec.Events {
-		out = append(out, e)
+	return rec.all()
+}
+
+// TestANilRecorderIsSafe. The field is documented as OPTIONAL, and the reason is not convenience:
+// the check is a Runnable that must never be able to take the operator down, so a wiring mistake
+// that left the recorder unset has to degrade to logs rather than panic on the one code path that
+// only runs when something is already wrong.
+func TestANilRecorderIsSafe(t *testing.T) {
+	c := &NamespacePostureCheck{
+		Reader:    postureReader{ns: namespaceWith(nil)},
+		Namespace: "crystal-backup-system",
 	}
-	return out
+	if err := c.Start(t.Context()); err != nil {
+		t.Fatalf("the posture check with no recorder returned an error: %v", err)
+	}
 }
 
 // TestAnUnlabelledOperatorNamespaceIsReportedLoudly is the case the chart's own guard structurally
@@ -84,16 +98,36 @@ func TestAnUnlabelledOperatorNamespaceIsReportedLoudly(t *testing.T) {
 		t.Fatalf("got %d event(s), want exactly 1: %v", len(events), events)
 	}
 	e := events[0]
+	if e.eventType != corev1.EventTypeWarning {
+		t.Errorf("eventType = %q, want %q", e.eventType, corev1.EventTypeWarning)
+	}
+	if e.reason != "PodSecurityPostureWrong" {
+		t.Errorf("reason = %q, want PodSecurityPostureWrong", e.reason)
+	}
+	// The `action` parameter exists only on events.k8s.io/v1 and is required to be non-empty by the
+	// apiserver's own validation, so an empty one is a rejected Event: a finding that never arrives.
+	if e.action == "" {
+		t.Error("the Event carries no action; events.k8s.io/v1 validation rejects an empty one, " +
+			"so this finding would be dropped by the apiserver rather than shown to anybody")
+	}
+	if e.objName != "crystal-backup-system" {
+		t.Errorf("the Event is about %q, want the operator namespace itself", e.objName)
+	}
 	for _, want := range []string{
-		"Warning", "PodSecurityPostureWrong",
 		"no pod-security.kubernetes.io/enforce label at all",
 		"kubectl label namespace crystal-backup-system",
 		"baseline",
 	} {
-		if !strings.Contains(e, want) {
+		if !strings.Contains(e.note, want) {
 			t.Errorf("the event does not contain %q — a reader must not have to translate the\n"+
-				"diagnosis into an action:\n%s", want, e)
+				"diagnosis into an action:\n%s", want, e.note)
 		}
+	}
+	// The note is what `kubectl describe` prints. eventCapture renders it through fmt.Sprintf the
+	// way the apiserver will, so a stray verb in the built sentence shows up here as %!(NOVERB) or
+	// %!s(MISSING) rather than in a customer's terminal.
+	if strings.Contains(e.note, "%!") {
+		t.Errorf("the note came out of formatting mangled:\n%s", e.note)
 	}
 }
 
@@ -108,8 +142,8 @@ func TestARestrictedOperatorNamespaceIsReportedToo(t *testing.T) {
 	if len(events) != 1 {
 		t.Fatalf("a `restricted` operator namespace raised %d event(s), want 1: %v", len(events), events)
 	}
-	if !strings.Contains(events[0], `"restricted"`) {
-		t.Errorf("the event does not name the level it found:\n%s", events[0])
+	if !strings.Contains(events[0].note, `"restricted"`) {
+		t.Errorf("the event does not name the level it found:\n%s", events[0].note)
 	}
 }
 

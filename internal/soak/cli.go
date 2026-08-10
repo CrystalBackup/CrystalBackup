@@ -22,6 +22,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -107,8 +108,71 @@ const startupScrapeAttempts = 3
 // startupScrapeBackoff is a var only so the tests can collapse it. Nothing at runtime changes it.
 var startupScrapeBackoff = 5 * time.Second
 
+// ---------------------------------------------------------------------------------------------
+// THE EXIT-CODE CONTRACT, and the ordering it forces.
+//
+// 2 means "you asked for something impossible": a flag is missing, malformed, or names a file that
+// is not there. 1 means "the world would not cooperate": no kubeconfig, an unwritable PVC, a
+// metrics endpoint that answers 401.
+//
+// That distinction only survives if every check that can be made WITHOUT a cluster is made BEFORE
+// the cluster is contacted. Through 0.6.5 the salt file was read AFTER the connection, so
+// `--redaction-salt-file=/typo` on a machine with no kubeconfig reported "no Kubernetes
+// configuration: try setting KUBERNETES_MASTER" and exited 1 — a true statement about the wrong
+// problem, and the wrong code for it. The check had become conditional on something it has nothing
+// to do with.
+//
+// It also made the test that pins this pass or fail depending on the MACHINE: on a laptop with a
+// kubeconfig the connection succeeded and control reached the salt check (green); on a CI runner
+// with none it did not (red). Hence the clusterConnector seam below — the same one
+// internal/selfcheck/cli.go uses, and for the same reason.
+// ---------------------------------------------------------------------------------------------
+
+// soakCluster is everything the collector needs from a cluster, opened once.
+//
+// The fields are concrete *kubernetes.Clientset rather than kubernetes.Interface because
+// clusterLister, EventStream and LogStream take the concrete type; widening them to interfaces to
+// suit a seam that only ever needs the FAILURE path would be a large change for no test.
+type soakCluster struct {
+	Clientset *kubernetes.Clientset
+	Reader    client.Reader
+	// Discovery is OPTIONAL and may be nil: it feeds the self-check's API-shape half, and a cluster
+	// that will not build a discovery client is not a reason to refuse a fortnight of collection.
+	Discovery discovery.DiscoveryInterface
+}
+
+// clusterConnector opens the cluster. It exists so a test can supply one that always FAILS, which
+// is the only way to prove — on any machine, with or without a kubeconfig — that the usage checks
+// above it never consult a cluster. See internal/selfcheck/cli.go's clusterConnector.
+type clusterConnector func() (soakCluster, error)
+
+// connectCluster is the production connector: the ambient kubeconfig or in-cluster config.
+func connectCluster() (soakCluster, error) {
+	cfg, err := ctrl.GetConfig()
+	if err != nil {
+		return soakCluster{}, fmt.Errorf("no Kubernetes configuration: %w", err)
+	}
+	cs, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		return soakCluster{}, fmt.Errorf("cannot build a Kubernetes client: %w", err)
+	}
+	reader, err := client.New(cfg, client.Options{Scheme: soakScheme()})
+	if err != nil {
+		return soakCluster{}, fmt.Errorf("cannot build an API reader: %w", err)
+	}
+	out := soakCluster{Clientset: cs, Reader: reader}
+	if d, err := discovery.NewDiscoveryClientForConfig(cfg); err == nil {
+		out.Discovery = d
+	}
+	return out, nil
+}
+
 // RunCollect is `crystal-backup soak-collect`. It returns a process exit code.
 func RunCollect(ctx context.Context, args []string, stderr io.Writer) int {
+	return runCollect(ctx, args, stderr, connectCluster)
+}
+
+func runCollect(ctx context.Context, args []string, stderr io.Writer, connect clusterConnector) int {
 	fs := flag.NewFlagSet(CommandCollect, flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	var (
@@ -155,6 +219,28 @@ func RunCollect(ctx context.Context, args []string, stderr io.Writer) int {
 				"Check the Service name against your release: kubectl -n <ns> get svc | grep metrics\n")
 		return 2
 	}
+	// And it has to BE a URL. Without this, a --metrics-url that is a hostname, a Service name or a
+	// value the chart interpolated badly is only discovered by proveScrape — after the cluster
+	// connection, as exit 1, reported as though the endpoint were unreachable rather than unwritten.
+	// Same argument as the salt file: decidable from the flag alone, so decided here.
+	if u, uerr := url.Parse(*metricsURL); uerr != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		_, _ = fmt.Fprintf(stderr,
+			"soak-collect: --metrics-url=%q is not an http(s) URL. It needs the scheme and the host:\n\n"+
+				"  --metrics-url=https://crystal-backup-metrics.<namespace>.svc:8443/metrics\n",
+			*metricsURL)
+		return 2
+	}
+	// An empty --operator-namespace is a usage error too, and it is reachable: the flag defaults to
+	// $POD_NAMESPACE, and `--operator-namespace=` (or a chart value that rendered to nothing) passes
+	// it explicitly empty. Without this it becomes a `get namespaces ""` against the apiserver — a
+	// cluster error, exit 1, about a flag.
+	if strings.TrimSpace(*namespace) == "" {
+		_, _ = fmt.Fprint(stderr,
+			"soak-collect: --operator-namespace is empty. It names the namespace whose operator, "+
+				"mover Jobs, events and logs are collected; there is no useful default beyond "+
+				"$POD_NAMESPACE, which is also unset here.\n")
+		return 2
+	}
 	for name, d := range map[string]time.Duration{
 		"--metrics-interval": *metricsIvl, "--metrics-resolution": *resolution,
 		"--mover-sample-interval": *moverIvl, "--selfcheck-interval": *selfIvl,
@@ -172,6 +258,25 @@ func RunCollect(ctx context.Context, args []string, stderr io.Writer) int {
 		_, _ = fmt.Fprintf(stderr, "soak-collect: %v\n", err)
 		return 2
 	}
+	// And the salt FILE is READ here, before the store is opened and before anything connects to a
+	// cluster, because whether a named file exists and holds >= 32 bytes is decidable from the flag
+	// alone. See the exit-code contract above: this used to sit below the connection, where a typo'd
+	// path was reported as a missing kubeconfig.
+	//
+	// --salt-method=auto cannot be resolved here BY CONSTRUCTION — it derives the salt from the
+	// operator namespace's UID, so it needs the cluster and is resolved after the connection below.
+	// The asymmetry is the whole point: from-secret needs no cluster, so it must not wait for one.
+	var (
+		salt       []byte
+		saltSource string
+	)
+	if *saltMethod == SaltMethodFromSecret {
+		salt, saltSource, err = ResolveSalt(*saltMethod, *saltFile, noNamespaceToRead)
+		if err != nil {
+			_, _ = fmt.Fprintf(stderr, "soak-collect: %v\n", err)
+			return 2
+		}
+	}
 
 	store, err := OpenStore(*dataDir, cap)
 	if err != nil {
@@ -182,31 +287,25 @@ func RunCollect(ctx context.Context, args []string, stderr io.Writer) int {
 		return 1
 	}
 
-	cfg, err := ctrl.GetConfig()
-	if err != nil {
-		_, _ = fmt.Fprintf(stderr, "soak-collect: no Kubernetes configuration: %v\n", err)
-		return 1
-	}
-	cs, err := kubernetes.NewForConfig(cfg)
-	if err != nil {
-		_, _ = fmt.Fprintf(stderr, "soak-collect: cannot build a Kubernetes client: %v\n", err)
-		return 1
-	}
-	reader, err := client.New(cfg, client.Options{Scheme: soakScheme()})
-	if err != nil {
-		_, _ = fmt.Fprintf(stderr, "soak-collect: cannot build an API reader: %v\n", err)
-		return 1
-	}
-
-	// The salt, from the named method. A REFUSAL either way — see ResolveSalt: there is no
-	// fallback from fromSecret to auto and none from auto to random, because both would produce
-	// an archive that claims one guarantee and holds another. It comes after the client because
-	// `auto` reads the namespace, and before anything is written because the whole fortnight is
-	// keyed on it.
-	salt, saltSource, err := ResolveSalt(*saltMethod, *saltFile, namespaceUID(ctx, cs, *namespace))
+	// Everything above this line is decided without a cluster. Nothing below it is a usage error.
+	cluster, err := connect()
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "soak-collect: %v\n", err)
-		return 2
+		return 1
+	}
+	cs, reader := cluster.Clientset, cluster.Reader
+
+	// The salt for --salt-method=auto, which is the one method that needs the cluster: it derives
+	// from the operator namespace's UID. A REFUSAL either way — see ResolveSalt: there is no
+	// fallback from fromSecret to auto and none from auto to random, because both would produce an
+	// archive that claims one guarantee and holds another. It comes after the client because `auto`
+	// reads the namespace, and before anything is written because the whole fortnight is keyed on it.
+	if *saltMethod != SaltMethodFromSecret {
+		salt, saltSource, err = ResolveSalt(*saltMethod, *saltFile, namespaceUID(ctx, cs, *namespace))
+		if err != nil {
+			_, _ = fmt.Fprintf(stderr, "soak-collect: %v\n", err)
+			return 2
+		}
 	}
 
 	scraper := NewScraper(*metricsURL, *skipVerify)
@@ -266,12 +365,8 @@ func RunCollect(ctx context.Context, args []string, stderr io.Writer) int {
 	// salt with LoadRedactionSalt(""), which cannot succeed, so the "self-check DISABLED" branch it
 	// carried was unreachable — soak-collect simply refused to start without a Secret. Both methods
 	// either yield a salt or refuse, so the stream is always on.
-	var disco discovery.DiscoveryInterface
-	if d, err := discovery.NewDiscoveryClientForConfig(cfg); err == nil {
-		disco = d
-	}
 	c.Selfcheck = &SelfcheckRunner{
-		Reader: reader, Discovery: disco, Namespace: *namespace,
+		Reader: reader, Discovery: cluster.Discovery, Namespace: *namespace,
 		Salt: salt, SaltSource: saltSource, Interval: *selfIvl, Store: store,
 	}
 	_, _ = fmt.Fprintf(stderr, "soak-collect: redaction salt from --salt-method=%s (saltSource: %s)\n",

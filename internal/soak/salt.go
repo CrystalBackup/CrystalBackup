@@ -201,6 +201,19 @@ func namespaceUID(ctx context.Context, cs kubernetes.Interface, ns string) func(
 	}
 }
 
+// noNamespaceToRead is the namespace reader handed to ResolveSalt on the paths that run BEFORE any
+// cluster connection — soak-collect's from-secret salt read, which is deliberately ordered ahead of
+// the connection because an unreadable salt file is a usage error and not a cluster failure.
+//
+// ResolveSalt only calls its namespaceUID for --salt-method=auto, and those call sites resolve auto
+// elsewhere, so this never runs. It is a function that errors rather than a nil parameter so that a
+// future method needing the cluster from here fails with a sentence somebody can act on instead of a
+// nil-func panic in a collector's first second.
+func noNamespaceToRead() (string, error) {
+	return "", fmt.Errorf("internal: the salt was resolved before any cluster connection, so there " +
+		"is no namespace to read a UID from here")
+}
+
 // exportNamespaceUID is namespaceUID for soak-export, which builds no client of its own.
 //
 // It builds one LAZILY, inside the closure, for the same reason namespaceUID is a closure at all:
