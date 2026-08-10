@@ -212,10 +212,29 @@ post	postgres-0	postgres	spec	Succeeded
 `status.hooks` is the durable account of the freeze window: which pods were quiesced,
 whether the release ran, and — when it did not — what you have to go and undo by hand.
 
-Results are `Succeeded`, `Failed`, and `Skipped`. `Skipped` means an earlier hook in the
-same phase failed with `onError: Fail`, so this one never ran. It is recorded rather than
-omitted on purpose: a list showing three of five hooks invites the reader to assume the
-missing two passed.
+Results are `Succeeded`, `Failed`, and `Skipped`. `Skipped` only ever appears in the **pre**
+phase: an earlier hook in it failed with `onError: Fail`, so this one never ran. It is
+recorded rather than omitted on purpose — a list showing three of five hooks invites the
+reader to assume the missing two passed.
+
+The **post** phase never stops. Every entry in it is a thaw owed to a different
+application, so a broken release on one pod costs that pod only and the rest still run.
+
+## When a pre hook aborts the backup
+
+An `onError: Fail` pre hook stops the quiesce, and the run ends `Failed` with no snapshot.
+The hooks **before** it, however, already succeeded, and their applications are quiesced —
+so the run releases them before it reports the failure. Concretely:
+
+- the release is scoped to the pods that were **actually** quiesced. A pod whose own hook
+  failed, and a pod behind the abort marked `Skipped`, were never frozen and are never sent
+  a thaw;
+- while that release is in flight the Backup stays in `SnapshottingHooks`, with
+  `Ready: ReleasingAfterAbortedQuiesce` naming both the abort and the attempt number;
+- it is bounded by the same three attempts as any release, and ends at the same
+  `UnfreezeFailed` Warning when they run out;
+- the run then reports `Failed` for the pre-hook abort. A thaw that worked does not make it
+  a success: no snapshot was taken.
 
 `source` is `spec` or `annotation` — which is how you tell whether the command that ran is
 the one you wrote.

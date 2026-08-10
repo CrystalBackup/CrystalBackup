@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -48,6 +49,21 @@ import (
 // is already captured, and the outstanding problem is an application that may still be quiesced. It
 // retries, and when it runs out of retries it says so loudly, because at that point a human has to
 // go and unfreeze something by hand.
+//
+// # "More important than the backup" now holds on the abort path too (0.6.6 lot 2)
+//
+// It did not. An aborted pre phase went straight to a terminal Failed, and the hooks that had already
+// SUCCEEDED before the aborting one kept their applications quiesced with nothing left running that
+// would ever release them: the already-terminal short-circuit at the top of Reconcile barred every
+// later pass, so closeFreezeWindow was unreachable. The priority stated in the paragraph above was
+// inverted on precisely the path where nobody looks, because a Backup that reports Failed for a
+// quiesce reads as a run that never started. abortFreezeWindow is the fix, and
+// quiescedPodsFromStatus is the answer to "released to whom".
+//
+// The same lot separated "this failure stops the backup" from "this failure abandons the rest of the
+// chain" in hooks.Run: stopping is right for the pre phase, where the chain has one collective
+// product, and wrong for the post phase, where every entry is a thaw owed to a different
+// application. See hooks.chainStopsOnAbort.
 //
 // # onError: Continue, and why "by default" is the whole of R16's claim
 //
@@ -141,6 +157,66 @@ type hookPhaseState struct {
 	aborted bool
 	// abortMessage explains the abort, for the terminal condition.
 	abortMessage string
+}
+
+// quiescedPods is the set of pod NAMES this run demonstrably froze and therefore owes a thaw to.
+//
+// A nil value means NO RESTRICTION — every hook the release phase resolves runs — which is the
+// normal, whole-run release. A non-nil value restricts the release to the pods in it, which is what
+// an ABORTED quiesce owes (see releaseAbortedQuiesce). The nil/empty distinction is real and
+// invisible to len(), so the one caller that can produce an empty set checks for it and never calls
+// through: "nothing was frozen" is answered before the pod listing, not by an empty filter.
+type quiescedPods map[string]struct{}
+
+// quiescedPodsFromStatus derives, from the durable record alone, which pods this run actually
+// quiesced — and it is the whole answer to "what is owed" after an aborted pre phase.
+//
+// IT READS STATUS AND NOTHING ELSE, for the same reason hookState does: the abort is decided on a
+// LATER pass than the execution, and a controller that died in between must come back knowing which
+// applications it froze. There is no in-memory record to consult and there must not be one.
+//
+// THE THREE RESULTS ARE NOT TREATED ALIKE, and each exclusion is load-bearing:
+//
+//   - Succeeded — the command ran and returned 0, so whatever it did is IN EFFECT. This is the only
+//     thing that owes a thaw, and it owes one whatever else happened on the run.
+//   - Skipped — the "an earlier hook aborted the phase" marker (hooks.ErrSkipped). It never ran, so
+//     nothing froze this pod, and thawing it would be running a `pg_backup_stop()` against a
+//     database that was never told to start a backup — an error at best, and at worst a command
+//     with side effects issued over an application this run never touched. This is the exclusion the
+//     roadmap entry names explicitly.
+//   - Failed — the quiesce did not happen. Same argument as Skipped, one step weaker (the command
+//     did run), and the same conclusion: we release what we know we took. A hook that froze
+//     something and THEN failed is conceivable, but it is indistinguishable here from one that
+//     failed before doing anything, and inventing a thaw on the strength of a maybe is how an
+//     operator ends up debugging a command they never asked to be run.
+//
+// A pod with SEVERAL pre hooks, some passing and some not, IS owed a thaw: one succeeded command's
+// effect is in effect, and the aborting one is why this run is failing. The set is keyed on the pod
+// rather than the hook because a thaw is addressed to an application, not to a command — the post
+// hook that releases it is a different hook with a different name, and nothing pairs them up.
+func quiescedPodsFromStatus(backup *cbv1.Backup) quiescedPods {
+	out := quiescedPods{}
+	for i := range backup.Status.Hooks {
+		h := &backup.Status.Hooks[i]
+		if h.Phase == string(hooks.PhasePre) && h.Result == cbv1.HookSucceeded {
+			out[h.Pod] = struct{}{}
+		}
+	}
+	return out
+}
+
+// restrictToPods keeps only the hooks addressed to pods in owedTo. A nil owedTo keeps everything.
+func restrictToPods(resolved []hooks.Resolved, owedTo quiescedPods) []hooks.Resolved {
+	if owedTo == nil {
+		return resolved
+	}
+	out := make([]hooks.Resolved, 0, len(resolved))
+	for _, h := range resolved {
+		if _, ok := owedTo[h.Pod.Name]; ok {
+			out = append(out, h)
+		}
+	}
+	return out
 }
 
 // hookState derives the freeze window's state from the durable record in status, so it survives an
@@ -237,10 +313,16 @@ func (r *BackupReconciler) openFreezeWindow(ctx context.Context, backup *cbv1.Ba
 	st hookPhaseState, spec cbv1.HooksSpec,
 ) (res ctrl.Result, done bool, err error) {
 	if st.aborted {
-		// rc rides along solely so the Failed terminal transition can be recorded with the same
-		// metric identity writeStatus would have given it — a hook abort is the one terminal path
-		// that never reaches the status writer.
-		return ctrl.Result{}, true, r.failHooks(ctx, backup, rc, st.abortMessage)
+		// (9c) THE ABORT NO LONGER GOES STRAIGHT TO THE TERMINAL WRITE. It releases what it already
+		// froze first, and only terminates once that release is settled or its budget is spent — see
+		// abortFreezeWindow, which is where the whole argument lives.
+		//
+		// done is stamped HERE rather than returned from there: an aborted quiesce always ends the
+		// pass, whether it terminated the run or is holding it for another release attempt, so a
+		// function returning a bool that can only be true would be a value pretending to carry a
+		// decision.
+		res, err := r.abortFreezeWindow(ctx, backup, rc, st, spec)
+		return res, true, err
 	}
 	if st.preRan {
 		return ctrl.Result{}, false, nil
@@ -311,6 +393,221 @@ func (r *BackupReconciler) openFreezeWindow(ctx context.Context, backup *cbv1.Ba
 			backup.Namespace, backup.Name, err)
 	}
 	return ctrl.Result{Requeue: true}, true, nil
+}
+
+// reasonReleasingAfterAbort is the Ready reason while an aborted quiesce is being undone. The
+// terminal reason stays PreHookFailed — that is why the run failed, and it must not be displaced by
+// the cleanup it triggered — so this one exists purely to make the HOLD legible: a run sitting in
+// SnapshottingHooks for three passes with `PreHookFailed` on it would read as a controller that had
+// decided and then stopped.
+const reasonReleasingAfterAbort = "ReleasingAfterAbortedQuiesce"
+
+// abortFreezeWindow is step (9c) of Reconcile: an aborted quiesce RELEASES WHAT IT ALREADY FROZE,
+// and only then fails the run.
+//
+// # The defect (0.6.6 lot 2, top of the 0.6.5 backlog)
+//
+// hooks.Run stops a PRE chain at the first onError=Fail failure — correctly, see
+// hooks.chainStopsOnAbort — but the hooks BEFORE it succeeded, and their applications are quiesced.
+// failHooks then wrote a terminal Failed, and the already-terminal short-circuit at the top of
+// Reconcile meant closeFreezeWindow never ran again. Nothing thawed them, and nothing said so. The
+// Backup reported Failed with a reason that reads "the quiesce did not work" while part of it worked
+// and was still in effect — R16's own priority (the release matters more than the backup) inverted on
+// the single path where a human is least likely to look, because the run looks like it never started.
+//
+// # The ordering, and the two orderings that were rejected
+//
+// CHOSEN: release first, terminate second, and hold the terminal write while a release is still owed.
+// The hold is bounded by the SAME attempt budget as the normal release (postHookMaxAttempts), because
+// every path that reports owed=true has already spent an attempt — which is the invariant lot 10
+// established for closeFreezeWindow and this path inherits rather than re-invents.
+//
+// REJECTED (1): run the thaw and let failHooks write terminal in the same pass, unconditionally.
+// Simpler, and it is the shape one reaches for first. It fails on the only case that matters. A thaw
+// that ITSELF fails would be recorded into a terminal Failed status, and the already-terminal
+// short-circuit then bars every retry: the product promises three attempts at unfreezing an
+// application and would deliver one — the exact bug 0.6.5 lot 10 closed for the normal release,
+// reintroduced on the path where the application is MORE likely to still be frozen. It is also worse
+// under a crash: the hook entries and the terminal phase would land in one write, so a process killed
+// between the exec and the write loses the whole record, and a process killed just after it finds a
+// terminal Backup with no way back in. Deriving the owed-ness from status (hookState + this function)
+// is what survives that, and it only survives it if the terminal write is the LAST thing to happen.
+//
+// REJECTED (2): let the terminal write stand and do the thaw from ensureTerminalTeardown, which
+// already re-enters on a terminal Backup and already refuses to stamp its cleaned marker while
+// residue remains. Attractive because it needs no reordering at all. Rejected because it CONFLATES
+// TWO DIFFERENT OWED-THINGS, and the conflation is not cosmetic:
+//
+//   - that sweep's subject is STORAGE residue — a VolumeSnapshotContent, a VolumeSnapshot, a temp
+//     clone PVC — verified by READING the cluster (exposureResidueRemains), all of it idempotent,
+//     derive-only and safe to repeat forever. A thaw is an EXEC of somebody's command inside a
+//     running container; it is not derivable, not verifiable by a list, and must be bounded by an
+//     attempt budget rather than retried until it works. Putting it behind AnnotationExposuresCleaned
+//     would make one marker mean two things, and the failure mode is that a draining VSC keeps
+//     re-running a `pg_backup_stop()` every exposureDrainRecheckInterval;
+//   - it has no status writer. The sweep PATCHES annotations and never touches status, deliberately,
+//     so that the terminal record it re-enters over is preserved exactly. Recording hook entries and
+//     PostHookAttempts from there means adding a status write to the one path whose contract is "do
+//     not rewrite the terminal record";
+//   - and it is dishonest in the same way the bug is. The Backup would report Failed and THEN thaw,
+//     so there is a window — unbounded, since the sweep is retried on error — in which the object
+//     says the run is over while an application is still frozen. That is precisely what writeStatus'
+//     hold exists to prevent, and answering the same question two ways is how a codebase acquires a
+//     contradiction.
+//
+// # What it does NOT change
+//
+// The run still ends Failed, for PreHookFailed, with the pre-hook abort's own message. A thaw that
+// worked does not make the backup a success, a partial success, or anything other than a run whose
+// quiesce failed and which took no snapshot: there is no restore point here to qualify. And a thaw
+// that keeps failing ends at the EXISTING loud UnfreezeFailed Event that advancePostHooks and
+// recordUnresolvedRelease already emit — a human has to go and unfreeze something by hand, which is
+// the same sentence whether the run failed on the quiesce or completed normally.
+func (r *BackupReconciler) abortFreezeWindow(ctx context.Context, backup *cbv1.Backup, rc *backupRunContext,
+	st hookPhaseState, spec cbv1.HooksSpec,
+) (ctrl.Result, error) {
+	owed, releaseErr := r.releaseAbortedQuiesce(ctx, backup, spec)
+	if !owed {
+		// Nothing is owed, or the budget that bounds the hold is spent. Either way the run is over.
+		//
+		// releaseErr is necessarily nil here: every error path in releaseAbortedQuiesce reports
+		// owed=true, because a release we could not even attempt is one we cannot call settled.
+		//
+		// failHooks' status write is what PERSISTS this pass's release record — the hook entries and
+		// the attempt count are on the same in-memory object — so the thaw and the terminal phase land
+		// together on the pass that ends the run. rc rides along solely so the Failed terminal
+		// transition is recorded with the same metric identity writeStatus would have given it: a hook
+		// abort is the one terminal path that never reaches the status writer.
+		return ctrl.Result{}, r.failHooks(ctx, backup, rc, st.abortMessage)
+	}
+
+	// A release is still owed: this pass must NOT go terminal, or the already-terminal short-circuit
+	// eats the remaining attempts — which is the defect, one layer down.
+	//
+	// The phase is left at SnapshottingHooks rather than rewritten to Uploading (which is what
+	// writeStatus uses for the same hold on the normal path, because a run whose volumes had already
+	// reached Uploading must not travel backwards through the phase enum). Here nothing is uploading
+	// and nothing ever will be: no volume left Pending, so SnapshottingHooks is both accurate and
+	// already the current value. What the phase alone cannot say is WHY a failed run is still moving,
+	// so the Ready condition says it.
+	status.SetCondition(&backup.Status.Conditions, ConditionReady, metav1.ConditionFalse,
+		reasonReleasingAfterAbort, truncate(fmt.Sprintf(
+			"%s — releasing the applications this run had already quiesced before the abort "+
+				"(attempt %d of %d); the run will then be reported Failed",
+			st.abortMessage, backup.Status.PostHookAttempts, postHookMaxAttempts), hookMessageLimit),
+		backup.Generation)
+
+	// A process killed between the exec above and the write below loses this attempt's record and
+	// re-runs the thaw next pass. That is the same trade advancePostHooks already makes on the normal
+	// release path, and it is the right way round: a thaw re-run costs an idempotent-ish command, while
+	// an attempt counted for an exec that never happened costs an application its release.
+	//
+	// PERSIST FIRST, THEN PROPAGATE — the same rule Reconcile applies to steps (10b) and (10c), and it
+	// is not optional here: recordUnresolvedRelease increments PostHookAttempts on exactly the error
+	// path below, and that increment is the ONLY thing bounding this hold. A pass that returned the
+	// error without writing status would retry forever against an attempt counter that never moves.
+	if err := r.Status().Update(ctx, backup); err != nil {
+		// errors.Join so a release failure is not lost behind a conflict on the write that was meant
+		// to record it; the write error requeues either way.
+		return ctrl.Result{}, errors.Join(fmt.Errorf(
+			"record the post-abort release for Backup %s/%s: %w", backup.Namespace, backup.Name, err), releaseErr)
+	}
+	if releaseErr != nil {
+		// controller-runtime ignores a Result returned beside an error, so the error IS the requeue —
+		// with backoff, which is the point of propagating a release that could not be resolved.
+		return ctrl.Result{}, releaseErr
+	}
+	return ctrl.Result{RequeueAfter: backupPollInterval}, nil
+}
+
+// releaseAbortedQuiesce runs the thaw owed by an aborted pre phase, and reports whether one is STILL
+// owed after this pass — the same three-state answer closeFreezeWindow gives, for the same reason
+// (see its `owed` section: a boolean error cannot distinguish "retry me" from "nothing to do").
+//
+// It is a SIBLING of closeFreezeWindow rather than a mode of it, and that is a deliberate refusal to
+// widen a function 0.6.5 rewrote twice. Two things genuinely differ, and neither is expressible as a
+// flag without leaving the next reader a parameter whose only plausible use is a gate that had to be
+// removed — which is the exact mistake 0.6.5 recorded when it deleted closeFreezeWindow's
+// hookPhaseState argument:
+//
+//   - THE TRIGGER. closeFreezeWindow fires on snapshotsCut, every volume having LEFT
+//     Pending/Snapshotting. On this path no volume ever leaves Pending — that is what aborting MEANS
+//     — so snapshotsCut is false forever and gating on it would be a thaw that never runs. The
+//     trigger here is the abort itself, which is already durable in status.
+//   - THE SCOPE. The whole-run release thaws everything the post phase resolves. This one owes a thaw
+//     only to the pods it actually froze (quiescedPodsFromStatus), because the pods behind the
+//     aborting hook were never quiesced and the pod whose hook failed was not either.
+//
+// Everything that BOUNDS the hold is shared rather than re-derived, and that is the half worth being
+// strict about: postHooksRan for "settled or spent", the spec-derived guard for "no release can ever
+// be owed", the `!ran` guard for "there was nothing to run", advancePostHooks for the attempt
+// accounting and the Events. Lot 10's report is explicit that a mutation survived until BOTH guards
+// existed; both are here, in the same order, for the same reasons.
+func (r *BackupReconciler) releaseAbortedQuiesce(ctx context.Context, backup *cbv1.Backup,
+	spec cbv1.HooksSpec,
+) (owed bool, err error) {
+	// Settled, or the budget is spent. postHooksRan covers both, and it is what ends the hold.
+	if postHooksRan(backup) {
+		return false, nil
+	}
+	// NO RELEASE CAN EVER BE OWED BY THIS RUN — decided from the spec, before any I/O, exactly as in
+	// closeFreezeWindow. What it prevents there is an aborted run in a namespace whose pods the
+	// operator may not list being held for its whole attempt budget and told three times, once loudly,
+	// that an application may be stuck — over a release it never declared.
+	//
+	// IT IS CURRENTLY REDUNDANT, AND THE MUTATION CAMPAIGN SAID SO RATHER THAN THE COMMENT CLAIMING
+	// OTHERWISE. Deleting these three lines changes no observable behaviour and kills no spec at either
+	// level, because resolveHooks is gated per phase (hookPhaseDeclared, 0.6.5's defect C): a run with
+	// no post hooks and no honorAnnotations resolves the post phase to nil WITHOUT listing pods, so the
+	// paths below reach the same "nothing owed, nothing spent" answer by a longer route. It is kept for
+	// two reasons, neither of which is "it is tested":
+	//
+	//   - the bound must be legible HERE. A reader comparing these two siblings must not find one of
+	//     them missing a guard the other has and be left deducing that the missing one is safe because
+	//     of a predicate three functions away;
+	//   - it is what makes the answer independent of hookPhaseDeclared. If that gate ever narrows — if
+	//     some future phase must list pods speculatively, say — the redundancy ends and this line is the
+	//     only thing between a doomed run and three attempts at a release nobody declared.
+	if len(spec.Post) == 0 && !spec.HonorAnnotations {
+		return false, nil
+	}
+	// NOTHING WAS FROZEN, so nothing is owed: every pre hook that ran failed or was skipped behind the
+	// one that aborted. This is the common single-hook case, and answering it here — before the pod
+	// listing, from status alone — is what keeps `hooks: {pre: [one broken hook], post: [...]}` failing
+	// as promptly as it did before this change.
+	//
+	// It is also why quiescedPods distinguishes nil from empty: an empty set handed to
+	// restrictToPods would filter every hook away and land in the `!ran` branch below, which is the
+	// right answer by luck rather than by construction, after a pods-list that could have failed and
+	// held the run. The distinction is documented on the type; this is the caller that respects it.
+	//
+	// UNLIKE THE GUARD ABOVE, THIS ONE IS LOAD-BEARING AND PINNED: deleting it turns
+	// TestReleaseAbortedQuiesceOwedIsThreeState's "nothing was ever frozen" case red — a refused
+	// pods-list then books an attempt and holds a doomed run, over applications this run demonstrably
+	// never quiesced. No envtest spec catches it, because none of them aborts a quiesce while declaring
+	// post hooks AND freezing nothing; the unit case is the right level for it and is where it lives.
+	frozen := quiescedPodsFromStatus(backup)
+	if len(frozen) == 0 {
+		return false, nil
+	}
+	ran, err := r.advancePostHooks(ctx, backup, spec, backup.Status.Volumes, frozen)
+	if err != nil {
+		// The hooks could not be RESOLVED, so we cannot know whether the thaw reached the applications
+		// we know we froze. Assume the worst and hold; advancePostHooks has already spent an attempt on
+		// it (recordUnresolvedRelease), so the hold costs at most the budget.
+		return true, err
+	}
+	if !ran {
+		// Nothing resolved for those pods — no post hook matches them, or no exec path is wired — so
+		// nothing is owed and, crucially, nothing was SPENT. Reporting owed here would be a hold with
+		// no budget behind it, which is the one shape that must not exist: the run would never reach
+		// Failed, its ClusterBackup would never roll up, and a Forbid schedule would skip every
+		// following night. That is 0.6.5's thirty-hour incident manufactured on purpose.
+		return false, nil
+	}
+	// The attempt executed. Another is owed only if it left an intolerable failure behind and the
+	// budget is not yet spent, which is exactly what postHooksRan answers.
+	return !postHooksRan(backup), nil
 }
 
 // closeFreezeWindow is step (10c) of Reconcile: the release, fired on the snapshots being CUT —
@@ -420,7 +717,9 @@ func (r *BackupReconciler) closeFreezeWindow(ctx context.Context, backup *cbv1.B
 		// does not roll up to a terminal phase.
 		return true, nil
 	}
-	ran, err := r.advancePostHooks(ctx, backup, spec, backup.Status.Volumes)
+	// A nil restriction: the whole-run release thaws everything the post phase resolves. The scoped
+	// variant belongs to the abort path only — see releaseAbortedQuiesce.
+	ran, err := r.advancePostHooks(ctx, backup, spec, backup.Status.Volumes, nil)
 	if err != nil {
 		// The hooks could not be RESOLVED, so we cannot know whether an application is frozen. Assume
 		// the worst and hold; it costs at most the attempt budget.
@@ -560,8 +859,19 @@ func emitHookSpan(
 
 // advancePostHooks runs the release as soon as every snapshot is cut, whatever their outcome — and
 // whatever the pre phase did, including not existing (see closeFreezeWindow, defect B).
+//
+// owedTo, when non-nil, restricts the release to those pods. Only the ABORT path passes it
+// (releaseAbortedQuiesce): a run whose quiesce was cut short owes a thaw to the applications it
+// actually froze and to no others. The whole-run release passes nil, and the filter is applied AFTER
+// resolution rather than by narrowing the pod listing because resolution is also where the
+// annotation-versus-spec precedence and the mounts-a-backed-up-PVC boundary are decided — a second
+// place deciding which pods exist is a second place for them to disagree.
+//
+// A restriction that filters everything away lands in the len(resolved)==0 branch, so it spends no
+// attempt and reports ran=false. That is correct but reached by accident, which is why the abort path
+// answers "nothing was frozen" from status before it ever gets here.
 func (r *BackupReconciler) advancePostHooks(ctx context.Context, backup *cbv1.Backup,
-	spec cbv1.HooksSpec, volumes []cbv1.VolumeStatus,
+	spec cbv1.HooksSpec, volumes []cbv1.VolumeStatus, owedTo quiescedPods,
 ) (ran bool, err error) {
 	resolved, err := r.resolveHooks(ctx, backup, spec, volumes, hooks.PhasePost)
 	if err != nil {
@@ -581,6 +891,7 @@ func (r *BackupReconciler) advancePostHooks(ctx context.Context, backup *cbv1.Ba
 		r.recordUnresolvedRelease(backup, err)
 		return false, err
 	}
+	resolved = restrictToPods(resolved, owedTo)
 	if len(resolved) == 0 || r.Hooks == nil {
 		return false, nil
 	}

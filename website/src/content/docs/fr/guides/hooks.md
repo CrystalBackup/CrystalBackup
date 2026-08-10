@@ -4,7 +4,7 @@ description: Quiescer une application autour du snapshot, et le ServiceAccount q
 sidebar:
   order: 8
 sourceFile: src/content/docs/guides/hooks.md
-sourceHash: 0064b0999b62fec19fd3330b892e74e3ffe60d1e
+sourceHash: aa330aadec32e40dbc0d75d4e2e8c66ba9140b61
 ---
 
 Les snapshots sont **crash-consistent** par défaut : le même état que votre application
@@ -219,10 +219,31 @@ post	postgres-0	postgres	spec	Succeeded
 quiescés, si le relâchement a bien eu lieu, et — quand ce n'est pas le cas — ce que vous avez
 à défaire à la main.
 
-Les résultats sont `Succeeded`, `Failed` et `Skipped`. `Skipped` signifie qu'un hook
-antérieur de la même phase a échoué avec `onError: Fail`, si bien que celui-ci ne s'est
-jamais exécuté. Il est enregistré plutôt qu'omis, et c'est délibéré : une liste montrant
-trois hooks sur cinq invite le lecteur à supposer que les deux manquants sont passés.
+Les résultats sont `Succeeded`, `Failed` et `Skipped`. `Skipped` n'apparaît jamais que dans
+la phase **pre** : un hook antérieur de celle-ci a échoué avec `onError: Fail`, si bien que
+celui-ci ne s'est jamais exécuté. Il est enregistré plutôt qu'omis, et c'est délibéré — une
+liste montrant trois hooks sur cinq invite le lecteur à supposer que les deux manquants sont
+passés.
+
+La phase **post**, elle, ne s'arrête jamais. Chaque entrée y est un dégel dû à une
+application différente : un relâchement cassé sur un pod ne coûte que ce pod, les autres
+s'exécutent quand même.
+
+## Quand un hook pre avorte la sauvegarde
+
+Un hook pre en `onError: Fail` interrompt la quiescence, et le run se termine en `Failed`
+sans snapshot. Mais les hooks qui le **précédaient** ont réussi, et leurs applications sont
+quiescées — le run les relâche donc avant de signaler l'échec. Concrètement :
+
+- le relâchement est limité aux pods **réellement** quiescés. Un pod dont le hook a échoué,
+  et un pod situé derrière l'avortement et marqué `Skipped`, n'ont jamais été gelés et ne
+  reçoivent aucun dégel ;
+- pendant ce relâchement le Backup reste en `SnapshottingHooks`, avec
+  `Ready: ReleasingAfterAbortedQuiesce` qui nomme l'avortement et le numéro de tentative ;
+- il est borné par les mêmes trois tentatives que n'importe quel relâchement, et se termine
+  sur le même Warning `UnfreezeFailed` quand elles sont épuisées ;
+- le run rapporte ensuite `Failed` pour l'avortement du hook pre. Un dégel réussi n'en fait
+  pas un succès : aucun snapshot n'a été pris.
 
 `source` vaut `spec` ou `annotation` — c'est ainsi que vous savez si la commande qui s'est
 exécutée est bien celle que vous avez écrite.

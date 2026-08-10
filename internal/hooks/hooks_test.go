@@ -254,12 +254,19 @@ func TestRunOnErrorContinue(t *testing.T) {
 
 // TestRunFailStopsAndReportsSkipped: a status listing three hooks where the CR declares five
 // invites the reader to assume the other two passed. Every hook gets a Result.
+//
+// The phase is stamped explicitly since 0.6.6, because it is now what decides whether the chain stops
+// at all — see TestRunStopsThePreChainOnly. A pre chain has one collective product, so abandoning the
+// rest of it once that product is forfeit is the kindest thing available.
 func TestRunFailStopsAndReportsSkipped(t *testing.T) {
 	exec := &fakeExec{fail: map[string]error{"db-0": errors.New("exit status 1")}}
 	hooks := []Resolved{
-		{Pod: types.NamespacedName{Name: "db-0"}, Command: []string{"a"}, OnError: cbv1.HookErrorPolicyFail},
-		{Pod: types.NamespacedName{Name: "db-1"}, Command: []string{"b"}, OnError: cbv1.HookErrorPolicyFail},
-		{Pod: types.NamespacedName{Name: "db-2"}, Command: []string{"c"}, OnError: cbv1.HookErrorPolicyFail},
+		{Pod: types.NamespacedName{Name: "db-0"}, Command: []string{"a"}, OnError: cbv1.HookErrorPolicyFail,
+			Phase: PhasePre},
+		{Pod: types.NamespacedName{Name: "db-1"}, Command: []string{"b"}, OnError: cbv1.HookErrorPolicyFail,
+			Phase: PhasePre},
+		{Pod: types.NamespacedName{Name: "db-2"}, Command: []string{"c"}, OnError: cbv1.HookErrorPolicyFail,
+			Phase: PhasePre},
 	}
 
 	results := Run(context.Background(), exec, hooks)
@@ -276,6 +283,80 @@ func TestRunFailStopsAndReportsSkipped(t *testing.T) {
 	}
 	if len(exec.calls) != 1 {
 		t.Errorf("exec calls = %v; nothing may run after an aborting hook", exec.calls)
+	}
+}
+
+// TestRunStopsThePreChainOnly is 0.6.6 lot 2's second fix, stated at the level it lives at.
+//
+// A Fail-policy POST hook failure used to mark the rest of the chain Skipped, and the controller
+// restarts the release from the beginning on every retry — so a permanently broken first hook meant
+// the later pods were never thawed across all three attempts. UnfreezeFailed fired, so it was loud;
+// it named the one pod whose command failed and said nothing about the others, which were the ones a
+// human could actually have unfrozen by hand.
+//
+// A POST chain is not one act with one product. Every entry is a thaw owed to a DIFFERENT
+// application, and they have nothing to do with one another, so a broken one must cost its own pod
+// only. The three sub-cases are one claim each.
+//
+// Mutations that must turn this red: chainStopsOnAbort returning true unconditionally (the post case
+// fails); returning false unconditionally (the pre and unstamped cases fail).
+func TestRunStopsThePreChainOnly(t *testing.T) {
+	chain := func(phase Phase) []Resolved {
+		return []Resolved{
+			{Pod: types.NamespacedName{Name: "db-0"}, Command: []string{"a"},
+				OnError: cbv1.HookErrorPolicyFail, Phase: phase},
+			{Pod: types.NamespacedName{Name: "db-1"}, Command: []string{"b"},
+				OnError: cbv1.HookErrorPolicyFail, Phase: phase},
+			{Pod: types.NamespacedName{Name: "db-2"}, Command: []string{"c"},
+				OnError: cbv1.HookErrorPolicyFail, Phase: phase},
+		}
+	}
+
+	// THE FIX. The release chain runs to the end: two applications get their thaw, and the ErrSkipped
+	// marker — which on a release entry would mean "a frozen application nobody is coming back for" —
+	// never appears.
+	exec := &fakeExec{fail: map[string]error{"db-0": errors.New("exit status 1")}}
+	results := Run(context.Background(), exec, chain(PhasePost))
+	if len(exec.calls) != 3 {
+		t.Errorf("exec calls = %v, want all three: a thaw owed to db-1 and db-2 was abandoned because a "+
+			"DIFFERENT application's hook was broken", exec.calls)
+	}
+	if !results[0].Failed() || !results[0].Aborts() {
+		t.Errorf("first result = %+v — the broken hook must still be recorded as an intolerable failure, "+
+			"or nothing pages the human who has to unfreeze it by hand", results[0])
+	}
+	for _, r := range results[1:] {
+		if r.Failed() {
+			t.Errorf("result %+v — a healthy thaw behind a broken one must simply run", r)
+		}
+		if errors.Is(r.Err, ErrSkipped) {
+			t.Error("a release entry was marked Skipped: an application left frozen with a status entry " +
+				"saying its thaw never ran, and no later attempt that reaches it")
+		}
+	}
+
+	// THE ANTI-REGRESSION. The pre chain still stops: it is one collective act producing one point in
+	// time, and once R16 has forfeited that point there is nothing to be gained by quiescing more
+	// applications for longer.
+	exec = &fakeExec{fail: map[string]error{"db-0": errors.New("exit status 1")}}
+	results = Run(context.Background(), exec, chain(PhasePre))
+	if len(exec.calls) != 1 {
+		t.Errorf("exec calls = %v; nothing may run after an aborting PRE hook — the snapshot is already "+
+			"forfeit and every extra hook is an application quiesced for nothing", exec.calls)
+	}
+	for _, r := range results[1:] {
+		if !errors.Is(r.Err, ErrSkipped) {
+			t.Errorf("result %+v, want ErrSkipped", r)
+		}
+	}
+
+	// AND THE UNSTAMPED PHASE FAILS CLOSED, which is why the predicate is `!= PhasePost` rather than
+	// `== PhasePre`: a phase added later, or a caller that forgets to stamp one, inherits the strict
+	// chain semantics until somebody argues otherwise for it.
+	exec = &fakeExec{fail: map[string]error{"db-0": errors.New("exit status 1")}}
+	Run(context.Background(), exec, chain(""))
+	if len(exec.calls) != 1 {
+		t.Errorf("exec calls = %v for an unstamped phase; chain semantics must fail closed", exec.calls)
 	}
 }
 

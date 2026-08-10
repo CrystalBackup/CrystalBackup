@@ -744,6 +744,14 @@ func (r *BackupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	}
 
 	// (9b) The freeze window opens here (R16), before any VolumeSnapshot exists.
+	//
+	// (9c) AND AN ABORTED QUIESCE IS UNDONE HERE, which is why done=true no longer implies "the run is
+	// over". A pre chain that stopped at an onError=Fail failure has already quiesced the applications
+	// BEFORE the failing hook, and this door is the only one left that can release them: writing the
+	// terminal Failed makes the short-circuit above the single most effective way to strand a frozen
+	// database. So the abort branch may now return non-terminal for up to postHookMaxAttempts passes,
+	// releasing what it froze, before it fails the run for the pre-hook reason. See abortFreezeWindow
+	// for the ordering, the two rejected alternatives, and why the hold cannot outlive the budget.
 	hookSt := hookState(&backup)
 	if res, done, err := r.openFreezeWindow(ctx, &backup, rc, hookSt, run.Hooks); done {
 		return res, err
@@ -1129,6 +1137,16 @@ func backupMetricSeries(backup *cbv1.Backup, rc *backupRunContext) metrics.Backu
 // trustworthy, so capturing anyway would produce a backup that LOOKS application-consistent and is
 // not — the one outcome worse than having no backup, because it is discovered at restore time.
 // It never requeues: Failed is terminal, so the caller's pass simply ends here.
+//
+// SINCE 0.6.6 IT IS NOT THE ABORT'S FIRST ACT BUT ITS LAST. abortFreezeWindow releases the
+// applications the aborted chain had already quiesced and calls this only once that release is
+// settled or its attempt budget is spent, because this write is what makes the run terminal and a
+// terminal Backup short-circuits at the top of Reconcile — there is no pass after this one. The
+// STATUS WRITE BELOW IS THEREFORE ALSO THE RELEASE'S: the hook entries and PostHookAttempts sit on
+// the same in-memory object, so the thaw and the terminal phase land together. A thaw that ended
+// badly is not hidden by that — it keeps its Failed entries, and the loud UnfreezeFailed Event has
+// already been emitted — but the run's own verdict stays what it was: a quiesce that did not happen
+// and a snapshot that was never taken.
 func (r *BackupReconciler) failHooks(ctx context.Context, backup *cbv1.Backup, rc *backupRunContext, message string) error {
 	backup.Status.Phase = string(status.BackupPhaseFailed)
 	justTerminal := backup.Status.BackupTime == nil

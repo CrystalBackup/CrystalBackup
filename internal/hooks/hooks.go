@@ -136,6 +136,13 @@ func (r Result) Failed() bool { return r.Err != nil }
 
 // Aborts reports whether this failure must stop the backup: a failed hook with onError Fail. A
 // hook with onError Continue records its error and the run proceeds.
+//
+// IT DOES NOT MEAN "ABANDON THE REST OF THE CHAIN", and conflating the two was a real defect (0.6.6
+// lot 2). Run used to treat this predicate as both questions at once, which is correct for the PRE
+// phase and wrong for the POST phase — see chainStopsOnAbort. Every OTHER caller wants exactly this
+// question and nothing else: untoleratedResults counts the failures that still owe somebody
+// something, hookFailureTolerated decides whether a recorded failure aborts the run. The contract
+// here is unchanged; what moved out of it is the chain decision.
 func (r Result) Aborts() bool {
 	return r.Err != nil && r.Hook.OnError != cbv1.HookErrorPolicyContinue
 }
@@ -300,18 +307,55 @@ func parseCommand(raw string) []string {
 // unhelpfully opaque.
 var ErrNoCommand = errors.New("hook has no command")
 
+// chainStopsOnAbort reports whether a failure whose policy is Fail must abandon the hooks BEHIND it
+// in the same phase. It is the per-phase half of what Result.Aborts() used to answer alone, and
+// separating them is 0.6.6 lot 2's second fix.
+//
+// # Why the answer differs by phase, and it is not a preference
+//
+// A PRE chain is one collective act with one product: a point in time that is worth trusting. The
+// hooks in it are not independent — hook 3 quiescing a cache is meaningless once hook 2 failed to
+// quiesce the database the cache fronts — and the moment any of them fails under `Fail`, R16 says
+// there will be no snapshot at all (01-architecture.md §5). Continuing would be quiescing more
+// applications, for longer, to produce nothing. Stopping is not merely allowed there, it is the
+// kindest thing available.
+//
+// A POST chain is the exact opposite shape: every entry is a THAW OWED TO A DIFFERENT APPLICATION,
+// and they have nothing to do with one another. Stopping at the first failure meant a permanently
+// broken hook on the first pod left every later pod frozen — across all three attempts, because the
+// retry restarts the chain from the beginning and dies at the same place. `UnfreezeFailed` did fire,
+// so the operator was told loudly that something was stuck; it named the ONE pod whose command
+// failed, and said nothing about the others, which were the ones a human could actually have
+// unfrozen by hand. That is the defect this closes: the chain runs to the end, every entry gets a
+// real result, and a broken thaw costs its own pod only.
+//
+// THE TEST IS `!= PhasePost` RATHER THAN `== PhasePre`, deliberately. A phase added later inherits
+// the strict, chain-stopping behaviour until somebody argues otherwise for it, and the zero Phase —
+// which unit tests and any future caller that forgets to stamp it produce — inherits it too. Failing
+// closed on chain semantics costs at most some unrun hooks; failing open costs a quiesce nobody
+// wanted, held while the rest of a doomed chain runs.
+func chainStopsOnAbort(phase Phase) bool { return phase != PhasePost }
+
 // Run executes hooks in order and returns one Result each, ALWAYS one per hook — including the
 // ones skipped after an abort, so a caller reporting status can distinguish "did not run" from
 // "ran and passed".
 //
-// It stops at the first failure whose policy is Fail. Ordering is the caller's: Resolve preserves
-// pod order and, within a pod, spec order.
+// In the PRE phase it stops at the first failure whose policy is Fail; in the POST phase it runs
+// every hook whatever the earlier ones did (see chainStopsOnAbort for why the two phases cannot
+// share one answer). Ordering is the caller's: Resolve preserves pod order and, within a pod, spec
+// order.
+//
+// The per-hook phase is consulted rather than a phase parameter, and that is on purpose: Resolve
+// stamps Phase on every hook it produces, so the fact is already carried by the data. A parameter
+// would be a second source for it, and a caller that passed the wrong one would get a chain that
+// stops in the release phase — which is precisely the bug being fixed, reintroduced by an argument
+// list instead of by a predicate.
 func Run(ctx context.Context, exec Executor, hooks []Resolved) []Result {
 	results := make([]Result, 0, len(hooks))
 	for i, h := range hooks {
 		res := runOne(ctx, exec, h)
 		results = append(results, res)
-		if res.Aborts() {
+		if res.Aborts() && chainStopsOnAbort(h.Phase) {
 			// Everything after an aborting hook is reported as not-run rather than dropped: a
 			// status listing three hooks where the CR declares five invites the reader to assume
 			// the other two passed.
@@ -324,7 +368,11 @@ func Run(ctx context.Context, exec Executor, hooks []Resolved) []Result {
 	return results
 }
 
-// ErrSkipped marks a hook that never ran because an earlier one aborted the phase.
+// ErrSkipped marks a hook that never ran because an earlier one aborted the phase. Since 0.6.6 it
+// can only appear in the PRE phase — a POST chain runs to the end (chainStopsOnAbort) — and the
+// controller relies on that in both directions: it must not thaw a pod whose quiesce carries this
+// marker (nothing ever froze it), and it must never see it on a release entry, because a thaw that
+// "did not run" is a frozen application nobody is coming back for.
 var ErrSkipped = errors.New("skipped: an earlier hook failed with onError=Fail")
 
 // runOne executes a single hook under its own deadline.

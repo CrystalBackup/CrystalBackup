@@ -56,8 +56,19 @@ func createHookedParent(name, location string, sel cbv1.PVCSelector, hooksSpec c
 // has no kubelet, so the Running phase is written by hand.
 func createMountingPod(namespace, name, pvc string, annotations map[string]string) {
 	GinkgoHelper()
+	createLabelledMountingPod(namespace, name, pvc, nil, annotations)
+}
+
+// createLabelledMountingPod is the same, with labels — which a spec needs whenever it declares
+// hooks with a podSelector, i.e. whenever DIFFERENT pods must run DIFFERENT commands. That is the
+// shape of every real multi-workload namespace, and of the aborted-chain specs in
+// hooks_abort_release_test.go, where one pod's quiesce must succeed and another's must fail.
+func createLabelledMountingPod(namespace, name, pvc string, labels, annotations map[string]string) {
+	GinkgoHelper()
 	pod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name, Annotations: annotations},
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: namespace, Name: name, Labels: labels, Annotations: annotations,
+		},
 		Spec: corev1.PodSpec{
 			Containers: []corev1.Container{{Name: "db", Image: "busybox"}},
 			Volumes: []corev1.Volume{{
