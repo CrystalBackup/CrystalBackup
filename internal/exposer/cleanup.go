@@ -124,9 +124,35 @@ func reclaimOrigin(ctx context.Context, c client.Client, ex *Exposure) error {
 // setting deletionPolicy=Delete and deleting the content directly makes the CSI snapshotter
 // reclaim the storage snapshot (a Retain-orphaned content would otherwise linger forever). With
 // no labels to select on there is nothing safe to do here, so it defers entirely to the reaper.
+//
+// A label whose value is EMPTY is one of those "nothing safe to do" cases, and learning that cost
+// 0.6.5 a leaked cluster-scoped content and five failed leak checks. The caller's identity map for a
+// namespace-plane backup used to contain crystalbackup.io/cluster-backup="" (no ClusterBackup parent
+// to name), and MatchingLabels turns that into `cluster-backup=`, which selects objects whose value
+// for that key is the empty STRING. The origin content this function hunts for does not carry the key
+// at all — it is label-stamped by patchOriginVSCForHandover, and mergeLabels skips a key whose desired
+// value equals the missing-and-therefore-"" current one. So the selector was built from labels the
+// target provably could not have, matched nothing, and reported a clean reclaim on every namespace-
+// plane teardown.
+//
+// The guard below refuses that selector instead of issuing it. It cannot repair it: labels are opaque
+// to this package by design (nothing here imports apiconst), so we cannot know which key was meant to
+// identify the owner, and dropping the empty key would leave a selector that no longer pins one owner
+// — on the namespace plane, (managed-by, namespace, pvc) alone matches a CONCURRENT run's origin
+// content for the same PVC, and this function's reaction to a match is restore-then-DELETE. Reclaiming
+// a live backup's snapshot is far worse than deferring to the reaper, which is the documented backstop
+// for exactly this "cannot select safely" case. The real fix is upstream, where the map is built:
+// controller.exposureLabels stamps no empty values and names the owner on both planes.
 func reclaimOrphanOriginVSC(ctx context.Context, c client.Client, ex *Exposure) error {
 	if len(ex.Labels) == 0 {
 		return nil // nothing to select on; the orphan reaper is the backstop.
+	}
+	for key, value := range ex.Labels {
+		if value == "" {
+			return fmt.Errorf("exposure label %q has an empty value, so no selector built from these"+
+				" labels can identify this exposure's origin VolumeSnapshotContent: refusing the"+
+				" crash-window reclaim and leaving it to the orphan reaper", key)
+		}
 	}
 	list := newUnstructuredList(volumeSnapshotContentGVK())
 	if err := c.List(ctx, list, client.MatchingLabels(ex.Labels)); err != nil {

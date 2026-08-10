@@ -284,7 +284,7 @@ func (r *OrphanReaper) sweepOnce(ctx context.Context) error {
 			func() error {
 				return r.Delete(ctx, obj, client.PropagationPolicy(metav1.DeletePropagationBackground))
 			},
-			"run", obj.GetLabels()[apiconst.LabelClusterBackup], "pvc", obj.GetLabels()[apiconst.LabelPVC])
+			"backup", ownerBackupNameFromLabels(obj.GetLabels()), "pvc", obj.GetLabels()[apiconst.LabelPVC])
 	}
 
 	for i := range jobs.Items {
@@ -512,7 +512,7 @@ func (r *OrphanReaper) reapSnapshotObjects(ctx context.Context, cutoff time.Time
 			func() error { return exposer.PrepareOrphanVolumeSnapshotContentForReclaim(ctx, r.Client, item) },
 			func() error { return r.Delete(ctx, item) },
 			"preProvisioned", exposer.IsPreProvisionedContent(item),
-			"run", item.GetLabels()[apiconst.LabelClusterBackup], "pvc", item.GetLabels()[apiconst.LabelPVC])
+			"backup", ownerBackupNameFromLabels(item.GetLabels()), "pvc", item.GetLabels()[apiconst.LabelPVC])
 	}
 
 	for _, item := range staticVSCs {
@@ -533,7 +533,7 @@ func (r *OrphanReaper) reapSnapshotObjects(ctx context.Context, cutoff time.Time
 			"leftover VolumeSnapshot whose nominal teardown never completed",
 			nil, // deleting the snapshot object is the whole reap; its content is handled in its own pass.
 			func() error { return r.Delete(ctx, item) },
-			"run", item.GetLabels()[apiconst.LabelClusterBackup], "pvc", item.GetLabels()[apiconst.LabelPVC])
+			"backup", ownerBackupNameFromLabels(item.GetLabels()), "pvc", item.GetLabels()[apiconst.LabelPVC])
 	}
 	for _, item := range dynamicVSCs {
 		reapVSC(item)
@@ -728,9 +728,23 @@ func (r *OrphanReaper) reapRestorePV(ctx context.Context, pv *corev1.PersistentV
 // cutoff, carry a per-PVC label (so it is a per-PVC exposure object, not a repository-init
 // Job), and its OWNER must be gone or done with it. The owner is resolved by the object's
 // own labels: a restore label (crystalbackup.io/restore or /cluster-restore) resolves a
-// Restore/ClusterRestore whose terminal phase means its teardown should already have run; a
-// cluster-backup label resolves the owning Backup, with the per-PVC volume-phase check. An
-// owner that is being deleted is left to its finalizer; live work is never reaped.
+// Restore/ClusterRestore whose terminal phase means its teardown should already have run;
+// otherwise the owning Backup is resolved by NAME (ownerBackupNameFromLabels) within the labelled
+// namespace, with the per-PVC volume-phase check. An owner that is being deleted is left to its
+// finalizer; live work is never reaped.
+//
+// The name lookup used to read crystalbackup.io/cluster-backup directly, which made this backstop
+// blind to the entire NAMESPACE plane: a Backup with no ClusterBackup parent stamps no run, the
+// value arrived here as "", and the short-circuit below refused the object as unresolvable — one
+// branch above the IsNotFound verdict that was precisely the answer it needed. That is how the
+// 0.6.5 campaign's leaked VolumeSnapshotContent survived three hours of ten-minute sweeps with its
+// owning Backup (and its whole namespace) long gone. The run label is now one entry in a fallback
+// chain rather than the identity, and the chain's last resort — an object carrying no owner name at
+// all, which is what an earlier version left on the namespace plane — goes through
+// unattributedExposureOrphaned rather than being abandoned.
+//
+// What did NOT change is the refusal itself: the goal was to resolve the namespace plane, not to
+// make the reaper braver. An object with no namespace to resolve an owner IN is still left alone.
 func (r *OrphanReaper) orphaned(ctx context.Context, obj client.Object, cutoff time.Time) (bool, error) {
 	labels := obj.GetLabels()
 	if labels[apiconst.LabelPVC] == "" {
@@ -747,13 +761,16 @@ func (r *OrphanReaper) orphaned(ctx context.Context, obj client.Object, cutoff t
 		return r.clusterRestoreOrphaned(ctx, labels[apiconst.LabelClusterRestore])
 	}
 
-	run := labels[apiconst.LabelClusterBackup]
 	ns := labels[apiconst.LabelNamespace]
-	if run == "" || ns == "" {
-		return false, nil // no resolvable owner shape; leave it alone.
+	if ns == "" {
+		return false, nil // no namespace to resolve an owner in: no resolvable owner shape.
+	}
+	name := ownerBackupNameFromLabels(labels)
+	if name == "" {
+		return r.unattributedExposureOrphaned(ctx, ns, labels[apiconst.LabelPVC])
 	}
 	var backup cbv1.Backup
-	if err := r.Get(ctx, client.ObjectKey{Namespace: ns, Name: run}, &backup); err != nil {
+	if err := r.Get(ctx, client.ObjectKey{Namespace: ns, Name: name}, &backup); err != nil {
 		if apierrors.IsNotFound(err) {
 			return true, nil // owning Backup is gone: pure orphan.
 		}
@@ -768,6 +785,64 @@ func (r *OrphanReaper) orphaned(ctx context.Context, obj client.Object, cutoff t
 		}
 	}
 	return true, nil // the Backup no longer tracks this PVC — its exposure is residue.
+}
+
+// unattributedExposureOrphaned is the reap verdict for an exposure object that names no owner: the
+// shape an operator OLDER than apiconst.LabelBackup left on the namespace plane, where the run label
+// was stamped empty on created objects and (through exposer.mergeLabels' skip-if-equal rule) not
+// stamped at all on the patched origin content. There is no name to GET, and refusing on that basis
+// would make an operator upgrade permanently strand every piece of residue the previous version had
+// already leaked — including the object this release exists to collect.
+//
+// So the owner is resolved BY EXCLUSION instead: list the Backups in the labelled namespace and ask
+// whether any of them could still want an exposure of this PVC. None ⇒ nobody owns it ⇒ reap. This
+// is weaker than a name lookup and it is treated as such:
+//
+//   - an unreadable Backup list refuses the reap. An owner set we could not read is not an empty
+//     one, and this is a DELETE decision — the same rule as the residue read's "unreadable is not
+//     clean", with more at stake;
+//   - a Backup with no volume status yet counts as a possible owner (it may be about to expose this
+//     PVC), so the MinAge race guard the caller already applied is not quietly undone here;
+//   - an empty PVC label cannot be excluded against and is refused. orphaned() rejects those before
+//     we get here; this is the second lock on the same door, because the whole value of this path is
+//     that it cannot be talked into deleting a live run's snapshot.
+//
+// It is scoped to objects with NO owner name, so it applies only to pre-upgrade residue and retires
+// itself as that residue is collected. Everything this version stamps takes the exact name lookup.
+func (r *OrphanReaper) unattributedExposureOrphaned(ctx context.Context, ns, pvc string) (bool, error) {
+	if pvc == "" {
+		return false, nil
+	}
+	var backups cbv1.BackupList
+	if err := r.List(ctx, &backups, client.InNamespace(ns)); err != nil {
+		return false, fmt.Errorf("list Backups in %s to resolve an unattributed exposure object: %w", ns, err)
+	}
+	for i := range backups.Items {
+		if backupMayStillNeedExposure(&backups.Items[i], pvc) {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// backupMayStillNeedExposure reports whether b could still be the owner of a live exposure of pvc —
+// the pessimistic half of unattributedExposureOrphaned's by-exclusion resolution. It answers "could
+// this Backup still want it?", not "does this Backup own it?": without an owner label on the object,
+// the second question has no answer and only the first is safe to act on.
+func backupMayStillNeedExposure(b *cbv1.Backup, pvc string) bool {
+	for i := range b.Status.Volumes {
+		if b.Status.Volumes[i].Pvc != pvc {
+			continue
+		}
+		// A candidate owner. Non-terminal means live work. Terminal but mid-deletion means its
+		// finalizer is running the teardown, and two collectors on one object is how a teardown
+		// races itself.
+		return !volumePhaseTerminal(b.Status.Volumes[i].Phase) || !b.DeletionTimestamp.IsZero()
+	}
+	// It tracks no volume for this PVC. A Backup that has not reached a terminal phase may simply not
+	// have got there yet, so it stays a possible owner; one that has finished without ever recording
+	// this PVC is not.
+	return !isTerminalBackupPhase(b.Status.Phase)
 }
 
 // restoreOrphaned resolves a restore-owned object: reap when the owning Restore is gone or

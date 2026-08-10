@@ -31,6 +31,10 @@ func TestConstants(t *testing.T) {
 		{"DefaultOperatorNamespace", DefaultOperatorNamespace, "crystal-backup-system"},
 
 		{"LabelClusterBackup", LabelClusterBackup, "crystalbackup.io/cluster-backup"},
+		// Deliberately the same string as FinalizerBackup, exactly as LabelLocation and
+		// FinalizerLocation already share one: labels and finalizers are different fields, and one
+		// domain-scoped word per concept beats two spellings of "backup".
+		{"LabelBackup", LabelBackup, "crystalbackup.io/backup"},
 		{"LabelOrigin", LabelOrigin, "crystalbackup.io/origin"},
 		{"LabelSchedule", LabelSchedule, "crystalbackup.io/schedule"},
 		{"LabelNamespace", LabelNamespace, "crystalbackup.io/namespace"},

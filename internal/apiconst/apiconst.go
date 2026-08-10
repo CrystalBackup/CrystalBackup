@@ -49,6 +49,37 @@ const (
 	// child Backup.metadata.name (see spec/02-api.md §Repository layout — "run" tag).
 	LabelClusterBackup = Domain + "/cluster-backup"
 
+	// LabelBackup names the OWNING Backup on every object one of its exposures creates or patches
+	// (the per-PVC VS/VSC pair, the temp clone PVC, the mover Job and its creds Secret). Its value
+	// is that Backup's metadata.name, and its namespace is LabelNamespace — together they are the
+	// object key of the owner, on BOTH planes.
+	//
+	// It exists because LabelClusterBackup is NOT that key. On the cluster plane the two coincide —
+	// a fan-out child's name equals the run, which is LabelClusterBackup's documented value contract
+	// above — but on the namespace plane a Backup has no ClusterBackup parent, so
+	// backup.Labels[LabelClusterBackup] is the EMPTY STRING, and every reader keyed on it went blind:
+	//
+	//   - exposureResidueRemains selected with MatchingLabels{cluster-backup: ""}, which selects the
+	//     objects whose value for that key is literally "" — NOT "any" — so the sweep's verification
+	//     read could not see the objects it exists to verify, and stamped "exposures cleaned" without
+	//     having looked;
+	//   - OrphanReaper.orphaned refused every namespace-plane object as "no resolvable owner shape",
+	//     one branch above the IsNotFound verdict that was exactly the answer it needed;
+	//   - exposer.reclaimOrphanOriginVSC listed by the exposure labels, which on that plane carried
+	//     the same empty value — while the origin content it hunts for does not carry the key at all,
+	//     because the handover patch merges labels and skips a key whose desired value is already
+	//     "equal" to the missing one. So the crash-window reclaim could never match its own target.
+	//
+	// That trio is the 0.6.5 campaign's single leaked VolumeSnapshotContent: nothing asked for its
+	// deletion, nothing could resolve its owner, and one such object fails EVERY leak check in the
+	// suite. The lesson recorded here: an empty label value is not a wildcard, and a key that is only
+	// populated on one plane must never be a lifecycle reader's identity.
+	//
+	// Objects created BEFORE this label existed do not carry it, so every reader treats it as the
+	// preferred — not the only — way to resolve an owner: see ownerBackupNameFromLabels in
+	// internal/controller for the fallback chain that keeps pre-upgrade residue collectable.
+	LabelBackup = Domain + "/backup"
+
 	// LabelOrigin records which plane produced a Backup: OriginCluster for a
 	// cluster-DR fan-out (read-only to users), OriginNamespace for the user plane.
 	LabelOrigin = Domain + "/origin"

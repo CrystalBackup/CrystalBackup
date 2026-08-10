@@ -101,6 +101,7 @@ l'extérieur de l'operator ne devrait en dépendre.
 
 | Clé | Signification |
 |---|---|
+| `crystalbackup.io/backup` | Le `Backup` auquel appartient un objet d'exposition ou un Job de mover, par son nom. Présent sur les deux plans — contrairement à `crystalbackup.io/cluster-backup`, que seul un run de DR cluster possède — c'est donc avec lui que le balayage de teardown et le reaper d'orphelins résolvent le propriétaire. (Même chaîne que le finalizer `Backup` ; labels et finalizers sont des champs différents.) |
 | `crystalbackup.io/pvc` | La PVC source à laquelle appartient un objet d'exposition ou un Job de mover. |
 | `crystalbackup.io/restore`, `crystalbackup.io/cluster-restore` | Le restore propriétaire. |
 | `crystalbackup.io/pv-role` | `twin` ou `transplant` — marque un PersistentVolume qu'un restore a créé ou adopté. |

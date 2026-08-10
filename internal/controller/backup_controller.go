@@ -2486,22 +2486,55 @@ func (r *BackupReconciler) ensureTerminalTeardown(ctx context.Context, backup *c
 // Backup's exposures — a labelled VolumeSnapshotContent (cluster-scoped), a labelled
 // VolumeSnapshot in the tenant or operator namespace, or a temp clone PVC — as a short
 // human-readable description, or "" when everything is genuinely gone. This is the sweep's
-// verification read: it deliberately checks what the crucible leak-check checks, scoped by the
-// exposure labels (managed-by + run + namespace). A cluster without the snapshot CRDs vacuously
-// has no VS/VSC residue (NoMatch tolerated); an errored LIST reports residue rather than
-// clean — never let an unreadable cluster read as a clean one.
+// verification read: the one thing standing between a missed delete and AnnotationExposuresCleaned,
+// which silences the sweep forever. It deliberately checks what the crucible leak-check checks.
+//
+// EVERY WAY OF NOT KNOWING REPORTS RESIDUE. That principle already covered an unreadable cluster
+// (an errored LIST is residue, never clean); 0.6.5 proved it had to cover an unaddressable one too:
+//
+//   - the selector was managed-by + cluster-backup + namespace, and on the namespace plane the run
+//     value is the empty string. `cluster-backup=` selects objects whose value for that key is "",
+//     which the leaked origin content did not carry at all (see exposureLabels rule 2). So the read
+//     returned nothing, the sweep called itself clean without having looked at the object it exists
+//     to verify, and the marker sealed it. A verification that cannot fail is worse than none,
+//     because it is believed — that is the defect class this release exists to remove, and it was
+//     sitting inside the release's own safety net;
+//   - so the selector is now VALIDATED before use, and a coordinate that cannot address this
+//     Backup's objects is reported as loudly as an API error rather than as a clean bill of health.
+//
+// Selection is (managed-by + namespace) — coordinates that are non-empty for every Backup on both
+// planes — and ATTRIBUTION to this specific Backup happens in Go, via exposureResidueBelongsTo.
+// Doing it that way rather than by putting the owner name in the selector is deliberate: the
+// attribution has to accept the pre-upgrade shape (no owner label at all), which no label selector
+// can express as "belongs to this one".
+//
+// A cluster without the snapshot CRDs vacuously has no VS/VSC residue (NoMatch tolerated).
 func (r *BackupReconciler) exposureResidueRemains(ctx context.Context, backup *cbv1.Backup) string {
 	sel := client.MatchingLabels{
-		apiconst.LabelManagedBy:     apiconst.ManagedByValue,
-		apiconst.LabelClusterBackup: backup.Labels[apiconst.LabelClusterBackup],
-		apiconst.LabelNamespace:     backup.Namespace,
+		apiconst.LabelManagedBy: apiconst.ManagedByValue,
+		apiconst.LabelNamespace: backup.Namespace,
+	}
+	// The validation is structural, not a check per known field: every coordinate must be non-empty,
+	// so a coordinate added here later cannot silently degrade into `key=` and take the read's ability
+	// to fail with it. backup.Name is validated too — it is not in the selector, but attribution is
+	// impossible without it, and "cannot attribute" must not read as "nothing to attribute".
+	for key, value := range sel {
+		if value == "" {
+			return "exposure residue selector unresolvable: label " + key +
+				" has no value for this Backup, so no read can address its exposure objects"
+		}
+	}
+	if backup.Name == "" {
+		return "exposure residue selector unresolvable: the Backup has no name to attribute residue to"
 	}
 
 	vscs := exposer.VolumeSnapshotContentList()
 	switch err := r.List(ctx, vscs, sel); {
 	case err == nil:
-		if len(vscs.Items) > 0 {
-			return "VolumeSnapshotContent " + vscs.Items[0].GetName()
+		for i := range vscs.Items {
+			if r.exposureResidueBelongsTo(backup, vscs.Items[i].GetLabels()) {
+				return "VolumeSnapshotContent " + vscs.Items[i].GetName()
+			}
 		}
 	case !apimeta.IsNoMatchError(err):
 		return "VolumeSnapshotContent list unreadable: " + err.Error()
@@ -2511,8 +2544,10 @@ func (r *BackupReconciler) exposureResidueRemains(ctx context.Context, backup *c
 		vss := exposer.VolumeSnapshotList()
 		switch err := r.List(ctx, vss, sel, client.InNamespace(ns)); {
 		case err == nil:
-			if len(vss.Items) > 0 {
-				return "VolumeSnapshot " + ns + "/" + vss.Items[0].GetName()
+			for i := range vss.Items {
+				if r.exposureResidueBelongsTo(backup, vss.Items[i].GetLabels()) {
+					return "VolumeSnapshot " + ns + "/" + vss.Items[i].GetName()
+				}
 			}
 		case !apimeta.IsNoMatchError(err):
 			return "VolumeSnapshot list unreadable: " + err.Error()
@@ -2523,10 +2558,54 @@ func (r *BackupReconciler) exposureResidueRemains(ctx context.Context, backup *c
 	if err := r.List(ctx, &pvcs, sel, client.InNamespace(r.OperatorNamespace)); err != nil {
 		return "temp clone PVC list unreadable: " + err.Error()
 	}
-	if len(pvcs.Items) > 0 {
-		return "temp clone PVC " + r.OperatorNamespace + "/" + pvcs.Items[0].Name
+	for i := range pvcs.Items {
+		if r.exposureResidueBelongsTo(backup, pvcs.Items[i].Labels) {
+			return "temp clone PVC " + r.OperatorNamespace + "/" + pvcs.Items[i].Name
+		}
 	}
 	return ""
+}
+
+// exposureResidueBelongsTo decides whether one labelled leftover in this Backup's namespace is
+// THIS Backup's residue. The caller has already narrowed the set to managed-by + our namespace, so
+// the only question left is which Backup in that namespace it belonged to.
+//
+// The three cases are the three label shapes that exist in the field, in decreasing precision:
+//
+//  1. an owner name (LabelBackup): exact, and the only shape this version creates. A sibling run's
+//     object is correctly disowned here — attribution must stay tight on the shape that can be
+//     attributed, or every terminal Backup in a busy namespace would wedge on its neighbours' junk.
+//  2. no owner name but a run label: a pre-upgrade CLUSTER-plane object, matched on the run, which
+//     is exactly the selector this function used to carry. Note this also disowns a cluster-plane
+//     object when we are a namespace-plane Backup (our run is "", theirs is not) — different owner.
+//  3. neither: a pre-upgrade NAMESPACE-plane object, which carries no owner identity anywhere, so
+//     the best available evidence is that it is an exposure of a PVC WE backed up. That is
+//     deliberately over-inclusive: a sibling run's leftover for the same PVC in the same namespace
+//     is indistinguishable and will be attributed here too.
+//
+// Over-inclusion is the right error for THIS caller and would be the wrong one for the reaper. The
+// consequence here is a false "not clean": the marker is withheld and the sweep re-verifies every
+// exposureDrainRecheckInterval, deleting only its OWN objects (the sweep is derive-only) — no
+// unrelated object is ever touched. The consequence there would be deleting a live run's snapshot,
+// which is why reaper.go pays for the same case with an explicit no-claimant scan instead. And the
+// loop is not forever: the reaper collects that legacy leftover, after which this read goes clean.
+func (r *BackupReconciler) exposureResidueBelongsTo(backup *cbv1.Backup, labels map[string]string) bool {
+	if name := labels[apiconst.LabelBackup]; name != "" {
+		return name == backup.Name
+	}
+	if run := labels[apiconst.LabelClusterBackup]; run != "" {
+		return run == backup.Labels[apiconst.LabelClusterBackup]
+	}
+	pvc := labels[apiconst.LabelPVC]
+	if pvc == "" {
+		return false // not a per-PVC exposure object; nothing here can attribute it.
+	}
+	for i := range backup.Status.Volumes {
+		if backup.Status.Volumes[i].Pvc == pvc {
+			return true
+		}
+	}
+	return false
 }
 
 // terminalPhaseCommitted disambiguates a failed writeStatus whose intended phase was terminal:
@@ -2996,20 +3075,25 @@ func (r *BackupReconciler) SetupWithManager(mgr ctrl.Manager) error {
 }
 
 // mapJobToBackup maps a mover Job to the Backup that created it, using only the Job's labels: our
-// managed-by marker gates it to CrystalBackup mover Jobs, and (cluster-backup, namespace) locate
-// the Backup — its name EQUALS the run (apiconst.LabelClusterBackup's value contract). A Job that
-// is not one of ours, or is missing either coordinate, maps to nothing.
+// managed-by marker gates it to CrystalBackup mover Jobs, and (owner name, namespace) locate the
+// Backup. A Job that is not one of ours, or is missing either coordinate, maps to nothing.
+//
+// The owner name goes through ownerBackupNameFromLabels rather than reading the run label directly,
+// which is what this function used to do — and which meant a NAMESPACE-plane mover Job (no run to
+// stamp, so the value was "") mapped to nothing at all. The requeue interval was still driving that
+// plane's progress, so nothing looked broken; what it cost was the faster nudge on every mover
+// transition, including the completion that starts teardown. Same key, same fix as the reaper's.
 func (r *BackupReconciler) mapJobToBackup(_ context.Context, obj client.Object) []reconcile.Request {
 	labels := obj.GetLabels()
 	if labels[apiconst.LabelManagedBy] != apiconst.ManagedByValue {
 		return nil
 	}
-	run := labels[apiconst.LabelClusterBackup]
+	name := ownerBackupNameFromLabels(labels)
 	namespace := labels[apiconst.LabelNamespace]
-	if run == "" || namespace == "" {
+	if name == "" || namespace == "" {
 		return nil
 	}
-	return []reconcile.Request{{NamespacedName: types.NamespacedName{Namespace: namespace, Name: run}}}
+	return []reconcile.Request{{NamespacedName: types.NamespacedName{Namespace: namespace, Name: name}}}
 }
 
 // ---------------------------------------------------------------------------
@@ -3017,18 +3101,68 @@ func (r *BackupReconciler) mapJobToBackup(_ context.Context, obj client.Object) 
 // ---------------------------------------------------------------------------
 
 // exposureLabels are stamped on every object a per-PVC backup creates (the exposure's VS/VSC/temp
-// PVC, the mover Job, its creds Secret). LabelManagedBy makes them all reaper-selectable, while
-// the crystalbackup.io/* trio (cluster-backup=run, namespace, pvc) both links them to their
-// origin and satisfies the crucible leak-check (which flags any residual object carrying a
-// crystalbackup.io/* label). They deliberately omit app.kubernetes.io/name=crystal-backup — the
-// operator pod's own label, which the crucible's operator-restart test selects on.
+// PVC, the mover Job, its creds Secret) or PATCHES (the externally-created origin
+// VolumeSnapshotContent). LabelManagedBy makes them all reaper-selectable, while the
+// crystalbackup.io/* keys both link them to their origin and satisfy the crucible leak-check (which
+// flags any residual object carrying crystalbackup.io/pvc). They deliberately omit
+// app.kubernetes.io/name=crystal-backup — the operator pod's own label, which the crucible's
+// operator-restart test selects on.
+//
+// TWO RULES here are the whole 0.6.5 leak, and neither is cosmetic.
+//
+// (1) The owner is named by LabelBackup — the Backup's own name — NOT by the run. On the cluster
+// plane the two are the same string (a fan-out child is named after its run), but on the namespace
+// plane there is no run, and every reader keyed on the run label went blind on that plane: the
+// terminal sweep's verification read, the orphan reaper, and the exposer's crash-window reclaim.
+// The name is the identity both planes share, so it is what gets stamped, unconditionally.
+//
+// (2) NO KEY IS EVER STAMPED WITH AN EMPTY VALUE. The run key is added only when there is a run to
+// name. Previously it was stamped as "" on the namespace plane, which is not the harmless no-op it
+// looks like:
+//
+//   - a selector built from this map (client.MatchingLabels) then carries `cluster-backup=`, which
+//     selects the objects whose value for that key is the empty STRING — it does not mean "any";
+//   - and the objects do not even agree on carrying it: SetLabels persists the empty value, while
+//     the origin content's handover patch goes through exposer.mergeLabels, which skips a key whose
+//     desired value equals the (missing ⇒ "") current one and therefore never writes it at all.
+//
+// So the created objects matched that selector and the PATCHED one — the cluster-scoped origin
+// VolumeSnapshotContent, the single most expensive object to leak — did not. That is the exact
+// object the campaign leaked, and the exact reason three separate collectors could not see it.
 func exposureLabels(backup *cbv1.Backup, pvcName string) map[string]string {
-	return map[string]string{
-		apiconst.LabelManagedBy:     apiconst.ManagedByValue,
-		apiconst.LabelClusterBackup: backup.Labels[apiconst.LabelClusterBackup],
-		apiconst.LabelNamespace:     backup.Namespace,
-		apiconst.LabelPVC:           pvcName,
+	labels := map[string]string{
+		apiconst.LabelManagedBy: apiconst.ManagedByValue,
+		apiconst.LabelBackup:    backup.Name,
+		apiconst.LabelNamespace: backup.Namespace,
+		apiconst.LabelPVC:       pvcName,
 	}
+	// Kept for the cluster plane: it is the run-wide coordinate humans and the crucible query by
+	// ("show me everything last night's run left behind"), which the per-Backup name cannot answer
+	// for a fan-out of many namespaces. Added only when it has a value — see rule (2).
+	if run := backup.Labels[apiconst.LabelClusterBackup]; run != "" {
+		labels[apiconst.LabelClusterBackup] = run
+	}
+	return labels
+}
+
+// ownerBackupNameFromLabels resolves the NAME of the Backup that owns an exposure object, reading
+// only the object's own labels; its namespace is LabelNamespace, and the two together are the owner's
+// object key. Returns "" when the object carries no owner name at all, which callers must treat as
+// "not attributable by name" — never as "no owner".
+//
+// The fallback chain IS the upgrade path. LabelBackup is stamped by this version on both planes;
+// objects created by an earlier one do not have it, and for those the run label is a complete
+// substitute ON THE CLUSTER PLANE ONLY, because its documented value contract is that the run name
+// equals the child Backup's metadata.name (see apiconst.LabelClusterBackup). A pre-upgrade
+// NAMESPACE-plane object has neither key — the run label was stamped empty there and, on the
+// merge-patched origin content, not stamped at all — so it resolves to "" here and needs the
+// by-exclusion fallback the reaper implements. Without that, upgrading the operator would convert
+// every piece of already-leaked namespace-plane residue into permanent residue.
+func ownerBackupNameFromLabels(labels map[string]string) string {
+	if name := labels[apiconst.LabelBackup]; name != "" {
+		return name
+	}
+	return labels[apiconst.LabelClusterBackup]
 }
 
 // resticBackupArgs builds the restic argv (after the mover shim's "--") for one PVC-data backup:

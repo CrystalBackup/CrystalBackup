@@ -54,16 +54,28 @@ func manifestsJobPrefix(namespace, backupName string) string {
 // named after the Job, so a mismatch here would leak a privilege silently.
 func manifestsJobName(prefix string) string { return prefix + "-mover" }
 
-// manifestsLabels are the run-identity labels on the manifest Job and its creds Secret. The
+// manifestsLabels are the owner-identity labels on the manifest Job and its creds Secret. The
 // mover-role label is what the NetworkPolicy selects on to grant API-server egress to this pod
 // and to no other mover (spec/03 §7).
+//
+// Owner identity follows the same two rules as exposureLabels (see its comment): the owning Backup
+// is named by LabelBackup on BOTH planes, and the run key is stamped only when there is a run to
+// name — never as an empty value, which is not a wildcard and which the readers keyed on it could
+// not tell apart from "no owner". These objects carry no per-PVC label, so they are outside the
+// orphan reaper's exposure sweep (their transient RoleBinding is reaped via its own job label), but
+// they are what a human greps for when a manifest capture leaves something behind, and a label that
+// is empty on one plane is a poor thing to grep for.
 func manifestsLabels(backup *cbv1.Backup) map[string]string {
-	return map[string]string{
-		apiconst.LabelManagedBy:     apiconst.ManagedByValue,
-		apiconst.LabelClusterBackup: backup.Labels[apiconst.LabelClusterBackup],
-		apiconst.LabelNamespace:     backup.Namespace,
-		apiconst.LabelMoverRole:     apiconst.MoverRoleManifest,
+	labels := map[string]string{
+		apiconst.LabelManagedBy: apiconst.ManagedByValue,
+		apiconst.LabelBackup:    backup.Name,
+		apiconst.LabelNamespace: backup.Namespace,
+		apiconst.LabelMoverRole: apiconst.MoverRoleManifest,
 	}
+	if run := backup.Labels[apiconst.LabelClusterBackup]; run != "" {
+		labels[apiconst.LabelClusterBackup] = run
+	}
+	return labels
 }
 
 // advanceManifests drives the namespace's manifest capture one step. It returns true when the

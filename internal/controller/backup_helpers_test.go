@@ -25,6 +25,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	cbv1 "github.com/CrystalBackup/CrystalBackup/api/v1alpha1"
+	"github.com/CrystalBackup/CrystalBackup/internal/apiconst"
 )
 
 // TestSetCompletionTimeNeverMovesAnExistingStamp is the guard on the one property
@@ -118,5 +119,133 @@ func TestMoverNamePrefixCollisionFreeUnderTruncation(t *testing.T) {
 	}
 	if !dns1123Label.MatchString(a) || !dns1123Label.MatchString(b) {
 		t.Errorf("truncated names are not valid DNS-1123 labels: %q / %q", a, b)
+	}
+}
+
+// TestExposureLabelsNameTheOwnerOnBothPlanesAndNeverStampAnEmptyValue is the root-cause guard for
+// the 0.6.5 leak, one level below the three collectors that went blind on it.
+//
+// exposureLabels is the single builder for the identity every exposure object carries, and it used
+// to key that identity on the ClusterBackup run — a coordinate the namespace plane does not have. It
+// therefore stamped `crystalbackup.io/cluster-backup: ""` there, and two things followed:
+//
+//   - a selector built from the map became `cluster-backup=`, which matches the objects whose value
+//     is literally "" rather than any object at all, so the terminal sweep's verification read, the
+//     orphan reaper and the exposer's crash-window reclaim were each keyed on a value that pins
+//     nothing;
+//   - and the objects did not even agree on carrying it, because the origin content's handover patch
+//     goes through a label MERGE that skips an empty desired value (pinned in
+//     internal/exposer/cleanup_test.go). The cluster-scoped content — the expensive one — was the one
+//     that lacked it.
+//
+// So the two properties asserted here are the fix, and every reader depends on both: an owner NAME
+// on both planes, and no empty values at all.
+func TestExposureLabelsNameTheOwnerOnBothPlanesAndNeverStampAnEmptyValue(t *testing.T) {
+	planes := []struct {
+		what    string
+		backup  *cbv1.Backup
+		wantRun string
+	}{
+		{
+			what: "namespace plane: no ClusterBackup parent, so no run to name",
+			backup: &cbv1.Backup{ObjectMeta: metav1.ObjectMeta{
+				Namespace: "m5-tenant", Name: "m5-np-run-tjip7a",
+				Labels: map[string]string{apiconst.LabelOrigin: apiconst.OriginNamespace},
+			}},
+			wantRun: "",
+		},
+		{
+			what: "cluster plane: a fan-out child, whose name IS the run",
+			backup: &cbv1.Backup{ObjectMeta: metav1.ObjectMeta{
+				Namespace: "c-db", Name: "nightly-20260803",
+				Labels: map[string]string{
+					apiconst.LabelOrigin:        apiconst.OriginCluster,
+					apiconst.LabelClusterBackup: "nightly-20260803",
+				},
+			}},
+			wantRun: "nightly-20260803",
+		},
+	}
+
+	for _, p := range planes {
+		t.Run(p.what, func(t *testing.T) {
+			got := exposureLabels(p.backup, "tenant-data")
+
+			for key, value := range got {
+				if value == "" {
+					t.Errorf("label %q was stamped with an empty value.\n"+
+						"An empty value is not a wildcard in a selector, and a label merge will not even "+
+						"write it — which is how one VolumeSnapshotContent survived three collectors and "+
+						"failed five leak checks.", key)
+				}
+			}
+			if got[apiconst.LabelBackup] != p.backup.Name {
+				t.Errorf("%s = %q, want the owning Backup's name %q — it is the only owner coordinate "+
+					"that exists on both planes",
+					apiconst.LabelBackup, got[apiconst.LabelBackup], p.backup.Name)
+			}
+			if got[apiconst.LabelNamespace] != p.backup.Namespace {
+				t.Errorf("%s = %q, want %q", apiconst.LabelNamespace, got[apiconst.LabelNamespace], p.backup.Namespace)
+			}
+			if got[apiconst.LabelPVC] != "tenant-data" {
+				t.Errorf("%s = %q, want the source PVC", apiconst.LabelPVC, got[apiconst.LabelPVC])
+			}
+			// The run key stays for the cluster plane (it is the run-wide coordinate humans and the
+			// crucible query by) and is ABSENT — not empty — where there is no run.
+			run, present := got[apiconst.LabelClusterBackup]
+			if p.wantRun == "" && present {
+				t.Errorf("%s is present as %q on the namespace plane; it must be omitted entirely",
+					apiconst.LabelClusterBackup, run)
+			}
+			if p.wantRun != "" && run != p.wantRun {
+				t.Errorf("%s = %q, want %q", apiconst.LabelClusterBackup, run, p.wantRun)
+			}
+		})
+	}
+}
+
+// TestOwnerBackupNameFromLabelsResolvesEveryShape pins the fallback chain the reaper and the Job
+// watch resolve owners through — including the two PRE-UPGRADE shapes, because an upgrade that
+// cannot attribute an older object turns residue that was merely leaked into residue that is
+// permanent.
+func TestOwnerBackupNameFromLabelsResolvesEveryShape(t *testing.T) {
+	cases := []struct {
+		what   string
+		labels map[string]string
+		want   string
+	}{
+		{
+			what:   "this version, either plane: the owner name is stamped",
+			labels: map[string]string{apiconst.LabelBackup: "m5-np-run-tjip7a"},
+			want:   "m5-np-run-tjip7a",
+		},
+		{
+			what:   "pre-upgrade cluster plane: only the run, whose value IS the child Backup's name",
+			labels: map[string]string{apiconst.LabelClusterBackup: "nightly-20260803"},
+			want:   "nightly-20260803",
+		},
+		{
+			what: "both present: the explicit owner name wins over the run-wide coordinate",
+			labels: map[string]string{
+				apiconst.LabelBackup:        "nightly-20260803",
+				apiconst.LabelClusterBackup: "nightly-20260803",
+			},
+			want: "nightly-20260803",
+		},
+		{
+			what:   "pre-upgrade namespace plane: no owner name anywhere",
+			labels: map[string]string{apiconst.LabelNamespace: "m5-tenant", apiconst.LabelPVC: "tenant-data"},
+			want:   "",
+		},
+		{
+			what:   "the empty run value an older version stamped is not an owner name",
+			labels: map[string]string{apiconst.LabelClusterBackup: ""},
+			want:   "",
+		},
+	}
+	for _, c := range cases {
+		if got := ownerBackupNameFromLabels(c.labels); got != c.want {
+			t.Errorf("%s: ownerBackupNameFromLabels = %q, want %q", c.what, got, c.want)
+		}
 	}
 }

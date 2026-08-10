@@ -95,6 +95,7 @@ depend on them.
 
 | Key | Meaning |
 |---|---|
+| `crystalbackup.io/backup` | The `Backup` an exposure object or mover Job belongs to, by name. Present on both planes — unlike `crystalbackup.io/cluster-backup`, which only a cluster-DR run has — so it is what the teardown sweep and the orphan reaper resolve an owner with. (Same string as the `Backup` finalizer; labels and finalizers are different fields.) |
 | `crystalbackup.io/pvc` | The source PVC an exposure object or mover Job belongs to. |
 | `crystalbackup.io/restore`, `crystalbackup.io/cluster-restore` | The owning restore. |
 | `crystalbackup.io/pv-role` | `twin` or `transplant` — marks a PersistentVolume a restore created or adopted. |
