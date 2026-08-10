@@ -92,7 +92,8 @@ const milestones = [
   ['0.6.2', 'Soak kit — the instrument for M6’s two-week soak', 'patch', [['Crucible 0.6.2', `${base}/reports/crucible-m6-2.html`]]],
   ['0.6.3', 'The first hour on somebody else’s cluster — install path, stall deadlines, mover placement', 'patch', [['Crucible 0.6.3', `${base}/reports/crucible-m6-3.html`]]],
   ['0.6.4', 'Escrow safety — the operator refuses to provision while it cannot prove no recoverable key exists', 'patch', [['Crucible 0.6.4', `${base}/reports/crucible-m6-4.html`]]],
-  ['0.6.5', 'No single volume holds its namespace’s queue — and every report that summarises children now agrees with them', 'patch here', [['Crucible 0.6.5', `${base}/reports/crucible-m6-5.html`]]],
+  ['0.6.5', 'No single volume holds its namespace’s queue — and every report that summarises children now agrees with them', 'patch', [['Crucible 0.6.5', `${base}/reports/crucible-m6-5.html`]]],
+  ['0.6.6', 'A check that cannot fail is not a check — eight days of red CI, an aborted quiesce that never thawed, and seven more guards that could not fire', 'patch here', [['Crucible 0.6.6', `${base}/reports/crucible-m6-6.html`]]],
   // These three carried their PRE-arbitration names until 0.6.2. The M7–M9 re-scope landed in
   // spec/90-roadmap.md and in the docs, and this array was missed — so the landing page was
   // still promising a CLI and a browse UI as the next milestone while the specs had moved them
@@ -150,7 +151,7 @@ const description =
       <section class="hero">
         <div class="hero-copy">
           <span class="pill">
-            <span class="dot"></span> M6 shipped (v0.6.5) · M7 up next
+            <span class="dot"></span> M6 shipped (v0.6.6) · M7 up next
           </span>
           <h1>
             Every namespace gets <span class="grad">its own backups.</span>
@@ -292,7 +293,7 @@ const description =
         <p class="eyebrow">How it compares</p>
         <h2>Where Crystal Backup stands</h2>
         <p class="section-lead">
-          Our column is <strong>v0.6.5 as shipped</strong> — every “yes” below is code you can
+          Our column is <strong>v0.6.6 as shipped</strong> — every “yes” below is code you can
           install today, exercised by the <a href={links.quality}>published acceptance reports</a>.
           The other columns are those tools’ <strong>current</strong> capabilities, to our
           knowledge — different projects, different goals, not a benchmark.
@@ -355,13 +356,14 @@ const description =
           CI, the core engine, cluster disaster recovery, self-service &amp; admin restore,
           manifest &amp; cluster-scoped DR, consistency hooks, repository maintenance, the
           namespace plane, external sync, the right to erasure and now the observability layer in
-          front of all of it are live (v0.6.5); up next is
+          front of all of it are live (v0.6.6); up next is
           <strong>M7 — reach</strong>: storage without snapshots, file-level restore and
           notifications. Each shipped milestone links its acceptance report below — the checks it
           had to pass on a real cluster, in full. Every report from M6 onward is unfiltered — the
           whole suite, nothing skipped — and the most recent is <strong>93 of 93</strong>, on its
-          second attempt: the first run stopped at its four-hour timeout with 21 of those 93 checks
-          never reached, and its report says so on the front page.
+          second attempt: the first run reached all 93 too and failed exactly one of them on a test
+          helper’s own five-minute bound, not on the product, and its report says so on the front
+          page.
         </p>
         <ol class="timeline">
           {
@@ -409,10 +411,10 @@ const description =
           <aside class="note">
             <h3>You’re early — and that’s the point</h3>
             <p>
-              M0 through M6 have shipped (v0.6.5) — real, tested code, accepted on a real
+              M0 through M6 have shipped (v0.6.6) — real, tested code, accepted on a real
               RKE2/Ceph cluster with <a href={links.quality}>the reports published</a>. It is
-              still early: four milestones are ahead, the CRD API is <code>v1alpha1</code> and
-              will still move, and the production-hardening pass is M6. So try it in a sandbox,
+              still early: three milestones are ahead, the CRD API is <code>v1alpha1</code> and
+              will still move, and the production-hardening pass landed only in M6. So try it in a sandbox,
               keep your existing backups, test your restores, and use it at your own risk. It’s
               provided <strong>as-is under Apache-2.0</strong>, without warranty. If the direction
               speaks to you, <a href={links.gh} target="_blank" rel="noopener">star or watch the
@@ -426,9 +428,9 @@ const description =
       <section class="cta">
         <h2>Try it, or read every decision</h2>
         <p>
-          M0–M6 are installable today (v0.6.5); the specifications, the {adrCount} decision records and
-          every acceptance report are public. Observability hardening &amp; production readiness
-          (M6) are next.
+          M0–M6 are installable today (v0.6.6); the specifications, the {adrCount} decision records and
+          every acceptance report are public. Reach — storage without snapshots, file-level restore
+          and notifications (M7) — is next.
         </p>
         <div class="hero-cta">
           <a class="btn btn-primary" href={`${base}/docs/start/install/`}>
