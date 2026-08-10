@@ -260,8 +260,39 @@ subjects:
 # high-water marks, which are the part that cannot be reconstructed. What it never does is fill the
 # volume.
 #
-# No storageClassName, deliberately, and no value for one: the cluster default is the right choice
-# here and naming one would be wrong on every cluster but the one this was written on.
+# THE ACCESS MODE, and the incident that put a value on it.
+#
+# ReadWriteOnce is still the default and has to stay the default: on the overwhelming majority of
+# clusters the default StorageClass provides RWO and nothing else, and a kit that required RWX
+# would be uninstallable in exactly the places it is most useful — the small, single-node-capable,
+# plain-default-class clusters this product is measured on. Requiring infrastructure the kit did not
+# require before is not an acceptable price for removing a failure window.
+#
+# But RWO has a real cost, observed on a customer cluster rather than reasoned about: an autosync
+# reconciler replaced the collector's pod, the volume reported `Multi-Attach error … already
+# exclusively attached to one node`, then attached to the NEW node, and then `rbd: map failed: (22)
+# Invalid argument` left the replacement pod in ContainerCreating indefinitely. collect.sh answered
+# `NOT COLLECTED: … no Running pod` and exited 3. The fortnight's archive was intact and unreachable
+# on the volume that was about to be deleted. Every RWO handover is an exclusive attachment moving
+# between nodes, and that is a step that can fail.
+#
+# So the mode is a VALUE. An administrator whose cluster has an RWX-capable class can eliminate the
+# handover entirely — a shared filesystem mount has no exclusive lock to move, so the replacement
+# pod mounts it whether or not the outgoing one has let go. Nobody has to, nothing changes for
+# anybody who does not set it, and there is now something to set for the people who can.
+#
+# storageClassName is a value for ONE reason, and it reverses what this comment said before: an RWX
+# access mode with no class to satisfy it is a trap, not an escape hatch. Almost nowhere is the
+# cluster's DEFAULT class RWX-capable, so `accessModes: [ReadWriteMany]` on its own would leave the
+# PVC Pending forever, the collector never starting, and the administrator worse off than with the
+# failure window they were closing. The two move together. Empty means the cluster default, which is
+# what every install has had until now and what every install that sets neither value still gets.
+{{- $accessModes := .Values.soak.accessModes | default (list "ReadWriteOnce") }}
+{{- range $accessModes }}
+{{- if not (has . (list "ReadWriteOnce" "ReadWriteMany")) }}
+{{- fail (printf "soak.accessModes: %q is not an access mode this collector can use. ReadWriteOnce (the default, and what nearly every default StorageClass provides) or ReadWriteMany (which removes the attachment handover on a pod replacement — set soak.storageClassName to a class that actually provides it, or the PVC stays Pending forever). ReadOnlyMany cannot work: the collector writes to this volume every minute for a fortnight. ReadWriteOncePod is ReadWriteOnce with the handover made stricter, which is the opposite of the reason this value exists." .) }}
+{{- end }}
+{{- end }}
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -270,7 +301,11 @@ metadata:
   labels:
     {{- include "crystal-backup.soak.labels" . | nindent 4 }}
 spec:
-  accessModes: [ReadWriteOnce]
+  accessModes:
+    {{- toYaml $accessModes | nindent 4 }}
+  {{- with .Values.soak.storageClassName }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
   resources:
     requests:
       storage: {{ .Values.soak.storage }}
@@ -284,9 +319,20 @@ metadata:
     {{- include "crystal-backup.soak.labels" . | nindent 4 }}
 spec:
   replicas: 1
-  # Recreate, not RollingUpdate. The volume is ReadWriteOnce: a rolling update would start the new
-  # pod before the old one released the PVC, and it would sit Pending on a multi-attach error until
-  # someone noticed — with the soak silently stopped in the meantime.
+  # Recreate, not RollingUpdate. The volume is ReadWriteOnce by default: a rolling update would
+  # start the new pod before the old one released the PVC, and it would sit Pending on a
+  # multi-attach error until someone noticed — with the soak silently stopped in the meantime.
+  #
+  # AND IT IS NOT A DEFENCE, which is the correction this release makes to the paragraph above. It
+  # was already here when a pod replacement lost access to a fortnight's archive on a customer
+  # cluster: Recreate did what it promises — the old pod went first, the multi-attach error cleared,
+  # the volume attached to the new node — and then `rbd: map failed: (22) Invalid argument` left the
+  # replacement in ContainerCreating for good. An orderly handover to a node that cannot mount the
+  # volume loses the volume just as thoroughly as a deadlocked one. Recreate makes the window brief
+  # and explicit rather than indefinite and confusing; it does not make it safe. What makes the
+  # measurements survive the window is that the collector writes the irreplaceable figures to its
+  # own log on the way out (internal/soak/shutdown.go) and that hack/soak/README.md's reset
+  # procedure exports before it deletes anything.
   strategy:
     type: Recreate
   selector:
@@ -306,6 +352,16 @@ spec:
     spec:
       serviceAccountName: {{ $name }}
       automountServiceAccountToken: true
+      # Written down rather than left to the default 30, because it is now load-bearing. On SIGTERM
+      # the collector flushes the open metrics window and then writes its shutdown report — the
+      # per-class high-water figures, which exist on this volume and nowhere else — to its own log,
+      # the one channel a terminating pod still has that is not the volume it is about to release.
+      # A grace period trimmed to "make rollouts snappier" would replace that block with a SIGKILL
+      # and turn the next failed handover back into the incident it was written for. Thirty seconds
+      # is enormous for what it does (a handful of small file reads) and is the value the pod had
+      # implicitly all along, so this line changes no behaviour today and pins the behaviour that
+      # matters. test/chart asserts it is present and not tiny.
+      terminationGracePeriodSeconds: 30
       {{- with .Values.imagePullSecrets }}
       # The same secrets as the operator: this is the same image, from the same registry.
       imagePullSecrets:

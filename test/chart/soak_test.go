@@ -130,6 +130,13 @@ func convert[T any](t *testing.T, u *unstructured.Unstructured, out *T) *T {
 // soakEnabled is the render every assertion below reads, with EVERY soak value moved off its
 // default. Defaults would pass a test that asserts nothing: a hardcoded flag and a wired one look
 // identical when the value happens to match.
+//
+// Two soak values are deliberately LEFT at their defaults here — soak.accessModes and
+// soak.storageClassName — because the default is the assertion for both: this render is what a
+// plain cluster with an RWO default class gets, and TestSoakDefaultsToWhatAPlainClusterHas pins that
+// it stays that way. They are moved off their defaults in
+// TestSoakAccessModeAndClassRemoveTheHandover, which is where "the knob reaches the manifest" is
+// proved.
 var soakEnabled = []string{
 	"soak.enabled=true",
 	"soak.storage=7Gi",
@@ -305,6 +312,14 @@ func TestSoakTemplateRefusals(t *testing.T) {
 		"no metrics-reader ClusterRole": {
 			values: []string{"soak.enabled=true", "rbac.create=false"},
 			expect: "requires rbac.create",
+		},
+		// ReadOnlyMany binds and mounts and then the collector cannot write a byte to it, which is
+		// a CrashLoopBackOff on somebody's cluster rather than a render error, and the archive it
+		// would have produced does not exist. The other two real modes are refused for reasons the
+		// message states; anything misspelled is refused with them.
+		"a volume the collector could not write to": {
+			values: []string{"soak.enabled=true", "soak.accessModes[0]=ReadOnlyMany"},
+			expect: "is not an access mode this collector can use",
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -485,6 +500,94 @@ func TestSoakPodIsNotSelectedByTheOperatorPolicies(t *testing.T) {
 	}
 	if labels["crystalbackup.io/soak"] != "collector" || labels["app.kubernetes.io/instance"] != releaseName {
 		t.Errorf("the collector pod's identity is not release-scoped: %v", labels)
+	}
+}
+
+// TestSoakSurvivesBeingRedeployed pins the two pod-level properties that a fortnight's archive now
+// depends on, both of which read like formatting and are not.
+//
+// The incident, on a customer cluster: an autosync reconciler replaced the collector's pod, the
+// volume reported `Multi-Attach error … already exclusively attached to one node`, attached to the
+// new node, and then `rbd: map failed: (22) Invalid argument` left the replacement in
+// ContainerCreating for good. collect.sh answered `NOT COLLECTED: … no Running pod`, exit 3, on an
+// archive that was intact and unreachable.
+//
+//   - `Recreate` was ALREADY there and did not prevent it. It is still required, because a
+//     RollingUpdate on an RWO volume deadlocks instead of handing over, and it is asserted here so
+//     that "make the rollout smoother" cannot quietly reintroduce that. It is not the defence.
+//   - `terminationGracePeriodSeconds` is the defence, and it is the reason this test exists at all:
+//     on SIGTERM the collector flushes its open window and writes the per-class high-water figures
+//     to its own log (internal/soak/shutdown.go), the only channel a terminating pod has that is not
+//     the volume it is about to release. Trimmed to a couple of seconds, that block becomes a
+//     SIGKILL and the next failed handover costs the figures again — silently, because the pod that
+//     would have reported them is already gone.
+func TestSoakSurvivesBeingRedeployed(t *testing.T) {
+	d := soakDeployment(t, mustRender(t, soakEnabled...))
+
+	if got := d.Spec.Strategy.Type; got != appsv1.RecreateDeploymentStrategyType {
+		t.Errorf("the collector's strategy is %q, want Recreate. On a ReadWriteOnce volume a "+
+			"RollingUpdate starts the replacement before the outgoing pod has released the PVC, so "+
+			"it sits Pending on a multi-attach error with the soak silently stopped.", got)
+	}
+
+	grace := d.Spec.Template.Spec.TerminationGracePeriodSeconds
+	if grace == nil {
+		t.Fatal("terminationGracePeriodSeconds is unset. It is what gives the collector time to " +
+			"write its shutdown report — the per-class peak figures, which exist on the PVC and " +
+			"nowhere else — before the kubelet SIGKILLs it.")
+	}
+	if *grace < 20 {
+		t.Errorf("terminationGracePeriodSeconds is %ds. The shutdown report is the only off-volume "+
+			"copy of the high-water table; a grace period trimmed this far turns an orderly SIGTERM "+
+			"into a SIGKILL and the block is never written.", *grace)
+	}
+}
+
+// TestSoakDefaultsToWhatAPlainClusterHas. The kit has to stay installable where it is most useful:
+// a small, single-node-capable cluster whose default StorageClass provides ReadWriteOnce and nothing
+// else, and which has no class to name. Both of this release's new values default to exactly that,
+// so an existing install renders byte-identically.
+func TestSoakDefaultsToWhatAPlainClusterHas(t *testing.T) {
+	var pvc corev1.PersistentVolumeClaim
+	convert(t, find(t, mustRender(t, soakEnabled...),
+		"PersistentVolumeClaim", "crystal-backup-soak-data"), &pvc)
+
+	want := []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}
+	if !slices.Equal(pvc.Spec.AccessModes, want) {
+		t.Errorf("the collector's PVC defaults to %v, want %v. Requiring ReadWriteMany would make "+
+			"this kit uninstallable on the clusters it is most useful on.", pvc.Spec.AccessModes, want)
+	}
+	if pvc.Spec.StorageClassName != nil {
+		t.Errorf("the PVC names storageClassName %q by default; the cluster default is the right "+
+			"choice and naming one is wrong on every cluster but the one it was named on",
+			*pvc.Spec.StorageClassName)
+	}
+}
+
+// TestSoakAccessModeAndClassRemoveTheHandover: the escape hatch for the administrators who can take
+// it. A ReadWriteMany volume has no exclusive attachment to move, so the pod replacement that lost
+// the archive cannot happen — but no cluster's DEFAULT class provides RWX, which is why the two
+// values have to reach the manifest TOGETHER. A mode with no class is a PVC that stays Pending
+// forever, and that is worse than the window it was closing.
+func TestSoakAccessModeAndClassRemoveTheHandover(t *testing.T) {
+	objs := mustRender(t, append(append([]string{}, soakEnabled...),
+		"soak.accessModes[0]=ReadWriteMany", "soak.storageClassName=cephfs-shared")...)
+
+	var pvc corev1.PersistentVolumeClaim
+	convert(t, find(t, objs, "PersistentVolumeClaim", "crystal-backup-soak-data"), &pvc)
+
+	want := []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany}
+	if !slices.Equal(pvc.Spec.AccessModes, want) {
+		t.Errorf("soak.accessModes did not reach the PVC: got %v, want %v", pvc.Spec.AccessModes, want)
+	}
+	if pvc.Spec.StorageClassName == nil || *pvc.Spec.StorageClassName != "cephfs-shared" {
+		t.Errorf("soak.storageClassName did not reach the PVC: got %v. Without it the RWX mode "+
+			"above is a claim nothing can bind.", pvc.Spec.StorageClassName)
+	}
+
+	// The size still lands, so the new fields did not displace the old one.
+	if got := pvc.Spec.Resources.Requests.Storage().String(); got != "7Gi" {
+		t.Errorf("soak.storage stopped reaching the PVC: got %s, want 7Gi", got)
 	}
 }
 

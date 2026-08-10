@@ -502,9 +502,33 @@ soak:
   # every token is reversible in seconds by dictionary.
   saltSecret: ""
   # -- Size of the collector's PVC. The cap below is what the collector actually honours; this
-  # leaves the filesystem room to breathe above it. No storageClassName: the cluster default is
-  # the right choice, and naming one would be wrong on every cluster but ours.
+  # leaves the filesystem room to breathe above it.
   storage: 1Gi
+  # -- Access mode for the collector's PVC. ReadWriteOnce unless you have a reason, and the default
+  # has to stay ReadWriteOnce: it is what nearly every cluster's default StorageClass provides, and
+  # a soak kit that required ReadWriteMany would be uninstallable on exactly the small clusters it
+  # is most useful on.
+  #
+  # WHAT IT COSTS YOU, so the choice is informed. Every replacement of the collector pod — a chart
+  # upgrade, a node drain, an autosync reconciler refreshing the Deployment — hands an exclusive
+  # volume attachment from one node to another, and that step can fail: it did on a customer
+  # cluster, where the attachment moved cleanly and then `rbd: map failed` left the replacement pod
+  # in ContainerCreating and a fortnight's archive intact and unreachable. `[ReadWriteMany]` removes
+  # the handover entirely (a shared filesystem mount has no exclusive lock to move), and it needs
+  # `storageClassName` below to name a class that actually provides RWX — without one the PVC stays
+  # Pending forever and you are worse off than you started.
+  #
+  # Either way, read hack/soak/README.md's "Ending a series and starting another" before you replace
+  # this pod on purpose: the collector writes its irreplaceable figures to its own log on the way
+  # out, but the ARCHIVE only survives if you export it first.
+  accessModes:
+    - ReadWriteOnce
+  # -- StorageClass for the collector's PVC. Empty means the cluster default, which is what every
+  # install has had and what the default still gives you: naming a class is wrong on every cluster
+  # but the one it was named on. It exists for one case only — `accessModes: [ReadWriteMany]`, which
+  # no cluster's default class satisfies, so setting the mode without the class is a PVC that never
+  # binds.
+  storageClassName: ""
   # -- Hard cap on the on-disk footprint (`--max-bytes`). On reaching it the collector drops the
   # OLDEST raw samples — keeping the aggregates and the high-water marks, which are the part that
   # cannot be reconstructed — and records the drop in its own manifest. What it never does is fill

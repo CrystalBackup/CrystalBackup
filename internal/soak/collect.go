@@ -110,6 +110,14 @@ func (c *Collector) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			c.progress("shutting down: flushing the open metrics window")
 			c.flushWindow(time.Now().UTC())
+			// AFTER the flush, so the figures the block carries include the window this shutdown
+			// just closed, and so a reader cannot be told a footprint that was true a minute ago.
+			//
+			// This is the collector's answer to being redeployed: the one channel a terminating pod
+			// still has that is NOT the ReadWriteOnce volume it is about to release is its own log.
+			// See shutdown.go for the incident, and for the four alternatives that were rejected —
+			// including `strategy: Recreate`, which was already in place and did not help.
+			c.progress("%s", ShutdownReport(c.Store, c.Info, time.Now()))
 			return nil
 		case <-t.C:
 			c.round(ctx, time.Now().UTC())

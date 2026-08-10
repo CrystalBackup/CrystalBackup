@@ -529,6 +529,54 @@ Rules, and each of them is the feature rather than a detail:
 - **No Prometheus, no alert rule, no configuration, no new dependency.** It lands in
   `kubectl logs` and therefore in whatever log pipeline the cluster already has.
 
+### The shutdown block
+
+Everything the collector has is on its PVC. That PVC is `ReadWriteOnce` unless the administrator
+chose otherwise, so every replacement of the pod hands an exclusive attachment from one node to
+another — and that step can fail in ways that have nothing to do with this product. It did: on a
+customer cluster an autosync reconciler replaced the pod, the attachment moved cleanly, `rbd: map
+failed: (22) Invalid argument` left the replacement in `ContainerCreating`, and a fortnight's
+archive was intact and unreachable on the volume that was about to be deleted. What saved the
+measurements was a human having read `soak-export --status` minutes earlier and copied its figures
+down.
+
+So on `SIGTERM`/`SIGINT`, after flushing the open metrics window, the collector does that
+transcription itself:
+
+```
+WARN soak-shutdown | at=<rfc3339> data-dir=<dir>
+WARN soak-shutdown | <why this block exists, and what to do before replacing the pod>
+WARN soak-shutdown | up P% of the D day(s) … across N session(s)
+WARN soak-shutdown | operator version     <v|unknown>
+WARN soak-shutdown | <the same per-stream and per-class lines soak-export --status prints>
+WARN soak-shutdown | on disk              <used> of <cap>
+```
+
+Rules:
+
+- **The marker is on every line, including the blank ones.** The daily line is one line because
+  seven have to fit on a screen; this is a block, emitted at a moment when several pods are being
+  replaced into an interleaving log pipeline, and `grep soak-shutdown` has to return all of it.
+- **The payload is the per-class high-water table**, rendered by the same `statusLines` the status
+  screen uses rather than a second formatting of the same numbers. Those peaks are the part of the
+  archive that cannot be reconstructed from anything else, and the daily line has never carried
+  them — it carries mover *counts*.
+- **It never fails and is never empty.** A collector eleven seconds old has nothing to report and
+  says so; a block withheld because one directory was unreadable would vanish on exactly the
+  shutdown that mattered, and an empty string cannot be told apart from a `SIGKILL`.
+- **The log, not the volume, and not the cluster.** The volume is the thing that may be
+  unreachable. A `ConfigMap` or an `Event` would mean a write verb held for a fortnight, against
+  §10. A `preStop` exec hook would write to nowhere at all: the kubelet does not append
+  lifecycle-hook output to the container log, and it only ever surfaces as a `FailedPreStopHook`
+  event when the hook *fails*. The process's own signal path is the one place in a terminating pod
+  whose stdout is still the pod's log.
+- **It is insurance, not an archive**, and it says so in its own last line. A pod's log dies with
+  the pod, so this reaches the administrator only through a log pipeline. The archive survives
+  because `hack/soak/README.md`'s "Ending a series and starting another" exports before it deletes.
+- **`strategy: Recreate` is not the answer to this**, though it was already in the chart and reads
+  like one. It prevents a *rolling* update from deadlocking on the multi-attach, which is worth
+  having; an orderly handover to a node that cannot mount the volume loses it just as completely.
+
 ## 10. What this deliberately does not do
 
 - **No writes to the cluster.** Not a Lease, not an Event, not a ConfigMap. The RBAC in
@@ -536,10 +584,13 @@ Rules, and each of them is the feature rather than a detail:
   rather than the list, so a rule added later still has to be a read. It should stay that way: a
   soak kit that mutates the cluster it is measuring has to be argued about on every review, and
   the argument is not worth what a Lease would buy.
-- **No `watch`, and three grants the standalone manifest carried that nothing reads.** The verbs
-  were checked against the code rather than carried over: nothing in `internal/soak` watches (the
-  event stream lists on a resync interval and §5 says why; the API reader is `client.New`, which
-  opens no informers), `storage.k8s.io` storageclasses/volumeattachments are read by the operator
+- **No `watch` beyond pods and mover Jobs, and three grants the standalone manifest carried that
+  nothing reads.** The verbs were checked against the code rather than carried over. `watch` is
+  granted on exactly `pods` and `batch/jobs`, because a mover Job lives ten to twenty seconds and
+  no poll interval can be relied on to land inside that (§5 measured it on the crucible); every
+  other stream still lists on an interval — the event stream because a watch "drops silently on an
+  apiserver rollover", the CR-state stream by design, and the API reader is `client.New`, which
+  opens no informers. `storage.k8s.io` storageclasses/volumeattachments are read by the operator
   and never by the collector, and the `nodes` resource is not read at all — the node a mover
   landed on comes off `pod.Spec.NodeName`.
 - **No exec into mover pods** to measure the cache from inside, though the operator's own

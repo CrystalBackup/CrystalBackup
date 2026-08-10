@@ -1,8 +1,13 @@
-# The soak — running 0.6.1 for two weeks and telling us how it went
+# The soak — running this build for two weeks and telling us how it went
 
-0.6.1 is offered for testing rather than production for one reason: nobody has yet run it
-alongside an incumbent backup tool, on real data, for two weeks. Every other M6 exit criterion is
-met. This one is not, and it cannot be met by a test suite — a suite runs what someone thought
+<!-- No version in the title or the first line, on purpose. Both said "0.6.1" for five releases
+     after 0.6.1 shipped, which is the same staleness this kit exists to prevent in other people's
+     measurements. The release you are installing is the one `helm upgrade` gave you, and the
+     archive records it in MANIFEST.json and on every heartbeat line. -->
+
+The release you are installing is offered for testing rather than production for one reason: nobody
+has yet run it alongside an incumbent backup tool, on real data, for two weeks. Every other M6 exit
+criterion is met. This one is not, and it cannot be met by a test suite — a suite runs what someone thought
 of, and the findings a soak produces are the ones nobody thought of. A pod evicted at 3am. A
 prune that ran forty minutes and blocked the window. A repository that stopped deduplicating on
 day six. A metric that drifted for ten days.
@@ -110,6 +115,13 @@ kubectl -n crystal-backup-system exec deploy/crystal-backup-soak -- /manager soa
 One screen, no archive. This is the cheapest possible defence against discovering on day fourteen
 that nothing was collected, and it is the single step most worth not skipping.
 
+On day one that screen is mostly zeros, and **most of those zeros are correct** — a fresh collector
+has collected nothing yet, and `highwater` stays `NOT MEASURED` until your first backup runs, which
+on a nightly schedule can be a day away. Which zeros are expected and which are a finding is
+written out under [what a fresh collector legitimately looks
+like](#5-what-a-fresh-collector-legitimately-looks-like--which-zeros-are-expected). Read it before
+you conclude anything from an empty screen, and in particular before you restart the collector.
+
 **KEEP `soak-salt.bin`.** You need it at the end, and it must never be in the archive: the tokens
 are HMACs under it, and the value space (`production`, `staging`, your customer's name) is small
 enough that anyone holding the salt reverses the whole archive in seconds.
@@ -196,6 +208,21 @@ lines, so a quiet log is a healthy one and a *stale* log is not.
 
 `soak-export --status` still gives the long form (per-stream detail, gaps, drops with reasons) —
 this is the version you can check without thinking about it.
+
+**And one block, once, whenever the collector is asked to stop.** It is the only other thing in that
+log:
+
+```sh
+kubectl -n crystal-backup-system logs deploy/crystal-backup-soak | grep soak-shutdown
+```
+
+Everything the collector has measured is on its PVC and nowhere else, so on `SIGTERM` — a chart
+upgrade, a node drain, a reconciler refreshing the Deployment — it writes the figures that cannot be
+reconstructed (the per-class peak memory table above all) into its own log on the way out. If the
+replacement pod then fails to get the volume, those lines are what you still have. They are not an
+archive and they do not replace exporting one: a pod's log dies with the pod, so this only reaches
+you through whatever log pipeline the cluster already has. Treat it as the thing that tells you
+something happened, and see the next section for the order that keeps it from mattering.
 
 ## During the soak — the rule that matters
 
@@ -295,6 +322,161 @@ property by property.
 
 Do not skip it. It is the only part of this fortnight that answers the question the product
 exists for.
+
+## Ending a series and starting another
+
+This kit was written for one fortnight, and for a long time that was all it said. If you are
+starting a second series — a new release, a different scope, a rerun of a fortnight that went
+wrong — you are starting on a volume that still holds the previous one, and the order matters.
+
+**Read all five steps before you run any of them.** Step 2 is the one that has actually cost an
+archive: the obvious way to reset a collector is reverted within minutes on most clusters, and it
+takes the archive with it.
+
+### 1. Export first, because deleting the PVC destroys the archive
+
+The collector's data lives on `crystal-backup-soak-data`, a PersistentVolumeClaim this chart
+renders. Nothing is copied off it: not to the operator, not to your object store, not into the
+archive you already sent. When that PVC goes, the series goes with it.
+
+So, in this order:
+
+```sh
+# 1a. the cheap insurance, thirty seconds, and it works even when there is no archive to make.
+#     --status reads the volume and prints what is on it, including the per-class peak memory
+#     figures that are the whole point of §5. SAVE THE OUTPUT — a file, a paste into your notes,
+#     a screenshot. Every soak that has ended badly ended with somebody glad they had this.
+kubectl -n crystal-backup-system exec deploy/crystal-backup-soak -- \
+  /manager soak-export --status 2>&1 | tee soak-series1-status.txt
+
+# 1b. the real archive.
+./collect.sh --salt-file soak-salt.bin
+```
+
+If `collect.sh` cannot reach the collector at all — it answers `NOT COLLECTED: … exists but has no
+Running pod` and exits 3 — then the pod is not running and its volume is not readable through it.
+Do **not** proceed to step 2; deleting the PVC at that point is deleting the only copy. `kubectl -n
+crystal-backup-system describe pod -l crystalbackup.io/soak=collector` will usually say why, and if
+it is a volume that will not attach or will not mount, the figures in `soak-shutdown` in the
+previous pod's log (see the section above) are what is left. Send those and say what happened; a
+lost archive with an explanation is worth more to us than a silent gap.
+
+### 2. The GitOps trap: `kubectl scale` and `kubectl delete` are undone
+
+If this cluster is reconciled by Argo CD, Flux or anything similar, the collector's Deployment and
+PVC are objects that reconciler owns. `kubectl scale deploy/crystal-backup-soak --replicas=0` is
+reverted at the next sync — three minutes by default in Argo CD — and so is `kubectl delete pvc`.
+What you get is not a stopped collector. It is a few minutes of confusion, then a collector back on
+its old volume; and if the timing is unlucky, a PVC deletion racing a pod that is still using it.
+
+That race is not hypothetical. On the morning this section was written, a pod replacement on a
+ReadWriteOnce volume produced, in order: `Multi-Attach error for volume … already exclusively
+attached to one node`, then a successful attach on the new node, then `rbd: map failed: (22) Invalid
+argument` and a pod in `ContainerCreating` for good. The archive was intact and unreachable, on the
+volume that was about to be deleted.
+
+**Do it through the values your reconciler reads**, not with `kubectl`:
+
+1. **Set `soak.enabled: false`** in the values file your reconciler syncs from — the Application,
+   the HelmRelease, the values in your repository. Commit it and let it sync. Do not use
+   `--set`; a value your reconciler does not know about is a value it will overwrite.
+
+2. **Verify that both objects are gone**, and verify it rather than assuming it. This is the step
+   people skip and it is the whole point of doing it this way:
+
+   ```sh
+   kubectl -n crystal-backup-system get deploy,pvc,pod -l crystalbackup.io/soak=collector
+   # want: "No resources found in crystal-backup-system namespace."
+   ```
+
+   If the Deployment went and the PVC did not, your reconciler is not pruning removed resources
+   (Argo CD: `syncPolicy.automated.prune`; Flux: `prune: true`), and the volume still holds the old
+   series. Nothing in this chart holds that PVC back — it carries no
+   `helm.sh/resource-policy: keep` and no finalizer of ours — so if something is holding it, it came
+   from your cluster's own policy and you will have to decide what to do about it. A PVC stuck
+   `Terminating` is usually a pod still mounting it: check the `pod` line in the output above.
+
+3. **Only then set `soak.enabled: true`** again and let it sync. A fresh PVC, a fresh collector, a
+   fresh `uptime.json`.
+
+**Installing with Helm directly, no reconciler?** The same three steps, with
+`helm upgrade --install … --reuse-values --set soak.enabled=false`, the same verification, then
+`--set soak.enabled=true`. Helm deletes resources that a new revision no longer renders, so the PVC
+does go — which is exactly why step 1 comes first.
+
+### 3. A new day zero
+
+The baseline is per-series. Take it again, with **the same salt file**, and keep the old one:
+
+```sh
+kubectl -n crystal-backup-system cp soak-salt.bin \
+  "$(kubectl -n crystal-backup-system get pod -l app.kubernetes.io/name=crystal-backup \
+     -o jsonpath='{.items[0].metadata.name}')":/tmp/soak-salt.bin
+kubectl -n crystal-backup-system exec deploy/crystal-backup -- \
+  /manager selfcheck --redaction-salt-file=/tmp/soak-salt.bin > soak-day0-series2.json
+```
+
+Start a new notes file too, and write in its first line what changed between the two series — the
+release, the scope, the schedule, whatever you are rerunning for. That sentence is what makes two
+archives a comparison instead of two unrelated fortnights.
+
+### 4. Why the two series are still comparable
+
+This is worth knowing rather than discovering: **the two archives share their tokens.**
+
+With the default `saltMethod: auto`, the salt is `SHA256("crystalbackup-soak-salt-v1" || the
+operator namespace's UID)`. It is derived, not generated — there is no state anywhere, so the same
+namespace produces the same salt today, next month, and on a collector that has been deleted and
+recreated in between. The token for `production` in series 1 is the same token in series 2, and the
+two can be read as one series with a gap in the middle.
+
+Two things break that, and only two:
+
+- **Recreating the operator namespace.** A new namespace has a new UID, so it has a new salt, and
+  the two archives then share no tokens at all. If you do that between series — a full uninstall
+  and reinstall, a cluster rebuild — **say so when you send them.** Nothing in the archives reveals
+  it; we would read them as two different clusters and compare nothing.
+- **Changing salt method between the series.** `auto` and `fromSecret` produce different salts by
+  construction. If you are on `fromSecret`, keep the same `soak-salt.bin`, and do not "regenerate it
+  to be safe" — that is the failure this whole design is arranged around.
+
+Deleting and recreating the *collector*, its PVC and its Deployment breaks nothing. That is the
+point of a derived salt.
+
+### 5. What a fresh collector legitimately looks like — which zeros are expected
+
+Eleven seconds after the collector starts, `soak-export --status` looks alarming and is fine. This
+is the screen that gets a working collector restarted, and every restart costs a session, a gap in
+`uptime.json`, and another volume handover.
+
+**Expected on a brand-new collector:**
+
+| what you see | why it is correct |
+|---|---|
+| `up 0.0% of the 0.0 day(s) … across 1 session(s)` | `up` is a fraction of elapsed time, and almost no time has elapsed. It climbs towards 100% over the first day. |
+| `metrics 0 day segment(s) (+0 core)` | a metrics segment is written when the first resolution window *closes* — five minutes by default. Nothing is on disk before that. |
+| `state 0 day segment(s)` | the CR snapshot runs on its own interval, an hour by default. |
+| `events 0 day segment(s)`, `logs 0 day segment(s)` | and these may stay at zero for the whole fortnight. No Warning event and no operator error line is a **good** fortnight; the daily heartbeat never names them as silent. |
+| `NOTHING COLLECTED` next to any of the above | it is a statement about the volume, not a diagnosis. On a new collector it is the truth. |
+| `highwater NOT MEASURED — no marks file yet` | **the big one.** The high-water table needs a mover pod to exist, which needs a backup to run. On a nightly schedule that is up to a day away. It will say `NOT MEASURED` until then, and that is not a fault. |
+| `cache high-water NOT MEASURED` | permanent unless you set `soak.kubeletStats=true`, which grants `nodes/proxy`. Deliberate; nothing else is affected. |
+| `on disk` a few tens of KiB | there is nothing on it yet. |
+
+**Not expected, at any age:**
+
+- `!! the collector has never recorded its configuration in /var/lib/crystal-backup-soak` — this is
+  not a young collector, it is one that never started. Look at the pod now.
+- `metrics 0 day segment(s)` still there after fifteen minutes, or `selfcheck 0 report(s)` after an
+  hour. Both of those run on the collector's first round.
+- `silent=metrics` on any heartbeat line. The daily line only names a stream once it has had time to
+  write something, so if it is named, it is a finding.
+- `data:0` or `manifests:0` in `movers_by_class=` once your schedules have actually fired. A class at
+  zero while backups are running is a blind instrument, not an idle one.
+- `up` below about 90% on any day after the first, or a `GAP` line you cannot explain from your notes.
+
+**And the rule that follows from all of it:** do not restart the collector to make it start
+collecting. It is already collecting; the first hour looks empty because it *is* empty. If you
+genuinely need to replace the pod, go back to step 1 and export first.
 
 ## Files
 
