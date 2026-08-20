@@ -102,6 +102,15 @@ type ClusterBackupStatus struct {
 	// failures is a capped list of per-namespace failures.
 	// +optional
 	Failures []FailureRecord `json:"failures,omitempty"`
+	// blockedReasons breaks namespacesBlocked down by the classification that blocked each
+	// namespace, and says for each cause how many of those coordinates nevertheless hold a backup.
+	//
+	// It is keyed by cause, so it is bounded by a closed set of codes rather than by the namespace
+	// count — the property that lets it account for EVERY blocked namespace where the capped
+	// failures list can only sample ten. Absent when nothing was blocked. Same shape discipline as
+	// failures: rebuilt from scratch each pass, in a fixed order.
+	// +optional
+	BlockedReasons []BlockedReason `json:"blockedReasons,omitempty"`
 	// conditions represent the current state.
 	// +listType=map
 	// +listMapKey=type

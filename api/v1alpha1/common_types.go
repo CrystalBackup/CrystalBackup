@@ -860,6 +860,45 @@ type FailureRecord struct {
 	Message string `json:"message,omitempty"`
 }
 
+// BlockedReason is one line of a ClusterBackup run's blocked-namespace breakdown: of the namespaces
+// this run did not back up at all, how many were blocked for THIS cause.
+//
+// It exists because status.failures cannot answer the question. That list is capped at ten (see
+// status.DefaultFailureCap, and adr/0009 on why there is no per-namespace map), so a run that blocked
+// thirty-two namespaces published ten prose sentences and twenty-two silences — and every one of those
+// sentences was identical, because the prose names the classifier's conclusion rather than the fact it
+// turned on. Nine consecutive nights of that archive answered nothing.
+//
+// This list is keyed by CAUSE, not by namespace, so its length is bounded by a closed set of
+// classification codes — a handful — however many namespaces the run fans out to. That is the whole
+// reason it is allowed to be a field: it accounts for every blocked namespace without growing with
+// them.
+type BlockedReason struct {
+	// reason is the classification the coordinate check actually reached, as a stable token
+	// (OwnChild, ForeignParentUID, DiscoveryProjection, UnstampedTerminalChild,
+	// UnstampedWithResults). Stable is the operative word: an operator compares one night's
+	// breakdown with the next's.
+	// +optional
+	Reason string `json:"reason,omitempty"`
+	// namespaces blocked for this reason. Summed over the list this equals namespacesBlocked.
+	// +optional
+	Namespaces int32 `json:"namespaces,omitempty"`
+	// withDataAtCoordinate is how many of them have a Backup HOLDING SNAPSHOTS sitting at the
+	// coordinate. The run did not write it and will not claim it — but "blocked" beside "there is
+	// a backup here" is a different report from "blocked" beside an empty coordinate, and it is
+	// the counter-side honesty this field exists for: it lets one run object answer "were these
+	// namespaces protected or not?", which the counters alone assert the opposite of.
+	// +optional
+	WithDataAtCoordinate int32 `json:"withDataAtCoordinate,omitempty"`
+	// stampedByThisRun is how many of them hold an object carrying THIS run's own parent-UID.
+	// A non-zero value is a contradiction worth surfacing: the fan-out refused a coordinate the
+	// run itself demonstrably created. It is recorded rather than acted on — the fan-out's refusal
+	// stands, because reading an occupant's phase instead is the false-success class the coordinate
+	// guard exists to prevent — and it is what an investigation of the remaining paths starts from.
+	// +optional
+	StampedByThisRun int32 `json:"stampedByThisRun,omitempty"`
+}
+
 // BackupRunSpec is the run configuration of ONE namespace's backup: what to select, how to
 // move it, what to exec. It deliberately holds nothing that says WHICH namespaces or WHICH
 // repository — that is the caller's business and differs per plane.

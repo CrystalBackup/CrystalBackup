@@ -13,6 +13,9 @@ func TestCollisionMessageSurvivesTheStatusClamp(t *testing.T) {
 		Namespace: "some-fairly-long-tenant-namespace",
 		Name:      "dr-daily-20260730-020000",
 		Detail:    "it was created by a different run (parent 3b282d8e-ca67-4a2d-bb4a-1e98f29c567c)",
+		// A realistic facts block, plus the aggregate's recheck token: the longest this part gets.
+		Facts: "class=UnstampedTerminalChild stamp=none phase=PartiallyCompleted data=yes age=-14h0m0s " +
+			"recheck=stampedByThisRun",
 	}
 	got := clampMessage(longest.Error())
 	// The invariant half — the part no operator can reconstruct from the object — must survive
@@ -20,6 +23,14 @@ func TestCollisionMessageSurvivesTheStatusClamp(t *testing.T) {
 	// carried structurally in FailureRecord.Namespace and .Backup.
 	for _, want := range []string{
 		reasonRunNameCollision,
+		// The facts the classification was reached on. They are new, they are fixed-length, and they
+		// are the part a nine-night production archive turned out not to have — so they belong on
+		// the same side of the clamp as the sentences above, not on the truncatable side.
+		"class=UnstampedTerminalChild",
+		"stamp=none",
+		"data=yes",
+		"age=-14h0m0s",
+		"recheck=stampedByThisRun",
 		"nothing was backed up here",
 		"already designates data this run did not write",
 		"Re-run under a name no earlier run or schedule has used",

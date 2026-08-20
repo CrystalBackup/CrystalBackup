@@ -31,6 +31,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	cbv1 "github.com/CrystalBackup/CrystalBackup/api/v1alpha1"
@@ -283,7 +284,7 @@ func (r *BackupScheduleReconciler) stampBackup(ctx context.Context, sched *cbv1.
 		if gerr := r.Get(ctx, client.ObjectKey{Namespace: sched.Namespace, Name: name}, &existing); gerr != nil {
 			return "", fmt.Errorf("re-read Backup %s/%s after AlreadyExists: %w", sched.Namespace, name, gerr)
 		}
-		switch owner, detail := classifyCoordinate(&existing, sched.UID); owner {
+		switch owner, reason := classifyCoordinate(&existing, sched.UID, sched.CreationTimestamp); owner {
 		case coordinateMine:
 			return name, nil // genuinely already fired this tick.
 		case coordinateAdoptable:
@@ -297,9 +298,14 @@ func (r *BackupScheduleReconciler) stampBackup(ctx context.Context, sched *cbv1.
 			if perr := r.Patch(ctx, &existing, patch); perr != nil {
 				return "", fmt.Errorf("stamp parent UID on Backup %s/%s: %w", sched.Namespace, name, perr)
 			}
+			logf.FromContext(ctx).Info("stamp: adopted an unstamped in-flight Backup at this tick's coordinate",
+				"namespace", sched.Namespace, "backup", name, "facts", reason.Facts())
 			return name, nil
 		default:
-			return "", &runNameCollisionError{Namespace: sched.Namespace, Name: name, Detail: detail}
+			return "", &runNameCollisionError{
+				Namespace: sched.Namespace, Name: name,
+				Detail: reason.Detail, Facts: reason.Facts(), Reason: reason.Code, HasData: reason.HasResults,
+			}
 		}
 	}
 	r.Recorder.Eventf(sched, nil, corev1.EventTypeNormal, "BackupStamped", "StampBackup",

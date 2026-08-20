@@ -287,7 +287,8 @@ status:
   completionTime: "2026-07-12T02:41:10Z"
   namespacesMatched: 42
   namespacesSucceeded: 41
-  namespacesFailed: 1
+  namespacesFailed: 1                # namespaces whose child RAN and failed
+  namespacesBlocked: 0               # namespaces this run never backed up at all — a different fact
   pvcsSucceeded: 135
   pvcsFailed: 2
   clusterResourcesCaptured: 37       # cluster-scoped objects in the kind=cluster-manifests snapshot (adr/0011)
@@ -296,6 +297,11 @@ status:
     - namespace: c-team-x
       backup: dr-daily-20260712-020000
       message: "pvc data-2: mover OOMKilled, raise memory limit"
+  blockedReasons:                    # why namespacesBlocked; keyed by CAUSE, so bounded by a
+    - reason: UnstampedTerminalChild #   closed set of codes rather than by the namespace count
+      namespaces: 32                 #   (the capped failures list can only ever sample ten)
+      withDataAtCoordinate: 32       #   ...and 32 of those coordinates DO hold a backup
+      stampedByThisRun: 0            #   ...none of which this run can prove it wrote
   conditions: [...]
 ```
 

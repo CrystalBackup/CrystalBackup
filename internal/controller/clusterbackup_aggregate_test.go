@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -57,6 +58,12 @@ const (
 	incidentRun    = "nightly-20260808-040000"
 	incidentRunUID = types.UID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
 )
+
+// incidentRunCreated is the run OBJECT's creationTimestamp — the tick its name encodes. The ledger
+// takes it for the record only: how an occupant's own creationTimestamp compares to it is the
+// discriminator the backlog's candidate fix turns on, so a run writes it down rather than acting on
+// it. Nothing in this file's assertions depends on its value.
+var incidentRunCreated = metav1.Date(2026, 8, 8, 4, 0, 0, 0, time.UTC)
 
 // aggregateScheme is the scheme the fake client needs: core (namespaces) plus the CRDs.
 func aggregateScheme(t *testing.T) *runtime.Scheme {
@@ -346,9 +353,15 @@ func TestLedgerCountsEveryNamespaceExactlyOnce(t *testing.T) {
 		ledgerChild("ns-projected", incidentRun, string(status.BackupPhaseCompleted), false,
 			map[string]string{apiconst.AnnotationProjected: apiconst.AnnotationProjectedValue}),
 	}
-	collided := map[string]string{"ns-collided": "occupied by a Backup this run did not create"}
+	collided := map[string]blockedCoordinate{"ns-collided": {
+		reason: coordinateCodeUnstampedTerminal,
+		err: runNameCollisionError{
+			Namespace: "ns-collided", Name: incidentRun,
+			Detail: "occupied by a Backup this run did not create",
+		},
+	}}
 
-	l := buildRunLedger(incidentRun, incidentRunUID, matched, children, collided)
+	l := buildRunLedger(incidentRun, incidentRunUID, incidentRunCreated, matched, children, collided)
 	tally := status.TallyNamespaceOutcomes(l.outcomes())
 
 	if !tally.SumsUp() {
@@ -398,7 +411,7 @@ func TestLedgerKeepsItsOwnChildInADeselectedNamespace(t *testing.T) {
 		ledgerChild("ns-deselected", incidentRun, string(status.BackupPhaseUploading), true, nil),
 	}
 
-	l := buildRunLedger(incidentRun, incidentRunUID, []string{"ns-still-matched"}, children, nil)
+	l := buildRunLedger(incidentRun, incidentRunUID, incidentRunCreated, []string{"ns-still-matched"}, children, nil)
 	tally := status.TallyNamespaceOutcomes(l.outcomes())
 
 	if tally.Namespaces != 2 {
@@ -422,7 +435,7 @@ func TestLedgerIgnoresAnUnstampedStranger(t *testing.T) {
 		ledgerChild("ns-stranger", incidentRun, string(status.BackupPhaseCompleted), false, nil),
 	}
 
-	l := buildRunLedger(incidentRun, incidentRunUID, []string{"ns-matched"}, children, nil)
+	l := buildRunLedger(incidentRun, incidentRunUID, incidentRunCreated, []string{"ns-matched"}, children, nil)
 	tally := status.TallyNamespaceOutcomes(l.outcomes())
 
 	if tally.Namespaces != 1 || tally.Succeeded != 1 {
@@ -442,7 +455,7 @@ func TestLedgerIgnoresABackupAtAnotherCoordinate(t *testing.T) {
 		ledgerChild("ns-a", "some-other-backup", string(status.BackupPhaseCompleted), true, nil),
 	}
 
-	l := buildRunLedger(incidentRun, incidentRunUID, []string{"ns-a"}, children, nil)
+	l := buildRunLedger(incidentRun, incidentRunUID, incidentRunCreated, []string{"ns-a"}, children, nil)
 	tally := status.TallyNamespaceOutcomes(l.outcomes())
 
 	if tally.InFlight != 1 || tally.Succeeded != 0 {

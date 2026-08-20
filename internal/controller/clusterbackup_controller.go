@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"maps"
 	"slices"
 	"time"
 
@@ -53,7 +54,16 @@ const clusterBackupPollInterval = 15 * time.Second
 // clusterBackupMessageCap bounds a FailureRecord/condition message so a pathological child error
 // cannot bloat the ClusterBackup's status (which already caps the failures LIST via
 // status.AppendCappedFailure); this caps each ENTRY's length.
-const clusterBackupMessageCap = 256
+//
+// 384, raised from 256, and the reason is measured rather than aesthetic: a run-name collision
+// message now leads with a fixed-length block of the facts the classification was reached on, and
+// at 256 that block pushed "Re-run under a name no earlier run or schedule has used" — the sentence
+// runNameCollisionError.Error() says must never be truncated away — off the end. Pinned by
+// TestCollisionMessageSurvivesTheStatusClamp. The bound this constant exists to provide is
+// untouched: the list is still capped at ten entries, so the worst case is 10 × 384 runes, and what
+// still truncates on a pathological name is the occupant's identity, which FailureRecord.Namespace
+// and .Backup carry structurally anyway.
+const clusterBackupMessageCap = 384
 
 // ClusterBackupReconciler reconciles a ClusterBackup: one cluster-DR RUN that fans a Backup out
 // into every namespace its selector matches, then aggregates those children into a single bounded
@@ -176,23 +186,49 @@ func (r *ClusterBackupReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// List will happily pick up, since a projection and a previous run's child both carry the
 	// cluster-backup label — must never be counted as this run's result.
 	var fanoutFailures []cbv1.FailureRecord
-	collided := make(map[string]string)
+	collided := make(map[string]blockedCoordinate)
 	for _, ns := range matched {
 		err := r.ensureChildBackup(ctx, &cb, ns)
 		if err == nil {
 			continue
 		}
 		if c := asRunNameCollision(err); c != nil {
-			log.Error(err, "fan-out: run-name collision; namespace NOT backed up", "namespace", ns, "run", cb.Name)
-			collided[ns] = clampMessage(c.Error())
-			r.Recorder.Eventf(&cb, nil, corev1.EventTypeWarning, reasonRunNameCollision, "FanOut",
-				"namespace %q was NOT backed up: %s", ns, c.Error())
+			// The per-namespace record goes to the LOG, untruncated, every namespace, every pass.
+			// The structured fields are the point: an operator greps a night by "reason" and gets a
+			// count per cause, which nine nights of the identical prose sentence never gave anyone.
+			log.Error(err, "fan-out: run-name collision; namespace NOT backed up",
+				"namespace", ns, "run", cb.Name, "reason", c.Reason, "facts", c.Facts)
+			collided[ns] = blockedCoordinate{reason: c.Reason, hasData: c.HasData, err: *c}
 			continue
 		}
 		log.Error(err, "fan-out: ensure child Backup failed", "namespace", ns, "run", cb.Name)
 		fanoutFailures = append(fanoutFailures, cbv1.FailureRecord{
 			Namespace: ns, Backup: cb.Name, Message: clampMessage(err.Error()),
 		})
+	}
+	// ONE Warning for the whole blocked set, not one per namespace, and that is a correction rather
+	// than a shortcut: the loop above used to emit a Warning per collided namespace on EVERY pass, so
+	// the run that produced this lot's evidence was writing 32 Warnings per reconcile — enough to
+	// evict the rest of the namespace's events well inside the hour they live, which is how the
+	// per-namespace detail managed to be both emitted and unavailable. The same release fixes another
+	// path for the same shape. What an Event is good for here is the headline and the breakdown; the
+	// per-namespace text is in the log line above and a sample of it is durable in status.failures.
+	if len(collided) > 0 {
+		blockedNamespaces := slices.Sorted(maps.Keys(collided))
+		facts := make([]blockedNamespaceFacts, 0, len(collided))
+		for _, ns := range blockedNamespaces {
+			facts = append(facts, blockedNamespaceFacts{reason: collided[ns].reason, dataAtCoordinate: collided[ns].hasData})
+		}
+		// One namespace's full untruncated text rides along, so the Event still shows what the prose
+		// looks like without the reader having to go to the log. The first in sorted order, not an
+		// arbitrary one, so the same run says the same thing on every pass.
+		first := collided[blockedNamespaces[0]]
+		r.Recorder.Eventf(&cb, nil, corev1.EventTypeWarning, reasonRunNameCollision, "FanOut",
+			"%d namespace(s) were NOT backed up: their run-name coordinate is occupied by a Backup this "+
+				"run did not create (%s). See status.blockedReasons for the full breakdown and "+
+				"status.failures for a sample. First: %s — %s",
+			len(collided), blockedBreakdownLine(summariseBlockedReasons(facts)),
+			blockedNamespaces[0], first.err.Error())
 	}
 
 	// (3.5) The run-level cluster-manifests capture (adr/0011 §1), driven INDEPENDENTLY of the
@@ -391,7 +427,7 @@ func (r *ClusterBackupReconciler) ensureChildBackup(ctx context.Context, cb *cbv
 func (r *ClusterBackupReconciler) resolveExistingChild(
 	ctx context.Context, cb *cbv1.ClusterBackup, existing *cbv1.Backup,
 ) error {
-	switch owner, detail := classifyCoordinate(existing, cb.UID); owner {
+	switch owner, reason := classifyCoordinate(existing, cb.UID, cb.CreationTimestamp); owner {
 	case coordinateMine:
 		return nil // idempotent: never mutate an existing child here.
 	case coordinateAdoptable:
@@ -407,9 +443,17 @@ func (r *ClusterBackupReconciler) resolveExistingChild(
 		if err := r.Patch(ctx, existing, patch); err != nil {
 			return fmt.Errorf("stamp parent UID on child Backup %s/%s: %w", existing.Namespace, existing.Name, err)
 		}
+		// Adoption is the ONE mutation the coordinate guard admits, and until now it left no trace
+		// anywhere: an object silently changed owner. Logged, not evented — it is a normal upgrade
+		// step, and it happens at most once per namespace per run.
+		logf.FromContext(ctx).Info("fan-out: adopted an unstamped in-flight child",
+			"namespace", existing.Namespace, "run", cb.Name, "facts", reason.Facts())
 		return nil
 	default:
-		return &runNameCollisionError{Namespace: existing.Namespace, Name: existing.Name, Detail: detail}
+		return &runNameCollisionError{
+			Namespace: existing.Namespace, Name: existing.Name,
+			Detail: reason.Detail, Facts: reason.Facts(), Reason: reason.Code, HasData: reason.HasResults,
+		}
 	}
 }
 
@@ -438,6 +482,13 @@ type namespaceVerdict struct {
 	namespace string
 	outcome   status.NamespaceOutcome
 	failure   *cbv1.FailureRecord
+	// blocked is non-nil exactly when outcome is NamespaceBlocked: WHY the namespace was never
+	// backed up, in a form that can be counted rather than read. It travels on the verdict for the
+	// same reason the failure does — a namespace must not be able to land in a bucket without its
+	// explanation coming with it — and it is what feeds status.blockedReasons. The capped failure
+	// list samples ten of these; this one is kept for every namespace and folded down to a bounded
+	// per-cause summary before it reaches the object.
+	blocked *blockedNamespaceFacts
 }
 
 // runLedger is the complete accounting of one aggregation pass: one verdict per namespace the run is
@@ -462,6 +513,20 @@ func (l runLedger) outcomes() []status.NamespaceOutcome {
 	return out
 }
 
+// blockedFacts projects the ledger onto the per-namespace blocked reasons, in verdict order, for
+// summariseBlockedReasons to fold. One entry per blocked namespace and nothing else — so the
+// summary's namespace counts are the same namespaces the tally's Blocked bucket counted, by
+// construction, in the same pass.
+func (l runLedger) blockedFacts() []blockedNamespaceFacts {
+	var out []blockedNamespaceFacts
+	for _, v := range l.verdicts {
+		if v.blocked != nil {
+			out = append(out, *v.blocked)
+		}
+	}
+	return out
+}
+
 // buildRunLedger decides, in one pass, what the run has to say about every namespace it is
 // answerable for. It is a pure function of its inputs — no client, no clock — because the counters
 // an administrator acts on deserve to be testable without an API server, and because the incident
@@ -478,7 +543,8 @@ func (l runLedger) outcomes() []status.NamespaceOutcome {
 // List is label-scoped, and a label is not a coordinate: keying a map by namespace alone let any
 // labelled Backup in that namespace stand in for the run's child, last write winning.
 func buildRunLedger(
-	runName string, runUID types.UID, matched []string, children []cbv1.Backup, collided map[string]string,
+	runName string, runUID types.UID, runCreated metav1.Time,
+	matched []string, children []cbv1.Backup, collided map[string]blockedCoordinate,
 ) runLedger {
 	atCoordinate := make(map[string]*cbv1.Backup, len(children))
 	for i := range children {
@@ -518,9 +584,29 @@ func buildRunLedger(
 		// such an occupant up (a projection and a previous run's child both carry the cluster-backup
 		// label), so reading its phase would be exactly the false success this guard exists to stop.
 		// Decided before the child lookup so no volume of it is ever tallied.
-		if msg, bad := collided[ns]; bad {
+		if bc, bad := collided[ns]; bad {
+			// The verdict is the fan-out's and is NOT revisited here. What is added is what the
+			// coordinate looks like now, one pass later, because that comparison is the only place
+			// the remaining trigger paths can show themselves: the archive that motivated this
+			// records runs whose refused coordinates hold a child carrying the run's OWN stamp,
+			// which the written-down cause (an unstamped pre-stamp child) cannot explain. Deciding
+			// on the re-read object instead would be exactly the false success the guard exists to
+			// stop — an occupant's Completed phase is not evidence this run wrote anything.
+			facts := blockedNamespaceFacts{reason: bc.reason, dataAtCoordinate: bc.hasData}
+			collision := bc.err
+			if child != nil {
+				facts.dataAtCoordinate = facts.dataAtCoordinate || backupHasResults(child)
+				if child.Annotations[apiconst.AnnotationParentUID] == string(runUID) {
+					facts.stampedByRun = true
+					// Re-rendered from the unclamped error rather than appended to a clamped
+					// message: the facts live at the FRONT of that string precisely so they survive
+					// the clamp, and appending here would put this one past the cap every time.
+					collision.Facts += " recheck=stampedByThisRun"
+				}
+			}
 			return namespaceVerdict{namespace: ns, outcome: status.NamespaceBlocked,
-				failure: &cbv1.FailureRecord{Namespace: ns, Backup: runName, Message: msg}}
+				blocked: &facts,
+				failure: &cbv1.FailureRecord{Namespace: ns, Backup: runName, Message: clampMessage(collision.Error())}}
 		}
 		if child == nil {
 			// Fanned out but not observed yet: no verdict, which keeps the run non-terminal.
@@ -532,12 +618,25 @@ func buildRunLedger(
 		// and none of them was written by this run. Even if the coordinate check upstream ever
 		// regressed, a projection must not be able to increment pvcsSucceeded.
 		if child.Annotations[apiconst.AnnotationProjected] == apiconst.AnnotationProjectedValue {
+			// The reason is built here rather than taken from classifyCoordinate, and deliberately:
+			// classifyCoordinate reads the parent-UID stamp FIRST, so a projection carrying this
+			// run's UID would come back OwnChild from it. This branch has already established what
+			// the object is; it only needs the facts described the same way everything else is.
+			reason := newCoordinateReason(child, runUID, runCreated)
+			reason.Code = coordinateCodeProjection
+			reason.Detail = "it is a discovery projection of snapshots already in the repository"
 			return namespaceVerdict{namespace: ns, outcome: status.NamespaceBlocked,
+				blocked: &blockedNamespaceFacts{
+					reason:           reason.Code,
+					dataAtCoordinate: reason.HasResults,
+					stampedByRun:     reason.Stamp == coordinateStampMine,
+				},
 				failure: &cbv1.FailureRecord{
 					Namespace: ns, Backup: child.Name,
 					Message: clampMessage((&runNameCollisionError{
 						Namespace: ns, Name: child.Name,
-						Detail: "it is a discovery projection of snapshots already in the repository",
+						Detail: reason.Detail, Facts: reason.Facts(),
+						Reason: reason.Code, HasData: reason.HasResults,
 					}).Error()),
 				}}
 		}
@@ -585,7 +684,7 @@ func buildRunLedger(
 // asserting that the buckets still added up to the namespaces being counted.
 func (r *ClusterBackupReconciler) aggregateAndWrite(
 	ctx context.Context, cb *cbv1.ClusterBackup, loc *cbv1.ClusterBackupLocation, matched []string,
-	fanoutFailures []cbv1.FailureRecord, collided map[string]string, captureDone bool,
+	fanoutFailures []cbv1.FailureRecord, collided map[string]blockedCoordinate, captureDone bool,
 ) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
@@ -602,7 +701,7 @@ func (r *ClusterBackupReconciler) aggregateAndWrite(
 		return ctrl.Result{}, fmt.Errorf("list child Backups for run %s: %w", cb.Name, err)
 	}
 
-	ledger := buildRunLedger(cb.Name, cb.UID, matched, children.Items, collided)
+	ledger := buildRunLedger(cb.Name, cb.UID, cb.CreationTimestamp, matched, children.Items, collided)
 	outcomes := ledger.outcomes()
 	tally := status.TallyNamespaceOutcomes(outcomes)
 
@@ -655,6 +754,21 @@ func (r *ClusterBackupReconciler) aggregateAndWrite(
 		}
 		st.Failures = status.AppendCappedFailure(st.Failures, *v.failure, status.DefaultFailureCap)
 	}
+	// WHY the blocked namespaces were blocked, and this is the field's whole argument for existing.
+	//
+	// status.failures already carries a per-namespace message, and it is the established pattern —
+	// so it stays the per-namespace record and this adds nothing to it. But it is capped at ten by
+	// design (adr/0009: no unbounded per-namespace map), and the run that motivated this blocked
+	// THIRTY-TWO: ten sampled sentences, twenty-two namespaces with no record at all, on ten
+	// consecutive nights. Raising the cap was the obvious alternative and is the wrong one — it
+	// makes the object grow with the namespace count, which is the property adr/0009 refuses.
+	//
+	// Keying by CAUSE instead makes the list bounded by a closed set of classification codes, so it
+	// accounts for every blocked namespace at a size that does not move when the run fans out to
+	// three hundred. An Event was the other candidate and carries the headline (one per pass, in the
+	// fan-out), but it expires in an hour: a nightly run read the next morning has lost it, and
+	// "what did last night say" is the entire question here.
+	st.BlockedReasons = summariseBlockedReasons(ledger.blockedFacts())
 
 	phase := status.RollUpNamespaceOutcomes(outcomes)
 	switch {

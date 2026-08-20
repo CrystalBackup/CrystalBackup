@@ -401,6 +401,37 @@ _Appears in:_
 | `conditions` _[Condition](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.30/#condition-v1-meta) array_ | conditions represent the current state. |  |  |
 
 
+## BlockedReason
+
+
+
+BlockedReason is one line of a ClusterBackup run's blocked-namespace breakdown: of the namespaces
+this run did not back up at all, how many were blocked for THIS cause.
+
+It exists because status.failures cannot answer the question. That list is capped at ten (see
+status.DefaultFailureCap, and adr/0009 on why there is no per-namespace map), so a run that blocked
+thirty-two namespaces published ten prose sentences and twenty-two silences — and every one of those
+sentences was identical, because the prose names the classifier's conclusion rather than the fact it
+turned on. Nine consecutive nights of that archive answered nothing.
+
+This list is keyed by CAUSE, not by namespace, so its length is bounded by a closed set of
+classification codes — a handful — however many namespaces the run fans out to. That is the whole
+reason it is allowed to be a field: it accounts for every blocked namespace without growing with
+them.
+
+
+
+_Appears in:_
+- [ClusterBackupStatus](#clusterbackupstatus)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `reason` _string_ | reason is the classification the coordinate check actually reached, as a stable token<br />(OwnChild, ForeignParentUID, DiscoveryProjection, UnstampedTerminalChild,<br />UnstampedWithResults). Stable is the operative word: an operator compares one night's<br />breakdown with the next's. |  |  |
+| `namespaces` _integer_ | namespaces blocked for this reason. Summed over the list this equals namespacesBlocked. |  |  |
+| `withDataAtCoordinate` _integer_ | withDataAtCoordinate is how many of them have a Backup HOLDING SNAPSHOTS sitting at the<br />coordinate. The run did not write it and will not claim it — but "blocked" beside "there is<br />a backup here" is a different report from "blocked" beside an empty coordinate, and it is<br />the counter-side honesty this field exists for: it lets one run object answer "were these<br />namespaces protected or not?", which the counters alone assert the opposite of. |  |  |
+| `stampedByThisRun` _integer_ | stampedByThisRun is how many of them hold an object carrying THIS run's own parent-UID.<br />A non-zero value is a contradiction worth surfacing: the fan-out refused a coordinate the<br />run itself demonstrably created. It is recorded rather than acted on — the fan-out's refusal<br />stands, because reading an occupant's phase instead is the false-success class the coordinate<br />guard exists to prevent — and it is what an investigation of the remaining paths starts from. |  |  |
+
+
 ## ClusterBackup
 
 
@@ -704,6 +735,7 @@ _Appears in:_
 | `clusterManifests` _[ManifestsStatus](#manifestsstatus)_ | clusterManifests records the run's one kind=cluster-manifests snapshot (adr/0011 §1). Its<br />presence is also the "capture is terminal" marker the reconcile keys on — set once, it<br />stops a second capture of the same run, exactly as backup.status.manifests does for a<br />namespace. Absent means either the capture is still in flight or the run opted out. |  |  |
 | `addedBytes` _integer_ | addedBytes is the deduplicated bytes added by this run. |  |  |
 | `failures` _[FailureRecord](#failurerecord) array_ | failures is a capped list of per-namespace failures. |  |  |
+| `blockedReasons` _[BlockedReason](#blockedreason) array_ | blockedReasons breaks namespacesBlocked down by the classification that blocked each<br />namespace, and says for each cause how many of those coordinates nevertheless hold a backup.<br />It is keyed by cause, so it is bounded by a closed set of codes rather than by the namespace<br />count — the property that lets it account for EVERY blocked namespace where the capped<br />failures list can only sample ten. Absent when nothing was blocked. Same shape discipline as<br />failures: rebuilt from scratch each pass, in a fixed order. |  |  |
 | `conditions` _[Condition](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.30/#condition-v1-meta) array_ | conditions represent the current state. |  |  |
 
 

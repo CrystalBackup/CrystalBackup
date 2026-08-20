@@ -101,11 +101,11 @@ func TestClassifyCoordinate(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, detail := classifyCoordinate(tc.backup, testOwnerUID)
+			got, reason := classifyCoordinate(tc.backup, testOwnerUID, incidentRunCreated)
 			if got != tc.want {
-				t.Fatalf("classifyCoordinate = %v, want %v (detail %q)", got, tc.want, detail)
+				t.Fatalf("classifyCoordinate = %v, want %v (detail %q)", got, tc.want, reason.Detail)
 			}
-			if got == coordinateForeign && detail == "" {
+			if got == coordinateForeign && reason.Detail == "" {
 				t.Fatal("a collision must carry a human-readable cause, not just a verdict")
 			}
 		})
@@ -118,7 +118,7 @@ func TestClassifyCoordinateBackupTimeIsAResult(t *testing.T) {
 	b := backupWith(nil, string(status.BackupPhaseUploading))
 	now := metav1.Now()
 	b.Status.BackupTime = &now
-	if got, _ := classifyCoordinate(b, testOwnerUID); got != coordinateForeign {
+	if got, _ := classifyCoordinate(b, testOwnerUID, incidentRunCreated); got != coordinateForeign {
 		t.Fatalf("a Backup with a stamped backupTime must never be adopted: got %v", got)
 	}
 }
