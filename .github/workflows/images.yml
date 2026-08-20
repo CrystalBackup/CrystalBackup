@@ -46,7 +46,7 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAMESPACE: crystalbackup
   # Pinned toolchain — bump deliberately (see adr/0012 scheduled-rebuild note).
-  GO_VERSION: "1.26.5" # matches mise.toml
+  GO_VERSION: "1.26.6" # matches mise.toml
   APKO_VERSION: "v1.2.25"
   MELANGE_VERSION: "v0.56.2"
   # VEX (adr/0012): govulncheck produces the statements, cosign attests them. No vexctl —

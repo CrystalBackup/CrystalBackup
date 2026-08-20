@@ -37,7 +37,7 @@ permissions:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAMESPACE: crystalbackup
-  GO_VERSION: "1.26.5"
+  GO_VERSION: "1.26.6"
   GOVULNCHECK_VERSION: "v1.6.0"
   TRIVY_VERSION: "0.70.0"
   # Support window (adr/0012): the N most recent releases keep a refreshed VEX. Older digests
