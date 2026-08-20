@@ -676,6 +676,81 @@ with no margin for a cold first pass is a bound that fires again, so it is ten m
 attempt is published anyway, which is the rule these reports follow whether the failure lands on the
 product or on the instrument.
 
+**Status as of 0.6.7 (2026-08-20) — three artefacts reported a fact when all they had was a refusal,
+a blind spot or a discarded string, and the soak found every one of them.** Not one finding in this
+release came from the crucible, and not one was reachable by any test in this repository: all three
+came out of a fortnight's archive exported from somebody's real cluster and read. That is the first
+time the soak kit has produced **findings** rather than merely uptime, and it is worth saying
+plainly — M6's remaining exit criterion began paying off before it had finished. The longest-lived
+of the three: the resident collector's daily self-check reported **30 of 30 PVCs** as
+`ExposerUnresolvable`, under a headline saying they would NOT be backed up, on **nine consecutive
+days**, while 28 of those volumes completed successfully every one of those nights. Every number in
+the report was arithmetically correct and its meaning was false. The cause is one missing line of
+RBAC — since 0.6.5 the exposer resolves a bound PVC's driver from its `PersistentVolume`, the
+collector's ClusterRole was never extended to match, the read came back `Forbidden`, and **the
+refusal was recorded as a fact about the storage**. The grant is the smaller half: any cluster that
+denies that permission would have gone on reading the same false headline, so a refused or failed
+read now has a class of its own, `ExposerUndetermined`, kept out of the count of volumes that will
+not be backed up. The line is *did the apiserver answer* — a `NotFound` is a finding about the
+storage, a `Forbidden` or a timeout is a finding about the observer — and the same conflation was
+closed in two further places. What keeps it closed is not the fix: the reads the self-check performs
+are now declared in **one place** that both the code and a chart test consume, so adding a read
+without extending the role fails a gate on the maintainer's machine. Writing that declaration
+immediately found a read no hand-audit had seen, which is exactly how the missing grant shipped.
+
+The second was a leak the kit's own check caught: a customer's PVC name verbatim in an exported
+Event, with the run name and the namespace in the same sentence properly tokenised. **The PVC had
+never been registered.** PVC names entered the redactor only through a metric label that exists once
+a volume has a `VolumeSnapshot`, and the volumes a schedule complains about by name are precisely
+the ones stuck before they ever get one — a class structurally invisible to the redactor, which no
+amount of care in the substitution pass could have covered. Both obvious repairs are rejected in
+comments: dropping the name destroys the message's only diagnostic value, on the administrator's own
+cluster, where their PVC name is not a secret from them; and substituting every known identifier
+inside free text is worse, because on the cluster that produced this archive the PVCs are named
+`data` and `backups`, so a blind pass would rewrite the English word and the CRD plural throughout
+while still not being complete. The rule is bounded instead — identifiers we control are written
+**quoted** at the source, and the exporter substitutes only quoted exact matches through a second
+registry the general free-text pass never sees. Two written claims that the leak disproved, in
+`manifest.go` and in the kit's SPEC, are corrected rather than deleted.
+
+The third is instrumentation and nothing else. **Ten nights out of ten** on that cluster, every
+`ClusterBackup` came back `PartiallyFailed` with `namespacesBlocked: 32` while its namespace-level
+children read `Completed` over 28 of 29 volumes — the backlog entry below, reproduced on demand
+rather than observed once. Because that entry says the trigger is an unenumerated set whose first
+job is to find the other paths, **nothing classificatory was changed here**: the diff over
+`classifyCoordinate`'s decision lines touches only its second return value. What that value
+discarded is the finding — all four foreign branches rendered one reason and differed only in prose,
+naming each branch's conclusion and never the facts behind it, and the run object's
+`creationTimestamp`, the quantity the entry's own candidate fix turns on, **was not a parameter of
+the function at all**, so no volume of production evidence could ever have confirmed or refuted that
+hypothesis. `ClusterBackupStatus.blockedReasons` now groups blocked namespaces by cause — five
+codes whatever the estate size, where the ten-entry failure list could only sample 10 of 32 and
+where a per-namespace map is what [adr/0009](adr/0009-shared-cluster-repo-tag-tenancy.md) refuses —
+with `withDataAtCoordinate` and `stampedByThisRun`, the second turning the falsified hypothesis into
+a measurement. **There is a CRD step in this release**, unlike 0.6.6: `blockedReasons` is a new
+optional field on `ClusterBackup.status` and the CRDs must be applied before or with the chart.
+
+Neither exit criterion closed. The two-week soak is **running** on a real build cluster, started on
+0.6.5 — and the operator there is still **0.6.5**, deliberately: this release is not being deployed
+onto it until that fortnight ends, because restarting the window to pick up the fixes the window
+itself produced is how a two-week measurement never completes one. The pilot rollout has not
+started. The PodSecurity review as a written document is still not written.
+
+**Validated: 93 of 93 crucible checks, 0 failed, 0 skipped, in 2h43m48s** — the whole suite
+unfiltered on a freshly provisioned six-node RKE2 v1.35.7 + Rook-Ceph v1.19.0 cluster with real S3.
+**It took three attempts, and both red ones were the harness rather than the product**: no product
+code changed between the three runs, and the same three image digests were deployed each time. Run 1
+gave a teardown **0.272s** on a leak check that fails fast on residue predating it — a premise that
+is false for a spec whose subject is a thirty-minute deadline, and the operator's log settles it,
+the sweep having logged in the same second the check entered that the residue was still draining.
+Run 2 failed behind Ginkgo's unpinned container shuffle, and fixing that found the larger half: the
+shared `dr` location was not merely created late but **deleted mid-suite** by six sites, each
+deletion garbage-collecting the `BackupRepository` the other lanes poll. Both had been winning that
+coin flip for two releases, which makes 0.6.6's green on the first of them luck rather than a
+verdict. The seed stays unpinned on purpose — the shuffle is this suite's only instrument for
+finding cross-container coupling, and it has now found two real defects that a fixed seed would have
+frozen into permanent green.
+
 ## M7 — Reach: storage without snapshots, file-level restore, notifications (0.7)
 
 **Re-scoped 2026-08-02.** M7 previously stacked the CLI and the UI under one number; both now
@@ -878,6 +953,29 @@ Recorded in [00-requirements.md §6](00-requirements.md); no milestone yet.
   same-named earlier run's child is necessarily older than the current run object), and "looks sound"
   is precisely the standard that should not be enough for this guard. It deserves its own lot and its
   own campaign, not a slot in a release already carrying six.
+
+  **0.6.7 instrumented it; the defect is unchanged and this entry stays open.** A nine-day archive
+  from a production cluster made the disagreement the normal path rather than an occasional one —
+  every `ClusterBackup`, **ten nights out of ten**, `PartiallyFailed` with `namespacesBlocked: 32`
+  beside namespace `Backup`s reading `Completed` over 28 of 29 volumes — and the archive answered
+  nothing, because the run object recorded a verdict and never the facts behind it. It now records
+  both. `classifyCoordinate` returns a stable code per branch plus the discriminators it decided on
+  (the occupant's own stamp as `mine`/`other`/`none`, its phase, whether it held results, and its
+  `creationTimestamp` relative to the run object's). That last discriminator is exactly the quantity
+  the candidate fix above turns on, and it **was not a parameter of `classifyCoordinate` at all**
+  before this release — so no volume of production evidence, however many nights it spans, could
+  ever have confirmed or refuted that hypothesis; it was not being looked at.
+
+  `ClusterBackupStatus` gained `blockedReasons`: the blocked namespaces broken down BY CAUSE, so it
+  is bounded by a closed set of codes rather than by the namespace count, with
+  `withDataAtCoordinate` — the counter-side honesty, since the whole difficulty is that the run says
+  "blocked" over coordinates that hold a backup —
+  and `stampedByThisRun`, which counts the coordinates the run itself demonstrably created and the
+  fan-out still refused. That last counter is the falsifier above turned into a measurement: the
+  next lot reads it off a night's objects instead of arguing about it.
+
+  Not one classification moved. No branch condition, no ordering, no adoption window — the codes are
+  attached to branches that already existed, and the guard's tests are unchanged.
 
 - **Namespace-plane backup as a partial repo copy** (`restic copy` from the cluster DR repo
   into the user's bucket instead of an independent re-backup) — could supersede independent

@@ -4,6 +4,147 @@ All notable changes to Crystal Backup. Versioning follows
 [adr/0014](spec/adr/0014-versioning-and-release.md): milestone `Mn` → minor `0.n.z` on
 major 0; `1.0.0` is a deliberate post-M9 API-stability decision.
 
+## 0.6.7 — Nine days of a report condemning volumes it was never allowed to look at (2026-08-20)
+
+**Validated on real infrastructure: 93 of 93 crucible checks, 0 failed, 0 skipped, in 2h43m48s** —
+the whole suite unfiltered on a freshly provisioned six-node RKE2 v1.35.7 + Rook-Ceph v1.19.0
+cluster with real S3, against the three image digests this release ships.
+
+**It took three attempts, and both red ones were the harness rather than the product.** No product
+code changed between the three runs — the same three digests were deployed each time — so the two
+failures are worth recording as findings in their own right, because both had been winning a coin
+flip for two releases.
+
+Run 1 failed the m6 stall check at **0.272s**. Its leak check fails fast on residue that predates
+it, on the premise that *"no teardown this spec is waiting on can remove an object that already
+existed before the spec looked"* — and that premise is false for a spec whose subject is a
+thirty-minute deadline. Its own run's clone PVC is necessarily older than its own leak check, and
+the teardown cannot even start until the node plugin is restored three lines earlier. The operator's
+log settles it: the run went terminal at 23:36:08Z, the teardown sweep logged *"exposure residue
+still draining; re-verifying"* in the same second, and the check entered at 23:36:09Z and gave it
+0.272s. The check now discriminates by **ownership** — residue attributed to a run this spec owns is
+polled within the existing budget, residue naming another run still fails fast, which is the 0.6.5
+lesson that must not be lost. 0.6.6's green on that check was luck, not a verdict.
+
+Run 2 failed a different check, after ten minutes waiting for the repository behind the shared `dr`
+location. Ginkgo shuffles top-level containers on every run and the suite pins no seed, so whether
+that lane found the location already created was decided by the shuffle. Fixing it found the larger
+half: `dr` was not merely created late, it was being **deleted mid-suite** by six sites — one lane's
+`BeforeAll` deleted and recreated it for a "clean slate" it never needed, and deleting a location
+garbage-collects the very `BackupRepository` the other lanes poll for. The location is now a
+suite-level precondition with one canonical bootstrap, all six deletions are gone, and the
+default-flag disagreement hiding behind them — four lanes creating it with `true`, one with `false`,
+each guarded by `IsNotFound` so the shuffle decided — is no longer expressible.
+
+The seed stays unpinned, deliberately. The shuffle is the only instrument this suite has for finding
+cross-container coupling, and it has now found two real defects that a fixed seed would have frozen
+into permanent green.
+
+Every finding in this release was produced by the same thing: a fortnight's soak on somebody's real
+cluster, exported and read. Not one of them was reachable by a test in this repository, and all
+three have the same shape — **an artefact that reported a fact when all it had was a refusal, a
+blind spot, or a discarded string.**
+
+### The self-check spent nine days condemning volumes that were being backed up every night
+
+The resident collector's daily self-check reported **30 of 30 PVCs** as `ExposerUnresolvable`, under
+a headline saying they would **NOT** be backed up, on nine consecutive days — while 28 of those
+volumes completed successfully every one of those nights. Every number in the report was
+arithmetically correct and its meaning was false.
+
+The cause is one missing line of RBAC. Since 0.6.5 the exposer resolves a bound PVC's driver from
+its `PersistentVolume`, because a StorageClass can be deleted and re-created under the same name
+with a different provisioner; the collector's ClusterRole was never extended to match, so the read
+came back `Forbidden` and **the refusal was recorded as a fact about the storage**. The grant is
+added — along with `storageclasses`, a second gap found on the way, which a comment in that same
+file had explicitly struck off as "never read by internal/selfcheck" while the census had been
+listing them for unbound PVCs all along.
+
+The grant is the smaller half. Any cluster that denies that permission — a restricted policy, a
+namespaced install — would have gone on reading the same false headline, so a refused or failed read
+now has its own class, `ExposerUndetermined`, and is kept out of the count of volumes that will not
+be backed up. The line is *did the apiserver answer*: a `NotFound` or a `NoMatch` is still a real
+finding about the storage, a `Forbidden` or a timeout is a finding about the observer. The same
+conflation was found and closed in two more places — a refused `VolumeSnapshotClass` list was
+rendering "nothing in this cluster can be backed up" on every row, and a refused schedule list made
+every PVC fall through to "selected by NO schedule".
+
+What keeps it closed is not the fix. The reads the self-check performs are now **declared in one
+place** that both the code and a chart test consume, so adding a read without extending the role
+fails a gate on the maintainer's machine. Writing that declaration immediately found a read no
+hand-audit had seen: the self-check reaches `ClusterErasure` through the alert predicate evaluated
+over its own reader. An audit done once, by hand, against code that then changes is worth nothing —
+which is exactly how the missing grant shipped.
+
+### An identifier the redactor could not have learned
+
+The soak archive's leak check failed: a customer's PVC name appeared verbatim in an exported Event.
+The free text around it was properly redacted — the run name and the namespace in the same sentence
+came out as tokens — which is what made the cause worth finding rather than patching.
+
+**The PVC had never been registered.** PVC names entered the redactor only through a metric label
+that exists once a volume has a `VolumeSnapshot`, and the volumes a schedule complains about by name
+are precisely the ones stuck before they ever get one. The class was structurally invisible to the
+redactor, and no amount of care in the substitution pass could have covered it.
+
+Both obvious fixes are wrong and are rejected in comments. Removing the name from the Event destroys
+its only diagnostic value, on the administrator's own cluster, where their PVC name is not a secret
+from them. Substituting every known identifier inside free text is worse: on the cluster that
+produced this archive the PVCs are named `data` and `backups`, so a blind pass would rewrite the
+English word "data" and the CRD plural `backups.crystalbackup.io` throughout, mangling the stream
+while still not being complete.
+
+So the rule is bounded instead: identifiers we control are written **quoted** at the source, and the
+exporter substitutes only *quoted exact matches* of identifiers it knows, through a second registry
+that the general free-text pass never sees. A PVC literally named `data` is tokenised where it is
+quoted and left alone in prose, and a test says so in those words. The convention was already
+half-present — both `ConcurrencySkip` emitters quote the previous run's name with `%q`, which is why
+the run came out tokenised in the leaking message and the PVC beside it did not.
+
+Two claims that the leak disproved are corrected rather than deleted: `manifest.go` and the kit's
+SPEC both asserted that every PVC name had been substituted out of the archive. What is deliberately
+NOT covered is stated where the rule lives — free text written by third parties, which is not quoted
+and reconstructs identifiers of its own, and the fuller treatment that triages leak-check hits by
+provenance instead of grepping verbatim. That is a larger piece of work and it is not in this
+release.
+
+### The run now says why it blocked a namespace, and that is all it does
+
+Ten nights out of ten, on the same cluster, every `ClusterBackup` came back `PartiallyFailed` with
+`namespacesBlocked: 32` while its namespace-level children were `Completed` and 28 of 29 volumes
+were backed up. The backlog entry this belongs to says the trigger is an unenumerated set and that
+the first job is to find the other paths — so **nothing classificatory was changed here.** No branch,
+no window, no guard: the diff over `classifyCoordinate`'s decision lines touches only its second
+return value.
+
+Reading what that return value discarded is the finding. All four foreign branches rendered one
+reason and differed only in prose, so nothing was countable or greppable. The prose named each
+branch's *conclusion*, never the facts behind it. And the run object's `creationTimestamp` — the
+quantity the backlog's own candidate fix turns on — **was not a parameter of the function at all**,
+so no volume of production evidence could ever have confirmed or refuted that hypothesis.
+
+`ClusterBackupStatus.blockedReasons` now groups blocked namespaces by cause, with `namespaces`,
+`withDataAtCoordinate` and `stampedByThisRun`. Keying by cause is what keeps it bounded — five
+codes, whatever the estate size — where the ten-entry failure list could only sample 10 of 32, and
+where a per-namespace map is what [adr/0009](spec/adr/0009-shared-cluster-repo-tag-tenancy.md)
+refuses. `stampedByThisRun` turns the falsified hypothesis into a measurement: it counts coordinates
+the run itself demonstrably created and the fan-out still refused.
+
+On the way, the shape this release exists to remove was found already present: the fan-out emitted
+one Warning **per blocked namespace per reconcile** — thirty-two a pass — evicting the rest of that
+namespace's events well inside the hour they live. It is one Event per pass now, carrying the count
+and the breakdown.
+
+### Upgrading
+
+**There is a CRD step**, unlike 0.6.6: `blockedReasons` is a new optional field on
+`ClusterBackup.status` and the CRDs must be applied before or with the chart. Two Event and message
+shapes changed and a script could be matching on either — the `ConcurrencySkip` message now quotes
+the PVC name, and the collision Warning leads with a bracketed fact block. An installation that
+pins or vendors the soak collector's ClusterRole must add the two read-only grants by hand. Nothing
+about selection, snapshots, movers, retention or restore moves in this release, and no data is
+touched.
+
 ## 0.6.6 — CI had been red for eight days, and looking for why found seven more (2026-08-10)
 
 **Validated on real infrastructure: 93 of 93 crucible checks, 0 failed, 0 skipped, in 2h50m16s** —
