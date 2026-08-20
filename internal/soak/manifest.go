@@ -119,14 +119,22 @@ type Manifest struct {
 }
 
 // unredactedResidual is the sentence §6 requires and collect.sh reproduces. It names what could
-// NOT be tokenised, because the honest boundary of this redaction is "every identifier the
-// collector enumerated over fourteen days" and there are things nobody enumerates.
-const unredactedResidual = "logs/ and events/ carry FREE TEXT. Every namespace, PVC, location, " +
-	"bucket, schedule, sync, node and pod name the collector saw over the whole soak has been " +
-	"substituted out of it, which is a far better registry than anything reconstructed " +
-	"afterwards — but it cannot catch a name nobody enumerated: a path inside a volume, a restic " +
-	"snapshot ID, a hostname inside a library's error string, an object created after the last " +
-	"listing. Read those two directories before you send this."
+// NOT be tokenised, because the honest boundary of this redaction has two edges: "every identifier
+// the collector enumerated over fourteen days", and — for PVC names, whose values are ordinary
+// words — "only where the text quotes it". Both have to be stated, or the sentence promises more
+// than the code does.
+const unredactedResidual = "logs/ and events/ carry FREE TEXT. Every namespace, location, bucket, " +
+	"schedule, sync, node and pod name the collector saw over the whole soak has been substituted " +
+	"out of it wherever it occurs, which is a far better registry than anything reconstructed " +
+	"afterwards. A PVC name is substituted only where it occurs IN DOUBLE QUOTES, and that bound " +
+	"is deliberate rather than a shortfall: PVCs are named by the application team and are " +
+	"routinely called `data` or `backups`, so substituting one everywhere would rewrite ordinary " +
+	"English, this archive's own sizing-class names and `backups.crystalbackup.io` — the messages " +
+	"this operator writes quote their identifiers so that the narrow rule is enough for them. " +
+	"What NONE of it catches is text written by something other than this operator, which quotes " +
+	"nothing on our terms: a CSI driver's provisioning error naming a generated object, a path " +
+	"inside a volume, a restic snapshot ID, a hostname inside a library's error string, an object " +
+	"created after the last listing. Read those two directories before you send this."
 
 // unredactedResidualFull is the same field when --full was used, because a manifest that said
 // "only free text is unredacted" over an archive where nothing is redacted would be worse than

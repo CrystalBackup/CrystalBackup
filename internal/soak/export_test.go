@@ -450,6 +450,155 @@ func TestNoIdentifierSurvivesTheExport(t *testing.T) {
 	}
 }
 
+// seedQuotingCollector lays down the exact shape the nine-day production archive had when its leak
+// check failed, reduced to the four records that matter.
+//
+// The PVC is named `data`, which is not a contrivance: it is what the cluster in question calls
+// them (`data` and `backups`), and it is why the obvious fix — substitute every identifier the
+// collector knows, everywhere, in every message — is the wrong one. `data` is an ordinary English
+// word, it is the name of one of this very archive's sizing CLASSES, and `backups` is the first
+// segment of `backups.crystalbackup.io`. A blind pass rewrites all three.
+func seedQuotingCollector(t *testing.T) *Store {
+	t.Helper()
+	s := newTestStore(t, 1<<20)
+	writeJSON(t, s, fileCollectorID, CollectorInfo{
+		OperatorVersion: "0.6.7", StartedAt: day0, OperatorNamespace: "crystal-backup-system",
+		MetricsResolution: "5m0s", StateInterval: "1h0m0s", SelfcheckInterval: "24h0m0s",
+	})
+	writeJSON(t, s, fileStarts, []Session{{
+		StartedAt: day0, LastBeat: day0.AddDate(0, 0, 1), BeatPeriod: "15s",
+	}})
+
+	// CR state is the ONLY place the collector can learn this PVC's name. A volume that never
+	// snapshots emits no per-PVC metric series, so nothing else in a fortnight ever mentions it —
+	// which is precisely how the leaking PVC stayed unknown to the redactor for nine days while
+	// every other identifier in the same sentence was tokenised.
+	state := mustJSON(t, StateSnapshot{
+		At: day0.Add(time.Hour), Kind: kindBackup, Namespace: "acme-prod", Name: "nightly-1",
+		Status: json.RawMessage(`{"phase":"Running","message":"waiting on PVC \"data\"",` +
+			`"volumes":[{"pvc":"data","phase":"Pending"}]}`),
+	})
+	if err := s.Append(StreamState, day0, [][]byte{state}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The offending Event, as the operator writes it once volumeInFlightReason quotes the PVC —
+	// with the same string occurring UNQUOTED twice beside it, once as an English noun and once as
+	// the sizing class this archive reports its peak memory under.
+	ev := mustJSON(t, Event{
+		At: day0.Add(2 * time.Hour), UID: "uid-1", Namespace: "acme-prod", Kind: "BackupSchedule",
+		Name: "nightly", Reason: "ConcurrencySkip", Count: 1,
+		Message: `previous run "nightly-1" is still making progress — namespace acme-prod: ` +
+			`PVC "data" is queued and has not been attempted yet; no data has moved and the data ` +
+			`sizing class is unaffected`,
+	})
+	if err := s.Append(StreamEvents, day0, [][]byte{ev}); err != nil {
+		t.Fatal(err)
+	}
+
+	// An operator error line, which is zap JSON: every value in it is already quoted, so the same
+	// rule reaches it without a second mechanism.
+	if err := s.Append(StreamLogs, day0, [][]byte{mustJSON(t, LogLine{
+		At: day0.Add(3 * time.Hour), Pod: "crystal-backup-7d9f-abcde",
+		Line: `{"level":"error","msg":"exposer unresolvable","pvc":"data",` +
+			`"note":"no data was moved"}`,
+	})}); err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
+// TestOnlyQuotedIdentifiersAreRedactedOutOfFreeText is the whole of lot 2, stated as a contract.
+//
+// THE FINDING. A nine-day archive from a production cluster failed its leak check: an Event the
+// operator emits itself (ConcurrencySkip) carried a customer's PVC name verbatim. Every STRUCTURED
+// field of that record was tokenised, and so were the run name and the namespace inside the message
+// — the free-text pass had done its work. Only the PVC survived, because the PVC was the one
+// identifier the collector had never registered: no per-PVC metric exists for a volume that never
+// snapshots, so nothing in the fortnight taught the redactor its name.
+//
+// THE TWO WRONG FIXES. Taking the name out of the Event is wrong: the Event lives on the
+// administrator's own cluster, is addressed to them, and naming which PVC is holding a run is the
+// entire diagnostic value of the message. Widening the free-text pass to every identifier the
+// collector knows is wrong too, and that is the one this test pins: with the PVC registered for
+// blind substitution, every `data` below — the English noun, the sizing class — becomes a token,
+// and the stream stops being readable.
+//
+// THE RULE. Identifiers we control are written QUOTED at the source, and the exporter substitutes
+// an identifier out of free text only where it appears between double quotes and matches exactly.
+func TestOnlyQuotedIdentifiersAreRedactedOutOfFreeText(t *testing.T) {
+	a := exportToArchive(t, ExportOptions{
+		DataDir: seedQuotingCollector(t).Dir(), Salt: exportSalt, Now: day0.AddDate(0, 0, 1),
+	})
+
+	pvcToken := tokenFor(t, "pvc", "data")
+	// Decoded, not grepped: an NDJSON record escapes the very quotes the rule keys on, so a test
+	// that matched the raw bytes would be asserting about `\"` and would pass or fail for reasons
+	// that have nothing to do with the redaction.
+	var ev Event
+	if err := json.Unmarshal(a.files["events/events.ndjson"], &ev); err != nil {
+		t.Fatalf("the event stream does not decode: %v\n%s", err, a.files["events/events.ndjson"])
+	}
+	var logLine LogLine
+	if err := json.Unmarshal(a.files["logs/operator-errors.ndjson"], &logLine); err != nil {
+		t.Fatalf("the log stream does not decode: %v", err)
+	}
+	state := string(gunzip(t, a.files["state/"+day0.Format(dayLayout)+".ndjson.gz"]))
+
+	// 1. The quoted PVC is tokenised, under the SAME token its structured field carries — which is
+	//    the only thing that lets a reader follow one volume from the CR state into the Event.
+	if !strings.Contains(ev.Message, `PVC "`+pvcToken+`"`) {
+		t.Errorf("the quoted PVC name is not tokenised in the event stream; hack/soak/collect.sh "+
+			"greps for it verbatim and reports \"do not send this archive\".\n%s", ev.Message)
+	}
+	if strings.Contains(ev.Message, `"data"`) {
+		t.Errorf("the PVC name survives QUOTED in the event stream:\n%s", ev.Message)
+	}
+
+	// 2. The same string, unquoted, in ordinary prose is UNTOUCHED. Both occurrences: the English
+	//    noun, and the name of one of this archive's own sizing classes.
+	if !strings.Contains(ev.Message, "no data has moved") ||
+		!strings.Contains(ev.Message, "the data sizing class is unaffected") {
+		t.Errorf("an unquoted occurrence of the PVC name was rewritten in prose — the message is "+
+			"mangled and the stream has lost the diagnostic value it exists for:\n%s", ev.Message)
+	}
+
+	// 3. The rule reaches the operator's own error lines, which are zap JSON and therefore quoted
+	//    throughout, on the same terms.
+	if !strings.Contains(logLine.Line, `"pvc":"`+pvcToken+`"`) {
+		t.Errorf("the operator error stream still carries the PVC name verbatim:\n%s", logLine.Line)
+	}
+	if !strings.Contains(logLine.Line, "no data was moved") {
+		t.Errorf("the operator error stream had unquoted prose rewritten:\n%s", logLine.Line)
+	}
+
+	// 4. And the CR state the name was LEARNED from must not be the place it escapes: the volume's
+	//    own `pvc` field, and the quoted name inside the status message beside it.
+	if strings.Contains(state, `"data"`) {
+		t.Errorf("the PVC name survives in the CR state stream, which is where the exporter read "+
+			"it from in the first place:\n%s", state)
+	}
+	if !strings.Contains(state, pvcToken) {
+		t.Errorf("the CR state stream does not carry the PVC's token:\n%s", state)
+	}
+}
+
+func gunzip(t *testing.T, body []byte) []byte {
+	t.Helper()
+	if len(body) == 0 {
+		t.Fatal("no such file in the archive")
+	}
+	zr, err := gzip.NewReader(bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("not gzip: %v", err)
+	}
+	out, err := io.ReadAll(zr)
+	if err != nil {
+		t.Fatalf("will not decompress: %v", err)
+	}
+	return out
+}
+
 // TestManifestReportsADeadStreamAsDead is the anti-vacuity contract.
 //
 // A collector that started happily and collected nothing must not produce an archive that reads

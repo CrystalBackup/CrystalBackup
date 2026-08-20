@@ -1771,3 +1771,96 @@ func (fakeDiscovery) ServerGroups() (*metav1.APIGroupList, error) {
 		Versions: []metav1.GroupVersionForDiscovery{{GroupVersion: apiconst.Domain + "/v1alpha1", Version: "v1alpha1"}},
 	}}}, nil
 }
+
+// TestRedactQuotedIsBoundedToQuotedExactMatches is the rule from lot 2 of 0.6.7, and it is written
+// as a table because every row of it is a way the rule could have been made wrong.
+//
+// The finding it comes from: a nine-day soak archive from a production cluster failed its leak
+// check on an Event the operator emits itself, whose message named a customer's PVC in clear beside
+// a namespace and a run name that had both been tokenised. The PVC was the one identifier nothing
+// had ever registered, because the only per-PVC metric family exists once a volume has a
+// VolumeSnapshot and the stuck volumes a schedule complains about never get one.
+//
+// The obvious repair — register PVC names and let Detail substitute them like everything else — is
+// what these rows refuse. On that cluster the PVCs are named `data` and `backups`.
+func TestRedactQuotedIsBoundedToQuotedExactMatches(t *testing.T) {
+	newRed := func(t *testing.T) (*Redactor, string) {
+		t.Helper()
+		r, err := NewRedactorWithSource(false, []byte("a-thirty-two-byte-salt-for-tests"), SaltCallerSupplied)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r, r.LearnQuoted(KindPVC, "data")
+	}
+
+	t.Run("quoted and exact is substituted", func(t *testing.T) {
+		r, tok := newRed(t)
+		got := r.RedactQuoted(`PVC "data" is queued and has not been attempted yet`)
+		if got != `PVC "`+tok+`" is queued and has not been attempted yet` {
+			t.Fatalf("got %q", got)
+		}
+	})
+
+	t.Run("unquoted prose is untouched", func(t *testing.T) {
+		// The half that makes the whole thing worth doing. `data` is an English noun and the name
+		// of one of the soak archive's own sizing classes; a pass that rewrote it here would trade
+		// a leak for an unreadable stream.
+		r, _ := newRed(t)
+		const s = "no data has moved and the data sizing class is unaffected"
+		if got := r.RedactQuoted(s); got != s {
+			t.Fatalf("unquoted prose was rewritten: %q", got)
+		}
+	})
+
+	t.Run("quoted but not an exact match is untouched", func(t *testing.T) {
+		// A ceph-csi ProvisioningFailed message welds identifiers into one generated name. Even
+		// quoted, it is not an identifier we hold, and this pass leaves it exactly as it found it
+		// rather than guessing at its parts.
+		r, _ := newRed(t)
+		const s = `failed to provision "acme-prod-nightly-1-data-restore"`
+		if got := r.RedactQuoted(s); got != s {
+			t.Fatalf("a quoted non-match was rewritten: %q", got)
+		}
+	})
+
+	t.Run("an unterminated quote is inert", func(t *testing.T) {
+		// The pass pairs quotes positionally, so any text that confuses the pairing yields spans
+		// that match nothing. That is the designed failure mode: a miss, never a mangling.
+		r, _ := newRed(t)
+		const s = `he said "data and then stopped`
+		if got := r.RedactQuoted(s); got != s {
+			t.Fatalf("an unterminated quote mangled the text: %q", got)
+		}
+	})
+
+	t.Run("LearnQuoted does not widen Detail", func(t *testing.T) {
+		// The load-bearing separation between the two registries. If this ever fails, every soak
+		// archive from a cluster with a PVC named `data` has had its prose rewritten.
+		r, _ := newRed(t)
+		const s = "no data has moved"
+		if got := r.Detail(s); got != s {
+			t.Fatalf("a quoted-only identifier reached Detail's blind substitution: %q", got)
+		}
+	})
+
+	t.Run("the quoted token is the token the structured fields carry", func(t *testing.T) {
+		// Without this, a reader cannot follow one volume from the CR state stream into the Event
+		// complaining about it, and the redaction has cost the archive its correlation.
+		r, tok := newRed(t)
+		if got := r.PVC("data"); got != tok {
+			t.Fatalf("PVC() = %q, LearnQuoted gave %q — one volume, two names", got, tok)
+		}
+	})
+
+	t.Run("full mode passes everything through", func(t *testing.T) {
+		r, err := NewRedactor(true, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.LearnQuoted(KindPVC, "data")
+		const s = `PVC "data" is queued`
+		if got := r.RedactQuoted(s); got != s {
+			t.Fatalf("--full redacted something: %q", got)
+		}
+	})
+}

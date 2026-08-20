@@ -90,6 +90,12 @@ type Redactor struct {
 	// known is every identifier the collector has registered through Learn, sorted longest-first so
 	// Detail's free-text substitution cannot corrupt a name that contains a shorter one.
 	known []knownName
+	// quoted is the second registry, and the reason it is second rather than more entries in the
+	// first is the whole of RedactQuoted's doc: these identifiers are substituted ONLY where they
+	// appear between double quotes. Registering them in `known` instead would hand them to Detail,
+	// which matches them anywhere — and an identifier class whose names are `data` and `backups`
+	// cannot be handed to a pass that matches anywhere.
+	quoted []knownName
 }
 
 // tokenBytes is how much of the HMAC ends up in a token: 4 bytes, 8 hex characters.
@@ -289,6 +295,13 @@ const (
 // absent label is meaningful in this system — the cluster repository's namespace label is empty,
 // and so is `cluster` when no location claims a default — and hashing "" would turn every one of
 // those absences into an identical fake identity that looks like a real one.
+//
+// One consequence of the lookup below is worth stating outright: a value already held in the
+// QUOTED registry is returned from there and is NOT promoted into `known`. So an identifier that
+// LearnQuoted registered stays quoted-only for the life of the redactor, however many typed
+// helpers are called on it afterwards. That is the intended reading of "registration is a
+// decision about exposure, taken once" — a later PVC() call is asking for the token, not asking
+// to widen the rule.
 func (r *Redactor) token(kind, value string) string {
 	if value == "" {
 		return ""
@@ -296,20 +309,47 @@ func (r *Redactor) token(kind, value string) string {
 	if r.full {
 		return value
 	}
+	if tok := r.lookup(value); tok != "" {
+		return tok
+	}
+	tok := r.compute(kind, value)
+	r.register(value, tok)
+	return tok
+}
+
+// lookup returns the token a value has already been given, under either registry, or "".
+//
+// BOTH registries, and that is not an optimisation: a PVC registered quoted-only from a CR status
+// and then met again as a metric label must keep the SAME token, or the archive would carry one
+// volume under two names in the two places a reader has to match up.
+func (r *Redactor) lookup(value string) string {
+	if value == "" {
+		return ""
+	}
 	for _, n := range r.known {
 		if n.value == value {
 			return n.token
 		}
 	}
+	for _, n := range r.quoted {
+		if n.value == value {
+			return n.token
+		}
+	}
+	return ""
+}
+
+// compute is the HMAC and nothing else. It registers nothing, which is why it is unexported and why
+// token() is still the only door for ordinary callers: see token's doc for why computing and
+// registering are inseparable there.
+func (r *Redactor) compute(kind, value string) string {
 	mac := hmac.New(sha256.New, r.salt)
 	// The kind is part of the message, not just of the prefix, so two DIFFERENT names cannot
 	// collide into one token merely by being hashed the same way.
 	mac.Write([]byte(kind))
 	mac.Write([]byte{0})
 	mac.Write([]byte(value))
-	tok := kind + "-" + hex.EncodeToString(mac.Sum(nil)[:tokenBytes])
-	r.register(value, tok)
-	return tok
+	return kind + "-" + hex.EncodeToString(mac.Sum(nil)[:tokenBytes])
 }
 
 func (r *Redactor) Namespace(s string) string { return r.token(kindNamespace, s) }
@@ -454,6 +494,112 @@ type knownName struct {
 // only needs in order to redact a sentence about it — so that the free-text half of a breach is
 // covered even where the structured half is not.
 func (r *Redactor) Learn(kind, value string) { _ = r.token(kind, value) }
+
+// LearnQuoted registers an identifier for QUOTED-ONLY substitution and returns its token.
+//
+// It is Learn's bounded sibling, for the identifier class Learn cannot safely take. A PVC name is
+// chosen by the application team, not by us, and the two commonest ones in the wild are `data` and
+// `backups` — an ordinary English noun and the first segment of `backups.crystalbackup.io`. Handed
+// to Learn, those become substitution rules that Detail applies ANYWHERE, and a soak archive comes
+// back with "no <tok> has moved", "the <tok> sizing class", "<tok>.crystalbackup.io" and every
+// other innocent occurrence rewritten. The stream survives the leak check and stops being readable,
+// which trades one failure for a quieter one.
+//
+// So the value goes into the quoted registry only, and the token it returns is the SAME token the
+// structured fields carry — that identity is the point, because it is what lets a reader follow one
+// volume from the CR state into the Event that complains about it.
+func (r *Redactor) LearnQuoted(kind, value string) string {
+	if value == "" {
+		return ""
+	}
+	if r.full {
+		return value
+	}
+	if tok := r.lookup(value); tok != "" {
+		// Already registered — under `known` if some other path met it first, in which case leaving
+		// it there is correct: this method only ever NARROWS a new identifier's exposure, it never
+		// widens or narrows one that is already registered.
+		return tok
+	}
+	tok := r.compute(kind, value)
+	// Appended rather than length-sorted: unlike Detail, this pass never scans for a name inside a
+	// string, so there is no shorter-name-inside-longer-name hazard to order around.
+	r.quoted = append(r.quoted, knownName{value: value, token: tok})
+	return tok
+}
+
+// RedactQuoted substitutes identifiers out of free text, but ONLY where they appear between double
+// quotes and match a registered identifier EXACTLY.
+//
+// # The rule, and why it is this narrow
+//
+// A nine-day soak archive from a production cluster failed its leak check on an Event the operator
+// emits itself: `… previous run "obj-35dbb362" is still making progress — namespace ns-f951a8c9:
+// PVC <a customer's PVC name>`. Every structured field was tokenised and so, inside the message,
+// were the run and the namespace — Detail had done its work. The PVC survived because it was the
+// one identifier nothing had ever registered: a volume that never snapshots emits no per-PVC metric
+// series, so a fortnight of collection never learns its name.
+//
+// The obvious repair is to register PVC names too and let Detail have them. That is the trap, and
+// LearnQuoted's doc is where it is written down. The repair that works instead is a CONVENTION with
+// two halves, and neither half is any use alone:
+//
+//   - every identifier this project interpolates into a message it writes is written QUOTED
+//     (`PVC "data" is queued …`). The surrounding code already did this for object names
+//     (`previous run "obj-…"`); this is that convention made uniform, not a new one.
+//   - and this pass replaces a quoted run of text when, and only when, it is exactly an identifier
+//     the redactor holds. Nothing else in the sentence is examined, so `no data has moved` and
+//     `backups.crystalbackup.io` come through untouched next to a redacted `"data"`.
+//
+// The narrowness is what makes the pass safe to be WRONG. A mis-paired quote — an escaped `\"`
+// inside a zap JSON line, an apostrophe, a stray quote in third-party text — yields a span that
+// matches no registered identifier and is written back byte for byte. There is no failure mode
+// where confusion mangles the message; the only failure mode is a miss.
+//
+// # What it deliberately does NOT cover
+//
+// Free text written by anyone other than this project. A ceph-csi `ProvisioningFailed` message
+// embeds a generated object name of the form `<namespace>-<run>-<pvc>-restore`, unquoted, with the
+// identifiers welded into one token that matches nothing; kubelet, the scheduler and every CSI
+// driver in the field write their own prose with their own quoting habits. Those are not reachable
+// by a convention we control, and pretending otherwise by widening the match is the very thing the
+// paragraphs above refuse.
+//
+// Covering them means a different instrument: triaging each leak-check hit by PROVENANCE — which
+// component wrote the string, and whether the identifier in it came from us or from the cluster —
+// instead of grepping the unpacked archive for names verbatim. That is a larger piece of work and
+// it is deliberately not in this release.
+func (r *Redactor) RedactQuoted(s string) string {
+	if s == "" || r.full || !strings.Contains(s, `"`) {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); {
+		open := strings.IndexByte(s[i:], '"')
+		if open < 0 {
+			b.WriteString(s[i:])
+			break
+		}
+		open += i
+		closing := strings.IndexByte(s[open+1:], '"')
+		if closing < 0 {
+			// An unterminated quote: the rest is prose as far as this pass is concerned.
+			b.WriteString(s[i:])
+			break
+		}
+		closing += open + 1
+		b.WriteString(s[i : open+1])
+		if tok := r.lookup(s[open+1 : closing]); tok != "" {
+			b.WriteString(tok)
+		} else {
+			b.WriteString(s[open+1 : closing])
+		}
+		b.WriteByte('"')
+		i = closing + 1
+	}
+	return b.String()
+}
 
 // LearnLabels registers every identifier in a breach's label set before that breach's Detail is
 // redacted.

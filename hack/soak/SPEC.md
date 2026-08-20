@@ -396,13 +396,31 @@ Two extensions to `internal/selfcheck/redact.go` are needed, and both are small:
 `soak-export --full` disables redaction, exactly as `selfcheck --full` does, and the manifest
 says so in a field `collect.sh` refuses to be quiet about.
 
-**Free text** — the operator's error lines, event messages — goes through `Redactor.Detail()`
-after every identifier the archive touches has been `Learn()`ed. That is the existing mechanism
-and it is why `Learn` exists; the collector has seen every namespace, PVC, location and CR name
-in the cluster over fourteen days, so its registry is far better than anything reconstructed
-afterwards. What it still cannot catch is a name nobody enumerated: a path inside a volume, a
-restic snapshot ID, a URL inside a library's error string. The manifest must SAY that, in the
-words `collect.sh` prints, so the admin reads the two streams before sending.
+**Free text** — the operator's error lines, event messages, CR status messages — goes through
+`Redactor.Detail()` after every identifier the archive touches has been `Learn()`ed. That is the
+existing mechanism and it is why `Learn` exists; the collector has seen every namespace, location,
+node, pod and CR name in the cluster over fourteen days, so its registry is far better than
+anything reconstructed afterwards.
+
+**PVC names are the exception, and they are the one class this had wrong.** A nine-day archive
+from a production cluster failed its leak check on a `ConcurrencySkip` Event the operator emits
+itself: the run name and the namespace inside the message were tokenised, the PVC name was not,
+because nothing had ever enumerated it — the per-PVC metric family only exists once a volume has
+a VolumeSnapshot, and the volumes a schedule complains about by name are precisely the ones stuck
+before they get one. The fix is *not* to `Learn()` them: PVCs are named by the application team,
+`data` and `backups` are the two commonest names in the field, and handing those to a pass that
+matches anywhere would rewrite ordinary English, this archive's own sizing-class names and
+`backups.crystalbackup.io`. So PVC names are registered through `LearnQuoted()` and substituted by
+`RedactQuoted()` only where they appear **between double quotes** — and every identifier this
+project interpolates into a message it writes is written quoted, which is the convention that
+makes the narrow rule sufficient for our own prose.
+
+What none of it catches is text written by anything other than this operator, which quotes nothing
+on our terms: a CSI driver's `ProvisioningFailed` naming a generated `<ns>-<run>-<pvc>-restore`
+object, a path inside a volume, a restic snapshot ID, a URL inside a library's error string.
+Reaching those means triaging each leak-check hit by *provenance* rather than grepping the unpacked
+archive for names verbatim, which is a larger instrument and is not built. The manifest must SAY
+all of that, in the words `collect.sh` prints, so the admin reads the two streams before sending.
 
 ## 7. `soak-export` — the archive
 
@@ -590,9 +608,18 @@ Rules:
   no poll interval can be relied on to land inside that (§5 measured it on the crucible); every
   other stream still lists on an interval — the event stream because a watch "drops silently on an
   apiserver rollover", the CR-state stream by design, and the API reader is `client.New`, which
-  opens no informers. `storage.k8s.io` storageclasses/volumeattachments are read by the operator
-  and never by the collector, and the `nodes` resource is not read at all — the node a mover
-  landed on comes off `pod.Spec.NodeName`.
+  opens no informers. `storage.k8s.io` volumeattachments are read by the operator and never by the
+  collector, and the `nodes` resource is not read at all — the node a mover landed on comes off
+  `pod.Spec.NodeName`.
+
+  Two grants were struck off that list and should not have been: `persistentvolumes` and
+  `storage.k8s.io` `storageclasses`, both of which the daily self-check reads (the exposer resolves
+  a bound PVC's driver from its PersistentVolume since 0.6.5, and an unbound PVC's from its class).
+  Without the first, a nine-day soak reported 30 of 30 volumes as unbackable every night while 28
+  of them were being backed up successfully every night. They are granted, read-only, since 0.6.7 —
+  and the audit that struck them off is no longer done by hand: `internal/selfcheck.APIReads`
+  declares what the self-check reads and `TestSoakCollectorRoleCoversEverySelfcheckRead` fails when
+  the ClusterRole does not cover it.
 - **No exec into mover pods** to measure the cache from inside, though the operator's own
   ClusterRole would allow it. Running commands inside a pod during a backup is perturbation, and
   the kubelet stats endpoint answers the same question from outside.

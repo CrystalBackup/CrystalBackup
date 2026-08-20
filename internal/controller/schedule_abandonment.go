@@ -144,25 +144,46 @@ const (
 // fail that volume on its own, on the very next pass. This function agreeing is not a race — the
 // two conclusions are the same conclusion, and if the controller gets there first the run goes
 // terminal and this whole path is never entered.
+//
+// ON THE QUOTES AROUND THE PVC NAME. They are not decoration and they are not free to drop. This
+// string travels into an Event, into a status message, and — for a cluster running the soak
+// collector — into an archive that LEAVES the cluster and goes to a maintainer. The name itself
+// stays: the Event is addressed to the administrator of the cluster the volume lives on, their own
+// PVC name is not a secret from them, and naming which volume is holding the run is the entire
+// diagnostic value of the message. What makes the same sentence safe to export is that
+// internal/selfcheck's RedactQuoted substitutes an identifier out of free text only where it is
+// QUOTED and matches exactly — so `"data"` is tokenised and the English word `data` beside it is
+// not. The convention was already here for object names: both ConcurrencySkip emitters
+// (backupschedule_controller.go, clusterbackupschedule_controller.go) already write the previous
+// run's name with %q, which is why the run in the leaking message came out tokenised while the PVC
+// beside it did not. These four sites are that convention made uniform, not a new one.
 func volumeInFlightReason(v *cbv1.VolumeStatus, now time.Time, pendingDeadline time.Duration) string {
 	switch v.Phase {
 	case status.VolumePhaseCompleted, status.VolumePhaseSkipped, status.VolumePhaseFailed:
 		return ""
 	case status.VolumePhaseUploading:
-		return "PVC " + v.Pvc + " is Uploading (a running mover is never bounded by this gate)"
+		return "PVC " + quoteName(v.Pvc) + " is Uploading (a running mover is never bounded by this gate)"
 	case status.VolumePhaseSnapshotting:
-		return "PVC " + v.Pvc + " is Snapshotting (bounded by the controller's own snapshot deadlines)"
+		return "PVC " + quoteName(v.Pvc) + " is Snapshotting (bounded by the controller's own snapshot deadlines)"
 	default: // Pending, or the empty phase a freshly enumerated volume carries.
 		if v.FirstAttemptAt == nil {
-			return "PVC " + v.Pvc + " is queued and has not been attempted yet"
+			return "PVC " + quoteName(v.Pvc) + " is queued and has not been attempted yet"
 		}
 		if waited := now.Sub(v.FirstAttemptAt.Time); waited <= pendingDeadline {
 			return fmt.Sprintf("PVC %s has been Pending for %s of its %s budget",
-				v.Pvc, waited.Round(time.Second), pendingDeadline)
+				quoteName(v.Pvc), waited.Round(time.Second), pendingDeadline)
 		}
 		return ""
 	}
 }
+
+// quoteName wraps an identifier in the double quotes the redaction convention keys on.
+//
+// Plain concatenation rather than %q: a Kubernetes object name is RFC 1123 and has nothing in it
+// for %q to escape, while %q on a name that somehow did would emit `\"` — which is exactly the
+// shape RedactQuoted's span pairing cannot read, turning a redactable identifier into a missed one.
+// Being unable to escape is the property we want here.
+func quoteName(name string) string { return `"` + name + `"` }
 
 // backupInFlightReason returns the first reason ANY volume of a Backup is still legitimately in
 // flight, or "" when not one of them is. It is the whole of the evidence half of the predicate for

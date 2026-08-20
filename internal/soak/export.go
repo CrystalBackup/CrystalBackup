@@ -216,6 +216,7 @@ func (e *exporter) learnIdentifiers() {
 			}
 			e.red.Learn(selfcheck.KindNamespace, snap.Namespace)
 			e.red.Learn(selfcheck.KindObject, snap.Name)
+			learnVolumePVCs(e.red, snap.Status)
 		}
 	}
 
@@ -255,6 +256,57 @@ func (e *exporter) learnIdentifiers() {
 			}
 		}
 	}
+}
+
+// learnVolumePVCs registers every PVC name in a CR status for QUOTED-ONLY substitution.
+//
+// This is the identifier class the leak was made of, and it is the only class the collector cannot
+// reach any other way. A PVC appears in a metric label exactly once it has a VolumeSnapshot
+// (crystalbackup_pvc_volumesnapshot_count), so the volumes that MATTER here — the ones stuck
+// Pending behind an unresolvable exposer, which are what a schedule complains about by name — never
+// appear in one. Their names exist only in status.volumes[].pvc, and until this pre-pass nothing
+// read them, so nine days of Events named them in clear beside a tokenised namespace.
+//
+// LearnQuoted rather than Learn, and that distinction is the lot: see LearnQuoted's doc for what
+// registering `data` for unbounded substitution does to the rest of the archive.
+//
+// Decoded through a named shape rather than walked generically because this is a targeted rule, not
+// a sweep: `status.volumes[].pvc` is one field of one kind — Backup's, the only status in the API
+// that names a PVC at all — and a decode that does not match simply yields no volumes. The generic
+// "any key called pvc, anywhere in a status" case is redactAny's, below, and it runs later.
+func learnVolumePVCs(red *selfcheck.Redactor, raw json.RawMessage) {
+	if len(raw) == 0 {
+		return
+	}
+	var st struct {
+		Volumes []struct {
+			Pvc string `json:"pvc"`
+		} `json:"volumes"`
+	}
+	if json.Unmarshal(raw, &st) != nil {
+		return
+	}
+	for _, v := range st.Volumes {
+		red.LearnQuoted(selfcheck.KindPVC, v.Pvc)
+	}
+}
+
+// redactFreeText is the ONE free-text redaction in this package, and every stream that carries
+// prose goes through it so the two passes can never drift apart.
+//
+//   - RedactQuoted first: a quoted run of text that is exactly a registered identifier becomes its
+//     token. This is what reaches the identifiers registered quoted-only (PVC names), and it is
+//     bounded by the convention the operator's own messages now follow.
+//   - Detail second: the older, wider pass, unchanged. It substitutes the identifier classes the
+//     archive has always registered through Learn — namespaces, object names, pods, nodes,
+//     locations — wherever they appear, quoted or not. Those classes are ours or the cluster's
+//     structural names, not names an application team picks, so the whole-word bounding inside
+//     replaceIdentifier is enough for them.
+//
+// Order matters only in that RedactQuoted must not be handed a string Detail has already rewritten
+// — it would still be correct, just doing nothing. Running it first keeps the quoted case readable.
+func redactFreeText(red *selfcheck.Redactor, s string) string {
+	return red.Detail(red.RedactQuoted(s))
 }
 
 type exporter struct {
@@ -532,9 +584,10 @@ func (e *exporter) writeState() {
 			snap.Namespace = e.red.Namespace(snap.Namespace)
 			snap.Name = e.red.Object(snap.Name)
 			// The status blob is walked as free-form JSON and every string in it goes through
-			// Detail. A CR's status carries object names in messages (a failing backup names its
-			// PVC), and the alternative — a typed walker per kind — would leak the first field
-			// anyone forgot to add to it.
+			// redactFreeText. A CR's status carries object names in messages (a failing backup
+			// names its PVC), and the alternative — a typed walker per kind — would leak the first
+			// field anyone forgot to add to it. The ONE field the walker does know by name is
+			// `pvc`: see statusPVCKey for why that class cannot be left to the generic pass.
 			snap.Status = e.redactRawJSON(snap.Status)
 			body, err := json.Marshal(snap)
 			if err != nil {
@@ -583,10 +636,19 @@ func (e *exporter) redactRawJSON(raw json.RawMessage) json.RawMessage {
 	return body
 }
 
+// statusPVCKey is the one status field this walker knows by NAME rather than by shape.
+//
+// It has to be known by name, because the value under it is a bare string by the time redactAny
+// sees it — no quotes left to key on, and no registration in Detail's registry to match against
+// (PVC names are registered quoted-only, deliberately: see LearnQuoted). Without this case the CR
+// state stream would emit `"pvc":"data"` in clear in the very file the exporter LEARNED the name
+// from, which would make the rest of this lot theatre.
+const statusPVCKey = "pvc"
+
 func redactAny(red *selfcheck.Redactor, v any) any {
 	switch t := v.(type) {
 	case string:
-		return red.Detail(t)
+		return redactFreeText(red, t)
 	case []any:
 		for i := range t {
 			t[i] = redactAny(red, t[i])
@@ -594,6 +656,10 @@ func redactAny(red *selfcheck.Redactor, v any) any {
 		return t
 	case map[string]any:
 		for k := range t {
+			if s, ok := t[k].(string); ok && k == statusPVCKey {
+				t[k] = red.LearnQuoted(selfcheck.KindPVC, s)
+				continue
+			}
 			t[k] = redactAny(red, t[k])
 		}
 		return t
@@ -627,7 +693,7 @@ func (e *exporter) writeHighwater() {
 		marks.Pods[i].Namespace = e.red.Namespace(marks.Pods[i].Namespace)
 		marks.Pods[i].Node = e.red.Host(marks.Pods[i].Node)
 		marks.Pods[i].Job = e.red.Object(marks.Pods[i].Job)
-		marks.Pods[i].EvictionMessage = e.red.Detail(marks.Pods[i].EvictionMessage)
+		marks.Pods[i].EvictionMessage = redactFreeText(e.red, marks.Pods[i].EvictionMessage)
 	}
 	for i := range marks.Jobs {
 		marks.Jobs[i].Job = e.red.Object(marks.Jobs[i].Job)
@@ -770,6 +836,9 @@ func (e *exporter) writeSelfchecks() {
 // the whole stream must be a substitution rule BEFORE any message reaches Detail(). Learning as
 // it emitted would leave the first occurrence of every name in clear — which is the occurrence
 // that matters, being the one that says what went wrong first.
+//
+// The message goes through redactFreeText, which is where the quoted-identifier rule lands: this
+// stream is where the leak was found, on an Event this operator emits itself.
 func (e *exporter) writeEvents() {
 	cutoff := e.cutoff()
 	days := dayIndex(e.opts.DataDir, StreamEvents)
@@ -819,7 +888,7 @@ func (e *exporter) writeEvents() {
 			seen[dedup] = true
 			ev.Namespace = e.red.Namespace(ev.Namespace)
 			ev.Name = e.red.Object(ev.Name)
-			ev.Message = e.red.Detail(ev.Message)
+			ev.Message = redactFreeText(e.red, ev.Message)
 			body, err := json.Marshal(ev)
 			if err != nil {
 				continue
@@ -850,6 +919,20 @@ func (e *exporter) writeEvents() {
 // operator error lines
 // ---------------------------------------------------------------------------------------------
 
+// writeLogs emits the operator's own error-level lines.
+//
+// They get the SAME treatment as the event stream — redactFreeText, quoted rule included — rather
+// than a weaker one, and they earn it twice over. These lines are zap JSON, so every value in them
+// is already between double quotes by construction (`"pvc":"data"`), which is the quoted rule's
+// best case and needs no convention from us. And the lines that are NOT JSON are the operator's own
+// console-format messages, which is the same prose the Events carry and now quotes its identifiers
+// the same way.
+//
+// The one thing that differs is a hazard rather than a gap: in a JSON line the quoted spans include
+// the KEYS, so a namespace or PVC literally named `msg`, `level` or `error` would have its key
+// rewritten. That corrupts a line's shape, it does not leak anything, and the alternative — parsing
+// each line to tell keys from values — would fail on the console-format half of the stream and on
+// every line a nested error string has already mangled.
 func (e *exporter) writeLogs() {
 	cutoff := e.cutoff()
 	var buf bytes.Buffer
@@ -870,7 +953,7 @@ func (e *exporter) writeLogs() {
 				continue
 			}
 			l.Pod = e.red.Pod(l.Pod)
-			l.Line = e.red.Detail(l.Line)
+			l.Line = redactFreeText(e.red, l.Line)
 			body, err := json.Marshal(l)
 			if err != nil {
 				continue

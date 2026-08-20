@@ -123,6 +123,15 @@ func (s *EventStream) Poll(ctx context.Context, now time.Time) {
 	}
 }
 
+// flattenEvent copies the message VERBATIM, and that is not the leak it looks like.
+//
+// Nothing in this package redacts at collection time. The store lives on the administrator's own
+// cluster, holds their own cluster's names, and is read by nobody else; redaction happens once, at
+// EXPORT, because that is the moment the data leaves — and because `crystal-backup soak export
+// --full` has to be able to produce the verbatim archive, which it could not if the names had
+// already been destroyed on the way to disk. The message's free text is redacted there, by
+// redactFreeText in export.go; the quoted-identifier rule it applies is documented on
+// selfcheck.Redactor.RedactQuoted.
 func flattenEvent(e *corev1.Event) Event {
 	at := e.LastTimestamp.Time
 	if at.IsZero() {

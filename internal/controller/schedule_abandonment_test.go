@@ -143,8 +143,16 @@ func TestVolumeInFlightReason(t *testing.T) {
 				t.Fatalf("volumeInFlightReason(%s/%s) = %q; want in-flight=%v",
 					tc.vol.Pvc, tc.vol.Phase, got, tc.wantInFlig)
 			}
-			if tc.wantInFlig && !strings.Contains(got, tc.vol.Pvc) {
-				t.Fatalf("the in-flight reason must name the PVC so an operator can go look at it; got %q", got)
+			// NAMED, and named IN DOUBLE QUOTES. The name is the diagnostic — this message is
+			// addressed to the administrator of the cluster the PVC lives on, and their own PVC name
+			// is not a secret from them, so it stays. The quotes are what make it safe to EXPORT: a
+			// soak archive leaves the cluster, and internal/soak's exporter redacts a free-text
+			// identifier only where it appears quoted (Redactor.RedactQuoted). An unquoted name here
+			// would travel verbatim into an archive bound for a maintainer — which is exactly what a
+			// nine-day archive from a production cluster was caught doing.
+			if tc.wantInFlig && !strings.Contains(got, `"`+tc.vol.Pvc+`"`) {
+				t.Fatalf("the in-flight reason must name the PVC IN DOUBLE QUOTES — the name so an "+
+					"operator can go look at it, the quotes so a soak export can redact it; got %q", got)
 			}
 		})
 	}
