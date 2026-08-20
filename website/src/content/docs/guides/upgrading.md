@@ -45,6 +45,92 @@ helm upgrade crystal-backup \
 `kubectl apply` on CRDs is additive and safe: it adds new fields and never drops stored
 objects.
 
+## 0.6.6 → 0.6.7: there IS a schema step this time, and a self-check that condemned your volumes may stop
+
+**Do not carry the conclusion of the section below over to this one.** `0.6.5` → `0.6.6` had no
+CRD change, and it says so in as many words; this hop has one. `ClusterBackup.status` gains
+**`blockedReasons`**, a new optional list, so the CRDs must be applied **before or with** the
+chart. Skip it and the API server prunes the field on every status write while the operator goes on
+computing it — the field simply never appears, and the run tells you nothing about why it blocked
+what it blocked.
+
+The scope is exactly that one field and the type under it. Only
+`config/crd/bases/crystalbackup.io_clusterbackups.yaml` moved; no other CRD changed, nothing was
+renamed, nothing was removed, and no `spec` field anywhere gained or lost a validation. Apply the
+CRDs before the chart as above, with `--version 0.6.7`.
+
+Each entry of `blockedReasons` is one **cause**, not one namespace — `reason` (a stable token:
+`OwnChild`, `ForeignParentUID`, `DiscoveryProjection`, `UnstampedTerminalChild`,
+`UnstampedWithResults`), `namespaces`, and two counts that are the point of the field:
+`withDataAtCoordinate`, how many of those coordinates nevertheless hold a Backup carrying snapshots,
+and `stampedByThisRun`, how many hold an object stamped with this run's own UID. The list is keyed
+by cause precisely so it stays short, which is what lets it account for **every** blocked namespace
+where the ten-entry `status.failures` list can only sample:
+
+```bash
+kubectl get clusterbackup <name> -o \
+  jsonpath='{range .status.blockedReasons[*]}{.reason}{"\t"}{.namespaces}{"\t"}{.withDataAtCoordinate}{"\t"}{.stampedByThisRun}{"\n"}{end}'
+```
+
+**No classification changed.** A namespace blocked on `0.6.6` is blocked on `0.6.7`, for the same
+reason, and `status.namespacesBlocked` still holds the same total — the branches were instrumented,
+not rewritten. The field is absent when nothing was blocked.
+
+**The self-check's coverage census stops condemning volumes it was merely not allowed to look at.**
+On a real cluster the resident soak collector reported `30 of 30` PVCs as `ExposerUnresolvable`,
+under a headline saying they would **NOT** be backed up, for nine consecutive nights — while 28 of
+them were being backed up successfully every one of those nights. Every number was arithmetically
+correct and its meaning was false: the collector's ClusterRole had no read on
+`persistentvolumes`, which is where the exposer has resolved a bound PVC's driver from since
+`0.6.5`, so the resolver's read was refused and the refusal was recorded as a fact about the
+storage. `0.6.7` gives a refused or failed read its own class, **`ExposerUndetermined`**, keeps it
+out of the "volumes that will NOT be backed up" count, and states it as its own clause instead. The
+same rule now covers the selection counts: a schedule or namespace list that could not be read no
+longer renders as *"selected by NO schedule"*. **So if you had learned to ignore that headline, read
+it again after upgrading** — what is left in it is the part that was always real.
+
+**The chart's soak collector ClusterRole gains two read-only rules, and this is the one upgrade
+action that is not automatic.** `persistentvolumes` (`get`, `list`) in the core group, and
+`storageclasses` (`get`, `list`) in `storage.k8s.io` — the second for PVCs that are not bound, where
+the class is the only evidence of a driver there is. Install the chart's RBAC and you get them. If
+you pin, vendor or hand-write that ClusterRole, **add the two rules yourself**; without them the
+census still degrades, just honestly now, reporting `ExposerUndetermined` instead of condemning
+your data. The collector's ServiceAccount is `<release>-soak`:
+
+```bash
+kubectl auth can-i list persistentvolumes \
+  --as=system:serviceaccount:crystal-backup-system:crystal-backup-soak
+kubectl auth can-i list storageclasses \
+  --as=system:serviceaccount:crystal-backup-system:crystal-backup-soak
+```
+
+None of this concerns you if `soak.enabled` is `false`. The operator's own ClusterRole is unchanged
+and always held both grants — that is why the backups were fine while the report said they were not.
+
+**Two message shapes changed, and a script or an alert could be matching on either.** The
+`ConcurrencySkip` Warning now **quotes the PVC name**: `PVC data is Uploading` becomes
+`PVC "data" is Uploading`, on both planes and in all four in-flight reasons. That is not cosmetic —
+the soak export substitutes an identifier out of free text only where it is quoted and matches
+exactly, and a PVC routinely called `data` or `backups` cannot be substituted safely on any looser
+rule. And the cluster fan-out's `RunNameCollision` Warning is now **one Event per pass**, naming the
+count and the per-cause breakdown, rather than one Event per collided namespace per pass: a run
+blocking thirty-two namespaces was writing thirty-two Warnings per reconcile and evicting the rest
+of that namespace's events well inside the hour they live. The per-namespace text moved to the
+operator log line, untruncated, with `reason` and `facts` as structured fields, and a sample stays
+in `status.failures`. That message also now **leads** with a bracketed fact block —
+`[class=… stamp=… phase=… data=… age=…]` — in front of the prose, and the status message cap rose
+from 256 to 384 runes to fit it. Anything anchored to the start of that string should look.
+
+**`selfcheck` JSON gains one key and one class value, both additive.** `coverage.selectionUndetermined`
+is a new boolean beside the existing counts, and `ExposerUndetermined` is a new value a
+`coverage.classes[].class` can take. Nothing was renamed and no key was removed, so the only thing
+to check is a parser that rejects unknown JSON keys or enumerates class names exhaustively — the
+soak kit's own CronJob is unaffected.
+
+**Nothing about backups themselves changed in this release.** No selection, snapshot, mover,
+retention or restore behaviour moves; no data moves; no repository is touched. What changed is what
+the product *says* about runs it was already doing, in one field, one report and two messages.
+
 ## 0.6.5 → 0.6.6: nothing to apply, but a failing backup now takes longer to say it failed
 
 **There is no CRD or API change in this release.** No field was added, renamed or removed on any

@@ -4,7 +4,7 @@ description: Mettre à niveau le chart, le problème des CRD que Helm ne résout
 sidebar:
   order: 10
 sourceFile: src/content/docs/guides/upgrading.md
-sourceHash: 58ef3baf9da44296552a764415a19b8376da9e0c
+sourceHash: 692d66c48fd99e28d6c8fd43db9538e9b28adcbb
 ---
 
 ## Ce que signifie un numéro de version ici
@@ -47,6 +47,101 @@ helm upgrade crystal-backup \
 
 Un `kubectl apply` sur des CRD est additif et sûr : il ajoute les nouveaux champs et ne
 supprime jamais d'objets stockés.
+
+## 0.6.6 → 0.6.7 : cette fois il Y A une étape de schéma, et un self-check qui condamnait vos volumes peut cesser
+
+**Ne reportez pas la conclusion de la section ci-dessous sur celle-ci.** La `0.6.5` → `0.6.6` ne
+changeait pas les CRD, et elle le dit en toutes lettres ; ce saut-ci en change une.
+`ClusterBackup.status` gagne **`blockedReasons`**, une nouvelle liste optionnelle : les CRD doivent
+donc être appliquées **avant ou avec** le chart. Sautez cette étape et l'API server élaguera le champ à chaque écriture de
+status pendant que l'operator continuera de le calculer — le champ n'apparaîtra tout simplement
+jamais, et le run ne vous dira rien de la raison pour laquelle il a bloqué ce qu'il a bloqué.
+
+La portée se limite exactement à ce champ et au type qui le compose. Seul
+`config/crd/bases/crystalbackup.io_clusterbackups.yaml` a bougé ; aucune autre CRD n'a changé, rien
+n'a été renommé, rien n'a été supprimé, et aucun champ de `spec` nulle part n'a gagné ni perdu une
+validation. Appliquez les CRD avant le chart comme ci-dessus, avec `--version 0.6.7`.
+
+Chaque entrée de `blockedReasons` est une **cause**, pas un namespace — `reason` (un token stable :
+`OwnChild`, `ForeignParentUID`, `DiscoveryProjection`, `UnstampedTerminalChild`,
+`UnstampedWithResults`), `namespaces`, et deux compteurs qui sont toute la raison d'être du champ :
+`withDataAtCoordinate`, combien de ces coordonnées portent malgré tout un Backup qui détient des
+snapshots, et `stampedByThisRun`, combien portent un objet estampillé de l'UID de ce run lui-même.
+La liste est indexée par cause précisément pour rester courte, et c'est ce qui lui permet de rendre
+compte de **tous** les namespaces bloqués là où la liste `status.failures`, plafonnée à dix
+entrées, ne peut qu'échantillonner :
+
+```bash
+kubectl get clusterbackup <name> -o \
+  jsonpath='{range .status.blockedReasons[*]}{.reason}{"\t"}{.namespaces}{"\t"}{.withDataAtCoordinate}{"\t"}{.stampedByThisRun}{"\n"}{end}'
+```
+
+**Aucune classification n'a changé.** Un namespace bloqué en `0.6.6` est bloqué en `0.6.7`, pour la
+même raison, et `status.namespacesBlocked` porte toujours le même total — les branches ont été
+instrumentées, pas réécrites. Le champ est absent quand rien n'a été bloqué.
+
+**Le recensement de couverture du self-check cesse de condamner des volumes qu'il n'avait
+simplement pas le droit de regarder.** Sur un vrai cluster, le collecteur de soak résident a
+rapporté `30 of 30` PVC en `ExposerUnresolvable`, sous un titre annonçant qu'ils ne seraient
+**PAS** sauvegardés, neuf nuits consécutives — alors que 28 d'entre eux étaient sauvegardés avec
+succès chacune de ces nuits. Chaque chiffre était arithmétiquement juste et son sens était faux :
+le ClusterRole du collecteur n'avait aucun droit de lecture sur `persistentvolumes`, l'objet depuis
+lequel l'exposer résout le driver d'un PVC lié depuis la `0.6.5` ; la lecture du résolveur était
+donc refusée, et ce refus était consigné comme un fait sur le stockage. La `0.6.7` donne à une
+lecture refusée ou échouée sa propre classe, **`ExposerUndetermined`**, la tient hors du décompte
+des « volumes qui ne seront PAS sauvegardés », et l'énonce comme une clause à part. La même règle
+couvre désormais les compteurs de sélection : une liste de schedules ou de namespaces qui n'a pas
+pu être lue ne se rend plus en *« sélectionné par AUCUN schedule »*. **Donc si vous aviez appris à
+ignorer ce titre, relisez-le après la mise à niveau** — ce qu'il en reste est la part qui a toujours
+été réelle.
+
+**Le ClusterRole du collecteur de soak du chart gagne deux règles en lecture seule, et c'est la
+seule action de mise à niveau qui ne soit pas automatique.** `persistentvolumes` (`get`, `list`)
+dans le groupe core, et `storageclasses` (`get`, `list`) dans `storage.k8s.io` — la seconde pour
+les PVC non liés, où la classe est la seule preuve de driver qui existe. Installez le RBAC du chart
+et vous les avez. Si vous figez, vendorisez ou écrivez ce ClusterRole à la main, **ajoutez les deux
+règles vous-même** ; sans elles le recensement se dégrade quand même, honnêtement désormais, en
+rapportant `ExposerUndetermined` au lieu de condamner vos données. Le ServiceAccount du collecteur
+est `<release>-soak` :
+
+```bash
+kubectl auth can-i list persistentvolumes \
+  --as=system:serviceaccount:crystal-backup-system:crystal-backup-soak
+kubectl auth can-i list storageclasses \
+  --as=system:serviceaccount:crystal-backup-system:crystal-backup-soak
+```
+
+Rien de tout cela ne vous concerne si `soak.enabled` vaut `false`. Le ClusterRole de l'operator
+lui-même est inchangé et a toujours détenu les deux droits — c'est bien pourquoi les backups se
+portaient bien pendant que le rapport disait le contraire.
+
+**Deux formes de message ont changé, et un script ou une alerte peut être en train de matcher l'une
+ou l'autre.** Le Warning `ConcurrencySkip` **met désormais le nom du PVC entre guillemets** :
+`PVC data is Uploading` devient `PVC "data" is Uploading`, sur les deux plans et dans les quatre
+raisons d'in-flight. Ce n'est pas cosmétique — l'export de soak ne substitue un identifiant hors du
+texte libre que là où il est entre guillemets et correspond exactement, et un PVC couramment appelé
+`data` ou `backups` ne peut être substitué sans risque sous aucune règle plus large. Et le Warning
+`RunNameCollision` du fan-out cluster est désormais **un Event par passe**, qui nomme le décompte et
+la ventilation par cause, plutôt qu'un Event par namespace en collision et par passe : un run
+bloquant trente-deux namespaces écrivait trente-deux Warnings par réconciliation et chassait le
+reste des events du namespace bien avant l'heure qu'ils vivent. Le texte par namespace est passé sur
+la ligne de log de l'operator, non tronqué, avec `reason` et `facts` en champs structurés, et un
+échantillon reste dans `status.failures`. Ce message **commence** en outre désormais par un bloc de
+faits entre crochets — `[class=… stamp=… phase=… data=… age=…]` — devant la prose, et le plafond du
+message de status est passé de 256 à 384 runes pour l'y loger. Tout ce qui s'ancre sur le début de
+cette chaîne mérite un coup d'œil.
+
+**Le JSON de `selfcheck` gagne une clé et une valeur de classe, toutes deux purement additives.**
+`coverage.selectionUndetermined` est un nouveau booléen à côté des compteurs existants, et
+`ExposerUndetermined` est une nouvelle valeur que peut prendre un `coverage.classes[].class`. Rien
+n'a été renommé et aucune clé n'a été supprimée : la seule chose à vérifier est un parser qui
+rejetterait les clés JSON inconnues ou qui énumérerait les noms de classes de façon exhaustive — le
+CronJob du kit de soak, lui, n'est pas affecté.
+
+**Rien de ce qui concerne les backups eux-mêmes ne change dans cette release.** Aucun comportement
+de sélection, de snapshot, de mover, de rétention ou de restore ne bouge ; aucune donnée ne se
+déplace ; aucun dépôt n'est touché. Ce qui change, c'est ce que le produit *dit* de runs qu'il
+faisait déjà, dans un champ, un rapport et deux messages.
 
 ## 0.6.5 → 0.6.6 : rien à appliquer, mais un backup en échec met désormais plus de temps à le dire
 
