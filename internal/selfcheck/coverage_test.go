@@ -26,6 +26,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -185,61 +186,244 @@ func TestCoverageSeparatesPrecheckFromUnsupported(t *testing.T) {
 }
 
 // TestCoverageSnapshotAPIAbsentIsOneStatementNotN pins the state a fresh cluster is most often in:
-// the VolumeSnapshot API cannot be read at all — the CRDs were never installed, or the operator's
-// ClusterRole has lost its read on VolumeSnapshotClasses.
+// the VolumeSnapshot API cannot be used at all, so no volume's treatment is knowable.
 //
 // Letting each PVC fail on its own would produce one identical error per volume — three thousand of
 // them on a real cluster — and a report nobody can read. One statement about the cluster is both
 // smaller and truer, and it must not read as "backed up" in the meantime.
 //
-// The unreadable API is simulated by refusing the LIST rather than by omitting the CRDs from the fake
-// client's scheme, and the difference matters: controller-runtime's fake client answers an
-// unregistered unstructured list with an empty result, not an error, so a scheme-based fixture would
-// exercise the "zero snapshot classes exist" path (correctly CSISnapshotUnsupported) and prove nothing
-// about this one.
+// WHICH statement is the part 0.6.7 had to split. The two causes were reported identically:
+//
+//   - the CRDs are not installed. The apiserver ANSWERED, and its answer is grave and true — nothing
+//     in this cluster can be backed up until somebody installs the snapshot API.
+//   - this identity may not list VolumeSnapshotClasses. The apiserver refused, and the report knows
+//     precisely nothing. The operator has its own, wider role and may be backing everything up
+//     perfectly.
+//
+// Sending a reader after a storage stack that was never broken is the failure this release exists to
+// end, so the two are asserted apart here — while the "one statement, not N" property, which is
+// orthogonal and was never wrong, is asserted for both.
+//
+// Both are simulated by failing the LIST rather than by omitting the CRDs from the fake client's
+// scheme: controller-runtime's fake client answers an unregistered unstructured list with an empty
+// result, not an error, so a scheme-based fixture would exercise the "zero snapshot classes exist"
+// path (correctly CSISnapshotUnsupported) and prove nothing about either of these.
 func TestCoverageSnapshotAPIAbsentIsOneStatementNotN(t *testing.T) {
-	base := coverageClient(t,
-		nsObj("tenant-a", "acme"),
-		covPVC("tenant-a", "rbd-data", "ceph-block", "pv-rbd", "1Gi"),
-		covCSIPV("pv-rbd", covRBD, "ceph-block"),
-		covPVC("tenant-a", "more-data", "ceph-block", "pv-rbd-2", "1Gi"),
-		covCSIPV("pv-rbd-2", covRBD, "ceph-block"),
-	)
-
-	rep, err := Collect(context.Background(), Options{
-		Reader: forbiddenReader{
-			Reader: base,
-			kinds:  map[string]bool{"VolumeSnapshotClassList": true},
+	for _, tc := range []struct {
+		name  string
+		err   error
+		class string
+	}{
+		{
+			name: "the CRDs are not installed",
+			err: &meta.NoKindMatchError{
+				GroupKind:        schema.GroupKind{Group: "snapshot.storage.k8s.io", Kind: "VolumeSnapshotClass"},
+				SearchedVersions: []string{"v1"},
+			},
+			class: CoverageSnapshotAPIAbsent,
 		},
-		OperatorNamespace: operatorNS, Now: fixtureNow(), Full: true,
-	})
-	if err != nil {
-		t.Fatalf("collect: %v", err)
+		{
+			name: "the identity may not list them",
+			err: apierrors.NewForbidden(
+				schema.GroupResource{Group: "snapshot.storage.k8s.io", Resource: "volumesnapshotclasses"},
+				"", fmt.Errorf("cannot list resource at the cluster scope")),
+			class: CoverageUndetermined,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			base := coverageClient(t,
+				nsObj("tenant-a", "acme"),
+				covPVC("tenant-a", "rbd-data", "ceph-block", "pv-rbd", "1Gi"),
+				covCSIPV("pv-rbd", covRBD, "ceph-block"),
+				covPVC("tenant-a", "more-data", "ceph-block", "pv-rbd-2", "1Gi"),
+				covCSIPV("pv-rbd-2", covRBD, "ceph-block"),
+			)
+			rep := collectUnreadable(t, base, map[string]error{"VolumeSnapshotClassList": tc.err})
+
+			cov := rep.Coverage
+			if cov == nil {
+				t.Fatal("no coverage section at all; an unusable snapshot API must still produce a census")
+			}
+			if len(cov.Classes) != 1 || cov.Classes[0].Class != tc.class {
+				t.Fatalf("classes %+v, want exactly one %q", cov.Classes, tc.class)
+			}
+			if cov.Classes[0].Count != 2 {
+				t.Errorf("the single class covers %d PVCs, want 2", cov.Classes[0].Count)
+			}
+			if cov.Classes[0].Verdict == CoverageVerdictBackedUp {
+				t.Error("an unusable snapshot API rendered as 'backed up', which is the one reading " +
+					"this package exists to refuse")
+			}
+			// One diagnostic, not one per PVC.
+			var covDiags int
+			for _, d := range rep.Diagnostics {
+				if d.Area == "coverage" {
+					covDiags++
+				}
+			}
+			if covDiags != 1 {
+				t.Errorf("%d coverage diagnostics, want exactly 1 — the point is not to repeat the "+
+					"same error per volume", covDiags)
+			}
+		})
 	}
+}
+
+// TestARefusedReadIsNotAVerdictAboutTheData is this release's reason for existing, reproduced from
+// the report that found it.
+//
+// A resident soak collector ran `selfcheck` daily for NINE DAYS under a ServiceAccount whose
+// ClusterRole had no read on PersistentVolumes. Since 0.6.5 the exposer resolves a bound PVC's driver
+// from its PV, so every resolution failed with the same Forbidden — and the census called all 30
+// volumes ExposerUnresolvable and the headline said they "will NOT be backed up". Twenty-eight of
+// them were being backed up successfully every single night. The report was not wrong about a fact;
+// it reported the limits of its own eyesight as a property of somebody's data.
+//
+// So: a read that could not be answered gets its own class, and the headline may not count those
+// volumes among the ones that will not be backed up. The error is a REAL apierrors Forbidden here,
+// exactly as the apiserver sends it, because that is the shape the field failure had.
+func TestARefusedReadIsNotAVerdictAboutTheData(t *testing.T) {
+	rep := collectUnreadable(t, syntheticCoverageCluster(t, 30), map[string]error{
+		"PersistentVolumeList": apierrors.NewForbidden(
+			schema.GroupResource{Resource: "persistentvolumes"}, "",
+			fmt.Errorf("User \"system:serviceaccount:crystal-backup-system:crystal-backup-soak\" "+
+				"cannot list resource \"persistentvolumes\" in API group \"\" at the cluster scope")),
+	})
 	cov := rep.Coverage
 	if cov == nil {
-		t.Fatal("no coverage section at all; an unreadable snapshot API must still produce a census")
+		t.Fatal("no census at all; a refused read must still produce one")
 	}
-	if len(cov.Classes) != 1 || cov.Classes[0].Class != CoverageSnapshotAPIAbsent {
-		t.Fatalf("classes %+v, want exactly one %q", cov.Classes, CoverageSnapshotAPIAbsent)
+
+	if len(cov.Classes) != 1 || cov.Classes[0].Class != CoverageUndetermined {
+		t.Fatalf("classes %+v, want exactly one %q: the volumes' treatment was not determined, and "+
+			"'unresolvable' is a claim about the storage this command is in no position to make",
+			cov.Classes, CoverageUndetermined)
 	}
-	if cov.Classes[0].Count != 2 {
-		t.Errorf("the single class covers %d PVCs, want 2", cov.Classes[0].Count)
+	if cov.Classes[0].Count != 30 {
+		t.Errorf("the class covers %d PVCs, want 30", cov.Classes[0].Count)
 	}
-	if cov.Classes[0].Verdict == CoverageVerdictBackedUp {
-		t.Error("an unreadable snapshot API rendered as 'backed up', which is the one reading this " +
-			"package exists to refuse")
+	if cov.Classes[0].Verdict != CoverageVerdictUnknown {
+		t.Errorf("verdict %q, want %q", cov.Classes[0].Verdict, CoverageVerdictUnknown)
 	}
-	// One diagnostic, not one per PVC.
-	var covDiags int
-	for _, d := range rep.Diagnostics {
-		if d.Area == "coverage" {
-			covDiags++
+	// The API error survives into the row: without it the reader cannot tell a missing grant from an
+	// apiserver having a bad minute, and those are different jobs.
+	if d := coverageRows(cov)["bulk/data-0000"].Detail; !strings.Contains(d, "forbidden") {
+		t.Errorf("the row does not carry the error that stopped the read: %q", d)
+	}
+
+	// The headline. This is the sentence nine days of reports got wrong.
+	if strings.Contains(rep.Verdict.Summary, "will NOT be backed up") {
+		t.Errorf("the verdict still condemns volumes whose treatment was never determined:\n  %s",
+			rep.Verdict.Summary)
+	}
+	if !strings.Contains(rep.Verdict.Summary, "could not be determined") {
+		t.Errorf("the verdict says nothing about the reads that were refused, so a reader has no "+
+			"way to know the census is blind:\n  %s", rep.Verdict.Summary)
+	}
+}
+
+// TestARefusedStorageClassReadIsNotAVerdictEither is the second read the census depends on, and the
+// one the collector's role was ALSO missing (the same audit struck storageclasses off the same list
+// on the same day). It reaches only unbound PVCs — there the class is the only evidence of a driver
+// there is — but the failure mode was identical, so the answer has to be.
+func TestARefusedStorageClassReadIsNotAVerdictEither(t *testing.T) {
+	base := coverageClient(t,
+		nsObj("tenant-a", "acme"),
+		// Unbound: the one shape that makes the resolver read a StorageClass at all.
+		covPVC("tenant-a", "pending-rbd", "ceph-block", "", "1Gi"),
+		&storagev1.StorageClass{ObjectMeta: metav1.ObjectMeta{Name: "ceph-block"}, Provisioner: covRBD},
+		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "csi-snap-creds", Namespace: "rook-ceph"}},
+		// A schedule that takes it, so the refusal is the ONLY thing the headline can be reacting to.
+		&cbv1.ClusterBackupSchedule{
+			ObjectMeta: metav1.ObjectMeta{Name: "nightly", CreationTimestamp: metav1.NewTime(fixtureNow())},
+			Spec: cbv1.ClusterBackupScheduleSpec{
+				Schedule: "0 2 * * *",
+				Template: cbv1.ClusterBackupTemplate{Spec: cbv1.ClusterBackupRunSpec{
+					LocationRef: cbv1.LocalObjectReference{Name: "dr"},
+					Namespaces:  cbv1.NamespaceSelector{MatchNames: []string{"tenant-a"}},
+				}},
+			},
+		},
+	)
+	rep := collectUnreadable(t, base, map[string]error{
+		"StorageClassList": apierrors.NewForbidden(
+			schema.GroupResource{Group: "storage.k8s.io", Resource: "storageclasses"}, "",
+			fmt.Errorf("cannot list resource at the cluster scope")),
+	})
+
+	got := coverageByName(rep.Coverage)
+	if got["tenant-a/pending-rbd"] != CoverageUndetermined {
+		t.Errorf("class %q, want %q: the StorageClass was not readable, which says nothing about "+
+			"whether this volume will be backed up", got["tenant-a/pending-rbd"], CoverageUndetermined)
+	}
+	if strings.Contains(rep.Verdict.Summary, "will NOT be backed up") {
+		t.Errorf("the verdict condemns a volume whose class it could not read:\n  %s", rep.Verdict.Summary)
+	}
+}
+
+// TestARefusedScheduleReadDoesNotInventUnprotectedVolumes is the THIRD place the same conflation
+// lived, and it is not a treatment class at all — which is why it survived the first pass.
+//
+// "Selected by NO schedule" is the single most valuable line this section prints, and the census
+// derives it by listing the schedules and seeing which PVCs they take. List refused: every PVC in the
+// cluster reads as selected by nothing, the headline reports them among the volumes that will NOT be
+// backed up, and the sentence is exactly as false as the class was — with no class involved. The
+// count is not a verdict this report is entitled to reach when it could not read the schedules.
+func TestARefusedScheduleReadDoesNotInventUnprotectedVolumes(t *testing.T) {
+	rep := collectUnreadable(t, syntheticCoverageCluster(t, 5), map[string]error{
+		"ClusterBackupScheduleList": apierrors.NewForbidden(
+			schema.GroupResource{Group: "crystalbackup.io", Resource: "clusterbackupschedules"}, "",
+			fmt.Errorf("cannot list resource at the cluster scope")),
+	})
+
+	if strings.Contains(rep.Verdict.Summary, "selected by NO schedule") {
+		t.Errorf("the verdict reports volumes as selected by nothing when the schedules could not be "+
+			"read; the schedule that selects all five is right there in the fixture:\n  %s",
+			rep.Verdict.Summary)
+	}
+	if !strings.Contains(rep.Verdict.Summary, "which schedules select") {
+		t.Errorf("the verdict does not say the selection could not be determined, so the missing "+
+			"clause reads as good news:\n  %s", rep.Verdict.Summary)
+	}
+	if !rep.Coverage.SelectionUndetermined {
+		t.Error("Coverage does not record that the selection is unknown, so every consumer of the " +
+			"JSON reads Unselected as a measured zero")
+	}
+
+	// Both renderers, because the flag has to survive into the two things a human actually reads. The
+	// page is where the earlier version of this sentence was boldest ("nothing in this cluster will
+	// ever back them up"), so a JSON field nobody rendered would have fixed the least-read output.
+	page, err := Render(rep)
+	if err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	if strings.Contains(string(page), "are selected by NO schedule") {
+		t.Error("the page still states the unmeasured count as a finding")
+	}
+	if !strings.Contains(string(page), "could not be determined") {
+		t.Error("the page does not say the selection is unknown")
+	}
+	if txt := string(RenderText(rep, TextOptions{})); !strings.Contains(txt, "COULD NOT BE DETERMINED") {
+		t.Errorf("the text report does not qualify the selection counts:\n%s", txt)
+	}
+}
+
+// TestCoverageKeepsGenuineUnresolvableApart is the guard on the other side of the same line: the new
+// class must not swallow the finding it was split off from.
+//
+// A PVC bound to a PersistentVolume that is NOT THERE is not a refusal — the apiserver answered, and
+// what it answered is that the object is gone. That is a real (if rare) finding about the cluster,
+// the controller parks the volume and retries it to a deadline, and it must keep reading as
+// ExposerUnresolvable. If this test ever goes green by turning everything into "undetermined", the
+// census has stopped saying anything at all.
+func TestCoverageKeepsGenuineUnresolvableApart(t *testing.T) {
+	cov := collectCoverage(t, coverageFixture(t))
+	got := coverageByName(cov)
+	for _, name := range []string{"tenant-a/ghost-volume", "tenant-a/never-bound"} {
+		if got[name] != CoverageUnresolved {
+			t.Errorf("%s: class %q, want %q — a NotFound is the API ANSWERING, not refusing",
+				name, got[name], CoverageUnresolved)
 		}
-	}
-	if covDiags != 1 {
-		t.Errorf("%d coverage diagnostics, want exactly 1 — the point is not to repeat the same "+
-			"error per volume", covDiags)
 	}
 }
 
@@ -432,6 +616,45 @@ func collectCoverageReport(t *testing.T, c client.Reader) *Report {
 		t.Fatalf("collect: %v", err)
 	}
 	return rep
+}
+
+// collectUnreadable collects over a cluster some of whose kinds cannot be read, each with the exact
+// error the apiserver would send. The error matters as much as the kind: a Forbidden, a NotFound and
+// a timeout are three different statements, and this package's whole job in this area is to stop
+// treating them as one.
+func collectUnreadable(t *testing.T, c client.Reader, kinds map[string]error) *Report {
+	t.Helper()
+	rep, err := Collect(context.Background(), Options{
+		Reader:            unreadableReader{Reader: c, kinds: kinds},
+		OperatorNamespace: operatorNS, Now: fixtureNow(), Full: true,
+	})
+	if err != nil {
+		t.Fatalf("a cluster this command cannot fully read must still produce a report: %v", err)
+	}
+	return rep
+}
+
+// unreadableReader is forbiddenReader with the error chosen by the caller. The two are kept apart
+// rather than merged because forbiddenReader's plain fmt error is itself a useful fixture — it is
+// what proves the new class does not depend on apierrors.IsForbidden being able to recognise the
+// failure.
+type unreadableReader struct {
+	client.Reader
+	kinds map[string]error
+}
+
+func (u unreadableReader) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	kind := fmt.Sprintf("%T", list)
+	if i := strings.LastIndex(kind, "."); i >= 0 {
+		kind = kind[i+1:]
+	}
+	if ul, ok := list.(*unstructured.UnstructuredList); ok {
+		kind = ul.GetObjectKind().GroupVersionKind().Kind
+	}
+	if err := u.kinds[kind]; err != nil {
+		return err
+	}
+	return u.Reader.List(ctx, list, opts...)
 }
 
 // collectCoverage is collectCoverageReport narrowed to the census, failing the test when there is none.

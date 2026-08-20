@@ -253,14 +253,32 @@ func textCoverage(w *textWriter, cov *Coverage, all bool) {
 			t.Count, textVerdictTag(t.Verdict), t.Class, textClassGist(t.Class)))
 	}
 
+	// The selection counts, and the one sentence that has to come BEFORE them when they are not
+	// measurements. "Nothing in this cluster will ever back these up" is the strongest claim this
+	// section makes; made on a schedule list that could not be read, it is a claim about the reader's
+	// permissions in the voice of a claim about their data. Same rule as the ExposerUndetermined
+	// class, applied to the numbers that are not a class.
+	if cov.SelectionUndetermined {
+		w.blank()
+		w.wrap("  ! ", "WHICH SCHEDULES SELECT WHICH VOLUMES COULD NOT BE DETERMINED: a schedule or "+
+			"namespace list this command needed was refused or failed (see DIAGNOSTICS). The counts "+
+			"below are what could be seen from here and are NOT a finding — a volume reported as "+
+			"selected by nothing may well be selected by a schedule in the list that was refused.")
+	}
 	if cov.Unselected > 0 {
 		w.blank()
-		w.wrap("  ! ", fmt.Sprintf(
-			"%d of those PVCs %s selected by NO schedule: whatever their storage can do, nothing in "+
-				"this cluster will ever back %s up.",
-			cov.Unselected, isAre(cov.Unselected), itThem(cov.Unselected)))
+		if cov.SelectionUndetermined {
+			w.wrap("  ! ", fmt.Sprintf(
+				"%d of those PVCs appeared to be selected by no schedule — unconfirmed, see above.",
+				cov.Unselected))
+		} else {
+			w.wrap("  ! ", fmt.Sprintf(
+				"%d of those PVCs %s selected by NO schedule: whatever their storage can do, nothing in "+
+					"this cluster will ever back %s up.",
+				cov.Unselected, isAre(cov.Unselected), itThem(cov.Unselected)))
+		}
 	}
-	if cov.InertOnly > 0 {
+	if cov.InertOnly > 0 && !cov.SelectionUndetermined {
 		w.wrap("  ! ", fmt.Sprintf(
 			"%d %s selected only by a schedule that cannot fire (suspended, or an unparseable cron), "+
 				"so %s covered on paper and unprotected in fact.",
@@ -391,6 +409,8 @@ func textClassGist(class string) string {
 		return "the snapshot class cannot be served today — fixable"
 	case CoverageUnresolved:
 		return "the exposer could not be resolved; retried to a deadline"
+	case CoverageUndetermined:
+		return "THIS REPORT could not read what it needed — not a finding about the data"
 	case CoverageSnapshotAPIAbsent:
 		return "the VolumeSnapshot API could not be read at all"
 	default:

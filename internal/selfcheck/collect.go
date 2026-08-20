@@ -1398,24 +1398,59 @@ func coverageClause(cov *Coverage) string {
 		return ""
 	}
 	var parts []string
-	if cov.Unselected > 0 {
-		parts = append(parts, fmt.Sprintf("%d selected by NO schedule", cov.Unselected))
+	// The selection counts are quoted only when they were MEASURED. A refused schedule list makes
+	// every PVC in the cluster fall through to "selected by nothing", which is the same defect as the
+	// treatment class one release earlier: a gap in this report's eyesight printed as a fact about
+	// somebody's data. The counts stay in the JSON, flagged; what they stop being is a headline.
+	if !cov.SelectionUndetermined {
+		if cov.Unselected > 0 {
+			parts = append(parts, fmt.Sprintf("%d selected by NO schedule", cov.Unselected))
+		}
+		if cov.InertOnly > 0 {
+			parts = append(parts, fmt.Sprintf(
+				"%d selected only by a schedule that cannot fire", cov.InertOnly))
+		}
 	}
-	if cov.InertOnly > 0 {
-		parts = append(parts, fmt.Sprintf(
-			"%d selected only by a schedule that cannot fire", cov.InertOnly))
-	}
+	undetermined := 0
 	for _, t := range cov.Classes {
 		if t.Verdict == CoverageVerdictBackedUp {
 			continue
 		}
+		// THE COUNT THAT MUST NOT BE IN THE PARENTHESIS. A volume whose treatment could not be
+		// determined — because a read this command needed was refused or failed — has not been found
+		// to be unprotected. Adding it to a sentence that begins "volumes that will NOT be backed up"
+		// converts a gap in this report's eyesight into an assertion about somebody's data, and that
+		// assertion is what a nine-day soak published every night about 28 volumes that were being
+		// backed up successfully every night. It is stated, loudly, as its own clause below; what it
+		// is not is evidence.
+		if t.Class == CoverageUndetermined {
+			undetermined = t.Count
+			continue
+		}
 		parts = append(parts, fmt.Sprintf("%d %s", t.Count, t.Class))
 	}
-	if len(parts) == 0 {
-		return ""
+
+	clause := ""
+	if len(parts) > 0 {
+		clause = fmt.Sprintf("the per-PVC census found volumes that will NOT be backed up (%s) — a "+
+			"finding from the coverage section below, not a breached rule", strings.Join(parts, ", "))
 	}
-	return fmt.Sprintf("the per-PVC census found volumes that will NOT be backed up (%s) — a finding "+
-		"from the coverage section below, not a breached rule", strings.Join(parts, ", "))
+	if cov.SelectionUndetermined {
+		clause = joinFindings(clause, "which schedules select which volumes could not be determined: "+
+			"a schedule or namespace list this command needed was refused or failed, so the census "+
+			"cannot say that any volume is unprotected — again a finding about THIS REPORT's "+
+			"permissions, not about your data")
+	}
+	if undetermined == 0 {
+		return clause
+	}
+	// Named in the headline rather than left to the coverage section, for the same reason every other
+	// clause here is: a reader who sees the verdict does not scroll. A census that is partly blind
+	// changes what every count under it means, so it has to be read before them and not after.
+	blind := fmt.Sprintf("%d volume(s) could not be determined at all — a read this command needed "+
+		"was refused or failed, which is a finding about THIS REPORT's permissions and not about your "+
+		"data; the operator reconciles with its own, wider ClusterRole", undetermined)
+	return joinFindings(clause, blind)
 }
 
 // stuckSnapshotClause states the snapshot observation as a clause the verdict sentence can be built

@@ -210,7 +210,7 @@ func (r *coverageReader) getPV(ctx context.Context, key client.ObjectKey, out *c
 	pv, ok := r.pvs[key.Name]
 	if !ok {
 		return apierrors.NewNotFound(
-			schema.GroupResource{Resource: "persistentvolumes"}, key.Name)
+			schema.GroupResource{Resource: resPersistentVolumes}, key.Name)
 	}
 	// DEEP-copied into the caller's object rather than assigned. The resolver does not mutate what it
 	// reads, but a cache that hands out its own storage is one refactor away from a scan that
@@ -237,7 +237,7 @@ func (r *coverageReader) getStorageClass(ctx context.Context, key client.ObjectK
 	sc, ok := r.classes[key.Name]
 	if !ok {
 		return apierrors.NewNotFound(
-			schema.GroupResource{Group: storagev1.GroupName, Resource: "storageclasses"}, key.Name)
+			schema.GroupResource{Group: storagev1.GroupName, Resource: resStorageClasses}, key.Name)
 	}
 	sc.DeepCopyInto(out)
 	return nil

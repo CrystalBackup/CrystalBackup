@@ -58,9 +58,13 @@ import (
 // reader deciding they are covered by a mechanism that does not exist. bestEffortNote says so in
 // words instead, once, in the section where somebody would go looking for it.
 
-// The coverage classes. Six values, and each one is anchored to something the code already declares
+// The coverage classes. Seven values, six of them anchored to something the code already declares
 // rather than invented here — that anchoring is what keeps this section honest as the resolver
 // changes underneath it.
+//
+// The seventh, CoverageUndetermined, is anchored to nothing in the resolver on purpose: it is the
+// class for a volume this command could not form an opinion about, and there is no resolver answer
+// that means "I was not allowed to look".
 const (
 	// CoverageClone is exposer.KindCSIGeneric: a VolumeSnapshot, then a temporary PVC PROVISIONED
 	// FROM that snapshot which the mover reads. This is the "with copy" half of the product owner's
@@ -100,11 +104,36 @@ const (
 	// claims to know which it is.
 	CoverageUnresolved = "ExposerUnresolvable"
 
+	// CoverageUndetermined is the class for "I could not read the object I needed, so I do not know",
+	// and it is the one class in this list that says nothing whatsoever about the storage.
+	//
+	// Every other class is a finding about a volume. This one is a finding about the OBSERVER: a read
+	// the resolution depends on was refused (an RBAC policy, a namespace-scoped install, a policy
+	// engine) or simply did not come back (a timeout, an apiserver having a bad minute). The volume
+	// may be perfectly protected; this command is in no position to say either way.
+	//
+	// It exists because collapsing it into CoverageUnresolved cost nine days of false alarms. A
+	// resident soak collector whose ClusterRole had no read on PersistentVolumes — the object the
+	// exposer has resolved a bound PVC's driver from since 0.6.5 — reported 30 of 30 volumes as
+	// ExposerUnresolvable every night, under a headline saying they would NOT be backed up, while 28
+	// of them were being backed up successfully every night by an operator that DID hold the grant.
+	// Every number in that report was arithmetically correct and its meaning was false.
+	//
+	// The line is drawn at whether the apiserver ANSWERED. A NotFound is an answer — the object is
+	// genuinely gone, which is CoverageUnresolved's business and the controller retries it. A
+	// Forbidden, an Unauthorized, a timeout or a transport failure is not an answer at all.
+	CoverageUndetermined = "ExposerUndetermined"
+
 	// CoverageSnapshotAPIAbsent is the one class that is NOT a per-PVC verdict. It is what every PVC
-	// in the census gets when the VolumeSnapshot API itself could not be read — no CRDs, or no RBAC
-	// on VolumeSnapshotClasses. Resolving 3000 PVCs against an API that is not there would produce
-	// 3000 identical errors and one useless report, so the scan stops at the first read, says so
-	// once, and classifies the whole cluster. It is a statement about the CLUSTER, and the honest
+	// in the census gets when the VolumeSnapshot API is not THERE: the CRDs are not installed, so the
+	// apiserver answers that it has never heard of the kind. Resolving 3000 PVCs against an API that
+	// is not there would produce 3000 identical errors and one useless report, so the scan stops at
+	// the first read, says so once, and classifies the whole cluster.
+	//
+	// A REFUSED read is not this class and used to be: an identity that may not list
+	// VolumeSnapshotClasses learns nothing about the cluster, and saying "nothing here can be backed
+	// up" on that evidence is the same false alarm CoverageUndetermined exists to end. That case is
+	// CoverageUndetermined, decided once for the whole cluster in the same place. It is a statement about the CLUSTER, and the honest
 	// reading is "nothing here can be backed up until the snapshot API is installed".
 	CoverageSnapshotAPIAbsent = "VolumeSnapshotAPIAbsent"
 )
@@ -149,6 +178,17 @@ type Coverage struct {
 	// cron expression that does not parse. Not merged into Unselected, because the remedy is
 	// different and much smaller — there IS a schedule, it is just switched off.
 	InertOnly int `json:"selectedOnlyByInertSchedules"`
+	// SelectionUndetermined says that Unselected and InertOnly are NOT measurements. It is set when a
+	// schedule list — or the namespace list the cluster-plane fan-out resolves through — could not be
+	// read, which makes "nothing selects this volume" unsupportable for every row at once: the
+	// schedule that selects it may be sitting in the list this command was refused.
+	//
+	// It is a flag beside the counts rather than a zeroing of them because the counts are still the
+	// best available reading and a reader may want them; what they may not be is quoted as a finding.
+	// Same discipline as the ExposerUndetermined class, applied to the one number in this section that
+	// is not a treatment class — and it is here because that number went wrong in exactly the same way
+	// and would have gone on doing so after the class was fixed.
+	SelectionUndetermined bool `json:"selectionUndetermined,omitempty"`
 	// StalledStorage counts PVCs whose treatment class says BACKED UP and whose StorageClass is
 	// carrying a VolumeSnapshot that has been bound and not ready past the grace period — a prediction
 	// this section can no longer make on its own. See qualifyWithSnapshotEvidence.
@@ -282,7 +322,7 @@ func coverageVerdict(class string) string {
 		return CoverageVerdictSkipped
 	case CoveragePrecheckFailed:
 		return CoverageVerdictFailed
-	case CoverageUnresolved, CoverageSnapshotAPIAbsent:
+	case CoverageUnresolved, CoverageSnapshotAPIAbsent, CoverageUndetermined:
 		return CoverageVerdictUnknown
 	default:
 		// A Kind this build has never heard of. It resolved, so the operator WILL try to back the
@@ -311,6 +351,10 @@ func coverageSummary(class string) string {
 	case CoverageUnresolved:
 		return "UNKNOWN: the exposer could not be resolved; the operator will retry and give up at " +
 			"a deadline"
+	case CoverageUndetermined:
+		return "NOT DETERMINED — this is about THIS REPORT, not about your data: a read it needed " +
+			"was refused or failed, so the treatment could not be worked out. It is not a finding " +
+			"that these volumes are unprotected"
 	case CoverageSnapshotAPIAbsent:
 		return "UNKNOWN: the VolumeSnapshot API could not be read, so no volume's treatment could " +
 			"be determined"
@@ -339,6 +383,12 @@ func coveragePhaseReason(class string) (phase, reason string) {
 		// Pending, not Failed, and that is the whole point of this class: the controller parks the
 		// volume and retries it. It becomes Failed only when pendingResolveDeadline runs out.
 		return string(status.VolumePhasePending), CoverageUnresolved
+	case CoverageUndetermined:
+		// No pair, and the empty return is the statement. The controller reconciles with the
+		// OPERATOR's RBAC; a read THIS command was refused predicts nothing about what will land in
+		// status.volumes[]. Naming a phase here would print a confident prediction on the one row
+		// whose entire content is "I do not know".
+		return "", ""
 	default:
 		return "", ""
 	}
@@ -354,18 +404,24 @@ func coverageOrder(class string) int {
 		return 0
 	case CoverageSnapshotAPIAbsent:
 		return 1
-	case CoverageUnresolved:
+	// Above the storage findings rather than below them, though it is not one. A reader whose census
+	// is partly blind must learn that BEFORE they read any of the counts underneath, because it
+	// changes what those counts mean — and the remedy (a grant) is usually a two-line edit, which
+	// makes it the cheapest thing on the list to act on.
+	case CoverageUndetermined:
 		return 2
-	case CoverageUnsupported:
+	case CoverageUnresolved:
 		return 3
+	case CoverageUnsupported:
+		return 4
 	case CoverageDirect:
-		return 5
-	case CoverageClone:
 		return 6
+	case CoverageClone:
+		return 7
 	default:
 		// An unrecognised Kind sorts between the problems and the known-good classes: it is not a
 		// failure, and it is not something this build can vouch for either.
-		return 4
+		return 5
 	}
 }
 
@@ -387,6 +443,19 @@ const bestEffortNote = "This version has no filesystem or \"best-effort\" copy m
 
 // snapshotAPIAbsentNote is the Coverage.Note when the scan could not read the VolumeSnapshot API and
 // gave up before resolving anything.
+// snapshotAPIUnreadableNote is the Coverage.Note when the VolumeSnapshotClass list was REFUSED rather
+// than absent. It is a separate sentence from snapshotAPIAbsentNote because the two send a reader to
+// completely different places: one to install a CRD, the other to look at the identity this command
+// ran as. Printing the first when the second is true is what makes an administrator go and check a
+// storage stack that was never broken.
+const snapshotAPIUnreadableNote = "The VolumeSnapshotClass list could not be READ by the identity " +
+	"this command ran as — it was refused, or the request failed — so no PVC's treatment could be " +
+	"determined. This is a statement about this report's permissions and NOT about your data: the " +
+	"volumes below may well be backed up perfectly. The operator reconciles with its own, wider " +
+	"ClusterRole, so it is entirely possible for every backup in this cluster to be succeeding while " +
+	"this section can see nothing. Grant this identity `list` on volumesnapshotclasses and run it " +
+	"again. The diagnostics section carries the error."
+
 const snapshotAPIAbsentNote = "The VolumeSnapshotClass list could not be read, so no PVC's " +
 	"treatment could be determined and the scan stopped rather than reporting one identical error " +
 	"per volume. Either the snapshot.storage.k8s.io CRDs are not installed — in which case NOTHING " +

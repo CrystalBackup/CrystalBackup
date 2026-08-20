@@ -107,9 +107,14 @@ automountServiceAccountToken: true
 #     is still there, still lists on its interval, and repairs whatever a dropped watch missed —
 #     so a collector whose watch dies on day four degrades to the previous release's behaviour
 #     rather than going silent. See internal/soak/moverwatch.go.
-#   * `storage.k8s.io` storageclasses/volumeattachments. Those are read by the operator
-#     (internal/rexposer, the restore and backup controllers), never by internal/selfcheck or
-#     internal/soak.
+#   * `storage.k8s.io` volumeattachments, read by the operator (internal/rexposer, the restore
+#     controller) and by neither internal/selfcheck nor internal/soak.
+#
+#     `storageclasses` was struck off with them and should not have been — the census does list
+#     them, for unbound PVCs — which is why the rule is back below. The lesson is not that the
+#     audit was careless: it is that an audit done ONCE, by hand, against code that then changes
+#     is worth nothing. What holds the two together now is
+#     TestSoakCollectorRoleCoversEverySelfcheckRead, driven off internal/selfcheck.APIReads.
 #   * the `nodes` resource. The node a mover landed on comes off pod.Spec.NodeName
 #     (highwater.go); the only thing that touches a node object is the kubelet-stats path, and
 #     that is nodes/proxy in the opt-in ClusterRole below, which does not need `nodes` itself.
@@ -131,6 +136,36 @@ rules:
   # hour, listed cluster-wide with type=Warning.
   - apiGroups: [""]
     resources: ["namespaces", "persistentvolumeclaims", "pods", "events"]
+    verbs: ["get", "list"]
+  # PersistentVolumes, read-only, and in their own rule because this one has a bill attached to it.
+  #
+  # The namespaces LIST above is already "for the self-check's coverage census"; this joins it, and
+  # for the same census. Since 0.6.5 the exposer resolves a bound PVC's CSI driver from its
+  # PersistentVolume rather than from its StorageClass (internal/exposer/registry.go, driverFor: the
+  # PV names the driver actually holding the data, while a StorageClass is a mutable indirection that
+  # can be deleted and re-created over a different provisioner). The census calls that resolver and
+  # nothing else, on purpose.
+  #
+  # WITHOUT IT, every bound PVC in the cluster comes back as ExposerUnresolvable and the report's
+  # headline reads "the per-PVC census found volumes that will NOT be backed up". That is what a
+  # nine-day soak on a production cluster actually produced: 30 of 30 volumes condemned nightly while
+  # 28 of them were being backed up successfully every night, because the operator holds this grant
+  # (rbac.yaml) and the collector did not. The report is now careful to say "I could not read that"
+  # rather than "your data is not protected" (internal/selfcheck: ExposerUndetermined), so a cluster
+  # that refuses this grant degrades honestly — but it still degrades, and the census is most of why
+  # a soak is run at all.
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get", "list"]
+  # StorageClasses, read-only, and the same story one path further along: the resolver consults a
+  # class for a PVC that is NOT bound, where it is the only evidence of a driver there is. Fewer
+  # volumes are affected — an unbound PVC has no data to back up yet — but the failure mode was
+  # identical, and this rule contradicts an earlier version of the comment above which listed
+  # storage.k8s.io among the grants nothing reads. It did read them: coverage_reader.go lists
+  # StorageClasses to serve exactly those Gets. That comment was written before the census existed
+  # and was never re-checked against it, which is the same defect as the missing PV rule.
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
     verbs: ["get", "list"]
   # WATCH, on pods only. A mover pod exists for the length of one restic invocation and is deleted
   # with its Job the moment the controller has read its result, so the exact peak RSS it writes

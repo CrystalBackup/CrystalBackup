@@ -32,7 +32,7 @@
       no rule fires on that, so it moves none of the numbers above, and it is the reason this verdict does not read as plainly healthy. See <b>Leak indicators</b> below.
     </p>
     {{ end }}
-    {{ with .Coverage }}{{ if or (has .Unselected) (has .InertOnly) }}
+    {{ with .Coverage }}{{ if and (not .SelectionUndetermined) (or (has .Unselected) (has .InertOnly)) }}
     <p>
       No alert rule fires on the PVC census either. <b>{{ .Unselected }} PVC(s) are selected by no schedule</b>{{ if has .InertOnly }} and <b>{{ .InertOnly }} only by one that cannot fire</b>{{ end }} —
       healthy volumes on healthy storage that nothing will ever back up. See <b>What will and will not be backed up</b> below.
@@ -111,7 +111,13 @@
     </tbody>
   </table>
   </div>
-  {{ if or (has .Unselected) (has .InertOnly) }}
+  {{ if .SelectionUndetermined }}
+  <div class="caveat">
+    <b>Which schedules select which volumes could not be determined.</b> A schedule or namespace list this report needed was refused or failed — see <b>What could not be read</b>.
+    The selection counts below are what could be seen from this identity and are NOT a finding: a volume that appears to be selected by nothing may be selected by a schedule in the list that was refused.
+    {{ if has .Unselected }} <b>{{ .Unselected }} PVC(s)</b> appeared to be selected by no schedule, unconfirmed.{{ end }}
+  </div>
+  {{ else if or (has .Unselected) (has .InertOnly) }}
   <div class="note">
     {{ if has .Unselected }}<b>{{ .Unselected }} PVC(s) are selected by NO schedule.</b> Whatever their storage can do, nothing in this cluster will ever back them up.{{ end }}
     {{ if has .InertOnly }} <b>{{ .InertOnly }} are selected only by a schedule that cannot fire</b> (suspended, or an unparseable cron) — covered on paper, unprotected in fact.{{ end }}

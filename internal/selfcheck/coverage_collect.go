@@ -24,6 +24,9 @@ import (
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	cbv1 "github.com/CrystalBackup/CrystalBackup/api/v1alpha1"
@@ -57,18 +60,31 @@ func (c *collector) coverage(ctx context.Context) *Coverage {
 	}
 
 	cov := &Coverage{Note: coverageNote}
-	sel := c.coverageSelectors(ctx, reader)
+	sel, selUndetermined := c.coverageSelectors(ctx, reader)
+	cov.SelectionUndetermined = selUndetermined
 
 	// Priming before the loop is what turns "no snapshot CRDs installed" from three thousand
 	// identical per-volume errors into one sentence about the cluster. See primeSnapshotClasses.
-	apiAbsent := false
+	//
+	// THE SAME CONFLATION LIVED HERE, one level up. A single class was reported whether the snapshot
+	// API was absent — nothing in this cluster can be backed up until it is installed, a grave and
+	// true statement — or merely unreadable by this identity, which says nothing about the cluster at
+	// all. Both produced VolumeSnapshotAPIAbsent on every row and both were counted in the headline
+	// as volumes that will not be backed up. One sentence about the cluster is still the right shape;
+	// which sentence depends on whether the apiserver answered.
+	clusterClass := ""
 	if err := reader.primeSnapshotClasses(ctx); err != nil {
-		apiAbsent = true
-		c.diag("coverage",
-			"no PVC's treatment could be determined; every volume is reported as unknown rather "+
-				"than as backed up",
-			err)
+		clusterClass = CoverageSnapshotAPIAbsent
+		impact := "no PVC's treatment could be determined; every volume is reported as unknown " +
+			"rather than as backed up"
 		cov.Note = snapshotAPIAbsentNote + " " + bestEffortNote
+		if readNotAnswered(err) {
+			clusterClass = CoverageUndetermined
+			impact = "no PVC's treatment could be determined — because this command could not read " +
+				"the VolumeSnapshotClasses, NOT because the volumes are unprotected"
+			cov.Note = snapshotAPIUnreadableNote + " " + bestEffortNote
+		}
+		c.diag("coverage", impact, err)
 	}
 
 	registry := exposer.NewRegistry(readOnlyClient{Reader: reader, scheme: buildScheme()}, c.OperatorNamespace)
@@ -95,7 +111,7 @@ func (c *collector) coverage(ctx context.Context) *Coverage {
 		c.red.Learn(kindPVC, pvc.Name)
 		namespaces[pvc.Namespace] = true
 
-		row := c.coverPVC(ctx, registry, pvc, sel, apiAbsent)
+		row := c.coverPVC(ctx, registry, pvc, sel, clusterClass)
 		// AFTER the resolution and never inside it. coverPVC's whole discipline is that it re-implements
 		// nothing about routing; this is a separate statement about the same volume, applied on top, and
 		// keeping it outside is what stops an observation from ever being mistaken for a resolution rule.
@@ -219,7 +235,7 @@ func (c *collector) coverPVC(
 	registry *exposer.Registry,
 	pvc *corev1.PersistentVolumeClaim,
 	sel []coverageSelector,
-	apiAbsent bool,
+	clusterClass string,
 ) CoveredPVC {
 	row := CoveredPVC{
 		Namespace:     c.red.Namespace(pvc.Namespace),
@@ -245,8 +261,11 @@ func (c *collector) coverPVC(
 	}
 	row.Selected = len(row.Schedules) > 0
 
-	if apiAbsent {
-		row.Class = CoverageSnapshotAPIAbsent
+	// A verdict already reached for the WHOLE cluster (the snapshot API is not there, or could not
+	// be read): the per-PVC resolution is not attempted, because it would produce one identical error
+	// per volume and no information. Which of the two classes it is was decided once, by the caller.
+	if clusterClass != "" {
+		row.Class = clusterClass
 		row.Verdict = coverageVerdict(row.Class)
 		return row
 	}
@@ -261,10 +280,19 @@ func (c *collector) coverPVC(
 		row.Class = CoverageUnsupported
 		row.Detail = c.red.Detail(err.Error())
 	default:
+		// THE DISTINCTION THIS RELEASE EXISTS FOR. Everything that lands here came out of a READ the
+		// resolver made — a PersistentVolume, a StorageClass, the VolumeSnapshotClass list — and until
+		// 0.6.7 all of it was called ExposerUnresolvable, i.e. a finding about the volume. It is not
+		// the same finding when the read was refused: "this cluster cannot work out how to back the
+		// volume up" and "this command was not allowed to look" are answers to different questions,
+		// and only one of them is about somebody's data. See readNotAnswered for where the line is.
 		row.Class = CoverageUnresolved
+		if readNotAnswered(err) {
+			row.Class = CoverageUndetermined
+		}
 		row.Detail = c.red.Detail(err.Error())
 	}
-	if row.Class == CoverageUnsupported || row.Class == CoverageUnresolved {
+	if row.Class == CoverageUnsupported || row.Class == CoverageUnresolved || row.Class == CoverageUndetermined {
 		row.Verdict = coverageVerdict(row.Class)
 		return row
 	}
@@ -274,15 +302,58 @@ func (c *collector) coverPVC(
 	// can" — two verdicts an administrator acts on completely differently, and the whole reason this
 	// section resolves rather than tabulating StorageClasses.
 	if err := ex.Precheck(ctx); err != nil {
-		if errors.Is(err, exposer.ErrPrecheckFailed) {
+		switch {
+		case errors.Is(err, exposer.ErrPrecheckFailed):
 			row.Class = CoveragePrecheckFailed
-		} else {
+		case readNotAnswered(err):
+			// Same line as above, drawn again rather than assumed: Precheck turns most unreadable
+			// answers into NOT_CHECKABLE itself (internal/exposer/precheck.go) and does not error at
+			// all, so this branch is narrow. It is here because "narrow" and "impossible" are
+			// different, and the one that gets through must not be reported as a fact about the
+			// storage either.
+			row.Class = CoverageUndetermined
+		default:
 			row.Class = CoverageUnresolved
 		}
 		row.Detail = c.red.Detail(err.Error())
 	}
 	row.Verdict = coverageVerdict(row.Class)
 	return row
+}
+
+// readNotAnswered reports whether err is a failure of THIS COMMAND'S READ rather than an answer about
+// the cluster.
+//
+// The precondition is that err came out of a read: the callers apply it only to resolver errors that
+// are neither ErrUnsupported nor ErrPrecheckFailed, and every one of those is a PersistentVolume, a
+// StorageClass, a Secret or a VolumeSnapshotClass request that did not come back. So the question is
+// not "is this an I/O error" but the narrower and answerable one: DID THE APISERVER ANSWER?
+//
+//   - Forbidden and Unauthorized are the field case, named first because they are the shape that ran
+//     for nine days: an identity that may not read PersistentVolumes gets one of these per volume.
+//   - NotFound is an ANSWER — the object really is gone — and belongs to CoverageUnresolved, which
+//     is where a PVC bound to a vanished PV has always been reported. NoMatch and not-registered are
+//     the same statement about a whole kind: the API is not there, which is a fact about the cluster.
+//   - Everything else — a timeout, a transport failure, a 500, a context cancelled halfway through a
+//     scan — is a read that produced nothing. The default is deliberately the honest one rather than
+//     the tidy one: a class we cannot justify is better than a verdict we cannot support, and this
+//     package's oldest rule is that an absence of measurement never renders as a finding.
+//
+// It is written over the error rather than over a flag set by the reader on purpose. A flag would
+// have to be threaded through internal/exposer, which resolves for the CONTROLLER as well, and the
+// controller's answer to a refused read is a retry with backoff — a reporting concern has no business
+// changing shape in there.
+func readNotAnswered(err error) bool {
+	switch {
+	case err == nil:
+		return false
+	case apierrors.IsForbidden(err), apierrors.IsUnauthorized(err):
+		return true
+	case apierrors.IsNotFound(err), apimeta.IsNoMatchError(err), runtime.IsNotRegisteredError(err):
+		return false
+	default:
+		return true
+	}
 }
 
 // storageClassKey is the grouping key the snapshot evidence is aggregated under: the PVC's own
@@ -465,7 +536,17 @@ func (s coverageSelector) selects(pvc *corev1.PersistentVolumeClaim) bool {
 // three duplicated requests on the whole command, and the alternative — one shared cache whose cost
 // is attributed to whichever section happened to touch it first — would make the reported figure
 // depend on the order of the calls in Collect.
-func (c *collector) coverageSelectors(ctx context.Context, reader *coverageReader) []coverageSelector {
+//
+// The second return value is "and I could not read all of it". It exists because THE SAME CONFLATION
+// this release is about lived here too, wearing different clothes: with a schedule list refused,
+// every PVC in the cluster falls through to "selected by NO schedule" and the headline reports them
+// as volumes that will not be backed up — no treatment class involved, and just as false. A
+// diagnostic was already recorded and a diagnostic is not enough, because the count above it goes on
+// being quoted as a finding. What the census may say when a selector source was refused is that it
+// does not know.
+func (c *collector) coverageSelectors(
+	ctx context.Context, reader *coverageReader,
+) (sel []coverageSelector, undetermined bool) {
 	var out []coverageSelector
 
 	var nsScheds cbv1.BackupScheduleList
@@ -474,6 +555,7 @@ func (c *collector) coverageSelectors(ctx context.Context, reader *coverageReade
 			"namespace-plane schedules were not counted, so some PVCs may be reported as selected "+
 				"by nothing when they are not",
 			err)
+		undetermined = undetermined || readNotAnswered(err)
 	} else {
 		for i := range nsScheds.Items {
 			s := &nsScheds.Items[i]
@@ -494,10 +576,10 @@ func (c *collector) coverageSelectors(ctx context.Context, reader *coverageReade
 			"cluster-plane schedules were not counted, so some PVCs may be reported as selected by "+
 				"nothing when they are not",
 			err)
-		return out
+		return out, undetermined || readNotAnswered(err)
 	}
 	if len(clScheds.Items) == 0 {
-		return out
+		return out, undetermined
 	}
 
 	var namespaces corev1.NamespaceList
@@ -506,7 +588,10 @@ func (c *collector) coverageSelectors(ctx context.Context, reader *coverageReade
 			"the cluster schedules' namespace fan-out could not be resolved, so their PVCs may be "+
 				"reported as selected by nothing",
 			err)
-		return out
+		// The namespace list counts as a selector source: without it a cluster schedule that selects
+		// every PVC in the fixture fans out into nothing, which is indistinguishable from a schedule
+		// that selects nothing — and only the second is a finding.
+		return out, undetermined || readNotAnswered(err)
 	}
 	for i := range clScheds.Items {
 		s := &clScheds.Items[i]
@@ -532,7 +617,7 @@ func (c *collector) coverageSelectors(ctx context.Context, reader *coverageReade
 			inertWhy:   why,
 		})
 	}
-	return out
+	return out, undetermined
 }
 
 // scheduleIsInert reports whether a schedule can produce a run at all, and why not.

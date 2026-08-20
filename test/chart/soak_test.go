@@ -42,6 +42,8 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilyaml "k8s.io/apimachinery/pkg/util/yaml"
+
+	"github.com/CrystalBackup/CrystalBackup/internal/selfcheck"
 )
 
 const (
@@ -400,6 +402,70 @@ func TestSoakCanWatchMoversOrItMeasuresNothing(t *testing.T) {
 				want.resource, want.group)
 		}
 	}
+}
+
+// TestSoakCollectorRoleCoversEverySelfcheckRead is the gate that was missing for nine days.
+//
+// The collector runs `selfcheck` daily under its own ServiceAccount. 0.6.5 made the exposer resolve a
+// bound PVC's CSI driver from its PersistentVolume, and nobody extended this role — so on a real
+// cluster the census classified 30 of 30 volumes as ExposerUnresolvable and the verdict said they
+// would NOT be backed up, while the operator (which does hold the grant) backed 28 of them up every
+// night. The chart rendered, the templates passed, and nothing anywhere connected "what selfcheck
+// reads" to "what this role grants".
+//
+// It is therefore driven off selfcheck.APIReads rather than off a list retyped here. A literal copy
+// is EXACTLY the shape of the defect: the resource list already existed twice, in Go and in YAML,
+// and a third copy in a test would have been a third thing to forget. Adding a read to the selfcheck
+// package fails internal/selfcheck's own TestSelfcheckReadsAreDeclared until it is declared, and
+// declaring it fails this test until the role grants it.
+func TestSoakCollectorRoleCoversEverySelfcheckRead(t *testing.T) {
+	objs := mustRender(t, soakEnabled...)
+	var cr rbacv1.ClusterRole
+	convert(t, find(t, objs, "ClusterRole", "crystal-backup-soak-collector"), &cr)
+
+	for _, read := range selfcheck.GrantedAPIReads() {
+		for _, verb := range read.Verbs {
+			if !ruleGrants(cr.Rules, read.Group, read.Resource, verb) {
+				t.Errorf("the collector may not %s %q in apiGroup %q.\n"+
+					"The self-check reads it for: %s\n"+
+					"Declared in internal/selfcheck/reads.go; every daily report this collector "+
+					"writes for the next fortnight will be missing that, and — worse — will say so "+
+					"in a voice that sounds like a finding about the cluster's data.",
+					verb, read.Resource, read.Group, read.Why)
+			}
+		}
+	}
+
+	// The other half of the same declaration: a read marked Ungranted is a REFUSAL, and a refusal
+	// nobody checks is a grant waiting to be added by accident. Secrets are the whole of this list
+	// today (invariant I3), and the collector's archive is not a place a credential can ever reach.
+	for _, read := range selfcheck.APIReads {
+		if read.Ungranted == "" {
+			continue
+		}
+		for _, verb := range read.Verbs {
+			if ruleGrants(cr.Rules, read.Group, read.Resource, verb) {
+				t.Errorf("the collector was granted %s on %q in apiGroup %q, which reads.go marks as "+
+					"deliberately withheld: %s", verb, read.Resource, read.Group, read.Ungranted)
+			}
+		}
+	}
+}
+
+// ruleGrants answers the RBAC union question the way the apiserver does: any single rule that names
+// the group, the resource and the verb is enough, and a wildcard in any of the three matches. The
+// wildcard matters here — the collector grants crystalbackup.io `*`, which really does cover every
+// product kind the self-check lists.
+func ruleGrants(rules []rbacv1.PolicyRule, group, resource, verb string) bool {
+	matches := func(list []string, want string) bool {
+		return slices.Contains(list, want) || slices.Contains(list, "*")
+	}
+	for _, rule := range rules {
+		if matches(rule.APIGroups, group) && matches(rule.Resources, resource) && matches(rule.Verbs, verb) {
+			return true
+		}
+	}
+	return false
 }
 
 // TestSoakRBACIsReadOnly. The collector writes nothing to the cluster — not a Lease, not an Event,
