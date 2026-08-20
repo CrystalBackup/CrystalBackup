@@ -73,19 +73,11 @@ var _ = Describe("M1 — same-named PVCs across namespaces do not collide (0.2.1
 	collisionNamespaces := []string{"c-collide-a", "c-collide-b"}
 
 	BeforeAll(func() {
-		m1RequireS3()
-
 		By("Given an initialized ClusterBackupLocation \"dr\" for the shared repository")
-		m1EnsurePlatformSecrets()
-		var loc cbv1.ClusterBackupLocation
-		if err := k8s.Get(ctx, client.ObjectKey{Name: m1LocationName}, &loc); apierrors.IsNotFound(err) {
-			// Ensure-only: never delete the shared location in AfterAll — a sibling container may
-			// depend on it, and the crucible teardown nukes the bucket regardless.
-			m1CreateLocation(m1LocationName, true)
-		} else {
-			Expect(err).NotTo(HaveOccurred(), "get ClusterBackupLocation %s", m1LocationName)
-		}
-		m1WaitRepositoryInitialized(m1LocationName)
+		// Ensure-only, never delete: a sibling container may depend on it, and the crucible
+		// teardown nukes the bucket regardless. That rule was right here and wrong in four other
+		// containers; it is now the helper's, and BeforeSuite does the creating.
+		m1EnsureSharedRepository()
 
 		By("And two namespaces each holding a ceph-block PVC of the IDENTICAL name " + homonymPVC)
 		for _, ns := range collisionNamespaces {

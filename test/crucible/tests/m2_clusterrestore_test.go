@@ -59,13 +59,7 @@ var _ = Describe("M2 — ClusterRestore reconstitutes a deleted namespace", Labe
 	runName := crucibleRunName("m2-doomed-src")
 
 	BeforeAll(func() {
-		m1RequireS3()
-		m1EnsurePlatformSecrets()
-		var loc cbv1.ClusterBackupLocation
-		if apierrors.IsNotFound(k8s.Get(ctx, client.ObjectKey{Name: m1LocationName}, &loc)) {
-			m1CreateLocation(m1LocationName, true)
-		}
-		m1WaitRepositoryInitialized(m1LocationName)
+		m1EnsureSharedRepository()
 
 		By("seeding the doomed namespace on a 2Gi RBD volume")
 		m2SeedVolume(doomedNS, pvcName, "ceph-block", "2Gi")

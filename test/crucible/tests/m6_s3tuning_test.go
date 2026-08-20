@@ -80,8 +80,13 @@ var _ = Describe("Milestone M6 — S3 connection tuning", Ordered, Label("m6", "
 	var captured bool
 
 	BeforeAll(func() {
-		m1RequireS3()
-		m1WaitRepositoryInitialized(m1LocationName)
+		// This is the lane the 0.6.7 campaign died in, twice-removed from its own subject: it only
+		// WAITED for the shared "dr" repository, never established it, so it passed or failed on
+		// Ginkgo's container shuffle. It timed out after 600s at 03:01:52 and the location was
+		// created at ~03:07 by a lane that ran later; the verdict printed was a connection-cap
+		// failure on a spec that had not yet set a connection cap. BeforeSuite creates the
+		// location now, and this ensures-then-waits like every other lane.
+		m1EnsureSharedRepository()
 
 		var loc cbv1.ClusterBackupLocation
 		Expect(k8s.Get(ctx, client.ObjectKey{Name: m1LocationName}, &loc)).To(Succeed())

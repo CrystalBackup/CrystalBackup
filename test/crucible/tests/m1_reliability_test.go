@@ -52,10 +52,6 @@ var _ = Describe("M1 — convergence and no orphans", Label("m1"), Ordered, func
 	const clusterBackupTerminalTimeout = 20 * time.Minute
 
 	var (
-		// createdLocation records whether THIS spec created the shared "dr" location (so it is
-		// the one that must delete it). A sibling feature may have created it first, in which
-		// case it is reused and left in place.
-		createdLocation bool
 		// seedNamespaces are the crucible's seeded tenant namespaces (label
 		// crystalbackup.io/seed=crucible), discovered at setup time.
 		seedNamespaces []string
@@ -134,21 +130,8 @@ var _ = Describe("M1 — convergence and no orphans", Label("m1"), Ordered, func
 	}
 
 	BeforeAll(func() {
-		m1RequireS3()
-		m1EnsurePlatformSecrets()
-
-		// Ensure the one shared cluster-DR location exists and its repository is initialized.
-		// Reuse a location a sibling feature already created; otherwise create (and own) it.
-		var loc cbv1.ClusterBackupLocation
-		err := k8s.Get(ctx, client.ObjectKey{Name: m1LocationName}, &loc)
-		switch {
-		case apierrors.IsNotFound(err):
-			m1CreateLocation(m1LocationName, true)
-			createdLocation = true
-		default:
-			Expect(err).NotTo(HaveOccurred(), "get ClusterBackupLocation %q", m1LocationName)
-		}
-		m1WaitRepositoryInitialized(m1LocationName)
+		// The one shared cluster-DR location, established by BeforeSuite; wait for its repository.
+		m1EnsureSharedRepository()
 
 		// Discover the seeded tenant namespaces (label crystalbackup.io/seed=crucible).
 		var nsList corev1.NamespaceList
@@ -171,9 +154,8 @@ var _ = Describe("M1 — convergence and no orphans", Label("m1"), Ordered, func
 				_ = k8s.Delete(ctx, cb)
 			}
 		}
-		if createdLocation {
-			m1DeleteLocation(m1LocationName)
-		}
+		// The shared "dr" location is suite infrastructure (BeforeSuite) and is never torn down
+		// by a lane: deleting it garbage-collects the BackupRepository the later lanes wait on.
 	})
 
 	It("Leak-check — a run leaves zero residual snapshot objects", func() {
@@ -190,7 +172,10 @@ var _ = Describe("M1 — convergence and no orphans", Label("m1"), Ordered, func
 		By("And zero temporary clone PVCs created by the exposer")
 		// The exposer's ReadyToUse wait + ordered cleanup + the orphan reaper must have removed
 		// every VolumeSnapshot, its VolumeSnapshotContent, and every temporary clone PVC.
-		m1AssertNoResidualSnapshotObjects(seedNamespaces...)
+		// leakRun is BeforeAll's run, so its residue predates this check by however long the run
+		// took — polled, not failed fast. The seeded namespaces are shared with other milestones,
+		// and residue from any of THEIR runs is still reported immediately.
+		m1AssertNoResidualSnapshotObjects([]string{leakRun.Name}, seedNamespaces...)
 	})
 
 	It("The operator killed mid-run converges via Job re-adoption", func() {
@@ -247,7 +232,9 @@ var _ = Describe("M1 — convergence and no orphans", Label("m1"), Ordered, func
 		}
 
 		By("And the leak-check invariant still holds afterwards")
-		m1AssertNoResidualSnapshotObjects(seedNamespaces...)
+		// restartRun only: leakRun was certified residue-free by the It above, and this container
+		// is Ordered, so that certification is a precondition of reaching this line.
+		m1AssertNoResidualSnapshotObjects([]string{restartRun.Name}, seedNamespaces...)
 	})
 
 	It("An OOMKilled mover is reported as a failure, not a silent success", func() {

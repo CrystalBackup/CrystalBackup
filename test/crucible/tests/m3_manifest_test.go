@@ -86,7 +86,7 @@ var _ = Describe("M3 — manifest backup & restore round-trip", Label("m3"), Ord
 	}
 
 	BeforeAll(func() {
-		m3EnsureDRLocation()
+		m1EnsureSharedRepository()
 
 		By("seeding a tenant namespace with a bound PVC and its checksummed corpus")
 		// m2SeedVolume ensures the namespace, provisions pvcName on ceph-block and writes a
@@ -192,7 +192,11 @@ var _ = Describe("M3 — manifest backup & restore round-trip", Label("m3"), Ord
 		// GONE, not merely deleted — this feature restores manifests into the namespace, so a
 		// finalizer transplanted by the restore would wedge it here (M3.2, rule S8).
 		deleteNamespaceAndWaitGone(nsName, 5*time.Minute)
-		m1AssertNoResidualSnapshotObjects(nsName)
+		// The source run plus the three Restores this container drove; a restore's staging objects
+		// carry LabelPVC (restoreEngine.volumeLabels), so they are residue by this predicate and
+		// have to be attributable to the spec that made them.
+		m1AssertNoResidualSnapshotObjects(
+			[]string{runName, "m3-cm-overwrite", "m3-cm-recreate", "m3-workload"}, nsName)
 		m2AssertNoResidualRestoreObjects()
 	})
 

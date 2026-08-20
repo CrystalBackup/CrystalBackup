@@ -95,9 +95,10 @@ var _ = Describe("Milestone M6 — mover placement", Ordered, Label("m6", "place
 	)
 
 	BeforeAll(func() {
-		m1RequireS3()
-		m1EnsurePlatformSecrets()
-		m1WaitRepositoryInitialized(m1LocationName)
+		// Ensure-then-wait, like every other lane: this one used to only WAIT, which made it
+		// depend on some other container having drawn an earlier position in Ginkgo's shuffle —
+		// the same latent flake that took m6/s3tuning down in 0.6.7.
+		m1EnsureSharedRepository()
 
 		By("Given the placement ConfigMap the operator mounts")
 		configMapName = m6FindPlacementConfigMap()

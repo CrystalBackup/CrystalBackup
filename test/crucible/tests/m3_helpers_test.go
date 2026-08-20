@@ -26,7 +26,6 @@ import (
 	. "github.com/onsi/gomega"
 
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientscheme "k8s.io/client-go/kubernetes/scheme"
@@ -55,20 +54,11 @@ import (
 // (child.status.manifests stays nil) or is refused outright with RunNameCollision. M3 used to keep
 // its own m3RunID for this; there is one now, for the whole suite.
 
-// m3EnsureDRLocation is the shared Given of every M3 spec: skip if S3 is unconfigured,
-// provision the platform KEK/S3 Secrets, ensure the canonical "dr" ClusterBackupLocation
-// exists, and wait for its BackupRepository to be Initialized. Idempotent — several M3
-// specs call it in their BeforeAll and share the one repository.
-func m3EnsureDRLocation() {
-	GinkgoHelper()
-	m1RequireS3()
-	m1EnsurePlatformSecrets()
-	var loc cbv1.ClusterBackupLocation
-	if apierrors.IsNotFound(k8s.Get(ctx, client.ObjectKey{Name: m1LocationName}, &loc)) {
-		m1CreateLocation(m1LocationName, true)
-	}
-	m1WaitRepositoryInitialized(m1LocationName)
-}
+// m3EnsureDRLocation was M3's own copy of the "dr" bootstrap. It is gone: the whole suite now
+// goes through m1EnsureSharedRepository (m1_helpers_test.go), because fifteen hand-written copies
+// of a get-or-create are what let one of them disagree with the others about the location's
+// default flag, and what made the location's existence depend on Ginkgo's container shuffle.
+// M3's call sites call m1EnsureSharedRepository directly.
 
 // m3RunClusterBackup creates a manual ClusterBackup like m1RunClusterBackup, but pins
 // clusterResources.enabled explicitly so an M3 spec's capture assertions

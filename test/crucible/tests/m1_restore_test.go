@@ -77,18 +77,8 @@ var _ = Describe("M1 — off-cluster restore with upstream restic", Label("m1"),
 	restoreRunName := crucibleRunName(m1OffClusterRunBase)
 
 	BeforeAll(func() {
-		m1RequireS3()
-
 		By("Given an initialized ClusterBackupLocation \"dr\" for the shared repository")
-		m1EnsurePlatformSecrets()
-		var loc cbv1.ClusterBackupLocation
-		err := k8s.Get(ctx, client.ObjectKey{Name: m1LocationName}, &loc)
-		if apierrors.IsNotFound(err) {
-			m1CreateLocation(m1LocationName, true)
-		} else {
-			Expect(err).NotTo(HaveOccurred(), "get ClusterBackupLocation %s", m1LocationName)
-		}
-		m1WaitRepositoryInitialized(m1LocationName)
+		m1EnsureSharedRepository()
 
 		By("And a completed cluster-DR backup of " + restoreNS)
 		var existing cbv1.ClusterBackup

@@ -38,7 +38,6 @@ import (
 	. "github.com/onsi/gomega"
 
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	cbv1 "github.com/CrystalBackup/CrystalBackup/api/v1alpha1"
@@ -55,36 +54,19 @@ var _ = Describe("M4 — crash-only teardown (terminal re-entry sweep)", Ordered
 	// sooner, but a loaded full-suite cluster deserves the same headroom.
 	const clusterBackupTerminalTimeout = 20 * time.Minute
 
-	var (
-		run             *cbv1.ClusterBackup
-		createdLocation bool
-	)
+	var run *cbv1.ClusterBackup
 
 	BeforeAll(func() {
-		m1RequireS3()
-		m1EnsurePlatformSecrets()
-
-		// Reuse the shared cluster-DR location a sibling feature already created; otherwise
-		// create (and own) it — the same convention as the m1 reliability container.
-		var loc cbv1.ClusterBackupLocation
-		err := k8s.Get(ctx, client.ObjectKey{Name: m1LocationName}, &loc)
-		switch {
-		case apierrors.IsNotFound(err):
-			m1CreateLocation(m1LocationName, true)
-			createdLocation = true
-		default:
-			Expect(err).NotTo(HaveOccurred(), "get ClusterBackupLocation %q", m1LocationName)
-		}
-		m1WaitRepositoryInitialized(m1LocationName)
+		// The shared cluster-DR location, established by BeforeSuite; wait for its repository.
+		m1EnsureSharedRepository()
 	})
 
 	AfterAll(func() {
 		if run != nil {
 			_ = k8s.Delete(ctx, run)
 		}
-		if createdLocation {
-			m1DeleteLocation(m1LocationName)
-		}
+		// The shared "dr" location is suite infrastructure (BeforeSuite) and is never torn down
+		// by a lane: deleting it garbage-collects the BackupRepository the later lanes wait on.
 	})
 
 	It("The operator SIGKILLed at the terminal transition still converges to zero residual snapshot objects", func() {
@@ -145,6 +127,9 @@ var _ = Describe("M4 — crash-only teardown (terminal re-entry sweep)", Ordered
 		}, 10*time.Minute, 5*time.Second).Should(Succeed())
 
 		By("And the leak-check invariant holds: zero residual snapshot objects")
-		m1AssertNoResidualSnapshotObjects(targetNS)
+		// This It's own run. Its residue predates the check by the whole kill-and-converge window,
+		// and draining it is precisely the property under test — so it is polled, while residue from
+		// any other lane in this shared seed namespace still fails fast.
+		m1AssertNoResidualSnapshotObjects([]string{run.Name}, targetNS)
 	})
 })

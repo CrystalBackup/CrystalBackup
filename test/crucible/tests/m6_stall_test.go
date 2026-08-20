@@ -192,15 +192,8 @@ var _ = Describe("M6 — the mover start deadline", Label("m6", "stall"), Ordere
 	var csiOperatorReplicas int32
 
 	BeforeAll(func() {
-		m1RequireS3()
-		m1EnsurePlatformSecrets()
-
 		By("Given the shared cluster-DR repository")
-		var loc cbv1.ClusterBackupLocation
-		if apierrors.IsNotFound(k8s.Get(ctx, client.ObjectKey{Name: m1LocationName}, &loc)) {
-			m1CreateLocation(m1LocationName, true)
-		}
-		m1WaitRepositoryInitialized(m1LocationName)
+		m1EnsureSharedRepository()
 
 		By("And a small Ceph RBD volume in this spec's own namespace")
 		ensureNamespace(m6StallNS)
@@ -418,7 +411,12 @@ var _ = Describe("M6 — the mover start deadline", Label("m6", "stall"), Ordere
 		// its creds Secret are checked separately because they live in the operator namespace,
 		// outside its per-tenant scope.
 		By("And nothing leaked — a failed-by-deadline volume is torn down like any other")
-		m1AssertNoResidualSnapshotObjects(m6StallNS)
+		// stalledRun is ours, and this is THE call site that proved ownership had to be the
+		// discriminator: its residue is thirty minutes old by the time the check looks (the deadline
+		// this spec exists to measure is thirty minutes long) and its teardown cannot even start
+		// until the node-plugin restore three lines above. Anything else in these namespaces belongs
+		// to another lane and must still fail fast.
+		m1AssertNoResidualSnapshotObjects([]string{stalledRun}, m6StallNS)
 		Eventually(func(g Gomega) {
 			err := k8s.Get(ctx, client.ObjectKey{Namespace: operatorNS, Name: moverJob}, &batchv1.Job{})
 			g.Expect(apierrors.IsNotFound(err)).To(BeTrue(),
@@ -457,7 +455,11 @@ var _ = Describe("M6 — the mover start deadline", Label("m6", "stall"), Ordere
 		Expect(m1WaitClusterBackupTerminal(recoveredRun, 20*time.Minute).Status.Phase).To(Equal("Completed"))
 
 		By("And nothing leaked")
-		m1AssertNoResidualSnapshotObjects(m6StallNS)
+		// recoveredRun only. stalledRun is deliberately NOT named here: the It above already
+		// certified it left zero residue, and this container is Ordered, so that certification is a
+		// precondition of ever reaching this line. Naming it too would re-open a ten-minute wait for
+		// an object that cannot legitimately have come back.
+		m1AssertNoResidualSnapshotObjects([]string{recoveredRun}, m6StallNS)
 	})
 })
 

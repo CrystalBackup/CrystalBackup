@@ -182,14 +182,9 @@ var _ = Describe("M6 — an unsnapshottable volume at the head of the queue does
 
 		BeforeAll(func() {
 			m6RequireS3()
-			m1EnsurePlatformSecrets()
 
 			By("Given the shared cluster-DR repository")
-			var loc cbv1.ClusterBackupLocation
-			if apierrors.IsNotFound(k8s.Get(ctx, client.ObjectKey{Name: m1LocationName}, &loc)) {
-				m1CreateLocation(m1LocationName, true)
-			}
-			m1WaitRepositoryInitialized(m1LocationName)
+			m1EnsureSharedRepository()
 
 			ensureNamespace(m6HeadlineNS)
 
@@ -375,7 +370,9 @@ var _ = Describe("M6 — an unsnapshottable volume at the head of the queue does
 
 		It("leaves no residue behind, skipped volume included", func() {
 			By("Then no exposure object outlived the run")
-			m1AssertNoResidualSnapshotObjects(m6HeadlineNS)
+			// headlineRun is this container's only run, created two Its ago — its residue predates
+			// this check by construction and is polled out; another lane's still fails fast.
+			m1AssertNoResidualSnapshotObjects([]string{headlineRun}, m6HeadlineNS)
 
 			By("And no mover Job of this run is still in the operator namespace")
 			Eventually(func(g Gomega) {

@@ -63,7 +63,7 @@ var _ = Describe("M3 — DR bootstrap (ClusterRestore into a fresh namespace)", 
 	runName := "m3-dr-src-" + crucibleRunID
 
 	BeforeAll(func() {
-		m3EnsureDRLocation()
+		m1EnsureSharedRepository()
 
 		By("seeding a source namespace on the default (ceph-block) class with a checksummed corpus")
 		m2SeedVolume(srcNS, pvcName, sourceClass, "1Gi")
@@ -87,7 +87,9 @@ var _ = Describe("M3 — DR bootstrap (ClusterRestore into a fresh namespace)", 
 		// backed up, so a plain delete is enough there.
 		deleteNamespaceAndWaitGone(rebornNS, 5*time.Minute)
 		deleteNamespace(srcNS)
-		m1AssertNoResidualSnapshotObjects(srcNS, rebornNS)
+		// The source run and the ClusterRestore that rebuilt rebornNS — the two things this
+		// container created and is therefore answerable for.
+		m1AssertNoResidualSnapshotObjects([]string{runName, "m3-dr-bootstrap"}, srcNS, rebornNS)
 		m2AssertNoResidualRestoreObjects()
 	})
 

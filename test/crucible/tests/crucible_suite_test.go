@@ -127,6 +127,26 @@ var _ = BeforeSuite(func() {
 	opCfg.Impersonate = rest.ImpersonationConfig{UserName: operatorSAUser}
 	k8sAsOperator, err = client.New(opCfg, client.Options{Scheme: sc})
 	Expect(err).NotTo(HaveOccurred())
+
+	// ---------------------------------------------------------------------------
+	// The shared "dr" ClusterBackupLocation is SUITE INFRASTRUCTURE, established here, once.
+	//
+	// It used to be a side effect: fifteen containers each carried a defensive get-or-create in
+	// their BeforeAll, so the location existed only from the moment the first of them ran — while
+	// three others (m6/s3tuning, m6/placement, m4/maintenance's shared-repository case) merely
+	// WAITED for it. Ginkgo randomises top-level container order on every run, so which of those
+	// two groups went first was a coin flip. 0.6.7 lost it: m6/s3tuning's BeforeAll timed out
+	// after 600s at 03:01:52 and the location was created at ~03:07 by a lane that ran later.
+	//
+	// Establishing it here removes the ordering dependency at its root rather than adding a
+	// sixteenth defensive bootstrap. m1EnsureSharedLocation also settles the quieter half of the
+	// bug — the default flag, which the same shuffle used to decide; its comment carries that
+	// reasoning.
+	//
+	// It creates and does not wait: `restic init` proceeds in the background while the infra and
+	// m0 lanes run, and each lane still waits for its own precondition through
+	// m1EnsureSharedRepository, where the timeout's diagnostics belong.
+	m1EnsureSharedLocation()
 })
 
 // ---------------------------------------------------------------------------

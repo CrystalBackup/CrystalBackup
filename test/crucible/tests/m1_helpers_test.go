@@ -167,13 +167,12 @@ func m1LocationObject(name string, isDefault bool) *cbv1.ClusterBackupLocation {
 	}
 }
 
-// m1CreateLocation builds and creates a location, asserting the create succeeds.
-func m1CreateLocation(name string, isDefault bool) *cbv1.ClusterBackupLocation {
-	GinkgoHelper()
-	loc := m1LocationObject(name, isDefault)
-	Expect(k8s.Create(ctx, loc)).To(Succeed(), "create ClusterBackupLocation %s", name)
-	return loc
-}
+// m1CreateLocation is GONE, deliberately. It was the shape every lane's defensive bootstrap
+// reached for — m1CreateLocation(m1LocationName, <flag of your choosing>) — and fifteen
+// independent choices of that flag is what made the shared location's configuration a function of
+// Ginkgo's shuffle. The shared location is created in exactly one place now
+// (m1EnsureSharedLocation); a spec that needs a location of its OWN builds it explicitly, as the
+// m4/m5/m6 isolated-repository helpers already do.
 
 // m1TryCreateLocation builds and creates a location, RETURNING the create error (nil on
 // success) instead of asserting — for tests that must observe an admission denial (the
@@ -183,8 +182,107 @@ func m1TryCreateLocation(name string, isDefault bool) error {
 }
 
 // m1DeleteLocation best-effort deletes a ClusterBackupLocation (cleanup; ignores NotFound).
+//
+// NEVER call this on m1LocationName. The shared "dr" location is suite infrastructure, owned by
+// BeforeSuite (see m1EnsureSharedLocation) and depended on by roughly twenty containers across
+// m1..m6; deleting it garbage-collects the owned BackupRepository through its ownerReference
+// (clusterbackuplocation_controller.finalize), so a lane that tears it down leaves every later
+// lane waiting on a repository that no longer exists. That is exactly the 0.6.7 failure. Use it
+// for the locations a spec creates for ITSELF (dr2, the m4/m5/m6 isolated repositories).
 func m1DeleteLocation(name string) {
 	_ = k8s.Delete(ctx, &cbv1.ClusterBackupLocation{ObjectMeta: metav1.ObjectMeta{Name: name}})
+}
+
+// m1LocationIsDefault is the default flag the shared "dr" location MUST carry, in exactly one
+// place, because it used to be decided by a coin flip.
+//
+// Until 0.6.7, fifteen containers each bootstrapped "dr" defensively — get; if IsNotFound, create
+// — and fourteen of them passed true while m1_discovery_test.go passed false. Since only the
+// FIRST of them to run actually created anything, and Ginkgo randomises top-level container order
+// on every run, the flag the shared location ended up with was decided by the shuffle. Nobody
+// noticed because the two requirements are not symmetric:
+//
+//   - true is REQUIRED. m1_repository_test.go's third scenario asserts spec.default is true on
+//     "dr" before creating a conflicting second default, and the whole MultipleDefaults election
+//     it exercises is meaningless without it. On the product side, location_binding.defaultClusterID
+//     resolves the cluster ID a namespaced BackupLocation inherits from THE default
+//     ClusterBackupLocation, and returns "" — "waiting" — when there is none.
+//   - false is required by NOTHING. m1_discovery never reads spec.default, never creates a
+//     namespaced BackupLocation, and its feature file (features/m1_discovery.feature) asks only
+//     for "an initialized ClusterBackupLocation dr whose repository already holds snapshots".
+//     The false dates to the original M1 commit and is an oversight, not a requirement.
+//
+// So there is no conflict to arbitrate: it is true. Rejected: giving m1_discovery its own
+// non-default location instead. m1LocationObject hard-codes clusterID and prefix, so a second
+// location under those coordinates addresses the SAME repository under another name — the alias
+// hazard m5_externalsync_test.go exists to refuse — and discovery's subject is precisely the
+// accumulated history of the shared repository, which a private one would not have.
+const m1LocationIsDefault = true
+
+// m1EnsureSharedLocation is the ONE way the shared "dr" ClusterBackupLocation comes into being.
+//
+// It is called from BeforeSuite (crucible_suite_test.go), which is what makes the location a
+// suite-level PRECONDITION rather than a side effect of whichever container the shuffle happened
+// to run first. In the 0.6.7 campaign m6/s3tuning drew a position ahead of every m1 lane, waited
+// its full 600s on a location nobody had created yet, and reported a placement failure on a spec
+// that had not yet done anything about placement. It had been winning that coin flip for
+// releases; 0.6.6's green was luck, the same shape as the leak-check bug.
+//
+// It stays idempotent and is still called from every lane's BeforeAll, so `mise run test m4` on
+// its own is a legitimate run. That is safe now only because every one of those call sites goes
+// through THIS function: a defensive bootstrap that builds its own location object can disagree
+// with the suite about the default flag, and for fifteen containers that is what one of them did.
+//
+// A pre-existing location with the wrong flag is CORRECTED rather than tolerated or failed on: it
+// can only come from a previous campaign's binary on a reused cluster (locations are cluster-scoped
+// and survive a namespace wipe), and leaving it would reinstate the ambiguity this function exists
+// to remove.
+//
+// It deliberately does NOT wait for the repository to initialise. `restic init` against Hetzner
+// object storage is the slow part, and starting it at second zero lets it finish while the infra
+// and m0 lanes run; the waiting stays at the call sites, where m1WaitRepositoryInitialized's
+// 10-minute budget and its failure diagnostics belong to the spec that needs the repository.
+func m1EnsureSharedLocation() {
+	GinkgoHelper()
+	m1RequireS3()
+	m1EnsurePlatformSecrets()
+
+	var loc cbv1.ClusterBackupLocation
+	err := k8s.Get(ctx, client.ObjectKey{Name: m1LocationName}, &loc)
+	switch {
+	case apierrors.IsNotFound(err):
+		// AlreadyExists is not a failure: a lane's own BeforeAll may have raced ahead of a
+		// re-entry here, and the object it created is the same object this would create.
+		createErr := k8s.Create(ctx, m1LocationObject(m1LocationName, m1LocationIsDefault))
+		if !apierrors.IsAlreadyExists(createErr) {
+			Expect(createErr).NotTo(HaveOccurred(), "create the shared ClusterBackupLocation %s", m1LocationName)
+		}
+	case err != nil:
+		Expect(err).NotTo(HaveOccurred(), "get ClusterBackupLocation %s", m1LocationName)
+	case loc.Spec.Default != m1LocationIsDefault:
+		Eventually(func() error {
+			var live cbv1.ClusterBackupLocation
+			if getErr := k8s.Get(ctx, client.ObjectKey{Name: m1LocationName}, &live); getErr != nil {
+				return getErr
+			}
+			if live.Spec.Default == m1LocationIsDefault {
+				return nil
+			}
+			live.Spec.Default = m1LocationIsDefault
+			return k8s.Update(ctx, &live)
+		}, time.Minute, 3*time.Second).Should(Succeed(),
+			"a leftover ClusterBackupLocation %s carries default=%t and could not be corrected to %t",
+			m1LocationName, loc.Spec.Default, m1LocationIsDefault)
+	}
+}
+
+// m1EnsureSharedRepository is the shared Given of every spec that touches the "dr" repository:
+// ensure the location (above), then wait for its BackupRepository to report Initialized.
+// Idempotent, and cheap once BeforeSuite has done the creating.
+func m1EnsureSharedRepository() *cbv1.BackupRepository {
+	GinkgoHelper()
+	m1EnsureSharedLocation()
+	return m1WaitRepositoryInitialized(m1LocationName)
 }
 
 // m1FindRepository returns the cluster-scoped BackupRepository backing locationName, if one
@@ -306,11 +404,18 @@ func m1ListBackups(namespace string) []cbv1.Backup {
 	return list.Items
 }
 
-// m1AssertNoResidualSnapshotObjects asserts (with a short grace period for async cleanup)
-// that a run left nothing behind in the given namespaces: no VolumeSnapshots, no
-// VolumeSnapshotContents pointing back at them, and no temporary clone PVCs (a
-// crystalbackup.io/* label but not the seed label the tenant PVCs carry).
-func m1AssertNoResidualSnapshotObjects(namespaces ...string) {
+// m1AssertNoResidualSnapshotObjects asserts (with a grace period for async cleanup) that a run left
+// nothing behind in the given namespaces: no VolumeSnapshots, no VolumeSnapshotContents pointing
+// back at them, and no temporary clone PVCs (the exposure label, but not the seed label the tenant
+// PVCs carry).
+//
+// ownRuns names the runs the CALLING SPEC is answerable for — the ClusterBackups, Backups and
+// Restores it created itself, whose teardown it is legitimately waiting on. It is a required
+// parameter, not an option, because the single question this helper cannot answer for itself is
+// "is this residue mine?", and a call site that silently forgot to say would inherit the very bug
+// this parameter fixes. Passing nil is a valid, meaningful answer — "this spec owns no run, so any
+// residue here is somebody else's" — and every call site says which of the two it means.
+func m1AssertNoResidualSnapshotObjects(ownRuns []string, namespaces ...string) {
 	GinkgoHelper()
 
 	// Exposure objects live in the tenant namespaces (the dynamic origin VolumeSnapshot) AND —
@@ -324,10 +429,10 @@ func m1AssertNoResidualSnapshotObjects(namespaces ...string) {
 		checkSet[ns] = true
 	}
 
-	// enteredAt bounds the BLAST RADIUS of somebody else's leak, and it exists because the 0.6.5
-	// campaign lost a whole suite to one object.
+	// The fail-fast below bounds the BLAST RADIUS of somebody else's leak, and it exists because the
+	// 0.6.5 campaign lost a whole suite to one object.
 	//
-	// The detection below is deliberately broad: an object carrying the operator's labels is residue
+	// The DETECTION is deliberately broad: an object carrying the operator's exposure label is residue
 	// no matter which namespace it sits in, because narrowing it per-spec is how a leak hides. That
 	// breadth is right and stays. What was wrong is the WAITING. One leaked VolumeSnapshotContent
 	// from the m5 lane failed five leak checks in four unrelated milestones, and each of them sat out
@@ -335,21 +440,58 @@ func m1AssertNoResidualSnapshotObjects(namespaces ...string) {
 	// the 240m suite timeout and left 21 of 93 specs unrun. A truncated suite is worse than a failed
 	// one: those 21 are not passes, they are unknowns.
 	//
-	// So residue that PREDATES this check is reported immediately, via StopTrying: no teardown this
-	// spec is waiting on can remove an object that already existed before the spec looked, so the
-	// wait cannot change the verdict and only spends the budget of every spec after it. Residue
-	// created DURING the window is still polled normally — that is the real race this helper is for.
+	// 0.6.5 discriminated on AGE, and stated its premise here as the rationale: "no teardown this spec
+	// is waiting on can remove an object that already existed before the spec looked". THE PREMISE IS
+	// FALSE, and it was false the day it was written. Every spec creates its run BEFORE it checks that
+	// run for residue, so a spec's own still-draining objects necessarily predate their own leak check
+	// and `created.Before(enteredAt)` is always true for them. The check could only ever pass by
+	// winning a race it explicitly refused to wait for.
+	//
+	// It has therefore been a coin flip in every campaign since. 0.6.6 passed m6/stall's check at
+	// 30m50.6s — that was LUCK, not a verdict. 0.6.7 lost the flip: the campaign reported a product
+	// leak that did not exist, on m6/stall's own temporary clone PVC, created 30 minutes before the
+	// check while the spec deliberately waited out the operator's 30-minute moverStartDeadline, and
+	// whose teardown could not even BEGIN until the RBD node plugin was restored two lines above the
+	// check. m6/stall is only where the window is widest; the flaw was general.
+	//
+	// So the discriminator is OWNERSHIP, not age. Residue attributable to one of ownRuns — via the
+	// crystalbackup.io/{backup,cluster-backup,restore,cluster-restore} link labels, see
+	// m1ResidueOwnedBy — is polled normally inside the budget below: that IS the race this helper
+	// exists for. Residue attributable to any other run, or to no run at all (the 0.6.5 object's own
+	// shape), still fails fast, unchanged.
+	//
+	// Rejected: raising the age threshold ("older than N minutes is foreign"). That is the same coin
+	// flip with a longer edge — m6/stall's residue is 30 minutes old by construction, while a leak
+	// from the immediately preceding lane can be seconds old, so no N separates the two classes.
+	// Also rejected: dropping the fail-fast and letting every check spend its budget. That is exactly
+	// the 95 minutes that truncated the 0.6.5 suite.
+	//
+	// enteredAt is no longer the discriminator, but it stays in both messages: "created 30 minutes
+	// before the check entered" is the fact that explains the verdict either way.
 	enteredAt := time.Now()
-	failFastIfOlder := func(g Gomega, created time.Time, format string, args ...any) {
-		if created.Before(enteredAt) {
-			StopTrying(fmt.Sprintf("residue PREDATES this leak check (created %s, check entered %s) — it "+
-				"leaked in an earlier lane, so waiting here cannot clear it and only burns this run's "+
-				"budget; fix the leak its own lane reported:\n  "+format,
-				append([]any{created.Format(time.RFC3339), enteredAt.Format(time.RFC3339)}, args...)...)).Now()
+	failFastIfForeign := func(g Gomega, created time.Time, labels map[string]string, names []string,
+		format string, args ...any) {
+		if own := m1ResidueOwnedBy(labels, names, ownRuns); own != "" {
+			// Ours, and possibly still draining. Poll it out, and SAY which discriminator decided
+			// that — a reader six months from now must not have to re-derive why this one waited and
+			// the next one did not.
+			//
+			// Gomega's optional description is variadic ...any, so a format plus its arguments has to
+			// be assembled into one slice rather than passed as two.
+			g.Expect(false).To(BeTrue(), append([]any{
+				"residue belongs to run %q, which THIS spec owns (created %s, check entered %s) — own-run " +
+					"residue is POLLED, never failed fast: it predates this check by construction, because " +
+					"the spec created the run before checking it. Still present at the end of the budget " +
+					"below means a real leak, not a race:\n  " + format,
+				own, created.Format(time.RFC3339), enteredAt.Format(time.RFC3339)}, args...)...)
+			return
 		}
-		// Gomega's optional description is variadic ...any, so a format plus its arguments has to be
-		// assembled into one slice rather than passed as two.
-		g.Expect(false).To(BeTrue(), append([]any{format}, args...)...)
+		StopTrying(fmt.Sprintf("residue is NOT this spec's: it attributes to %s, and this spec owns %v "+
+			"(created %s, check entered %s) — it leaked in another lane, so waiting here cannot clear it "+
+			"and only burns the budget of every spec after this one; fix the leak its own lane reported:\n  "+
+			format,
+			append([]any{m1DescribeResidueOwner(labels), ownRuns,
+				created.Format(time.RFC3339), enteredAt.Format(time.RFC3339)}, args...)...)).Now()
 	}
 
 	Eventually(func(g Gomega) {
@@ -363,7 +505,8 @@ func m1AssertNoResidualSnapshotObjects(namespaces ...string) {
 			g.Expect(k8s.List(ctx, vs, client.InNamespace(ns))).To(Succeed())
 			for i := range vs.Items {
 				if m1IsExposureResidue(vs.Items[i].GetLabels()) {
-					failFastIfOlder(g, vs.Items[i].GetCreationTimestamp().Time,
+					failFastIfForeign(g, vs.Items[i].GetCreationTimestamp().Time,
+						vs.Items[i].GetLabels(), []string{vs.Items[i].GetName()},
 						"residual VolumeSnapshot %s/%s (labels %v)", ns, vs.Items[i].GetName(), vs.Items[i].GetLabels())
 				}
 			}
@@ -389,7 +532,12 @@ func m1AssertNoResidualSnapshotObjects(namespaces ...string) {
 			policy, _, _ := unstructured.NestedString(item.Object, "spec", "deletionPolicy")
 			refName, _, _ := unstructured.NestedString(item.Object, "spec", "volumeSnapshotRef", "name")
 			if labelled || checkSet[refNS] {
-				failFastIfOlder(g, item.GetCreationTimestamp().Time,
+				// refName joins the object's own name in the attribution names: a dynamic origin
+				// content that leaked before the handover patch stamped our labels carries none of
+				// them, and the VolumeSnapshot it references is named from moverNamePrefix — which is
+				// the only thread left tying it to the run that made it.
+				failFastIfForeign(g, item.GetCreationTimestamp().Time,
+					item.GetLabels(), []string{item.GetName(), refName},
 					"residual VolumeSnapshotContent %s (labels %v, refNS %s/%s, deletionPolicy %s, created %s, deletionTimestamp %v, ownerRefs %v, operator restarts: %s)",
 					item.GetName(), item.GetLabels(), refNS, refName, policy,
 					item.GetCreationTimestamp().Format(time.RFC3339), item.GetDeletionTimestamp(),
@@ -405,7 +553,7 @@ func m1AssertNoResidualSnapshotObjects(namespaces ...string) {
 			for i := range pvcs.Items {
 				p := &pvcs.Items[i]
 				if m1IsExposureResidue(p.Labels) && p.Labels[m1SeedLabel] == "" {
-					failFastIfOlder(g, p.CreationTimestamp.Time,
+					failFastIfForeign(g, p.CreationTimestamp.Time, p.Labels, []string{p.Name},
 						"residual temporary clone PVC %s/%s (labels %v)", ns, p.Name, p.Labels)
 				}
 			}

@@ -46,10 +46,10 @@ var _ = Describe("Milestone M4 — repository maintenance & verification", Label
 	// one failing must not skip the other two. `mise run test m4` failing at spec 1 and reporting
 	// the rest as skipped hides two independent results that would have run fine.
 	BeforeEach(func() {
-		// Ensures the shared "dr" location EXISTS, rather than assuming it. It is created by the M1
-		// specs, so running this label alone found no repository at all — a dependency on another
-		// label is not a dependency the runner knows about.
-		m3EnsureDRLocation()
+		// Ensures the shared "dr" location EXISTS, rather than assuming it. BeforeSuite creates it
+		// now, but this stays: `mise run test m4` must be a legitimate run, and a dependency on
+		// another label is not a dependency the runner knows about.
+		m1EnsureSharedRepository()
 	})
 
 	// ------------------------------------------------------------------

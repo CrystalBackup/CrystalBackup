@@ -23,6 +23,7 @@ import (
 	"go/parser"
 	"go/token"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/CrystalBackup/CrystalBackup/internal/apiconst"
@@ -107,6 +108,101 @@ func TestLeakPredicateCatchesEveryExposureObject(t *testing.T) {
 	// this predicate with the seed label, so a seed carrying the exposure label would be wrong.
 	if m1IsExposureResidue(map[string]string{m1SeedLabel: "true"}) {
 		t.Error("a seed PVC was flagged as exposure residue")
+	}
+}
+
+// TestResidueOwnershipDiscriminatesRunsNotAge pins the OTHER half of the leak check: not "is this
+// residue?" but "is this residue MINE?".
+//
+// That question replaced an age test in 0.6.7. The age test asserted that residue older than the
+// check belonged to an earlier lane — but every spec creates its run before it checks that run, so
+// its own still-draining objects always predated their own check. m6/stall is the widest window
+// (its residue is thirty minutes old by the time the check looks, because the deadline it measures
+// is thirty minutes long); it failed 0.6.7 and passed 0.6.6 by winning the same race.
+//
+// Both directions are pinned here because either one alone is satisfiable by a broken answer: an
+// "always mine" discriminator restores the 95 minutes of waiting that truncated the 0.6.5 suite,
+// and an "always foreign" one restores the coin flip.
+func TestResidueOwnershipDiscriminatesRunsNotAge(t *testing.T) {
+	const mine = "m6-stall-stuck-tk1dcf"
+	const theirs = "m5-np-run-9zq4t7"
+
+	cases := []struct {
+		what   string
+		labels map[string]string
+		names  []string
+		own    []string
+		want   string
+	}{
+		{
+			"the m6/stall clone PVC that failed 0.6.7 — the spec's own run, on both link labels",
+			map[string]string{
+				apiconst.LabelPVC: "probe", apiconst.LabelBackup: mine, apiconst.LabelClusterBackup: mine,
+			},
+			[]string{"m6-stall-" + mine + "-probe-clone"}, []string{mine}, mine,
+		},
+		{
+			"a namespace-plane object: no cluster-backup label at all, only crystalbackup.io/backup",
+			map[string]string{apiconst.LabelPVC: "tenant-data", apiconst.LabelBackup: mine},
+			[]string{"m5-tenant-" + mine + "-tenant-data-clone"}, []string{mine}, mine,
+		},
+		{
+			"a restore's staging PVC, attributed through crystalbackup.io/restore",
+			map[string]string{apiconst.LabelPVC: "data", apiconst.LabelRestore: "m2-overwrite"},
+			[]string{"m2-restore-m2-overwrite-data-staging"},
+			[]string{"m2-restore-src-abc123", "m2-overwrite"}, "m2-overwrite",
+		},
+		{
+			"an unlabelled dynamic origin content, attributed only by the VolumeSnapshot it references",
+			map[string]string{apiconst.LabelPVC: "probe"},
+			[]string{"snapcontent-8b1f", "m6-stall-" + mine + "-probe-snap"}, []string{mine}, mine,
+		},
+		{
+			"ANOTHER lane's residue — the 0.6.5 case: fails fast, budget preserved",
+			map[string]string{
+				apiconst.LabelPVC: "tenant-data", apiconst.LabelBackup: theirs, apiconst.LabelClusterBackup: theirs,
+			},
+			[]string{"m5-tenant-" + theirs + "-tenant-data-clone"}, []string{mine}, "",
+		},
+		{
+			"residue attributable to no run at all — the exact shape 0.6.5 leaked",
+			map[string]string{apiconst.LabelPVC: "data"},
+			[]string{"snapcontent-4d2a"}, []string{mine}, "",
+		},
+		{
+			"a spec that owns no run: every residue is somebody else's",
+			map[string]string{apiconst.LabelPVC: "data", apiconst.LabelClusterBackup: mine},
+			[]string{"whatever"}, nil, "",
+		},
+		{
+			"an empty own-run entry must never act as a wildcard (see apiconst.LabelBackup)",
+			map[string]string{apiconst.LabelPVC: "data"},
+			[]string{"snapcontent-4d2a"}, []string{""}, "",
+		},
+	}
+
+	for _, c := range cases {
+		if got := m1ResidueOwnedBy(c.labels, c.names, c.own); got != c.want {
+			t.Errorf("%s:\n  m1ResidueOwnedBy(%v, %v, %v) = %q, want %q",
+				c.what, c.labels, c.names, c.own, got, c.want)
+		}
+	}
+}
+
+// TestResidueOwnerDescriptionNamesTheUnattributableCase guards the forensics rather than the
+// verdict. A leak that costs three paid crucible rounds to attribute is the incident this whole
+// helper is written around, so the message a fail-fast prints has to distinguish "belongs to run X"
+// from "belongs to nothing" — the second is the expensive one, and an empty string in its place
+// reads as a bug in the harness rather than as the finding it is.
+func TestResidueOwnerDescriptionNamesTheUnattributableCase(t *testing.T) {
+	named := m1DescribeResidueOwner(map[string]string{apiconst.LabelClusterBackup: "nightly-20260803"})
+	if !strings.Contains(named, "nightly-20260803") {
+		t.Errorf("the owner description does not name the run it attributed to: %q", named)
+	}
+	unattributed := m1DescribeResidueOwner(map[string]string{apiconst.LabelPVC: "data"})
+	if unattributed == "" || !strings.Contains(unattributed, apiconst.LabelClusterBackup) {
+		t.Errorf("the unattributable case must say so, and list the labels it looked for; got %q",
+			unattributed)
 	}
 }
 

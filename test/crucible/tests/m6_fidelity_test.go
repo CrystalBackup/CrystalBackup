@@ -104,14 +104,9 @@ var _ = Describe("M6 — restore-fidelity gate on Rook-Ceph RBD", Label("m6"), O
 
 	BeforeAll(func() {
 		m6RequireS3()
-		m1EnsurePlatformSecrets()
 
 		By("Given the shared cluster-DR repository")
-		var loc cbv1.ClusterBackupLocation
-		if apierrors.IsNotFound(k8s.Get(ctx, client.ObjectKey{Name: m1LocationName}, &loc)) {
-			m1CreateLocation(m1LocationName, true)
-		}
-		m1WaitRepositoryInitialized(m1LocationName)
+		m1EnsureSharedRepository()
 
 		By("And a Rook-Ceph RBD volume seeded with the fidelity corpus")
 		m6SeedCorpus(sourceNS, pvcName, capacity)
@@ -176,7 +171,10 @@ var _ = Describe("M6 — restore-fidelity gate on Rook-Ceph RBD", Label("m6"), O
 		// finalizer nothing will release, this is where it strands the claim forever (M3.2, S8).
 		deleteNamespaceAndWaitGone(restoredNS, 10*time.Minute)
 		deleteNamespaceAndWaitGone(sourceNS, 10*time.Minute)
-		m1AssertNoResidualSnapshotObjects(sourceNS, restoredNS)
+		// Both of this container's objects: the source run, and the ClusterRestore — a restore
+		// stamps LabelPVC on its staging PVC and twin PV too (restoreEngine.volumeLabels), so its
+		// residue is visible to this check and must be attributable to it.
+		m1AssertNoResidualSnapshotObjects([]string{runName, restoreCR}, sourceNS, restoredNS)
 		m2AssertNoResidualRestoreObjects()
 	})
 

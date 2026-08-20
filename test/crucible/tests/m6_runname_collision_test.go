@@ -100,14 +100,9 @@ var _ = Describe("M6 — a re-used run name fails loudly instead of reporting a 
 
 		BeforeAll(func() {
 			m6RequireS3()
-			m1EnsurePlatformSecrets()
 
 			By("Given the shared cluster-DR repository")
-			var loc cbv1.ClusterBackupLocation
-			if apierrors.IsNotFound(k8s.Get(ctx, client.ObjectKey{Name: m1LocationName}, &loc)) {
-				m1CreateLocation(m1LocationName, true)
-			}
-			m1WaitRepositoryInitialized(m1LocationName)
+			m1EnsureSharedRepository()
 
 			By("And a Rook-Ceph RBD volume holding real data")
 			m2SeedVolume(collideNS, collidePVC, "ceph-block", capacity)

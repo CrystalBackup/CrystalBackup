@@ -89,7 +89,7 @@ var _ = Describe("M3 — cluster-scoped capture & selective restore", Label("m3"
 	}
 
 	BeforeAll(func() {
-		m3EnsureDRLocation()
+		m1EnsureSharedRepository()
 
 		By("planting the cluster-scoped fixtures: a CRD, its StorageClass, and a non-system ClusterRole")
 		Expect(client.IgnoreAlreadyExists(k8s.Create(ctx, m3FixtureCRD()))).To(Succeed())

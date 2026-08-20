@@ -60,9 +60,6 @@ var (
 	m1CascadeScheduleName = "crucible-cascade"
 	// m1CascadeRunName is the pinned run R, captured once in BeforeAll and read by every scenario.
 	m1CascadeRunName string
-	// m1CascadeLocationCreated records whether THIS suite created the "dr" location (so AfterAll
-	// only deletes what it made, leaving a pre-existing / sibling-owned location alone).
-	m1CascadeLocationCreated bool
 )
 
 // m1CascadeSeedNamespaces are the six seeded tenant namespaces of the cascade feature's
@@ -72,20 +69,10 @@ var m1CascadeSeedNamespaces = []string{"c-db", "c-media", "c-edge", "c-legacy", 
 var _ = Describe("M1 — cluster-DR backup cascade", Label("m1"), Ordered, func() {
 
 	BeforeAll(func() {
-		m1RequireS3()
-
 		By("Given an initialized ClusterBackupLocation \"dr\" for the shared repository")
-		m1EnsurePlatformSecrets()
-		var loc cbv1.ClusterBackupLocation
-		err := k8s.Get(ctx, client.ObjectKey{Name: m1LocationName}, &loc)
-		switch {
-		case apierrors.IsNotFound(err):
-			m1CreateLocation(m1LocationName, true)
-			m1CascadeLocationCreated = true
-		default:
-			Expect(err).NotTo(HaveOccurred(), "get ClusterBackupLocation %s", m1LocationName)
-		}
-		m1WaitRepositoryInitialized(m1LocationName)
+		// Established by BeforeSuite; this only waits for it. It no longer matters whether this
+		// container drew the first position in the shuffle.
+		m1EnsureSharedRepository()
 
 		By("And the seeded tenant namespaces labelled crystalbackup.io/seed=crucible")
 		for _, ns := range m1CascadeSeedNamespaces {
@@ -165,9 +152,9 @@ var _ = Describe("M1 — cluster-DR backup cascade", Label("m1"), Ordered, func(
 			_ = k8s.DeleteAllOf(ctx, &cbv1.Backup{}, client.InNamespace(ns),
 				client.MatchingLabels{apiconst.LabelOrigin: apiconst.OriginCluster})
 		}
-		if m1CascadeLocationCreated {
-			m1DeleteLocation(m1LocationName)
-		}
+		// The shared "dr" location is NOT torn down here. It is suite infrastructure now
+		// (BeforeSuite), and deleting it garbage-collects the BackupRepository every later lane
+		// waits on — the ownership bookkeeping this used to do could not tell the difference.
 	})
 
 	It("A ClusterBackupSchedule fans out a Backup into every matched namespace", func() {

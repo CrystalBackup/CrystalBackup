@@ -52,28 +52,20 @@ const m1DiscoveryGhostNS = "c-ghost"
 
 var _ = Describe("M1 — discovery projects restorable backups", Label("m1"), Ordered, func() {
 	// Shared across the Ordered scenarios; assigned in BeforeAll.
-	var (
-		m1DiscoveryRun  string
-		createdLocation bool
-	)
+	var m1DiscoveryRun string
 
 	BeforeAll(func() {
-		m1RequireS3()
-		m1EnsurePlatformSecrets()
-
-		// An initialized ClusterBackupLocation "dr" for the shared repository —
-		// reused if a sibling feature already created it, so we only own (and later
-		// tear down) the location when this suite created it.
-		var loc cbv1.ClusterBackupLocation
-		err := k8s.Get(ctx, client.ObjectKey{Name: m1LocationName}, &loc)
-		switch {
-		case apierrors.IsNotFound(err):
-			m1CreateLocation(m1LocationName, false)
-			createdLocation = true
-		default:
-			Expect(err).NotTo(HaveOccurred(), "get ClusterBackupLocation %s", m1LocationName)
-		}
-		m1WaitRepositoryInitialized(m1LocationName)
+		// The initialized ClusterBackupLocation "dr" for the shared repository, established by
+		// BeforeSuite.
+		//
+		// This container used to bootstrap it with default=FALSE while the other fourteen passed
+		// true, and since only the first container to run created anything, the shuffle decided
+		// the flag. Nothing here ever needed a non-default location — this spec never reads
+		// spec.default and its feature file asks only for an initialized "dr" whose repository
+		// already holds snapshots — so the false was an oversight, not a requirement. See
+		// m1LocationIsDefault for why true is the one that is actually load-bearing, and why a
+		// private location for this container would be the wrong repair.
+		m1EnsureSharedRepository()
 
 		// A namespace with a SNAPSHOTTABLE PVC (ceph-block), backed up then deleted so its data
 		// snapshot (tagged namespace=c-ghost) is the repo group that must outlive the namespace.
@@ -113,9 +105,8 @@ var _ = Describe("M1 — discovery projects restorable backups", Label("m1"), Or
 			}
 		}
 		deleteNamespace(m1DiscoveryGhostNS)
-		if createdLocation {
-			m1DeleteLocation(m1LocationName)
-		}
+		// The shared "dr" location is suite infrastructure (BeforeSuite) and is never torn down
+		// by a lane: deleting it garbage-collects the BackupRepository the later lanes wait on.
 	})
 
 	It("Discovery projects a Backup per (namespace, run) into existing namespaces", func() {

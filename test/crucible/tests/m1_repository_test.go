@@ -27,7 +27,6 @@ import (
 	. "github.com/onsi/gomega"
 
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -41,8 +40,9 @@ import (
 // step is one By() so the readable report reproduces the feature prose.
 //
 // The three scenarios share one expensive fact — a provisioned, initialized shared
-// repository behind the default ClusterBackupLocation "dr" — so they run Ordered with
-// the location created once in BeforeAll. Assertions speak the pinned M1 contract
+// repository behind the default ClusterBackupLocation "dr" — so they run Ordered. The
+// location itself is the SUITE's (BeforeSuite, via m1EnsureSharedLocation), not this
+// container's: it is the one every other lane depends on. Assertions speak the pinned M1 contract
 // (BackupRepository.status, the crystal-dek-<loc> envelope, restic.RepoURL, the
 // Reachable/Ready/MultipleDefaults conditions) and read the object store through the
 // crucible's independent restic oracle, never trusting a CrystalBackup CR to grade
@@ -53,46 +53,57 @@ var _ = Describe("M1 — shared cluster-DR repository lifecycle", Label("m1"), O
 	const secondName = "dr2"
 
 	BeforeAll(func() {
-		m1RequireS3()
-		m1EnsurePlatformSecrets()
-
-		// A ClusterBackupLocation is cluster-scoped and survives a namespace wipe, so a
-		// previous aborted run may have left "dr"/"dr2" behind. Clear them and wait for
-		// the name to free up before (re)creating the shared default location.
-		m1DeleteLocation(m1LocationName)
+		// This container used to DELETE the shared "dr" location here and recreate it, to clear a
+		// leftover from a previous aborted run. That was the sharpest edge of the 0.6.7 ordering
+		// bug: deleting a ClusterBackupLocation garbage-collects the owned BackupRepository
+		// through its ownerReference (clusterbackuplocation_controller.finalize), so whenever the
+		// shuffle put this container ahead of a lane that only WAITS for the repository — m6's
+		// s3tuning and placement lanes, m4's shared-repository maintenance case — that lane sat
+		// out its whole Eventually budget on a repository this one had just removed.
+		//
+		// It never needed the clean slate. `restic init` is idempotent, the DEK Secret and the
+		// repository outlive both the location and the campaign (adr/0009: delete never erases),
+		// and every assertion below is about the state m1LocationObject describes — which
+		// BeforeSuite already established, deterministically and with the default flag settled.
+		//
+		// dr2 IS still cleared: it belongs to this container alone, and a leftover default from an
+		// aborted run would make the third scenario's premise ("a default dr, and then a second
+		// one") false before it starts.
 		m1DeleteLocation(secondName)
-		Eventually(func() error {
-			var l cbv1.ClusterBackupLocation
-			err := k8s.Get(ctx, client.ObjectKey{Name: m1LocationName}, &l)
-			switch {
-			case apierrors.IsNotFound(err):
-				return nil
-			case err != nil:
-				return err
-			default:
-				return fmt.Errorf("ClusterBackupLocation %q still present (terminating?)", m1LocationName)
-			}
-		}, 2*time.Minute, 3*time.Second).Should(Succeed())
-
-		m1CreateLocation(m1LocationName, true)
+		m1EnsureSharedLocation()
 	})
 
 	AfterAll(func() {
-		// Best-effort teardown of the two locations we created; leave the platform KEK/S3
-		// Secrets and the DEK/repository in place (they are shared, reusable crucible state
-		// — dropping the KEK would strand every DEK wrapped under it).
+		// Only dr2, which this container created. The shared "dr" location, the platform KEK/S3
+		// Secrets and the DEK/repository all stay: they are shared, reusable crucible state, and
+		// tearing any of them down here is how a later lane inherits a missing repository
+		// (dropping the KEK would additionally strand every DEK wrapped under it).
 		m1DeleteLocation(secondName)
-		m1DeleteLocation(m1LocationName)
+
+		// And WAIT for the conflict to clear, because the scenario above deliberately degrades
+		// shared state: with two defaults live, the election is allowed to pick "dr" as the loser
+		// — the assertion is `readyDefaults <= 1`, and it does not care which one keeps Ready. So
+		// this container can hand the next one a shared location reporting MultipleDefaults and
+		// not Ready. That is the same class of defect as the one this file's BeforeAll used to
+		// have: state left behind for whichever container the shuffle runs next. Deleting dr2 is
+		// not enough; the election has to be observed re-settling.
+		Eventually(func(g Gomega) {
+			var l cbv1.ClusterBackupLocation
+			g.Expect(k8s.Get(ctx, client.ObjectKey{Name: m1LocationName}, &l)).To(Succeed())
+			g.Expect(apimeta.IsStatusConditionTrue(l.Status.Conditions, "MultipleDefaults")).To(BeFalse(),
+				"the shared location %q still reports MultipleDefaults after %q was deleted — every "+
+					"later lane would inherit a degraded default", m1LocationName, secondName)
+		}, 3*time.Minute, 5*time.Second).Should(Succeed())
 	})
 
 	It("A ClusterBackupLocation provisions one initialized shared repository", func() {
 		By("Given an S3 bucket reachable at the crucible's S3 endpoint")
 		By(`And a platform KEK (an age X25519 identity) stored as a Secret in "crystal-backup-system"`)
-		// Both Background givens are established by BeforeAll (m1RequireS3 +
+		// Both Background givens are established by m1EnsureSharedLocation (m1RequireS3 +
 		// m1EnsurePlatformSecrets); the KEK identity is now in m1KEKIdentity.
 
 		By(`When I create a ClusterBackupLocation "dr" for the bucket with clusterID "crucible"`)
-		// Created once in BeforeAll (shared, Ordered). Assert it landed as configured.
+		// Created once, by BeforeSuite. Assert it landed as configured.
 		var loc cbv1.ClusterBackupLocation
 		Expect(k8s.Get(ctx, client.ObjectKey{Name: m1LocationName}, &loc)).To(Succeed())
 		Expect(loc.Spec.ClusterID).To(Equal(m1ClusterID))

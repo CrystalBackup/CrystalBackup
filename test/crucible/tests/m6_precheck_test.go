@@ -139,15 +139,8 @@ var _ = Describe("M6 — snapshot pre-check and progress deadline", Label("m6", 
 	var rookReplicas, snapControllerReplicas int32
 
 	BeforeAll(func() {
-		m1RequireS3()
-		m1EnsurePlatformSecrets()
-
 		By("Given the shared cluster-DR repository")
-		var loc cbv1.ClusterBackupLocation
-		if apierrors.IsNotFound(k8s.Get(ctx, client.ObjectKey{Name: m1LocationName}, &loc)) {
-			m1CreateLocation(m1LocationName, true)
-		}
-		m1WaitRepositoryInitialized(m1LocationName)
+		m1EnsureSharedRepository()
 
 		By("And a small Ceph RBD volume in this spec's own namespace")
 		ensureNamespace(m6PrecheckNS)
@@ -237,7 +230,9 @@ var _ = Describe("M6 — snapshot pre-check and progress deadline", Label("m6", 
 		Expect(cb.Status.Phase).To(BeElementOf("Failed", "PartiallyFailed"))
 
 		By("And nothing leaked")
-		m1AssertNoResidualSnapshotObjects(m6PrecheckNS)
+		// refusedRun is this It's own run, and its residue predates this check by the several
+		// minutes the refusal took — poll it out. Anything else here is another lane's.
+		m1AssertNoResidualSnapshotObjects([]string{refusedRun}, m6PrecheckNS)
 	})
 
 	It("completes the very next run once the Secret is back", func() {
@@ -265,7 +260,9 @@ var _ = Describe("M6 — snapshot pre-check and progress deadline", Label("m6", 
 		Expect(m1WaitClusterBackupTerminal(restoredRun, 15*time.Minute).Status.Phase).To(Equal("Completed"))
 
 		By("And nothing leaked")
-		m1AssertNoResidualSnapshotObjects(m6PrecheckNS)
+		// restoredRun only: refusedRun was certified residue-free by the It above, and this
+		// container is Ordered, so that certification is a precondition of reaching this line.
+		m1AssertNoResidualSnapshotObjects([]string{restoredRun}, m6PrecheckNS)
 	})
 
 	It("fails a volume whose snapshot request nobody picks up, instead of hanging to the suite timeout", func() {
@@ -314,7 +311,10 @@ var _ = Describe("M6 — snapshot pre-check and progress deadline", Label("m6", 
 		m6ScaleDeployment(m6SnapshotControllerNS, snapControllerDeploy, snapControllerReplicas)
 
 		By("And nothing leaked — a failed-by-deadline volume is torn down like any other")
-		m1AssertNoResidualSnapshotObjects(m6PrecheckNS)
+		// stalledRun's objects are older than this check by the full 15-minute progress deadline,
+		// and their teardown only becomes possible when the snapshot-controller comes back one
+		// line above — the same shape as m6/stall, and the same reason ownership decides here.
+		m1AssertNoResidualSnapshotObjects([]string{stalledRun}, m6PrecheckNS)
 	})
 })
 

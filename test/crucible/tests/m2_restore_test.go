@@ -56,13 +56,7 @@ var _ = Describe("M2 — self-service restore (modes × selection × mediation)"
 	runName := crucibleRunName("m2-restore-src")
 
 	BeforeAll(func() {
-		m1RequireS3()
-		m1EnsurePlatformSecrets()
-		var loc cbv1.ClusterBackupLocation
-		if apierrors.IsNotFound(k8s.Get(ctx, client.ObjectKey{Name: m1LocationName}, &loc)) {
-			m1CreateLocation(m1LocationName, true)
-		}
-		m1WaitRepositoryInitialized(m1LocationName)
+		m1EnsureSharedRepository()
 
 		By("seeding a dedicated RBD volume with a checksummed corpus")
 		m2SeedVolume(nsName, pvcName, "ceph-block", "1Gi")
@@ -84,7 +78,12 @@ var _ = Describe("M2 — self-service restore (modes × selection × mediation)"
 		// into it, and a restored finalizer nothing will release is precisely what would leave it
 		// Terminating forever (M3.2, sanitization rule S8 + the applier's own strip).
 		deleteNamespaceAndWaitGone(nsName, 5*time.Minute)
-		m1AssertNoResidualSnapshotObjects(nsName)
+		// Everything this container created: the source run, and the four Restores. The Restores are
+		// named too because their staging objects carry LabelPVC (restoreEngine.volumeLabels), so
+		// this check sees them as residue as well — m2AssertNoResidualRestoreObjects below is a
+		// second, restore-specific pass over them, not the only one that can trip on them.
+		m1AssertNoResidualSnapshotObjects(
+			[]string{runName, "m2-overwrite", "m2-partial", "m2-recreate", "m2-negative"}, nsName)
 		m2AssertNoResidualRestoreObjects()
 	})
 

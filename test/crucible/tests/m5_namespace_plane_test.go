@@ -253,6 +253,9 @@ var _ = Describe("M5 — namespace plane (the user's own repository, under the u
 			// The namespace-plane path runs the SAME exposure machinery as cluster DR — a
 			// VolumeSnapshot in the tenant namespace, a static VS/VSC pair and a clone PVC in the
 			// operator namespace — so it inherits the same leak surface, and gets the same check.
-			m1AssertNoResidualSnapshotObjects(m5TenantNS)
+			// backupName is the namespace-plane Backup the first It ran. On this plane there is no
+			// ClusterBackup, so its objects are attributable only through crystalbackup.io/backup —
+			// which m1ResidueOwnedBy reads first, for exactly this case.
+			m1AssertNoResidualSnapshotObjects([]string{backupName}, m5TenantNS)
 		})
 	})
