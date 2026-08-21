@@ -231,10 +231,26 @@ var _ = Describe("M1 — convergence and no orphans", Label("m1"), Ordered, func
 				"child Backup %s/%s is stuck in a non-terminal phase (phase=%q)", bk.Namespace, bk.Name, bk.Status.Phase)
 		}
 
-		By("And the leak-check invariant still holds afterwards")
+		By("And nothing the crash left unrecorded is lost permanently: the backstop collects it")
 		// restartRun only: leakRun was certified residue-free by the It above, and this container
 		// is Ordered, so that certification is a precondition of reaching this line.
-		m1AssertNoResidualSnapshotObjects([]string{restartRun.Name}, seedNamespaces...)
+		//
+		// CRASH PATH — this is why the budget is the wide one. The operator was killed mid-run,
+		// above, so residue here splits into two classes: what the fresh operator can DERIVE from
+		// the Backup's own record (torn down in seconds by the terminal re-entry sweep) and what
+		// the dead process never got to record at all — a dynamic snapcontent-<uuid> with no
+		// ownerReference and no deletionTimestamp, which nothing derives and nothing
+		// garbage-collects. The second class is the orphan reaper's, and the reaper's floor is
+		// 30m MinAge + up to one 10m Interval; the 0.6.7 campaign-7 failure of this very line was
+		// a ten-minute budget waiting for a collection that could not occur for another 25.
+		//
+		// So what this line asserts is NOT "teardown is prompt" — the spec that asserts that is
+		// the Leak-check It above, on a live operator. It is the weaker and truer claim that a
+		// CRASHED OPERATOR LOSES NOTHING PERMANENTLY: whatever the crash left unrecorded, the
+		// backstop still collects it. A failure here is a real permanent leak — residue that
+		// survived both the re-entry sweep and the reaper.
+		m1AssertNoResidualSnapshotObjectsWithin(m1CrashPathLeakCheckBudget,
+			[]string{restartRun.Name}, seedNamespaces...)
 	})
 
 	It("An OOMKilled mover is reported as a failure, not a silent success", func() {

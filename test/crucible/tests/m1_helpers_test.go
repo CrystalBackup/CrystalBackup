@@ -574,6 +574,90 @@ func m1ListBackups(namespace string) []cbv1.Backup {
 	return list.Items
 }
 
+// m1LeakCheckBudget bounds the leak check on the ORDINARY path, where the operator survived the run
+// and its own teardown is what removes the residue.
+//
+// 10 min (was 5, was 2): finalizer teardown of VolumeSnapshots/VSContents/clone PVCs on Ceph is slow
+// under full-suite load, and M3's default manifest capture adds a manifest-mover Job to every
+// backup's teardown. The objects DO drain — a round-1 validation lane measured the external
+// snapshot-controller taking just over 5 minutes to collect a Delete-policy content whose teardown
+// was already complete (the SAME helper passed at 5m12.8s in the very next spec, and the lane ended
+// at zero residuals) — so 5 was the knife's edge of a latency we do not own. This stays a real
+// leak-check, not a sleep: the property asserted is unchanged, only the external controller's
+// patience.
+//
+// This number is UNCHANGED by the crash-path budget below, and for the reason
+// m1WarmRepositoryInitBudget states in the same file: budgets that everybody spends are how a run
+// reaches the suite timeout with a third of its specs unrun. Sixteen of the eighteen call sites run
+// on a live operator whose teardown is prompt, and they keep the tight bound.
+const m1LeakCheckBudget = 10 * time.Minute
+
+// m1CrashPathLeakCheckBudget bounds the leak check on a spec that DELIBERATELY KILLED THE OPERATOR.
+// It is the only budget wide enough to contain the orphan reaper, and only a crash-path spec needs
+// it, because only a crash can produce residue that nothing but the reaper will ever collect.
+//
+// Why the ordinary budget cannot work here, measured on the 0.6.7 campaign-7 failure of
+// "The operator killed mid-run converges via Job re-adoption" (m1_reliability_test.go):
+//
+//	VolumeSnapshotContent snapcontent-… created   21:26:10   deletionTimestamp <nil>, ownerRefs []
+//	leak check entered                            21:31:16
+//	leak check gave up (600.002s)                 21:41:16
+//
+// deletionTimestamp <nil> and ownerRefs [] together say that nothing had asked for this object's
+// deletion and nothing would garbage-collect it: it is not draining, it is WAITING FOR THE REAPER —
+// the designed backstop for exactly what a crashed operator never got to record. And the reaper's
+// floor puts that collection out of reach of any ten-minute window:
+//
+//	internal/controller/reaper.go  defaultReaperMinAge   = 30 * time.Minute
+//	internal/controller/reaper.go  defaultReaperInterval = 10 * time.Minute
+//
+//	eligible at            created + MinAge          = 21:56:10
+//	swept no later than    eligible + one Interval   = 22:06:10   (the sweep before eligibility misses it)
+//
+// The check could not have observed the collection; it gave up 25 minutes before the object even
+// became eligible. The spec has been green until now only when the ordinary terminal teardown won
+// the race instead — the kill landing in this particular window is what removed that luck.
+//
+// The derivation, carried here rather than rounded away, so a change to either reaper figure is
+// traceable to this bound:
+//
+//	MinAge                      30m   eligibility floor, from creation
+//	+ one Interval              10m   worst case: the sweep just before eligibility misses it
+//	                          = 40m   worst case from CREATION to the sweep that collects it
+//	+ sweep + drain margin      10m   the sweep's delete and read-back, plus the external
+//	                                  snapshot-controller's cascade on a Delete-policy content
+//	                                  (measured at just over 5 min under load — the same latency
+//	                                  m1LeakCheckBudget above was raised for), plus one 5s poll
+//	                          = 50m
+//
+// The clock here starts when the CHECK ENTERS, which is strictly later than creation (5m06s later
+// in the measurement above), so the real margin is this 10 minutes plus however long the spec spent
+// between creating the run and looking — never less.
+//
+// WHAT A SPEC ON THIS BUDGET IS ACTUALLY ASSERTING — say it plainly, because it is weaker than what
+// the same line used to claim and the change must not hide inside a bigger number. It is no longer
+// "teardown is prompt". It is: A CRASHED OPERATOR LOSES NOTHING PERMANENTLY — the backstop collects
+// what the crash left unrecorded. Promptness is still asserted on the ordinary path by the sixteen
+// call sites that keep m1LeakCheckBudget; here the property under test is durability, not speed,
+// and a spec that fails on THIS budget is reporting a genuine permanent leak: an object that
+// outlived both the operator's own teardown and the reaper that exists to catch what teardown
+// missed.
+//
+// THE FIX THIS IS NOT, and where it belongs. The right change is to make the reaper's floor
+// reachable by a campaign: MinAge and Interval are already struct fields
+// (internal/controller/reaper.go:167-168) with the defaults applied in Start, so the product is one
+// step from configurable — but NOTHING EXPOSES THEM. There is no CLI flag (cmd/main.go constructs
+// OrphanReaper with Client/APIReader/Recorder/OperatorNamespace and leaves both zero) and no Helm
+// value, so a campaign cannot shorten the floor and has no choice but to tolerate forty minutes.
+// That is worth naming for what it is: A BACKSTOP NO CAMPAIGN CAN REACH IS A BACKSTOP NOBODY HAS
+// VERIFIED — until this failure, every green run of this spec was a run in which the ordinary
+// teardown won and the reaper was never exercised at all. Exposing the two fields would let a
+// crash-path spec set MinAge to a minute and assert the collection in minutes instead of enduring
+// it, turning forty minutes of waiting into a real, repeatable test of the backstop. That is an M7
+// product change (flag + Helm value + defaulting), deliberately NOT made here: this fix is
+// test-side only.
+const m1CrashPathLeakCheckBudget = 50 * time.Minute
+
 // m1AssertNoResidualSnapshotObjects asserts (with a grace period for async cleanup) that a run left
 // nothing behind in the given namespaces: no VolumeSnapshots, no VolumeSnapshotContents pointing
 // back at them, and no temporary clone PVCs (the exposure label, but not the seed label the tenant
@@ -585,7 +669,22 @@ func m1ListBackups(namespace string) []cbv1.Backup {
 // "is this residue mine?", and a call site that silently forgot to say would inherit the very bug
 // this parameter fixes. Passing nil is a valid, meaningful answer — "this spec owns no run, so any
 // residue here is somebody else's" — and every call site says which of the two it means.
+//
+// This is the ORDINARY-PATH entry point and it spends m1LeakCheckBudget. A spec that killed the
+// operator must call m1AssertNoResidualSnapshotObjectsWithin(m1CrashPathLeakCheckBudget, …)
+// instead, and say so at the call site.
 func m1AssertNoResidualSnapshotObjects(ownRuns []string, namespaces ...string) {
+	GinkgoHelper()
+	m1AssertNoResidualSnapshotObjectsWithin(m1LeakCheckBudget, ownRuns, namespaces...)
+}
+
+// m1AssertNoResidualSnapshotObjectsWithin is m1AssertNoResidualSnapshotObjects with the grace period
+// named by the caller. It exists so that the ONE class of call site that depends on the orphan
+// reaper — a spec that killed the operator mid-teardown — can wait for the reaper without every
+// other call site paying for it. The detection, the ownership discriminator and the fail-fast are
+// identical; only the patience differs. See m1LeakCheckBudget / m1CrashPathLeakCheckBudget for
+// which is which and why, in the same spirit as the cold/warm repository-init budgets above.
+func m1AssertNoResidualSnapshotObjectsWithin(budget time.Duration, ownRuns []string, namespaces ...string) {
 	GinkgoHelper()
 
 	// Exposure objects live in the tenant namespaces (the dynamic origin VolumeSnapshot) AND —
@@ -728,15 +827,12 @@ func m1AssertNoResidualSnapshotObjects(ownRuns []string, namespaces ...string) {
 				}
 			}
 		}
-		// 10 min (was 5, was 2): finalizer teardown of VolumeSnapshots/VSContents/clone PVCs on
-		// Ceph is slow under full-suite load, and M3's default manifest capture adds a
-		// manifest-mover Job to every backup's teardown. The objects DO drain — a round-1
-		// validation lane measured the external snapshot-controller taking just over 5 minutes to
-		// collect a Delete-policy content whose teardown was already complete (the SAME helper
-		// passed at 5m12.8s in the very next spec, and the lane ended at zero residuals) — so 5
-		// was the knife's edge of a latency we do not own. This stays a real leak-check, not a
-		// sleep: the property asserted is unchanged, only the external controller's patience.
-	}, 10*time.Minute, 5*time.Second).Should(Succeed())
+		// The budget is the caller's: m1LeakCheckBudget (10 min) on the ordinary path, where the
+		// operator's own teardown removes the residue, and m1CrashPathLeakCheckBudget (50 min) for
+		// a spec that killed the operator and can therefore only be cleared by the orphan reaper.
+		// Both constants carry their own derivation; neither is a sleep — the property asserted
+		// here is identical, only the patience differs.
+	}, budget, 5*time.Second).Should(Succeed())
 }
 
 // m1OperatorRestartSummary reports the operator pods' identity, start time and container restart

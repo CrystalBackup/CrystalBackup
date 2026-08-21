@@ -126,10 +126,28 @@ var _ = Describe("M4 — crash-only teardown (terminal re-entry sweep)", Ordered
 				"the sweep must never disturb the terminal record")
 		}, 10*time.Minute, 5*time.Second).Should(Succeed())
 
-		By("And the leak-check invariant holds: zero residual snapshot objects")
+		By("And nothing the SIGKILL left unrecorded is lost permanently: zero residual snapshot objects")
 		// This It's own run. Its residue predates the check by the whole kill-and-converge window,
 		// and draining it is precisely the property under test — so it is polled, while residue from
 		// any other lane in this shared seed namespace still fails fast.
-		m1AssertNoResidualSnapshotObjects([]string{run.Name}, targetNS)
+		//
+		// CRASH PATH, the same exposure as m1_reliability_test.go's restart spec and for the same
+		// reason: this It aims a grace-0 SIGKILL at the teardown window, so an exposure object the
+		// dying process never recorded is not derivable by the re-entry sweep and has no
+		// ownerReference to collect it. The exposures-cleaned marker above does NOT exclude that
+		// case — the sweep stamps its receipt once everything it can DERIVE is gone, which is
+		// exactly the set an unrecorded object is not in. What remains belongs to the orphan
+		// reaper, whose floor is 30m MinAge + up to one 10m Interval, so this line gets
+		// m1CrashPathLeakCheckBudget too.
+		//
+		// The claim is therefore the same weaker, truer one: not "teardown is prompt" but a
+		// CRASHED OPERATOR LOSES NOTHING PERMANENTLY. This spec has been green on the 10-minute
+		// budget so far, which means every one of those runs was a run where the inline teardown
+		// or the re-entry sweep won the race — the indifference this It claims to test was never
+		// actually exercised against the unrecorded case. See m1CrashPathLeakCheckBudget for the
+		// derivation, and for the M7 product change (exposing the reaper's MinAge/Interval, which
+		// nothing does today) that would let a campaign verify the backstop in minutes instead of
+		// tolerating forty.
+		m1AssertNoResidualSnapshotObjectsWithin(m1CrashPathLeakCheckBudget, []string{run.Name}, targetNS)
 	})
 })
