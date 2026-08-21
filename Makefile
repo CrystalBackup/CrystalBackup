@@ -531,13 +531,27 @@ crd-ref-docs: $(CRD_REF_DOCS) ## Download crd-ref-docs locally if necessary.
 $(CRD_REF_DOCS): $(LOCALBIN)
 	$(call go-install-tool,$(CRD_REF_DOCS),github.com/elastic/crd-ref-docs,$(CRD_REF_DOCS_VERSION))
 
+# GO_TOOLCHAIN is read from go.mod so it can never drift from a toolchain bump, and it exists for
+# ONE reason: `golangci-lint custom` builds the plugin binary with the AMBIENT toolchain, which
+# resolves through the UPSTREAM module's own `toolchain` directive — currently a 1.25. The binary it
+# produces then refuses this tree with "the Go language version (go1.25) used to build golangci-lint
+# is lower than the targeted Go version", and `make lint` exits 3.
+#
+# The trap is that `make lint` REBUILDS the linter through this very target, so rebuilding it by
+# hand with the right toolchain does not stick: the gate overwrites the good binary with a bad one
+# on its next run. That cost four rounds in one day before it was understood — each time reading
+# like a fresh failure, each time "fixed" by a manual rebuild that the next `make lint` undid.
+# Pinning it here is what makes the gate reproducible instead of dependent on which `go` happens to
+# be first in PATH.
+GO_TOOLCHAIN ?= $(shell awk '/^toolchain /{print $$2}' go.mod)
+
 .PHONY: golangci-lint
 golangci-lint: $(GOLANGCI_LINT) ## Download golangci-lint locally if necessary.
 $(GOLANGCI_LINT): $(LOCALBIN)
 	$(call go-install-tool,$(GOLANGCI_LINT),github.com/golangci/golangci-lint/v2/cmd/golangci-lint,$(GOLANGCI_LINT_VERSION))
 	@test -f .custom-gcl.yml && { \
-		echo "Building custom golangci-lint with plugins..." && \
-		$(GOLANGCI_LINT) custom --destination $(LOCALBIN) --name golangci-lint-custom && \
+		echo "Building custom golangci-lint with plugins (GOTOOLCHAIN=$(GO_TOOLCHAIN))..." && \
+		GOTOOLCHAIN=$(GO_TOOLCHAIN) $(GOLANGCI_LINT) custom --destination $(LOCALBIN) --name golangci-lint-custom && \
 		mv -f $(LOCALBIN)/golangci-lint-custom $(GOLANGCI_LINT); \
 	} || true
 
