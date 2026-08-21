@@ -1016,6 +1016,138 @@ Recorded in [00-requirements.md §6](00-requirements.md); no milestone yet.
   generic exec hooks are already good, but everyone rewrites the same `pg_start_backup`. The trap
   to avoid: a preset that suggests a *database-aware* backup, which the project explicitly does not
   do. The label stays "quiescence", never "Postgres backup".
+- **The orphan reaper's cadence is not exposed, so no campaign can reach the backstop** (found
+  0.6.7; the test-side tolerance shipped there, the product change deliberately did not).
+  `internal/controller/reaper.go` sets `defaultReaperInterval = 10 * time.Minute` (line 46) and
+  `defaultReaperMinAge = 30 * time.Minute` (line 53). `MinAge` and `Interval` are struct fields
+  (lines 167-168) whose defaults `Start` applies, so the product is one step from configurable —
+  and **nothing exposes them**. There is no CLI flag (`cmd/main.go` line 728 constructs
+  `OrphanReaper` with `Client`/`APIReader`/`Recorder`/`OperatorNamespace` and leaves both zero) and
+  no Helm value. An orphan is therefore eligible at creation + 30m and swept no later than +40m —
+  the sweep just before eligibility misses it — which puts the collection outside any budget a
+  crucible spec can sanely hold.
+
+  The consequence is the point of this entry, and it is worse than a slow test. Until 0.6.7 the two
+  crash-path specs (`test/crucible/tests/m1_reliability_test.go` line 252,
+  `m4_teardown_test.go` line 151) were green **only when the ordinary teardown won the race**. The
+  campaign that broke the tie recorded it exactly: a `VolumeSnapshotContent` created 21:26:10 with
+  `deletionTimestamp <nil>` and `ownerRefs []` — nothing had asked for its deletion and nothing
+  would garbage-collect it, so it was waiting for the reaper — while the leak check entered at
+  21:31:16 and gave up at 21:41:16, twenty-five minutes before the object became eligible. So the
+  reaper was never exercised by any campaign, ever.
+
+  0.6.7 bought the observation with patience instead: `m1CrashPathLeakCheckBudget = 50 * time.Minute`
+  on those two sites, derived rather than rounded (30m eligibility floor + one 10m interval for a
+  sweep that just missed + 10m for the sweep's own delete and read-back plus the external
+  snapshot-controller's Delete-policy cascade, measured at just over five minutes under load). That
+  is up to 100 minutes of waiting added to a suite that has measured 2h50m16s green and 3h10m55s
+  red, so a pathological run now lands between roughly four and a half and five hours against the
+  330m timeout in `test/crucible/scripts/run-tests.sh` — inside the ceiling, with less headroom than
+  any other raise in the suite has left.
+
+  The fix is a product change and a small one: flag + Helm value + defaulting on the two fields, so
+  a crash-path spec sets `MinAge` to a minute and **asserts** the collection in minutes rather than
+  enduring forty, giving that wall clock back. Two alternatives are rejected. Leaving it test-side
+  and living with the 50m budget buys the assertion but never the backstop — the spec still cannot
+  distinguish "the reaper collected it" from "the reaper would have, eventually". And shortening the
+  production defaults themselves trades away what the 30m floor exists to be: a race guard, since an
+  exposure's temp clone PVC or mover Job can exist for a few reconciles before the owning Backup's
+  status catches up, and reaping one out from under a slow-but-live reconcile corrupts an in-flight
+  backup. Say the finding plainly, because it generalises past the reaper: **a backstop no campaign
+  can reach is a backstop nobody has verified.**
+- **Pre-pull the mover image at provisioning time** (found 0.6.7, after two campaigns died on the
+  same bound). Measured on two independently provisioned clusters, and the second measurement is the
+  one worth noting: `ClusterBackupLocation dr` created 07:29:56Z and `BackupRepository dr
+  Initialized` 07:41:04Z — **11m08s** (668s), missing a 600s budget by 68 seconds; then, on the next
+  cluster, **11m02s**, reported by the wait itself through the `repository.init` report entry the
+  same lot introduced (`initialized after 11m2s (budget 20m0s; at entry: NO repository had yet
+  initialised on this cluster …)`). Six seconds apart on two clusters is what turned this from a
+  hypothesis into a figure — and it is the instrument reporting its own cost, which is the whole
+  reason that entry exists rather than a log line nobody reads. In the same campaign every later
+  repository initialised without trouble (m4-killed 10:08, m4-corrupt 10:13, m5-erase 10:28) and a
+  manual probe on a warm cluster measured a fresh repository at 31 seconds. So the 637-second
+  difference is neither provisioning nor the object store: `restic init` runs in a Job built from the
+  mover image, which carries restic **and** rclone, and on a node with an empty cache that Job
+  cannot start until the pull finishes. It is paid once per *node*, not once per cluster —
+  `pullPolicy: IfNotPresent` (`charts/crystal-backup/values.yaml` line 84) against three workers
+  (`test/crucible/terraform/servers.tf`), so `dr`'s init warms exactly one of them and the first real
+  backup schedules movers onto the other two, each paying the pull again.
+
+  0.6.7 raised two bounds to tolerate it — the shared-repository init to 20m
+  (`m1ColdRepositoryInitBudget`, with `m1WarmRepositoryInitBudget` deliberately left at 10m for the
+  other eighteen call sites) and m6/headline's run wait to 20m — and the survey that came with it
+  named the bounds still exposed. That survey is **not repeated here**: it lives at the constants it
+  argues about, in `test/crucible/tests/m1_helpers_test.go` (`m1ColdRepositoryInitBudget` and
+  `m1RepositoryInitBudgetFor`) and in the comment above the 20-minute `m1WaitClusterBackupTerminal`
+  in `test/crucible/tests/m6_headline_test.go`. Read those before raising a third one, because the
+  cold-start comment says what a third raise would mean: the bound is the wrong instrument.
+
+  The fix is to pull the mover image at `mise run seed` time (`test/crucible/mise.toml`), so that no
+  test bound carries it and the cost is paid once, visibly, during provisioning. The honest
+  counter-argument belongs with the work rather than after it: **a pre-pull hides a genuine
+  first-pull regression from every campaign** — a mover image that doubled in size, or a registry
+  serving at a quarter of the bandwidth, would stop being observable anywhere. So whatever does the
+  pre-pull must *report* its duration rather than swallow it, into somewhere a campaign actually
+  reads, in the same spirit as the self-measuring wait 0.6.7 added.
+  **The bounds this cost measured, and which are still exposed.** 0.6.7's commit message promised
+  this list lives here, so here it is rather than in a comment nobody greps. Raised: the shared
+  repository's init (10m → 20m, `m1ColdRepositoryInitBudget`) and `m6/headline`'s wait for the first
+  real backup (10m → 20m), the latter because ten minutes *was the pull alone*. Still exposed, each
+  needing its own measurement rather than a speculative raise: `m6/precheck`'s two 10-minute run
+  waits (lower exposure — both are runs where a mover is expected not to complete normally); the
+  six 15-minute run waits (m4 maintenance ×3, m5, `m6/s3tuning`, `m6/stall`), which leave ~4.4
+  minutes of real backup after a cold pull; and the `sync` image, a third image no mover ever warms,
+  whose first pull is paid by whichever external sync runs first — `m5/externalsync` already sets 20
+  minutes and its comment already names the reason, chosen independently and arriving at the same
+  number. Not exposed, checked: the 3-minute operator-pod wait (`IfNotPresent`, and the image is on
+  the node the pod just left) and the two 1-minute waits that re-wait an already-terminal run.
+
+- **Triage leak-check hits by provenance instead of grepping the archive verbatim** (found 0.6.7 in
+  the soak export; the narrow quoted-match rule shipped there, this did not). `hack/soak/collect.sh`
+  searches the unpacked archive for every namespace, PVC, location and bucket name of the cluster,
+  **verbatim**. On the cluster that produced the archive the PVCs are named `data` and `backups`, so
+  the check reports the CRD plural `backups.crystalbackup.io` and the English word "data" as leaks —
+  92 hits in the log stream alone, every one of that shape — and it therefore fails on every export
+  from that cluster, forever. A check that always fails is a check nobody reads, which is the same
+  defect class 0.6.x spent twelve lots removing.
+
+  Three classes have to be separated, and they are already named in the CHANGELOG's 0.6.7 entry.
+  The product's own vocabulary — a CRD plural, a sizing-class name, an ordinary English word — is a
+  false positive and nothing about the archive should change for it. Third-party free text that
+  reconstructs an identifier without quoting it is a real exposure the shipped rule does not reach:
+  a ceph-csi message of the form `<namespace>-<run>-<pvc>-restore`, a path inside a volume, a restic
+  snapshot ID, a URL inside a library's error string — 0.6.7's rule substitutes only *quoted exact
+  matches*, which works because this project writes its own identifiers quoted and says nothing
+  about anyone else's. And a genuine leak in a field that should have been tokenised is the only one
+  of the three that is a defect. Today all three read identically, which is why the count is
+  useless rather than merely noisy.
+
+  The residual 0.6.7 deliberately left, recorded here because it is the half a narrowing would
+  break: a PVC name that reaches the redactor through a **metric label** still lands in the general
+  (blind) registry rather than the quoted one, so on a cluster with a PVC named `data` that has
+  snapshots, ordinary prose is still rewritten. Narrowing that — moving the metric-label path to the
+  quoted registry as well — would regress a documented guarantee of the selfcheck report, so it is
+  not a patch to the release that found it; it is part of this entry, and whoever takes it decides
+  both halves at once or neither.
+- **Nothing durable records the timings that decide an attribution** (0.6.7 hit this twice and
+  answered it neither time). When a campaign or a soak window fails, the evidence needed to say
+  *why* is gone within the hour: Kubernetes Events have expired, and the operator pod has been
+  recreated — routinely, because several lanes kill it deliberately — so `kubectl logs --previous`
+  finds nothing. Both times 0.6.7 could reconstruct the timings only from
+  `status.conditions[].lastTransitionTime`, which happened to be enough once (the cold repository
+  init, 07:29:56Z created against 07:41:04Z Initialized) and impossible the other time, where the
+  question was what the dying operator had and had not managed to record.
+
+  This is stated as a question rather than a design, because it is not settled: **what is the
+  smallest durable, bounded record of the few timings that decide an attribution, and who writes
+  it?** Not more logging — the logs were written, and then the pod holding them was replaced. Three
+  candidates worth costing rather than adopting: the operator persisting a handful of per-run
+  transition timestamps where the CR outlives the pod; the harness capturing them at the moment it
+  observes them, which is what `m1WaitRepositoryInitialized`'s self-measurement now does for exactly
+  one bound and is the cheapest evidence 0.6.7 produced; or the collector's export carrying an
+  event and log tail with a retention it declares. Each moves the cost somewhere different — CR
+  size, harness complexity, archive size — and the mistake to avoid is the one the soak kit already
+  made once: building the instrument before stating what it must be able to answer.
 
 ## Global Definition of Done (every task)
 
