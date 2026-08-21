@@ -301,7 +301,21 @@ var _ = Describe("M6 — an unsnapshottable volume at the head of the queue does
 			}, 2*time.Minute, 10*time.Second).Should(Succeed())
 
 			By("And the platform run counts three successes and no failures")
-			cb := m1WaitClusterBackupTerminal(headlineRun, 10*time.Minute)
+			// 20 minutes, not 10, and the reason is the cold image cache rather than anything this
+			// run does. `dr`'s init warms the mover image on exactly ONE of the three workers
+			// (pullPolicy: IfNotPresent), so the FIRST real backup after it schedules movers onto
+			// the other two, each paying a fresh pull. 0.6.7 measured that pull at ~10m36s — which
+			// is the whole of the old budget, leaving nothing for the backup itself. The suite
+			// shuffles top-level containers, so whether this lane draws the position that pays it
+			// is a coin flip, and this bound is the one the survey after 0.6.7's cold-start failure
+			// named as most exposed.
+			//
+			// This is test PATIENCE, not a product guarantee: a run that genuinely hangs is still
+			// caught by the operator's own deadlines (moverStartDeadline 30m, snapshotReadyDeadline
+			// 2h), which is what actually fails a stuck volume. Widening here delays a red, it does
+			// not hide one. The proper fix is to pre-pull the mover image at provisioning time so
+			// no bound has to carry it; that is named in the roadmap rather than done here.
+			cb := m1WaitClusterBackupTerminal(headlineRun, 20*time.Minute)
 			Expect(cb.Status.Phase).To(Equal("Completed"))
 			Expect(cb.Status.NamespacesMatched).To(Equal(int32(1)))
 			Expect(cb.Status.PVCsSucceeded).To(Equal(int32(len(m6HeadlineGoodPVCs))),

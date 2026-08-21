@@ -238,10 +238,16 @@ const m1LocationIsDefault = true
 // and survive a namespace wipe), and leaving it would reinstate the ambiguity this function exists
 // to remove.
 //
-// It deliberately does NOT wait for the repository to initialise. `restic init` against Hetzner
-// object storage is the slow part, and starting it at second zero lets it finish while the infra
-// and m0 lanes run; the waiting stays at the call sites, where m1WaitRepositoryInitialized's
-// 10-minute budget and its failure diagnostics belong to the spec that needs the repository.
+// It deliberately does NOT wait for the repository to initialise. `restic init` is the slow part,
+// and starting it at second zero lets it finish while the infra and m0 lanes run; the waiting stays
+// at the call sites, where m1WaitRepositoryInitialized's budget and its failure diagnostics belong
+// to the spec that needs the repository.
+//
+// Creating it HERE is also what makes "dr" the one location that pays the cold start, and 0.6.7
+// found that out the expensive way: the first `restic init` cannot run until the mover image has
+// been pulled onto a node with an empty cache, and BeforeSuite is the coldest moment there is.
+// That is a cost, not a regression — the ordering fix is still right — and it is answered by
+// m1ColdRepositoryInitBudget, which explains the 668s that two campaigns died on.
 func m1EnsureSharedLocation() {
 	GinkgoHelper()
 	m1RequireS3()
@@ -309,8 +315,9 @@ func m1FindRepository(locationName string) (cbv1.BackupRepository, bool) {
 	return cbv1.BackupRepository{}, false
 }
 
-// m1WaitRepositoryInitialized waits (up to 10 min) for the BackupRepository backing
-// locationName to report status.initialized==true, and returns it.
+// m1WarmRepositoryInitBudget bounds an init that runs on a cluster where SOME repository has
+// already initialised — which means the mover image (restic + rclone) has already been pulled at
+// least once, and `restic init` starts as soon as its Job is scheduled.
 //
 // 10 min, was 5, and the measurement is worth writing down because the previous number lost a whole
 // campaign by 462 milliseconds. In the 0.6.6 run this helper's Eventually gave up at 16:05:59.462
@@ -326,12 +333,157 @@ func m1FindRepository(locationName string) (cbv1.BackupRepository, bool) {
 // Five minutes was not a wrong estimate of provisioning; it was an estimate with no headroom left
 // for the state the suite is in by then.
 //
+// This number is UNCHANGED by the 0.6.7 cold-start raise below, deliberately. Every warm caller is
+// an isolated repository created by a spec that is already deep into its lane, and the 0.6.7
+// campaign measured three of them — m4-killed at 10:08, m4-corrupt at 10:13, m5-erase at 10:28 —
+// initialising without trouble in the same run that lost "dr" at second zero. Raising all eighteen
+// call sites to the cold budget would buy nothing and would cost the suite the thing 0.6.5 already
+// taught it: budgets that everybody spends are how a run reaches the 240m suite timeout with 21 of
+// 93 specs unrun (see m1AssertNoResidualSnapshotObjects).
+const m1WarmRepositoryInitBudget = 10 * time.Minute
+
+// m1ColdRepositoryInitBudget bounds the FIRST init on a cluster, which pays for the mover image
+// pull before `restic init` can run at all.
+//
+// 20 min, was 10, was 5 — and a THIRD raise would mean this bound is the wrong instrument. Read
+// that sentence before changing this number.
+//
+// The 0.6.7 campaign failed twice, on two independently provisioned clusters, at the same bound.
+// The measurement, from the cluster that produced it:
+//
+//	ClusterBackupLocation dr created   07:29:56Z
+//	BackupRepository dr Initialized    07:41:04Z   → 11m08s (668s)
+//
+// It missed 600s by 68 seconds. In the SAME campaign every LATER repository initialised without
+// trouble, and a manual probe on a warm cluster measured a fresh repository at 31 seconds. So the
+// 637-second difference is not provisioning and is not the object store: it is a cold-start cost
+// paid ONCE per cluster. `restic init` runs in a Job built from the mover image, which carries both
+// restic and rclone; on a node with an empty image cache that Job cannot start until the image is
+// pulled.
+//
+// 0.6.7's own change made it worse, and that is not an argument against the change. Moving the
+// shared "dr" location into a BeforeSuite precondition (m1EnsureSharedLocation) is correct for
+// ordering — it removed a coin flip that had been decided by Ginkgo's shuffle for releases — but it
+// moved the first initialisation to the coldest possible moment, the first seconds of the suite,
+// before anything has pulled the image. Before that change the first init happened later, after
+// some lane had already paid the pull, which is why the cost had never been visible.
+//
+// Why 20 and not a rounder or a tighter number. 668s is the ONLY measured cold value, so the budget
+// is an argument about the variable term, not a scaled guess at the total. Decomposed: 31s of
+// actual init, ~637s of image pull. 1200s leaves ~1169s for the pull — 1.8× what was measured —
+// which is enough to absorb one kubelet pull retry (ImagePullBackOff is 10s/20s/40s… before a fresh
+// attempt) or a registry serving at roughly half the bandwidth. 15 min was considered and rejected:
+// 900s leaves 869s, a 1.36× margin over a single sample, and 1.36× is the same knife's edge that
+// has now lost two campaigns — 0.6.6 by 462ms at the 5m bound, 0.6.7 by 68s at the 10m bound. The
+// cost of the extra ten minutes is bounded and paid at most once per run: only the shared location
+// draws this budget (m1RepositoryInitBudgetFor), and only when the repository never initialises.
+//
+// What a third raise would actually mean, and why the answer would not be a bigger number: it would
+// mean either the pull is being paid more than once per cluster (the init Job's placement is
+// unconstrained, so a later Job CAN land on a node that never pulled the image), or the pull is not
+// the cause at all. Neither is fixed by widening the window. The fixes are to pre-pull the mover
+// image at provisioning time, or to wait on the init Job's pod events instead of on a wall clock.
+// The helper now MEASURES and reports the elapsed time on every run, so that decision is made from
+// a number rather than reconstructed afterwards — which is exactly what 0.6.7 needed and could
+// barely do: the events had expired and the operator pod had been recreated by a lane that kills it
+// deliberately, so the only surviving evidence was a lastTransitionTime.
+const m1ColdRepositoryInitBudget = 20 * time.Minute
+
+// m1RepositoryInitBudgetFor is the rule that decides which of the two budgets a wait gets, in one
+// place and by a fact rather than by taste.
+//
+// The shared "dr" location is the only one that can pay the cold start, and that is provable rather
+// than observed: BeforeSuite creates it (m1EnsureSharedLocation) before any spec runs, so its init
+// is necessarily the first init on the cluster, and every other location in the suite is created by
+// a spec that runs afterwards.
+//
+// Rejected: deciding at RUN time from "has any repository initialised yet?". It is cheap — the List
+// is already there — but as a budget selector it is dangerous in exactly one direction: an init Job
+// whose placement lands it on a node that never pulled the image is cold even though another
+// repository initialised long ago, and the run-time rule would hand that case the SHORT budget.
+// Being generous when wrong costs a slower failure; being stingy when wrong is the bug that lost
+// 0.6.7. The observation is still worth having, so it is REPORTED (m1InitializedRepositoryCount)
+// and never used to shorten anything.
+func m1RepositoryInitBudgetFor(locationName string) time.Duration {
+	if locationName == m1LocationName {
+		return m1ColdRepositoryInitBudget
+	}
+	return m1WarmRepositoryInitBudget
+}
+
+// m1InitializedRepositoryCount reports how many BackupRepositories already report
+// status.initialized==true. Best-effort: it returns -1 rather than turning an unreadable list into
+// a spec failure, the same stance m1OperatorRestartSummary takes.
+//
+// Zero is the one value that carries a real inference, and it is a sound one: a mover pod can only
+// run against an initialized repository, so if nothing has initialized here then nothing has ever
+// finished pulling the mover image, and this wait includes that pull. A non-zero count is only
+// evidence that SOME node has the image, not this Job's node — which is why it is reported and not
+// acted on.
+func m1InitializedRepositoryCount() int {
+	var repos cbv1.BackupRepositoryList
+	if err := k8s.List(ctx, &repos); err != nil {
+		return -1
+	}
+	n := 0
+	for i := range repos.Items {
+		if repos.Items[i].Status.Initialized {
+			n++
+		}
+	}
+	return n
+}
+
+// m1DescribeInitializedRepositoryCount renders that count for a human, including the "unknown" case.
+func m1DescribeInitializedRepositoryCount(n int) string {
+	switch {
+	case n < 0:
+		return "the repository list was unreadable, so it is unknown whether any had initialised"
+	case n == 0:
+		return "NO repository had yet initialised on this cluster, so this wait includes the one-time mover image pull"
+	default:
+		return fmt.Sprintf("%d repository(ies) had already initialised on this cluster, so the mover image was "+
+			"already pulled onto at least one node (not necessarily this init Job's node)", n)
+	}
+}
+
+// m1WaitRepositoryInitialized waits for the BackupRepository backing locationName to report
+// status.initialized==true, and returns it. The budget is m1RepositoryInitBudgetFor's — 20 min for
+// the shared location, which pays the cold start, 10 for every other.
+//
+// It MEASURES, and that is the point of the helper as much as the waiting is. Every campaign now
+// yields the elapsed time to initialisation as a report entry, on success as well as on timeout,
+// because 0.6.7 needed that number and had to reconstruct it from a lastTransitionTime after the
+// events had expired and the operator pod had been replaced. AddReportEntry is how the rest of this
+// suite surfaces a measured fact it does not assert on (m6_fidelity's corpus line,
+// m6_s3tuning's per-wave throughput); this is the same channel, not a new one.
+//
 // This bound exists so a slow answer is not read as a missing one. It is not a claim about how fast
-// provisioning should be: if the operator ever takes ten minutes there IS a defect, and the failure
-// message names the location and the URL so the next reader starts from the object store rather than
-// from here.
+// provisioning should be: if a WARM init ever takes ten minutes there IS a defect, and the failure
+// message names the location, the URL and the elapsed time so the next reader starts from the init
+// Job and the object store rather than from here.
 func m1WaitRepositoryInitialized(locationName string) *cbv1.BackupRepository {
 	GinkgoHelper()
+
+	budget := m1RepositoryInitBudgetFor(locationName)
+	startedAt := time.Now()
+	priorInits := m1InitializedRepositoryCount()
+
+	// Reported from a defer so the measurement survives BOTH exits: on a timeout Ginkgo unwinds the
+	// goroutine from inside Should(), and anything after the Eventually would never run. A wait that
+	// only reports its number when it succeeds is the instrument 0.6.7 did not have.
+	initialized := false
+	defer func() {
+		outcome := "TIMED OUT"
+		if initialized {
+			outcome = "initialized"
+		}
+		AddReportEntry(fmt.Sprintf("repository.init %s", locationName),
+			fmt.Sprintf("%s after %s (budget %s; at entry: %s)",
+				outcome, time.Since(startedAt).Round(time.Second), budget,
+				m1DescribeInitializedRepositoryCount(priorInits)))
+	}()
+
 	var repo cbv1.BackupRepository
 	Eventually(func(g Gomega) {
 		found, ok := m1FindRepository(locationName)
@@ -340,7 +492,25 @@ func m1WaitRepositoryInitialized(locationName string) *cbv1.BackupRepository {
 			"BackupRepository %s (location %q) not Initialized yet (url=%q)",
 			found.Name, locationName, found.Status.RepositoryURL)
 		repo = found
-	}, 10*time.Minute, 5*time.Second).Should(Succeed())
+	}, budget, 5*time.Second).Should(Succeed(),
+		// A func() string description, not a format string: Gomega evaluates it only on failure,
+		// which is the only way the elapsed time in it can be the REAL elapsed time rather than
+		// zero measured at the call.
+		func() string {
+			return fmt.Sprintf(
+				"BackupRepository for location %q never reported Initialized: gave up after %s (budget %s).\n"+
+					"At the moment this wait began, %s.\n"+
+					"The EXPECTED cause is a first-init on a cold cluster. `restic init` runs in a Job built from "+
+					"the mover image (restic + rclone), and on a node with an empty image cache that Job cannot "+
+					"start until the image is pulled. 0.6.7 measured that once: 668s cold, against 31s for a later "+
+					"init on a warm cluster — a cost paid ONCE per cluster.\n"+
+					"If the line above says a repository had ALREADY initialised, or the elapsed time is far past "+
+					"668s, the pull is NOT the explanation and raising this bound a third time will not help: go to "+
+					"the init Job and its pod events, and to the object store, not to this number.",
+				locationName, time.Since(startedAt).Round(time.Second), budget,
+				m1DescribeInitializedRepositoryCount(priorInits))
+		})
+	initialized = true
 	return &repo
 }
 
