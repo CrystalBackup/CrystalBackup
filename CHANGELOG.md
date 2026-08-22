@@ -4,16 +4,31 @@ All notable changes to Crystal Backup. Versioning follows
 [adr/0014](spec/adr/0014-versioning-and-release.md): milestone `Mn` → minor `0.n.z` on
 major 0; `1.0.0` is a deliberate post-M9 API-stability decision.
 
-## 0.6.7 — Nine days of a report condemning volumes it was never allowed to look at (2026-08-20)
+## 0.6.7 — Nine days of a report condemning volumes it was never allowed to look at (2026-08-22)
 
-**Validated on real infrastructure: 93 of 93 crucible checks, 0 failed, 0 skipped, in 2h43m48s** —
-the whole suite unfiltered on a freshly provisioned six-node RKE2 v1.35.7 + Rook-Ceph v1.19.0
-cluster with real S3, against the three image digests this release ships.
+**Validated on real infrastructure: 93 of 93 crucible checks, 0 failed, 0 skipped, in 2h45m57s** —
+the whole suite unfiltered on a freshly provisioned six-node RKE2 v1.35.7 + Rook-Ceph v1.19.0 cluster
+with real S3, against the three go1.26.6 image digests this release ships. An earlier 93 of 93 in this
+same cycle is deliberately NOT the verdict: it validated the go1.26.5 tree, which the seven reachable
+advisories below disqualified, and a verdict describing a tree nobody will install is exactly the
+shape this release exists to remove.
 
-**It took three attempts, and both red ones were the harness rather than the product.** No product
-code changed between the three runs — the same three digests were deployed each time — so the two
-failures are worth recording as findings in their own right, because both had been winning a coin
-flip for two releases.
+**The release's own security gates refused it, and they were right.** The first tag built cleanly and
+then stopped: govulncheck reported **seven advisories reachable** from the operator and the trivy
+0-known-CVE gate refused the mover and the sync images. All seven are in the Go standard library —
+`net/url`, `net/http`, `crypto/tls`, `encoding/asn1`, `encoding/xml`, `html/template` — and all seven
+are fixed in **go1.26.6**. The scheduled `vex-refresh` had failed four hours earlier on the same wave:
+it was the canary, and nobody was watching it. A reachable advisory is a bug to fix, not a statement
+to publish, so this is a toolchain bump rather than a VEX entry, applied at the four places the
+version is pinned. Both binaries now report *No vulnerabilities found* where the operator was
+affected by seven.
+
+**The campaigns are worth recording, because none of the red ones was the product.** No product code
+changed between them; the same digests were deployed each time. Two were the harness winning a coin
+flip it had been winning for two releases, one was a cold-start cost the previous fix had made worse,
+and one is disqualified by an operator error — a campaign relaunched on a cluster that still carried
+a deliberately corrupted repository from an aborted lane, which the next lane's alert assertions
+could not survive. Cleanliness of a cluster is not the absence of product residue.
 
 Run 1 failed the m6 stall check at **0.272s**. Its leak check fails fast on residue that predates
 it, on the premise that *"no teardown this spec is waiting on can remove an object that already
@@ -35,6 +50,17 @@ garbage-collects the very `BackupRepository` the other lanes poll for. The locat
 suite-level precondition with one canonical bootstrap, all six deletions are gone, and the
 default-flag disagreement hiding behind them — four lanes creating it with `true`, one with `false`,
 each guarded by `IsNotFound` so the shuffle decided — is no longer expressible.
+
+A later run then failed on a **cold cluster's first repository initialisation**: the shared location
+was created at 07:29:56Z and reported Initialized at 07:41:04Z — 11m08s against a 10-minute budget,
+missed by 68 seconds — while every later repository in the same campaign initialised without trouble
+and a probe on a warm cluster measured 31 seconds. That is ~31s of `restic init` behind ~637s of
+pulling the mover image, which carries restic and rclone, onto a node with an empty cache, and it is
+paid once per cluster. This release's own `BeforeSuite` precondition made it worse by moving the
+first init to the coldest possible moment — right for ordering, and worth saying. The budget is now
+per-case with the rule proved rather than assumed, the wait **measures itself** so the next campaign
+reports a number instead of leaving it to be reconstructed, and the survey that came with it raised
+the next bound it found exposed.
 
 The seed stays unpinned, deliberately. The shuffle is the only instrument this suite has for finding
 cross-container coupling, and it has now found two real defects that a fixed seed would have frozen
