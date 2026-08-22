@@ -132,13 +132,16 @@ fi
 
 # --- 2b. rclone, for the ONE image that ships it (sync) -----------------------------------
 # Same shape as the restic block and for the same reason: we build this binary, so we analyse the
-# source we build. The override matters as much here — rclone ${RCLONE_VERSION} pulls an
-# x/text whose norm.Iter carries CVE-2026-56852 (fixed in 0.39.0). Keep the x/text version in
-# LOCKSTEP with build/melange/rclone.yaml; a drift here would produce a VEX describing a binary
-# nobody runs. grpc gets the same override for the same reason it does in the restic block:
-# GO-2026-6061 is reachable through rclone's Google Cloud Storage backend. x/image needs no
-# override at 1.74.4 — rclone's own pin is already past the two TIFF advisories that started
-# this detour.
+# source we build. The override matters as much here — rclone ${RCLONE_VERSION} pulls an x/image
+# whose VP8L decoder carries CVE-2026-46603 / GO-2026-6222 (fixed in 0.45.0). Keep the x/image
+# version in LOCKSTEP with build/melange/rclone.yaml; a drift here would produce a VEX describing
+# a binary nobody runs.
+#
+# The x/text and grpc overrides that used to be here are GONE, and deliberately so: rclone 1.75.0
+# pins x/text v0.40.0 and a grpc pseudo-version above 1.82.1 on its own, so forcing them would
+# assert a difference this build no longer makes. They remain in the restic block above because
+# restic 0.19.1 has NOT caught up. The two blocks are allowed to diverge; each must mirror its own
+# melange recipe, not the other one.
 if [ "$COMPONENT" = "sync" ]; then
   RECIPE="${REPO_ROOT}/build/melange/rclone.yaml"
   RCLONE_VERSION="$(sed -n 's/^  version: *"\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' "$RECIPE" | head -n1)"
@@ -165,7 +168,7 @@ if [ "$COMPONENT" = "sync" ]; then
   mkdir -p "${WORK}/rclone-src"
   tar xzf "$TARBALL" -C "${WORK}/rclone-src" --strip-components=1
   ( cd "${WORK}/rclone-src" \
-      && GOFLAGS=-mod=mod go get golang.org/x/text@v0.40.0 google.golang.org/grpc@v1.82.1 \
+      && GOFLAGS=-mod=mod go get golang.org/x/image@v0.45.0 \
       && GOFLAGS=-mod=mod go mod tidy \
       && govulncheck -format openvex . ) > "${WORK}/rclone.json"
   DOCS+=("${WORK}/rclone.json")

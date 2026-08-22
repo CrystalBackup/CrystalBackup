@@ -8,11 +8,28 @@
 #
 # Version pin: restic >= 0.19.1 (spec/90-roadmap.md M1, "delta 3" stale-lock fixes).
 # Bumping restic = bump `version` + `expected-sha256` here AND the `restic=` pin in
-# build/apko/mover.yaml, in the same PR (deliberate, tested upgrade — adr/0001).
+# build/apko/mover.yaml AND build/apko/sync.yaml, in the same PR (deliberate, tested
+# upgrade — adr/0001). The EPOCH is part of that lockstep for the reason spelled out below.
+#
+# THE EPOCH IS LOAD-BEARING, and it is a claim rather than a counter — the same rule
+# build/melange/rclone.yaml carries, learned the same way. trivy matches Wolfi advisories
+# against the apk's NAME and VERSION, not against the module graph or the toolchain actually
+# linked into the binary. A package calling itself restic-0.19.1-r0 is flagged by every
+# advisory Wolfi records as fixed in a later epoch of 0.19.1, however clean the bytes are.
+#
+# Wolfi names 0.19.1-r3 as the release carrying the go1.25.13/go1.26.6 standard-library fixes
+# (CVE-2026-33818, CVE-2026-39821, CVE-2026-56853, CVE-2026-56858, CVE-2026-56859,
+# CVE-2026-56860, CVE-2026-56862 — net/url, net/http, crypto/tls, encoding/asn1, encoding/xml,
+# html/template), and THIS BUILD CARRIES THOSE SAME FIXES: the go-package below is go-1.26,
+# which Wolfi ships at 1.26.7. The epoch asserts an equivalence the pipeline actually
+# establishes. Wolfi's later 0.19.1-r4 and -r5 record no security fixes, so claiming them
+# would over-state what this build closes; r3 is the smallest honest number.
+# If the toolchain were ever moved back, this number would become a lie that silences a
+# scanner — the suppression adr/0013 refused. The two must move together.
 package:
   name: restic
   version: "0.19.1"
-  epoch: 0
+  epoch: 3
   description: "Fast, secure, efficient backup program — pinned engine for Crystal Backup movers"
   url: https://restic.net/
   copyright:
@@ -30,16 +47,19 @@ environment:
     repositories:
       - https://packages.wolfi.dev/os
     packages:
-      # The go toolchain (go-1.25, pinned below), build-base, busybox and
+      # The go toolchain (go-1.26, pinned below), build-base, busybox and
       # ca-certificates-bundle are added automatically by the go/build pipeline's
       # `needs.packages`; only the extras go here.
       - git # module-resolution fallback for any non-proxy dependency
-      - go-1.25 # needed BEFORE go/build too, for the x/text override step below
+      - go-1.26 # needed BEFORE go/build too, for the x/text override step below
   environment:
     CGO_ENABLED: "0"
     GOFLAGS: "-trimpath -mod=readonly"
     # Fail loudly instead of silently network-fetching a toolchain: keeps the build
-    # hermetic/reproducible. go-1.25 (>= 1.25.8, restic's go.mod) satisfies it.
+    # hermetic/reproducible. restic's go.mod asks for `go 1.25.8`, which is a MINIMUM, not a
+    # match: a 1.26 toolchain builds it while compiling the code at the go1.25 language
+    # version the directive names, so the semantics do not shift under us. GOTOOLCHAIN=local
+    # only forbids *downloading* another toolchain — it does not require an exact minor.
     GOTOOLCHAIN: local
 
 pipeline:
@@ -71,7 +91,15 @@ pipeline:
   - name: Build restic (CLI)
     uses: go/build
     with:
-      go-package: go-1.25 # pin the toolchain minor to restic's go.mod (go 1.25.8); Wolfi go-1.25 = 1.25.12
+      # go-1.26 (Wolfi ships 1.26.7), NOT go-1.25. The seven standard-library advisories named
+      # in the epoch note above are fixed in go1.25.13 AND go1.26.6 — Go backports to the two
+      # most recent minors, so the 1.25 line does have a fix upstream. Wolfi has not packaged
+      # it: go-1.25 stops at 1.25.12-r1 (2026-07-22) and Go 1.25 went end-of-life when 1.27.0
+      # shipped, so a fixed go-1.25 is not coming. With GOTOOLCHAIN=local the build cannot
+      # fetch go1.25.13 itself, so go-1.26 is the only toolchain in the hermetic environment
+      # that closes all seven. Rejected: relaxing GOTOOLCHAIN to pull go1.25.13 over the
+      # network (breaks hermeticity for a line that is already EOL).
+      go-package: go-1.26
       packages: ./cmd/restic
       output: restic
       # restic bakes its version into internal/global.Version (a compile-time const), so

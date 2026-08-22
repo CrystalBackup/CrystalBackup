@@ -14,7 +14,7 @@ contents:
     - glibc                    # adr/0012: glibc base (NOT musl) — DNS/NSS fidelity for the data path
     - ca-certificates-bundle   # TLS to S3 / object storage
     - tzdata                   # IANA zones (consistent time handling in the mover)
-    - restic=0.19.1-r0         # pinned engine from build/melange/restic.yaml (local apk); exact pin selects our build
+    - restic=0.19.1-r3         # pinned engine from build/melange/restic.yaml (local apk); exact pin selects our build
     - crystal-backup-mover     # local apk (build/melange/mover.yaml); CI stages it into ./packages
 
 # No `accounts` block: the image default user is root (uid 0). This is intentional — the

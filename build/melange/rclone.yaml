@@ -27,14 +27,27 @@
 # A package calling itself rclone-1.74.3-r0 is flagged by the advisory that names 1.74.3-r5 as the
 # fix, however clean the bytes are. Verified by building exactly that and scanning it.
 #
-# So the version string has to be true in the scanner's own terms. `1.74.4-r2` is chosen because
-# Wolfi names 1.74.4-r2 as the release carrying the x/text fix, and THIS BUILD CARRIES THAT SAME
-# FIX — see the override below. The epoch asserts an equivalence that the pipeline actually
-# establishes. If the override were ever removed, this number would become a lie that silences a
-# scanner, which is precisely the suppression adr/0013 refused; the two must move together.
+# So the version string has to be true in the scanner's own terms. `1.75.0-r2` is chosen because
+# Wolfi names two releases of 1.75.0 as carrying fixes this image needs, and THIS BUILD CARRIES
+# BOTH OF THEM:
+#   * 1.75.0-r1 — the go1.25.13/go1.26.6 standard-library batch (CVE-2026-33818, CVE-2026-39821,
+#     CVE-2026-56853, CVE-2026-56858, CVE-2026-56859, CVE-2026-56860, CVE-2026-56862: net/url,
+#     net/http, crypto/tls, encoding/asn1, encoding/xml, html/template). Carried by the go-1.26
+#     toolchain pinned below, which Wolfi ships at 1.26.7.
+#   * 1.75.0-r2 — CVE-2026-46603 / GO-2026-6222, excessive memory allocation while decoding VP8L
+#     in golang.org/x/image, fixed in 0.45.0. rclone 1.75.0 still pins 0.44.0, so this one is
+#     carried by the x/image override below.
+# The epoch asserts an equivalence that the pipeline actually establishes. If either the toolchain
+# or that override were removed, this number would become a lie that silences a scanner, which is
+# precisely the suppression adr/0013 refused; they must move together.
+#
+# Why the VERSION moved and not just the epoch: apk orders 1.74.4-r99 *below* 1.75.0-r1, so no
+# epoch bump on the 1.74.4 line could ever clear the standard-library batch — Wolfi recorded that
+# fix against 1.75.0. Tracking the newest upstream release is not a preference here, it is the
+# only option that does not suppress a finding.
 package:
   name: rclone
-  version: "1.74.4"
+  version: "1.75.0"
   epoch: 2
   description: "rsync for cloud storage — pinned backend for Crystal Backup external sync"
   url: https://rclone.org/
@@ -56,12 +69,15 @@ environment:
       # The go toolchain, build-base, busybox and ca-certificates-bundle are added automatically
       # by the go/build pipeline's `needs.packages`; only the extras go here.
       - git # module-resolution fallback for any non-proxy dependency
-      - go-1.25 # needed BEFORE go/build too, for the x/image override step below
+      - go-1.26 # needed BEFORE go/build too, for the x/image override step below
   environment:
     CGO_ENABLED: "0"
     GOFLAGS: "-trimpath -mod=readonly"
     # Fail loudly instead of silently network-fetching a toolchain: keeps the build
-    # hermetic/reproducible.
+    # hermetic/reproducible. rclone's go.mod asks for `go 1.25.0`, which is a MINIMUM, not a
+    # match: the go-1.26 toolchain builds it while compiling at the go1.25 language version the
+    # directive names, so no semantics shift under us. GOTOOLCHAIN=local only forbids
+    # *downloading* another toolchain — it does not require an exact minor.
     GOTOOLCHAIN: local
 
 pipeline:
@@ -74,35 +90,42 @@ pipeline:
       # Same asset and same hash Dockerfile.sync verifies, so the kind e2e and the production image
       # build the same source.
       uri: https://github.com/rclone/rclone/releases/download/v${{package.version}}/rclone-v${{package.version}}.tar.gz
-      expected-sha256: 23fb09cd209ac6f4540f75cbcfc913fb1e2a35b90cf1a9d67292e2239b4f3a24
+      expected-sha256: 4e08746025d989a4bb1c9a51a7fbdb927e9df61216c9172fd344823aa6a8acd8
       strip-components: 1
 
-  - name: Override x/text and grpc past their reachable advisories
+  - name: Override x/image past its reachable advisory
     runs: |
-      # GO-2026-5970 / CVE-2026-56852 — infinite loop in x/text/unicode/norm, fixed in 0.39.0.
-      # rclone 1.74.4 still pins 0.38.0, and Wolfi names 1.74.4-r2 as the release that carries the
-      # fix; this build carries it here, which is what makes the epoch above honest.
+      # GO-2026-6222 / CVE-2026-46603 — excessive memory allocation while decoding VP8L in
+      # golang.org/x/image, fixed in 0.45.0. rclone 1.75.0 still pins v0.44.0, and Wolfi names
+      # 1.75.0-r2 as the release that carries the fix; this build carries it here, which is what
+      # makes the epoch above honest.
       #
-      # x/image needs NO override at this version: the two TIFF advisories that started this whole
-      # detour (GO-2026-5062 / CVE-2026-46602 and GO-2026-5066 / CVE-2026-46604, both fixed in
-      # 0.43.0) are cleared by rclone 1.74.4's own pin of x/image v0.43.0. Upstream got there
-      # first — which is the outcome to prefer, and the reason this recipe tracks the newest
-      # release rather than the one Wolfi happens to package.
+      # x/image is back in this step after being absent at 1.74.4, and the reason is worth
+      # recording: the override was dropped when rclone's own pin (v0.43.0) overtook the two TIFF
+      # advisories that started this detour (GO-2026-5062 / CVE-2026-46602 and GO-2026-5066 /
+      # CVE-2026-46604). A NEW x/image advisory has since landed on the decoder, and upstream has
+      # not caught up again. The module keeps needing this treatment; the list of overrides is a
+      # moving target, not a one-off.
+      #
+      # TWO OVERRIDES WERE DELIBERATELY REMOVED HERE, because 1.75.0 makes them obsolete rather
+      # than because the gate stopped complaining:
+      #   * golang.org/x/text — GO-2026-5970 / CVE-2026-56852 (infinite loop in unicode/norm,
+      #     fixed in 0.39.0). rclone 1.75.0 pins v0.40.0 itself, the exact version this recipe
+      #     used to force.
+      #   * google.golang.org/grpc — GO-2026-6061 / GHSA-hrxh-6v49-42gf (xDS RBAC authorization
+      #     engine and HTTP/2 transport server, fixed in 1.82.1), reached through the Google Cloud
+      #     Storage backend. rclone 1.75.0 pins v1.84.0-dev.0.20260723093437-b6eac429d7b6, which
+      #     sorts above 1.82.1.
+      # Upstream overtaking an override is the outcome to prefer, and the reason this recipe
+      # tracks the newest release rather than the one Wolfi happens to package. Re-add either the
+      # moment a future rclone regresses its pin below those versions — govulncheck in the release
+      # gate is what will say so.
       #
       # Kept in LOCKSTEP with build/vex/generate-vex.sh, which applies the same override so the
       # VEX describes this binary rather than the vanilla tarball.
       #
-      # GO-2026-6061 / GHSA-hrxh-6v49-42gf — xDS RBAC authorization engine and HTTP/2 transport
-      # server in google.golang.org/grpc, fixed in 1.82.1. rclone reaches it through its Google
-      # Cloud Storage backend, exactly as restic reaches it through its own GCS backend — so this
-      # gets the treatment restic.yaml has carried since GO-2026-6061 was published.
-      #
-      # It was missed when this recipe was written, and the release gate caught it: govulncheck
-      # refused to publish the sync image with a REACHABLE advisory, which is precisely the job
-      # that gate exists to do. The mover passed the same gate because restic already had it.
-      #
       # The go/build step below runs with -mod=readonly; the module edit needs -mod=mod.
-      GOFLAGS=-mod=mod go get golang.org/x/text@v0.40.0 google.golang.org/grpc@v1.82.1
+      GOFLAGS=-mod=mod go get golang.org/x/image@v0.45.0
       # tidy completes go.sum for the NEW graph; without it the -mod=readonly go/build below
       # fails on a missing go.sum entry.
       GOFLAGS=-mod=mod go mod tidy
@@ -110,7 +133,14 @@ pipeline:
   - name: Build rclone (CLI)
     uses: go/build
     with:
-      go-package: go-1.25
+      # go-1.26 (Wolfi ships 1.26.7), NOT go-1.25. The standard-library batch named in the epoch
+      # note above is fixed in go1.25.13 AND go1.26.6 — Go backports to the two most recent minors,
+      # so the 1.25 line does have a fix upstream. Wolfi has not packaged it: go-1.25 stops at
+      # 1.25.12-r1 (2026-07-22), and Go 1.25 went end-of-life when 1.27.0 shipped, so a fixed
+      # go-1.25 is not coming. With GOTOOLCHAIN=local the build cannot fetch go1.25.13 itself, so
+      # go-1.26 is the only toolchain in the hermetic environment that closes the batch. Rejected:
+      # relaxing GOTOOLCHAIN to pull go1.25.13 over the network (breaks hermeticity for an EOL line).
+      go-package: go-1.26
       packages: .
       output: rclone
       # rclone reads its version from a LINKER variable, unlike restic which bakes a compile-time

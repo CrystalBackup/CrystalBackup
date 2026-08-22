@@ -17,8 +17,8 @@ Three images:
 | Image | melange wraps | extra |
 |-------|---------------|-------|
 | **operator** (`build/{melange,apko}/operator.yaml`) | the `manager` binary (`./cmd`) | — |
-| **mover** (`build/{melange,apko}/mover.yaml`) | the `crystal-mover` binary (`./cmd/crystal-mover`) | **also needs `restic` built from source** (`build/melange/restic.yaml`), which apko pins as `restic=0.19.1-r0` |
-| **sync** (`build/{melange,apko}/sync.yaml`) | the **same** `crystal-mover` binary | the same pinned `restic`, **plus `rclone`** built from source too (`build/melange/rclone.yaml`), which apko pins as `rclone=1.74.4-r2` |
+| **mover** (`build/{melange,apko}/mover.yaml`) | the `crystal-mover` binary (`./cmd/crystal-mover`) | **also needs `restic` built from source** (`build/melange/restic.yaml`), which apko pins as `restic=0.19.1-r3` |
+| **sync** (`build/{melange,apko}/sync.yaml`) | the **same** `crystal-mover` binary | the same pinned `restic`, **plus `rclone`** built from source too (`build/melange/rclone.yaml`), which apko pins as `rclone=1.75.0-r2` |
 
 > **The mover and sync are the slow ones** (they compile restic from source under emulation). They
 > change rarely — the operator computes the restic arguments, the mover just runs `restic`. **Build
@@ -142,7 +142,7 @@ GOTOOLCHAIN=local CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
   mise exec -- go build -trimpath -ldflags="-s -w" -o stage-x86_64/crystal-mover ./cmd/crystal-mover
 
 # 2. build restic FROM SOURCE into the local apk repo — the slow step (minutes under QEMU).
-#    Produces packages/x86_64/restic-0.19.1-r0.apk, which the apko pin restic=0.19.1-r0 selects.
+#    Produces packages/x86_64/restic-0.19.1-r3.apk, which the apko pin restic=0.19.1-r3 selects.
 melange build build/melange/restic.yaml \
   --arch x86_64 --runner docker \
   --signing-key melange.rsa --out-dir ./packages
@@ -227,7 +227,7 @@ mise run test            # in test/crucible/  (e.g. `mise run test m1`)
 | `Cannot connect to the Docker daemon at unix:///var/run/docker.sock` | `DOCKER_HOST` not set to the Rancher Desktop socket → `export DOCKER_HOST="unix://$HOME/.rd/docker.sock"`. |
 | `melange … unable to populate workspace: open build/melange/test-dirfs-0: no such file` | melange's multi-arch test-workspace race. **Build one arch at a time** (`--arch x86_64` only, as above). CI hit this with combined `--arch x86_64,aarch64` and fixes it with a per-arch loop. |
 | `go: downloading go1.26.5` / toolchain version mismatch | a stray older `/usr/local/go`. Use `GOTOOLCHAIN=local mise exec -- go …` and keep the mise go first on `PATH`. |
-| `apko lock` can't resolve `restic=0.19.1-r0` | the restic apk isn't in `./packages` (or is a different version). Re-run the restic melange build (mover step 2); the apko pin in `build/apko/mover.yaml` must equal `restic.yaml`'s `version`-r`epoch`. |
+| `apko lock` can't resolve `restic=0.19.1-r3` | the restic apk isn't in `./packages` (or is a different version). Re-run the restic melange build (mover step 2); the apko pin in `build/apko/mover.yaml` must equal `restic.yaml`'s `version`-r`epoch`. |
 | mover Jobs `ImagePullBackOff`, or the operator runs old code | you deployed `head image-refs.txt` instead of the tag's INDEX digest. Always resolve it with `docker buildx imagetools inspect …:dev \| awk '/^Digest:/{print $2; exit}'` — and not the `--format '{{.Manifest.Digest}}'` template, which some buildx versions ignore, printing the entire inspect instead. The release workflow signed an amd64 child manifest for four releases because of exactly this. |
 | `denied` on `apko publish` | `docker login ghcr.io` with a `write:packages` token (packages are public to pull, but pushing needs auth). |
 | stale `./packages` after a version bump | `rm -rf ./packages apko.lock.json` and rebuild; melange appends to the local apk index, so a leftover old version can shadow the new one. |

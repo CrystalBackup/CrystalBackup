@@ -48,14 +48,14 @@ RUN echo "${RESTIC_SHA256}  /tmp/restic.tar.gz" | sha256sum -c - \
 # The tarball is rclone's OWN release asset (rclone-vX.Y.Z.tar.gz, listed in their PGP-signed
 # SHA256SUMS), not the GitHub `archive/refs/tags/` URL — that one is generated on demand and is not
 # guaranteed byte-stable, so a hash pinned against it can start failing without anything changing.
-# Hash below verified against the published SHA256SUMS on 2026-07-28.
+# Hash below verified against the published SHA256SUMS on 2026-08-22.
 #
 # The version tracks build/melange/rclone.yaml — which is now also a from-source build, since Wolfi
 # carried advisories with no published fix (adr/0013). It does NOT have to match exactly (this image
 # never ships), but keeping it in step is what makes an e2e failure informative about the production
 # image rather than about a version nobody runs.
-ARG RCLONE_VERSION=1.74.4
-ARG RCLONE_SHA256=23fb09cd209ac6f4540f75cbcfc913fb1e2a35b90cf1a9d67292e2239b4f3a24
+ARG RCLONE_VERSION=1.75.0
+ARG RCLONE_SHA256=4e08746025d989a4bb1c9a51a7fbdb927e9df61216c9172fd344823aa6a8acd8
 ADD https://github.com/rclone/rclone/releases/download/v${RCLONE_VERSION}/rclone-v${RCLONE_VERSION}.tar.gz /tmp/rclone.tar.gz
 RUN echo "${RCLONE_SHA256}  /tmp/rclone.tar.gz" | sha256sum -c - \
     && mkdir -p /tmp/rclone \
