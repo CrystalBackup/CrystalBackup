@@ -1149,6 +1149,22 @@ Recorded in [00-requirements.md §6](00-requirements.md); no milestone yet.
   size, harness complexity, archive size — and the mistake to avoid is the one the soak kit already
   made once: building the instrument before stating what it must be able to answer.
 
+- **An envtest bound that fails only on a shared runner** (seen once, 0.6.7, on the tagged commit).
+  `Unit tests` went red in CI on `restore_resources_job_test.go`: `waitForResourcesJob` timed out
+  after 90s with `jobs.batch "rst-rr-blank-recover-blank-resources-mover" not found`, while the same
+  suite was green locally on that exact tree, repeatedly, and the crucible campaign exercised real
+  restores end to end. It passed on rerun. **That is not proof of innocence** — 0.6.6 spent a whole
+  release on gates that were red for reasons nobody looked at — but it is not a reproduction either,
+  and one observation does not distinguish "the runner was slow" from "there is a race here that a
+  fast machine hides".
+
+  What makes it worth an entry rather than a shrug: it is the same shape as the three bounds this
+  release had to move — a patience chosen against a mechanism whose worst case nobody measured. The
+  cheap first step is not to raise it but to make it SAY something: report the elapsed time and what
+  the controller had done by then, the way `m1WaitRepositoryInitialized` now does, so the second
+  occurrence arrives with evidence instead of a name. Raising it blind would convert a possible race
+  into a slower possible race.
+
 ## Global Definition of Done (every task)
 
 - Unit tests written and passing; integration (envtest) tests for controller behaviour; e2e
