@@ -6,12 +6,17 @@ major 0; `1.0.0` is a deliberate post-M9 API-stability decision.
 
 ## 0.6.7 — Nine days of a report condemning volumes it was never allowed to look at (2026-08-22)
 
-**Validated on real infrastructure: 93 of 93 crucible checks, 0 failed, 0 skipped, in 2h45m57s** —
+**Validated on real infrastructure: 93 of 93 crucible checks, 0 failed, 0 skipped, in 2h40m25s** —
 the whole suite unfiltered on a freshly provisioned six-node RKE2 v1.35.7 + Rook-Ceph v1.19.0 cluster
-with real S3, against the three go1.26.6 image digests this release ships. An earlier 93 of 93 in this
-same cycle is deliberately NOT the verdict: it validated the go1.26.5 tree, which the seven reachable
-advisories below disqualified, and a verdict describing a tree nobody will install is exactly the
-shape this release exists to remove.
+with real S3, against the three image digests this release ships: an operator on go1.26.6, a mover
+carrying restic built on go1.26.7, and a sync carrying rclone 1.75.0.
+
+Two earlier 93-of-93 campaigns in this same cycle are deliberately NOT the verdict, and both are kept
+here rather than dropped. The first validated the go1.26.5 tree that the seven reachable advisories
+below disqualified. The second validated a tree whose mover and sync still carried the unpatched
+restic and rclone — green, and describing images that would never be published. A verdict describing
+a tree nobody will install is exactly the shape this release exists to remove, and it would have been
+the same defect to leave either number at the top of these notes.
 
 **The release's own security gates refused it, and they were right.** The first tag built cleanly and
 then stopped: govulncheck reported **seven advisories reachable** from the operator and the trivy
@@ -23,12 +28,18 @@ to publish, so this is a toolchain bump rather than a VEX entry, applied at the 
 version is pinned. Both binaries now report *No vulnerabilities found* where the operator was
 affected by seven.
 
-**The campaigns are worth recording, because none of the red ones was the product.** No product code
-changed between them; the same digests were deployed each time. Two were the harness winning a coin
-flip it had been winning for two releases, one was a cold-start cost the previous fix had made worse,
-and one is disqualified by an operator error — a campaign relaunched on a cluster that still carried
-a deliberately corrupted repository from an aborted lane, which the next lane's alert assertions
-could not survive. Cleanliness of a cluster is not the absence of product residue.
+**Nine campaigns, six of them red, and not one of the reds was the product.** No product code
+changed between most of them; the same digests were deployed. Two were the harness winning a coin
+flip it had been winning since 0.6.5 — a leak check that fail-fasted on age rather than ownership,
+and a shared location deleted mid-suite by six sites while the container shuffle decided who noticed.
+Two more were a cold cluster's first repository initialisation, measured at 11m08s and 11m02s against
+a 600s budget, a cost this cycle's own ordering fix had moved to the coldest possible moment. One was
+the crash-path leak invariant, which could never observe the orphan reaper it depends on — MinAge 30m
+against a 10-minute patience — so every green run of that spec had been a run where the ordinary
+teardown won and the backstop was never exercised at all. And one is disqualified by an operator
+error: a campaign relaunched on a cluster that still carried a deliberately corrupted repository from
+an aborted lane, while the next lane asserts the critical alert fires only for the damaged repository
+— there were two. Cleanliness of a cluster is not the absence of product residue.
 
 Run 1 failed the m6 stall check at **0.272s**. Its leak check fails fast on residue that predates
 it, on the premise that *"no teardown this spec is waiting on can remove an object that already
