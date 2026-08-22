@@ -676,7 +676,7 @@ with no margin for a cold first pass is a bound that fires again, so it is ten m
 attempt is published anyway, which is the rule these reports follow whether the failure lands on the
 product or on the instrument.
 
-**Status as of 0.6.7 (2026-08-20) — three artefacts reported a fact when all they had was a refusal,
+**Status as of 0.6.7 (2026-08-22) — three artefacts reported a fact when all they had was a refusal,
 a blind spot or a discarded string, and the soak found every one of them.** Not one finding in this
 release came from the crucible, and not one was reachable by any test in this repository: all three
 came out of a fortnight's archive exported from somebody's real cluster and read. That is the first
@@ -736,10 +736,20 @@ onto it until that fortnight ends, because restarting the window to pick up the 
 itself produced is how a two-week measurement never completes one. The pilot rollout has not
 started. The PodSecurity review as a written document is still not written.
 
-**Validated: 93 of 93 crucible checks, 0 failed, 0 skipped, in 2h43m48s** — the whole suite
-unfiltered on a freshly provisioned six-node RKE2 v1.35.7 + Rook-Ceph v1.19.0 cluster with real S3.
-**It took three attempts, and both red ones were the harness rather than the product**: no product
-code changed between the three runs, and the same three image digests were deployed each time. Run 1
+**Validated: 93 of 93 crucible checks, 0 failed, 0 skipped, in 2h40m25s** — the whole suite
+unfiltered on a freshly provisioned six-node RKE2 v1.35.7 + Rook-Ceph v1.19.0 cluster with real S3,
+against the digests this release ships: an operator on go1.26.6, a mover carrying restic built on
+go1.26.7, and a sync carrying rclone 1.75.0.
+
+**It took NINE campaigns, six of them red, and not one of the reds was the product.** Two of the
+greens are deliberately not the verdict and are named here rather than dropped: one validated the
+go1.26.5 tree the seven reachable advisories disqualified, the other a tree whose mover and sync
+still carried the unpatched restic and rclone — a real verdict about images nobody would publish.
+Beyond the two harness defects below, a cold cluster's first repository initialisation was measured
+at 11m08s and 11m02s against a 600s budget and 31s warm; one campaign is disqualified by an operator
+error, having been relaunched on a cluster still carrying a deliberately corrupted repository from an
+aborted lane; and the crash-path leak invariant could never observe the orphan reaper it depended on,
+so every past green of that spec was a run where the ordinary teardown won. Run 1
 gave a teardown **0.272s** on a leak check that fails fast on residue predating it — a premise that
 is false for a spec whose subject is a thirty-minute deadline, and the operator's log settles it,
 the sweep having logged in the same second the check entered that the residue was still draining.

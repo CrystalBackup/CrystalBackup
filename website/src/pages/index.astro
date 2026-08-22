@@ -93,7 +93,8 @@ const milestones = [
   ['0.6.3', 'The first hour on somebody else’s cluster — install path, stall deadlines, mover placement', 'patch', [['Crucible 0.6.3', `${base}/reports/crucible-m6-3.html`]]],
   ['0.6.4', 'Escrow safety — the operator refuses to provision while it cannot prove no recoverable key exists', 'patch', [['Crucible 0.6.4', `${base}/reports/crucible-m6-4.html`]]],
   ['0.6.5', 'No single volume holds its namespace’s queue — and every report that summarises children now agrees with them', 'patch', [['Crucible 0.6.5', `${base}/reports/crucible-m6-5.html`]]],
-  ['0.6.6', 'A check that cannot fail is not a check — eight days of red CI, an aborted quiesce that never thawed, and seven more guards that could not fire', 'patch here', [['Crucible 0.6.6', `${base}/reports/crucible-m6-6.html`]]],
+  ['0.6.6', 'A check that cannot fail is not a check — eight days of red CI, an aborted quiesce that never thawed, and seven more guards that could not fire', 'patch', [['Crucible 0.6.6', `${base}/reports/crucible-m6-6.html`]]],
+  ['0.6.7', 'Nine days of a report condemning volumes it was never allowed to look at — a refused read recorded as a fact about the storage, a name the redactor could not have learned, and a run that never said why it blocked a namespace', 'patch here', [['Crucible 0.6.7', `${base}/reports/crucible-m6-7.html`]]],
   // These three carried their PRE-arbitration names until 0.6.2. The M7–M9 re-scope landed in
   // spec/90-roadmap.md and in the docs, and this array was missed — so the landing page was
   // still promising a CLI and a browse UI as the next milestone while the specs had moved them
@@ -151,7 +152,7 @@ const description =
       <section class="hero">
         <div class="hero-copy">
           <span class="pill">
-            <span class="dot"></span> M6 shipped (v0.6.6) · M7 up next
+            <span class="dot"></span> M6 shipped (v0.6.7) · M7 up next
           </span>
           <h1>
             Every namespace gets <span class="grad">its own backups.</span>
@@ -293,7 +294,7 @@ const description =
         <p class="eyebrow">How it compares</p>
         <h2>Where Crystal Backup stands</h2>
         <p class="section-lead">
-          Our column is <strong>v0.6.6 as shipped</strong> — every “yes” below is code you can
+          Our column is <strong>v0.6.7 as shipped</strong> — every “yes” below is code you can
           install today, exercised by the <a href={links.quality}>published acceptance reports</a>.
           The other columns are those tools’ <strong>current</strong> capabilities, to our
           knowledge — different projects, different goals, not a benchmark.
@@ -356,14 +357,16 @@ const description =
           CI, the core engine, cluster disaster recovery, self-service &amp; admin restore,
           manifest &amp; cluster-scoped DR, consistency hooks, repository maintenance, the
           namespace plane, external sync, the right to erasure and now the observability layer in
-          front of all of it are live (v0.6.6); up next is
+          front of all of it are live (v0.6.7); up next is
           <strong>M7 — reach</strong>: storage without snapshots, file-level restore and
           notifications. Each shipped milestone links its acceptance report below — the checks it
           had to pass on a real cluster, in full. Every report from M6 onward is unfiltered — the
-          whole suite, nothing skipped — and the most recent is <strong>93 of 93</strong>, on its
-          second attempt: the first run reached all 93 too and failed exactly one of them on a test
-          helper’s own five-minute bound, not on the product, and its report says so on the front
-          page.
+          whole suite, nothing skipped — and the most recent is <strong>93 of 93</strong> in
+          2h40m25s, on a freshly provisioned six-node cluster. It closes a cycle of nine campaigns
+          of which six came back red, and <strong>not one of the reds was the product</strong>:
+          two harness checks that had been winning a coin flip since 0.6.5, two cold-start costs,
+          one campaign disqualified by an operator error, and one leak invariant that could never
+          observe the reaper it depended on.
         </p>
         <ol class="timeline">
           {
@@ -411,7 +414,7 @@ const description =
           <aside class="note">
             <h3>You’re early — and that’s the point</h3>
             <p>
-              M0 through M6 have shipped (v0.6.6) — real, tested code, accepted on a real
+              M0 through M6 have shipped (v0.6.7) — real, tested code, accepted on a real
               RKE2/Ceph cluster with <a href={links.quality}>the reports published</a>. It is
               still early: three milestones are ahead, the CRD API is <code>v1alpha1</code> and
               will still move, and the production-hardening pass landed only in M6. So try it in a sandbox,
@@ -428,7 +431,7 @@ const description =
       <section class="cta">
         <h2>Try it, or read every decision</h2>
         <p>
-          M0–M6 are installable today (v0.6.6); the specifications, the {adrCount} decision records and
+          M0–M6 are installable today (v0.6.7); the specifications, the {adrCount} decision records and
           every acceptance report are public. Reach — storage without snapshots, file-level restore
           and notifications (M7) — is next.
         </p>

@@ -31,14 +31,14 @@ Apply the CRDs yourself, before the chart:
 
 ```bash
 # Pull the chart and take its CRDs. Use the version you are upgrading *to*;
-# 0.6.6 is the current release.
-helm pull oci://ghcr.io/crystalbackup/charts/crystal-backup --version 0.6.6 --untar
+# 0.6.7 is the current release.
+helm pull oci://ghcr.io/crystalbackup/charts/crystal-backup --version 0.6.7 --untar
 kubectl apply -f crystal-backup/crds/
 
 # Then upgrade the operator.
 helm upgrade crystal-backup \
   oci://ghcr.io/crystalbackup/charts/crystal-backup \
-  --version 0.6.6 \
+  --version 0.6.7 \
   --namespace crystal-backup-system
 ```
 

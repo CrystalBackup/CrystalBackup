@@ -111,7 +111,7 @@ spec:
   interval: 1h
   url: oci://ghcr.io/crystalbackup/charts/crystal-backup
   ref:
-    tag: "0.6.6"        # the pin. Bumping this IS the upgrade.
+    tag: "0.6.7"        # the pin. Bumping this IS the upgrade.
 ```
 
 :::note
@@ -141,7 +141,7 @@ Confirm the identity against the release you are actually pinning **before** you
 a `verify` block that does not match turns a working install into a stalled `OCIRepository`:
 
 ```bash
-cosign verify ghcr.io/crystalbackup/charts/crystal-backup:0.6.6 \
+cosign verify ghcr.io/crystalbackup/charts/crystal-backup:0.6.7 \
   --certificate-oidc-issuer=https://token.actions.githubusercontent.com \
   --certificate-identity-regexp='^https://github.com/CrystalBackup/CrystalBackup/'
 ```
@@ -227,7 +227,7 @@ repository, and apply them from a `Kustomization` the `HelmRelease` `dependsOn`.
 with:
 
 ```bash
-helm pull oci://ghcr.io/crystalbackup/charts/crystal-backup --version 0.6.6 --untar
+helm pull oci://ghcr.io/crystalbackup/charts/crystal-backup --version 0.6.7 --untar
 ls crystal-backup/crds/
 ```
 

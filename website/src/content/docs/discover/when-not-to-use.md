@@ -10,10 +10,12 @@ not a caveat added for form.
 
 Milestones M0 through M6 have shipped and are tested — unit and envtest suites, a Kind
 end-to-end suite, and a real-infrastructure suite on provisioned clusters, which for
-`v0.6.6` ran unfiltered:
-[93 of 93 checks](/CrystalBackup/reports/crucible-m6-6.html), nothing failed and nothing
-skipped — on the **second** attempt, the first having come back 92 passed and 1 failed on a
-test helper's own five-minute timeout rather than on anything the product did. But the CRD
+`v0.6.7` ran unfiltered:
+[93 of 93 checks](/CrystalBackup/reports/crucible-m6-7.html), nothing failed and nothing
+skipped, in 2h40m25s — at the end of a cycle of nine campaigns of which six came back red,
+and not one of those reds was the product: two harness checks, two cold-start costs, one
+campaign disqualified by an operator error, and one leak invariant that could never observe
+the reaper it depended on. But the CRD
 API is `v1alpha1` and will still move before `1.0.0`, and two of M6's own exit criteria are
 unmet — nobody has run this alongside an incumbent tool for two weeks, and there has been no
 pilot rollout. The honest summary is: **early, but no longer hypothetical.** That is not the

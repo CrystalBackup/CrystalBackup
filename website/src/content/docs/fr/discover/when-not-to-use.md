@@ -2,7 +2,7 @@
 title: Quand ne pas le choisir
 description: Les cas que Crystal Backup ne couvre pas, les coûts qu'il impose, et les situations où un autre outil est la meilleure réponse.
 sourceFile: src/content/docs/discover/when-not-to-use.md
-sourceHash: 7de6a06f73755f474a249dc08a9f5a18247f2557
+sourceHash: 341b1f4d74bd1cbd12f2a00ca2361237fbbc4f66
 ---
 
 Lisez ceci avant le démarrage rapide. Chaque point est une limitation réelle de la version
@@ -12,11 +12,12 @@ courante, pas une réserve ajoutée pour la forme.
 
 Les jalons M0 à M6 sont livrés et testés — suites unitaires et envtest, une suite de bout en
 bout sur Kind, et une suite sur infrastructure réelle sur des clusters provisionnés, qui pour
-`v0.6.6` a tourné sans filtre :
-[93 checks sur 93](/CrystalBackup/reports/crucible-m6-6.html), aucun échec et aucun saut —
-à la **deuxième** tentative, la première étant revenue à 92 passés et 1 en échec sur le
-timeout de cinq minutes d'un helper de test, et non sur quoi que ce soit
-qu'ait fait le produit. Mais l'API des
+`v0.6.7` a tourné sans filtre :
+[93 checks sur 93](/CrystalBackup/reports/crucible-m6-7.html), aucun échec et aucun saut, en
+2h40m25s — au terme d'un cycle de neuf campagnes dont six sont revenues rouges, et aucune de
+ces rouges n'était le produit : deux checks du harnais, deux coûts de démarrage à froid, une
+campagne disqualifiée par une erreur d'opérateur, et un invariant de fuite qui ne pouvait
+jamais observer le reaper dont il dépendait. Mais l'API des
 CRD est en `v1alpha1` et bougera encore avant `1.0.0`, et deux des critères de sortie de M6
 ne sont pas remplis — personne n'a fait tourner ceci deux semaines aux côtés d'un outil en
 place, et il n'y a pas eu de déploiement pilote. Le résumé honnête est : **précoce, mais ce

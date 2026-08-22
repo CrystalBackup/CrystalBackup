@@ -2,7 +2,7 @@
 title: Installer avec Argo CD
 description: Gérer Crystal Backup depuis Git avec Argo CD — ce qui va dans Git, ce qui ne doit jamais y aller, et le prune qui détruit vos clés.
 sourceFile: src/content/docs/start/install-argocd.md
-sourceHash: 67f7668960d4b932065c11d92ef0a8b889275638
+sourceHash: cc9d4f4cfa0fba6d8aca11df70600fe4deaced1e
 ---
 
 C'est l'[install Helm](/CrystalBackup/fr/docs/start/install/) pilotée depuis Git. Le chart
@@ -204,7 +204,7 @@ spec:
   source:
     repoURL: ghcr.io/crystalbackup/charts
     chart: crystal-backup
-    targetRevision: 0.6.6          # the pin. Bumping this IS the upgrade.
+    targetRevision: 0.6.7          # the pin. Bumping this IS the upgrade.
     helm:
       # Keep the release name fixed. The chart stamps
       # `app.kubernetes.io/instance: <release name>` on every object, and Argo CD
@@ -332,7 +332,7 @@ Douze est la réponse attendue. Zéro signifie que les CRDs ne sont pas dans vot
 rendu, et que vous devez les appliquer vous-même avant chaque mise à niveau :
 
 ```bash
-helm pull oci://ghcr.io/crystalbackup/charts/crystal-backup --version 0.6.6 --untar
+helm pull oci://ghcr.io/crystalbackup/charts/crystal-backup --version 0.6.7 --untar
 kubectl apply -f crystal-backup/crds/
 ```
 

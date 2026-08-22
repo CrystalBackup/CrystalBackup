@@ -180,6 +180,16 @@ jobs:
       - name: Verify no translated page is stale
         run: make check-translations
 
+      # Three releases running — 0.6.5, 0.6.6 and 0.6.7 — shipped documentation telling readers to
+      # install the PREVIOUS release. Each was found by hand after the tag, and each cost the same
+      # thirty edits: fifteen sites per language across six pages, two of them outside the install
+      # section, which is why a per-page sweep kept missing them. This reads the chart's appVersion
+      # as the authority and checks only what a reader would RUN — helm --version, targetRevision,
+      # tag:, and image references. Prose about past releases is deliberately untouched: rewriting
+      # "fixed in 0.6.2" would be the mirror defect.
+      - name: Every install pin in the docs names the shipped version
+        run: hack/check-doc-version-pins.sh
+
   helm-lint:
     name: helm lint
     runs-on: ubuntu-latest

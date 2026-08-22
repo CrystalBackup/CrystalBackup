@@ -2,12 +2,12 @@
 title: État du projet
 description: Ce qui est livré, ce qui ne l'est pas, comment le projet est versionné, et comment il est construit.
 sourceFile: src/content/docs/discover/status.md
-sourceHash: 7eebd89aa192d630a00e95e8531d0e5dd9f27f83
+sourceHash: a346196ac1ca2c9da04eac989e3c0b0ba6a1236b
 ---
 
 ## Où en est le projet
 
-La version courante est **`v0.6.6`**. Les jalons M0 à M6 sont livrés : le moteur de backup,
+La version courante est **`v0.6.7`**. Les jalons M0 à M6 sont livrés : le moteur de backup,
 le disaster recovery du cluster, le restore, les manifests et le DR cluster-scoped, les
 hooks de cohérence, la maintenance et la vérification du repository, le plan namespace, la
 synchronisation externe, le droit à l'effacement, et la couche d'observabilité posée devant
@@ -16,7 +16,7 @@ l'ensemble.
 Trois jalons restent. L'API des CRD est en `v1alpha1` et **changera encore** avant `1.0.0`.
 M6 **était** la passe de durcissement pour la production, et elle est livrée — mais deux de
 ses propres critères de sortie ne sont pas remplis : un soak de deux semaines aux côtés d'un
-outil en place, et un déploiement pilote. C'est pourquoi **0.6.6 est proposée pour être
+outil en place, et un déploiement pilote. C'est pourquoi **0.6.7 est proposée pour être
 testée en conditions réelles, pas pour la production** — une affirmation plus étroite que
 « pas durci », et plus utile. Le résumé honnête est : **précoce, mais ce n'est plus
 hypothétique.** Les chemins livrés sont testés contre de l'infrastructure réelle ; ce n'est
