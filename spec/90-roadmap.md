@@ -1149,6 +1149,29 @@ Recorded in [00-requirements.md §6](00-requirements.md); no milestone yet.
   size, harness complexity, archive size — and the mistake to avoid is the one the soak kit already
   made once: building the instrument before stating what it must be able to answer.
 
+- **The supply-chain gate will refuse this project on a cadence, not as an incident** (measured 0.6.7,
+  which it refused twice). Our melange packages carry a frozen epoch while Wolfi's advance: Wolfi moved
+  `restic` from `-r0` to `-r5` in six weeks, three of those epochs carrying security fixes. trivy does
+  not read our binaries — its own output says `language-specific files num=0` — it matches the apk's
+  NAME AND VERSION against the Wolfi security database. So every Go security batch, which lands roughly
+  every four to six weeks, re-reds the gate whether or not anything of ours changed, and the fix each
+  time is two things that must move together: a patched toolchain, which makes the claim true, and an
+  epoch bump, which makes it visible. Neither alone is acceptable — the epoch alone is a lie that
+  silences a scanner, which [adr/0013](adr/0013-external-backup-sync.md) already refused once.
+
+  Two further facts make this worse than a chore. **Wolfi's security database runs ahead of its own
+  index**: at 0.6.7 it named `rclone 1.75.0-r1` and `-r2` as carrying fixes while no 1.75.0 package
+  existed in the APKINDEX at all — the same shape adr/0013 recorded for an unpublished `1.74.3-r5`, so
+  it is now twice. And **two findings currently sit below the gate's `CRITICAL,HIGH` threshold** —
+  CVE-2026-42505 (MEDIUM) and CVE-2026-46603 (UNKNOWN, fixed by the `x/image` override 0.6.7 added) —
+  so a re-scoring by NVD reddens the gate with no change of ours at all.
+
+  What to decide, rather than what to do: whether this stays a manual per-release chore that costs a
+  day when it lands mid-release, or becomes a scheduled dependency sweep that meets the batch before a
+  tag does. `vex-refresh` already runs nightly and is the natural place — but it failed silently for
+  three consecutive nights during 0.6.7 and nobody was watching it, which is its own finding. A canary
+  nobody reads is not a canary.
+
 - **An envtest bound that fails only on a shared runner** (seen once, 0.6.7, on the tagged commit).
   `Unit tests` went red in CI on `restore_resources_job_test.go`: `waitForResourcesJob` timed out
   after 90s with `jobs.batch "rst-rr-blank-recover-blank-resources-mover" not found`, while the same
