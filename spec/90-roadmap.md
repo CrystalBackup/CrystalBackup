@@ -966,7 +966,7 @@ Recorded in [00-requirements.md §6](00-requirements.md); no milestone yet.
 
   **0.6.7 instrumented it; the defect is unchanged and this entry stays open.** A nine-day archive
   from a production cluster made the disagreement the normal path rather than an occasional one —
-  every `ClusterBackup`, **ten nights out of ten**, `PartiallyFailed` with `namespacesBlocked: 32`
+  every `ClusterBackup`, **eighteen nights out of eighteen**, `PartiallyFailed` with `namespacesBlocked: 32`
   beside namespace `Backup`s reading `Completed` over 28 of 29 volumes — and the archive answered
   nothing, because the run object recorded a verdict and never the facts behind it. It now records
   both. `classifyCoordinate` returns a stable code per branch plus the discriminators it decided on
