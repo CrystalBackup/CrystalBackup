@@ -399,8 +399,7 @@ func (e *runNameCollisionError) Error() string {
 
 // asRunNameCollision unwraps err to a *runNameCollisionError, or nil.
 func asRunNameCollision(err error) *runNameCollisionError {
-	var c *runNameCollisionError
-	if errors.As(err, &c) {
+	if c, ok := errors.AsType[*runNameCollisionError](err); ok {
 		return c
 	}
 	return nil
