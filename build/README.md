@@ -75,8 +75,8 @@ Three rules come out of that:
    ≥ 1.26.0 and first on `PATH`).
 4. **apko + melange**, pinned to the versions CI uses, on `PATH`:
    ```bash
-   go install chainguard.dev/apko@v1.2.25
-   go install chainguard.dev/melange@v0.56.2
+   go install chainguard.dev/apko@v1.4.18
+   go install chainguard.dev/melange@v0.64.1
    export PATH="$HOME/go/bin:$PATH"
    ```
 5. **A melange signing key** (one-time, writes `melange.rsa` + `melange.rsa.pub` to the repo root):
