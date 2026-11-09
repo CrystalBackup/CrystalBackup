@@ -47,14 +47,14 @@ env:
   IMAGE_NAMESPACE: crystalbackup
   # Pinned toolchain — bump deliberately (see adr/0012 scheduled-rebuild note).
   GO_VERSION: "1.27.3" # matches mise.toml
-  APKO_VERSION: "v1.2.25"
-  MELANGE_VERSION: "v0.56.2"
+  APKO_VERSION: "v1.4.18"
+  MELANGE_VERSION: "v0.64.1"
   # VEX (adr/0012): govulncheck produces the statements, cosign attests them. No vexctl —
   # generation is govulncheck's job and re-keying is a jq transform, so a third tool would
   # only add a pin to track. Trivy CLI is pinned separately from trivy-action because the
   # action exposes no `--vex` input.
-  GOVULNCHECK_VERSION: "v1.6.0"
-  TRIVY_VERSION: "0.70.0"
+  GOVULNCHECK_VERSION: "v1.9.0"
+  TRIVY_VERSION: "0.76.2"
 
 jobs:
   # ===========================================================================
@@ -97,7 +97,7 @@ jobs:
             with_restic: "true"
             with_rclone: "true"
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Gate — skip components whose binary is not in the tree yet
         id: gate
@@ -110,7 +110,7 @@ jobs:
             echo "::notice title=Skipping mover::cmd/crystal-mover lands in M1 (spec/90-roadmap.md); mover image build deferred."
           fi
 
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         if: steps.gate.outputs.proceed == 'true'
         with:
           go-version: ${{ env.GO_VERSION }}
@@ -118,7 +118,7 @@ jobs:
 
       - name: Set up QEMU (aarch64 melange build sandbox)
         if: steps.gate.outputs.proceed == 'true'
-        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
 
       - name: Install apko + melange (pinned)
         if: steps.gate.outputs.proceed == 'true'
@@ -281,7 +281,7 @@ jobs:
             with_restic: "true"
             with_rclone: "true"
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Gate — skip components whose binary is not in the tree yet
         id: gate
@@ -298,7 +298,7 @@ jobs:
         if: steps.gate.outputs.proceed == 'true'
         run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
 
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         if: steps.gate.outputs.proceed == 'true'
         with:
           go-version: ${{ env.GO_VERSION }}
@@ -306,7 +306,7 @@ jobs:
 
       - name: Set up QEMU (aarch64 melange build sandbox)
         if: steps.gate.outputs.proceed == 'true'
-        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
 
       - name: Install apko + melange (pinned)
         if: steps.gate.outputs.proceed == 'true'
@@ -316,12 +316,17 @@ jobs:
           go install "chainguard.dev/melange@${MELANGE_VERSION}"
           echo "${HOME}/go/bin" >> "$GITHUB_PATH"
 
-      - uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
         if: steps.gate.outputs.proceed == 'true'
+        with:
+          # cosign stays on the v2 line on purpose: installer v4 defaults to cosign v3, whose new
+          # bundle format moves attestations from the legacy `.att` tag to OCI referrers, which the
+          # documented verify commands depend on. That move is its own deliberate change.
+          cosign-release: v2.6.5
 
       - name: Log in to GHCR
         if: steps.gate.outputs.proceed == 'true'
-        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -586,7 +591,7 @@ jobs:
 
       - name: SLSA build provenance (SLSA L3, keyless) → GHCR
         if: steps.gate.outputs.proceed == 'true'
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-name: ${{ env.IMAGE_NAME }}
           subject-digest: ${{ env.IMAGE_DIGEST }}
@@ -609,16 +614,21 @@ jobs:
       packages: write # helm push the chart to GHCR (OCI)
       id-token: write # cosign keyless-sign the chart (Fulcio/Rekor OIDC)
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Resolve release version from tag (adr/0014)
         run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
 
-      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
         with:
-          version: v3.17.0
+          version: v3.22.1
 
-      - uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+        with:
+          # cosign stays on the v2 line on purpose: installer v4 defaults to cosign v3, whose new
+          # bundle format moves attestations from the legacy `.att` tag to OCI referrers, which the
+          # documented verify commands depend on. That move is its own deliberate change.
+          cosign-release: v2.6.5
 
       - name: Log in to GHCR (docker for digest lookup, helm for the OCI push)
         run: |
