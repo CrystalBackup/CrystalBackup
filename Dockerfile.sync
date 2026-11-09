@@ -64,7 +64,7 @@ RUN echo "${RCLONE_SHA256}  /tmp/rclone.tar.gz" | sha256sum -c - \
     && CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
        go build -trimpath -ldflags="-s -w" -o /out/rclone .
 
-FROM gcr.io/distroless/base-debian12:latest
+FROM gcr.io/distroless/base-debian13:latest
 COPY --from=builder /out/crystal-mover /usr/bin/crystal-mover
 COPY --from=builder /out/restic /usr/bin/restic
 COPY --from=builder /out/rclone /usr/bin/rclone
