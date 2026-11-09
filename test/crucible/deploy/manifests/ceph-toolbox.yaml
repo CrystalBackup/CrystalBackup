@@ -23,7 +23,7 @@ spec:
         crystalbackup.io/node-role: worker
       containers:
         - name: rook-ceph-tools
-          image: quay.io/ceph/ceph:v19.2.7
+          image: quay.io/ceph/ceph:v20.2.5
           command:
             - /bin/bash
             - -c

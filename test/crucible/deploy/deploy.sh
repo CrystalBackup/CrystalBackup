@@ -21,13 +21,6 @@ REPO_ROOT="$(cd "${CRUCIBLE_DIR}/../.." && pwd)"
 # ---------------------------------------------------------------------------
 SNAPSHOTTER_REF="${SNAPSHOTTER_REF:-v8.7.0}"
 ROOK_CHART_VERSION="${ROOK_CHART_VERSION:-v1.21.2}"
-# Ceph itself is pinned in manifests/ceph-cluster.yaml, to Squid (v19.2.x) and NOT to the Tentacle
-# v20 Rook 1.21 defaults to. Measured on this platform (Ubuntu 24.04 LTS, kernel 6.8): Tentacle mints
-# client keys the kernel cannot load — every krbd map and every kernel CephFS mount fails with
-# "adding ceph secret key to kernel failed: Invalid argument" — and flags the legacy cipher it
-# still accepts with two HEALTH_WARN codes. A storage plane no kernel client can mount is not a
-# platform to qualify a backup product on. Revisit when the node image ships a kernel that loads
-# Tentacle's keys.
 # Since Rook 1.20 the CSI drivers are run by the ceph-csi-operator and configured by this SEPARATE
 # chart; the rook-ceph chart only installs the operator and its CRDs. Pinned to the version the
 # rook-ceph chart of ROOK_CHART_VERSION depends on, and installed with the values file Rook ships at
@@ -112,6 +105,15 @@ while true; do
   phase="$(kubectl -n rook-ceph get cephcluster rook-ceph -o jsonpath='{.status.phase}' 2>/dev/null || true)"
   echo "  cephcluster phase=${phase:-<none>} health=${health:-<none>}"
   [[ "${health}" == "HEALTH_OK" ]] && break
+  # AUTH_INSECURE_KEYS_ALLOWED / AUTH_INSECURE_KEYS_CREATABLE are the deliberate cost of
+  # `security.cephx.csi.keyType: aes` in manifests/ceph-cluster.yaml: kernel clients on the node
+  # image cannot load aes256k keys, so the monitors must keep accepting aes. Exactly those two codes
+  # are muted, by name; any other warning still keeps this loop waiting and fails the deploy.
+  if [[ "${health}" == "HEALTH_WARN" ]]; then
+    for code in AUTH_INSECURE_KEYS_ALLOWED AUTH_INSECURE_KEYS_CREATABLE; do
+      kubectl -n rook-ceph exec deploy/rook-ceph-tools -- ceph health mute "${code}" >/dev/null 2>&1 || true
+    done
+  fi
   if ((SECONDS > deadline)); then
     echo "FATAL: Ceph did not reach HEALTH_OK within ${CEPH_HEALTH_TIMEOUT}s" >&2
     kubectl -n rook-ceph get cephcluster rook-ceph -o yaml | tail -40 >&2

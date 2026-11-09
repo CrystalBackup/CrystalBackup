@@ -14,8 +14,20 @@ metadata:
 spec:
   cephVersion:
     # Pinned; bump together with ROOK_CHART_VERSION in ../deploy.sh.
-    image: quay.io/ceph/ceph:v19.2.7
+    image: quay.io/ceph/ceph:v20.2.5
   dataDirHostPath: /var/lib/rook
+  # The CSI keys are the ones the KERNEL loads (krbd map, kernel CephFS mount), and Rook 1.21 mints
+  # them as aes256k whenever Ceph supports that type (19.2.7 and every 20.x). The Ubuntu 24.04 LTS
+  # kernel (6.8) cannot load an aes256k key: every map and mount failed with "adding ceph secret key
+  # to kernel failed: Invalid argument". Measured on this platform, and fixed in place by exactly
+  # this setting (rotation to keyGeneration 2, key length 60 -> 40, both mounts then succeeded).
+  # Daemon keys are never handed to a kernel and keep Rook's default.
+  # Consequence, accepted: the monitors must keep allowing the aes cipher, which Ceph reports as
+  # AUTH_INSECURE_KEYS_ALLOWED / AUTH_INSECURE_KEYS_CREATABLE — deploy.sh mutes those two by name.
+  security:
+    cephx:
+      csi:
+        keyType: aes
   mon:
     count: 3
     allowMultiplePerNode: false
