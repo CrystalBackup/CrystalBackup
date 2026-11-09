@@ -487,7 +487,7 @@ PROMTOOL ?= $(LOCALBIN)/promtool
 
 ## Tool Versions
 KUSTOMIZE_VERSION ?= v5.8.3
-CONTROLLER_TOOLS_VERSION ?= v0.21.0
+CONTROLLER_TOOLS_VERSION ?= v0.23.0
 # v0.2.0 is the floor that still builds on a current Go toolchain: v0.1.0 pins
 # golang.org/x/tools v0.19.0, whose tokeninternal package no longer compiles.
 CRD_REF_DOCS_VERSION ?= v0.3.0

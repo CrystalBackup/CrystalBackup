@@ -74,6 +74,18 @@ const backupTeardownTimeout = 30 * time.Second
 // direct reclaim, so the sweep accelerates the drain instead of merely observing it.
 const exposureDrainRecheckInterval = 15 * time.Second
 
+// requeueAfterOwnWrite is how soon a reconciler comes back after a write to its own object that it
+// must observe before going further — adding the finalizer, or recording the hooks phase. It
+// replaces `Result{Requeue: true}`, deprecated in controller-runtime 0.25.
+//
+// It is a BACKSTOP, not the trigger: none of these controllers filters its primary watch with a
+// generation predicate, so the write itself produces the update event that re-runs the reconcile
+// at once. What the requeue covers is that event being lost. The old rate-limited requeue retried
+// within milliseconds, which is also the window in which the cached client may not yet show the
+// write (see the read-after-write note in the controllers that refetch); a second gives the cache
+// time to catch up and costs nothing on the path where the watch event already arrived.
+const requeueAfterOwnWrite = time.Second
+
 const (
 	// moverJobTTLSeconds is the data-mover Job's ttlSecondsAfterFinished: a finished mover Job
 	// self-cleans after an hour even if the explicit post-result delete is missed. The
@@ -704,7 +716,7 @@ func (r *BackupReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		if err := r.Update(ctx, &backup); err != nil {
 			return ctrl.Result{}, fmt.Errorf("add finalizer to Backup %s/%s: %w", backup.Namespace, backup.Name, err)
 		}
-		return ctrl.Result{Requeue: true}, nil
+		return ctrl.Result{RequeueAfter: requeueAfterOwnWrite}, nil
 	}
 
 	// Terminal Backups are done: they neither re-execute nor requeue. But before this pass goes

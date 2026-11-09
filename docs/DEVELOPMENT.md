@@ -38,7 +38,7 @@ into `./bin` the first time it's needed (see the `## Tool Versions` block in
 
 | Tool | Version | Installed by |
 |---|---|---|
-| controller-gen | v0.21.0 | `make manifests`, `make generate` |
+| controller-gen | v0.23.0 | `make manifests`, `make generate` |
 | kustomize | v5.8.3 | `make build-installer`, `make deploy` |
 | setup-envtest | derived from `go.mod` | `make test` (downloads the envtest apiserver/etcd) |
 | golangci-lint | v2.15.0 | `make lint` — **custom-built** with the `logcheck` plugin from [`../.custom-gcl.yml`](../.custom-gcl.yml) |
