@@ -21,8 +21,8 @@ mise run doc                 # serve the docs site (Astro dev server, website/)
 | Tool | Version | Used for |
 |---|---|---|
 | Go | 1.27.3 | operator toolchain |
-| kubebuilder | 4.15.0 | `kubebuilder create api/webhook` scaffolding |
-| node / pnpm | 24.18.0 / 10.33.2 | the docs website (`website/`) |
+| kubebuilder | 4.16.0 | `kubebuilder create api/webhook` scaffolding |
+| node / pnpm | 26.13.0 / 12.18.0 | the docs website (`website/`) |
 
 > **Go version note.** The project builds with **Go 1.27** (mise pin `1.27.3`); `go.mod` pins
 > `toolchain go1.27.3` and CI resolves the version from it (`actions/setup-go` with

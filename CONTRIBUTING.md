@@ -21,7 +21,7 @@ mise install          # installs the pinned Go, kubebuilder, node, pnpm
 | Tool | Provided by | Notes |
 |---|---|---|
 | Go **1.27** | mise (`go = "1.27.3"`) | the operator toolchain |
-| kubebuilder 4.15 | mise | scaffolding CLI |
+| kubebuilder 4.16 | mise | scaffolding CLI |
 | controller-gen, kustomize, setup-envtest, golangci-lint | the Makefile (`go install` into `./bin`) | pinned in the Makefile; installed on demand, no manual step |
 | **docker**, **kind**, **helm** | must be on your `PATH` | e2e + chart lint |
 | **apko**, **cosign** | must be on your `PATH` | only needed to build/verify container images locally (see below) |
