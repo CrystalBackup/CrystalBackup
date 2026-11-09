@@ -23,7 +23,8 @@ spec:
   # this setting (rotation to keyGeneration 2, key length 60 -> 40, both mounts then succeeded).
   # Daemon keys are never handed to a kernel and keep Rook's default.
   # Consequence, accepted: the monitors must keep allowing the aes cipher, which Ceph reports as
-  # AUTH_INSECURE_KEYS_ALLOWED / AUTH_INSECURE_KEYS_CREATABLE — deploy.sh mutes those two by name.
+  # AUTH_INSECURE_KEYS_ALLOWED / AUTH_INSECURE_KEYS_CREATABLE, and the four CSI entities themselves
+  # as AUTH_INSECURE_CLIENT_KEY_TYPE — deploy.sh mutes those three by name.
   security:
     cephx:
       csi:

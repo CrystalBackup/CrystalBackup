@@ -105,12 +105,14 @@ while true; do
   phase="$(kubectl -n rook-ceph get cephcluster rook-ceph -o jsonpath='{.status.phase}' 2>/dev/null || true)"
   echo "  cephcluster phase=${phase:-<none>} health=${health:-<none>}"
   [[ "${health}" == "HEALTH_OK" ]] && break
-  # AUTH_INSECURE_KEYS_ALLOWED / AUTH_INSECURE_KEYS_CREATABLE are the deliberate cost of
-  # `security.cephx.csi.keyType: aes` in manifests/ceph-cluster.yaml: kernel clients on the node
-  # image cannot load aes256k keys, so the monitors must keep accepting aes. Exactly those two codes
-  # are muted, by name; any other warning still keeps this loop waiting and fails the deploy.
+  # AUTH_INSECURE_KEYS_ALLOWED / AUTH_INSECURE_KEYS_CREATABLE / AUTH_INSECURE_CLIENT_KEY_TYPE are
+  # the deliberate cost of `security.cephx.csi.keyType: aes` in manifests/ceph-cluster.yaml: kernel
+  # clients on the node image cannot load aes256k keys, so the CSI entities hold aes keys (the third
+  # code names exactly those four) and the monitors must keep accepting aes (the first two). Exactly
+  # those three codes are muted, by name; any other warning still keeps this loop waiting and fails
+  # the deploy.
   if [[ "${health}" == "HEALTH_WARN" ]]; then
-    for code in AUTH_INSECURE_KEYS_ALLOWED AUTH_INSECURE_KEYS_CREATABLE; do
+    for code in AUTH_INSECURE_KEYS_ALLOWED AUTH_INSECURE_KEYS_CREATABLE AUTH_INSECURE_CLIENT_KEY_TYPE; do
       kubectl -n rook-ceph exec deploy/rook-ceph-tools -- ceph health mute "${code}" >/dev/null 2>&1 || true
     done
   fi
