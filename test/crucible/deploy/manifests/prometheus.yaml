@@ -88,7 +88,7 @@ spec:
   # Pinned to the same version promtool is pinned to in the repo Makefile. The two layers of lot I
   # then agree on what PromQL means: an expression that behaves one way in CI and another on the
   # cluster would make both results worthless.
-  version: 3.13.1
+  version: 3.16.0
   replicas: 1
   serviceAccountName: crucible-prometheus
   # Pinned rather than left to the default, because the Service below addresses the port BY NAME

@@ -19,11 +19,17 @@ REPO_ROOT="$(cd "${CRUCIBLE_DIR}/../.." && pwd)"
 # ---------------------------------------------------------------------------
 # Version pins — bump deliberately, together with the manifests.
 # ---------------------------------------------------------------------------
-SNAPSHOTTER_REF="${SNAPSHOTTER_REF:-v8.2.0}"
-ROOK_CHART_VERSION="${ROOK_CHART_VERSION:-v1.19.0}"
-LONGHORN_CHART_VERSION="${LONGHORN_CHART_VERSION:-1.10.0}"
-LOCAL_PATH_REF="${LOCAL_PATH_REF:-v0.0.30}"
-PROMETHEUS_OPERATOR_REF="${PROMETHEUS_OPERATOR_REF:-v0.93.0}"
+SNAPSHOTTER_REF="${SNAPSHOTTER_REF:-v8.7.0}"
+ROOK_CHART_VERSION="${ROOK_CHART_VERSION:-v1.21.2}"
+# Since Rook 1.20 the CSI drivers are run by the ceph-csi-operator and configured by this SEPARATE
+# chart; the rook-ceph chart only installs the operator and its CRDs. Pinned to the version the
+# rook-ceph chart of ROOK_CHART_VERSION depends on, and installed with the values file Rook ships at
+# that same tag, which keeps the historical driver names (rook-ceph.rbd.csi.ceph.com,
+# rook-ceph.cephfs.csi.ceph.com) that ceph-storage.yaml and the exposers key on.
+CEPH_CSI_DRIVERS_CHART_VERSION="${CEPH_CSI_DRIVERS_CHART_VERSION:-1.1.0}"
+LONGHORN_CHART_VERSION="${LONGHORN_CHART_VERSION:-1.13.0}"
+LOCAL_PATH_REF="${LOCAL_PATH_REF:-v0.0.37}"
+PROMETHEUS_OPERATOR_REF="${PROMETHEUS_OPERATOR_REF:-v0.95.1}"
 CEPH_HEALTH_TIMEOUT="${CEPH_HEALTH_TIMEOUT:-1800}" # seconds
 
 # Operator image override (no released image exists before the first v0.0.x tag;
@@ -78,6 +84,14 @@ helm repo add rook-release https://charts.rook.io/release --force-update >/dev/n
 helm upgrade --install rook-ceph rook-release/rook-ceph \
   --namespace rook-ceph --create-namespace \
   --version "${ROOK_CHART_VERSION}" \
+  --wait --timeout 10m
+
+step "ceph-csi drivers ${CEPH_CSI_DRIVERS_CHART_VERSION} (Rook >= 1.20 configures CSI here, not in rook-ceph)"
+helm repo add ceph-csi-operator https://ceph.github.io/ceph-csi-operator --force-update >/dev/null
+helm upgrade --install ceph-csi-drivers ceph-csi-operator/ceph-csi-drivers \
+  --namespace rook-ceph \
+  --version "${CEPH_CSI_DRIVERS_CHART_VERSION}" \
+  -f "https://raw.githubusercontent.com/rook/rook/${ROOK_CHART_VERSION}/deploy/charts/ceph-csi-drivers/values.yaml" \
   --wait --timeout 10m
 
 step "CephCluster + pools + filesystem + toolbox"
