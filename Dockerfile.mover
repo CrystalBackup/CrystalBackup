@@ -8,7 +8,7 @@
 #   * `restic` on PATH                    (the shim execs `restic` — cmd/crystal-mover/main.go)
 #   * restic pinned to 0.19.1             (build/melange/restic.yaml)
 #   * glibc base, runs as root (uid 0)    (the mover POD's securityContext governs privilege)
-FROM golang:1.26 AS builder
+FROM golang:1.27 AS builder
 ARG TARGETOS
 ARG TARGETARCH
 
