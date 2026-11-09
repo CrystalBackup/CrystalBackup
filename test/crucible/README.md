@@ -277,7 +277,7 @@ and `m2` restore specs verify integrity against it, byte for byte.
 | what                 | where                            | pin        |
 | -------------------- | -------------------------------- | ---------- |
 | RKE2                 | `terraform/variables.tf`         | channel `stable` (override `rke2_version`) |
-| rook chart + ceph    | `deploy/deploy.sh` + `deploy/manifests/ceph-*.yaml` | `v1.21.2` / ceph `v20.2.5` |
+| rook chart + ceph    | `deploy/deploy.sh` + `deploy/manifests/ceph-*.yaml` | `v1.21.2` / ceph `v19.2.7` (Squid — see deploy.sh on Tentacle) |
 | ceph-csi drivers chart | `deploy/deploy.sh`             | `1.1.0` (Rook >= 1.20 runs CSI under the ceph-csi-operator) |
 | longhorn chart       | `deploy/deploy.sh`               | `1.13.0`   |
 | external-snapshotter | `deploy/deploy.sh`               | `v8.7.0`   |
