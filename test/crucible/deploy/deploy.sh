@@ -92,7 +92,12 @@ helm upgrade --install ceph-csi-drivers ceph-csi-operator/ceph-csi-drivers \
   --namespace rook-ceph \
   --version "${CEPH_CSI_DRIVERS_CHART_VERSION}" \
   -f "https://raw.githubusercontent.com/rook/rook/${ROOK_CHART_VERSION}/deploy/charts/ceph-csi-drivers/values.yaml" \
+  --set drivers.rbd.snapshotPolicy=volumeSnapshot \
+  --set drivers.cephfs.snapshotPolicy=volumeSnapshot \
   --wait --timeout 10m
+# snapshotPolicy is commented out in Rook's values file, and an unset policy deploys NO csi-snapshotter
+# sidecar: the RBD driver came up without one, every ceph-block VolumeSnapshot stayed readyToUse=false
+# forever, and a whole suite run timed out behind it. Set it explicitly for both drivers.
 
 step "CephCluster + pools + filesystem + toolbox"
 kubectl apply -f "${SCRIPT_DIR}/manifests/ceph-cluster.yaml"
