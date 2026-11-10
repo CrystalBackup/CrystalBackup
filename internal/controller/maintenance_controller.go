@@ -211,14 +211,11 @@ func (r *MaintenanceReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			return ctrl.Result{}, err
 		}
 	}
-	if running {
-		// An op is on the lane. Nothing to decide until it lands; the wake channel will bring us
-		// back, and the watchdog covers a lost wake.
-		return ctrl.Result{RequeueAfter: maintenanceWatchdogInterval}, nil
-	}
-
 	// Nothing to maintain until the repository exists on the far end.
 	if !repo.Status.Initialized {
+		if running {
+			return ctrl.Result{RequeueAfter: maintenanceWatchdogInterval}, nil
+		}
 		return ctrl.Result{}, nil
 	}
 
@@ -230,9 +227,21 @@ func (r *MaintenanceReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		// The footprint probe is independent of the schedules: it runs even on a location with no
 		// maintenance configured (the size and stale-lock gauges are useful regardless), and it
 		// keeps its own cadence while a multi-hour prune holds the lane.
+		//
+		// That last promise is why this sits BEFORE the in-flight return below, not after it. It
+		// used to sit after, so the probe only ran in the gaps between ops — and a repository
+		// wedged by an orphaned exclusive lock has almost none: each prune waits out restic's lock
+		// retry, fails, and the next one is enqueued within the second. The wedge starved the one
+		// measurement that detects it (staleLocks), so the reap that clears it never fired. The
+		// crucible's killed-prune spec sat 45 minutes on a lock that had been stale for 20 of them.
 		if err := r.reconcileProbe(ctx, &repo, loc); err != nil {
 			return ctrl.Result{}, err
 		}
+	}
+	if running {
+		// An op is on the lane. Nothing to decide until it lands; the wake channel will bring us
+		// back, and the watchdog covers a lost wake.
+		return ctrl.Result{RequeueAfter: maintenanceWatchdogInterval}, nil
 	}
 	if loc == nil {
 		// Not linked yet, or mid-teardown. A steady state, not an error: the ClusterBackupLocation
