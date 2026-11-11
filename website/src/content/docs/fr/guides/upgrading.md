@@ -4,7 +4,7 @@ description: Mettre à niveau le chart, le problème des CRD que Helm ne résout
 sidebar:
   order: 10
 sourceFile: src/content/docs/guides/upgrading.md
-sourceHash: 6ca9980ed303eee28603c03386e1787945dfa812
+sourceHash: 25bf61146043dc8604ad996e60d23418f2d22bc1
 ---
 
 ## Ce que signifie un numéro de version ici
@@ -34,19 +34,45 @@ Appliquez les CRD vous-même, avant le chart :
 
 ```bash
 # Pull the chart and take its CRDs. Use the version you are upgrading *to*;
-# 0.6.7 is the current release.
-helm pull oci://ghcr.io/crystalbackup/charts/crystal-backup --version 0.6.7 --untar
+# 0.6.8 is the current release.
+helm pull oci://ghcr.io/crystalbackup/charts/crystal-backup --version 0.6.8 --untar
 kubectl apply -f crystal-backup/crds/
 
 # Then upgrade the operator.
 helm upgrade crystal-backup \
   oci://ghcr.io/crystalbackup/charts/crystal-backup \
-  --version 0.6.7 \
+  --version 0.6.8 \
   --namespace crystal-backup-system
 ```
 
 Un `kubectl apply` sur des CRD est additif et sûr : il ajoute les nouveaux champs et ne
 supprime jamais d'objets stockés.
+
+## 0.6.7 → 0.6.8 : rien à appliquer, et un dépôt bloqué par une prune tuée se rétablit seul
+
+**Pas d'étape CRD.** Les CRD ont été régénérées, mais seule l'annotation de version de
+controller-gen a changé : aucun champ ajouté, renommé ni supprimé, aucune validation déplacée. Un
+`helm upgrade` suffit. Appliquer quand même les CRD comme ci-dessus est sans risque.
+
+Le changement de comportement porte sur le reap des verrous périmés. Une prune tuée après avoir pris
+le verrou exclusif de restic le laissait derrière elle, et restic ne retire jamais seul un verrou
+périmé : toutes les prunes suivantes échouaient dessus. Le reap de l'operator devait le lever. Mais la
+sonde qui mesure `staleLocks` ne tournait qu'entre deux opérations de maintenance, et un dépôt bloqué
+n'a presque jamais de trou entre deux : chaque prune en échec est suivie de la suivante dans la
+seconde. Depuis 0.6.8, la sonde tourne aussi pendant qu'une opération occupe la file. Un dépôt dans
+cet état se rétablit en une heure environ après la montée de version :
+
+- 30 minutes pour que le verrou devienne périmé ;
+- jusqu'à 15 minutes pour la sonde suivante ;
+- le jitter du reap ;
+- l'unlock lui-même.
+
+Surveillez `status.staleLocks` sur le `BackupRepository` : il doit retomber à 0. S'il reste au-dessus
+de 0 plus longtemps, il s'agit d'autre chose.
+
+Tout le reste de cette release concerne la toolchain et les dépendances (Go 1.27.3, bibliothèques
+Kubernetes 0.37, controller-runtime 0.25, restic 0.19.1-r14, rclone 1.76.0). Rien ne bouge côté
+sélection, snapshots, movers, rétention ou restauration, et aucune donnée n'est touchée.
 
 ## 0.6.6 → 0.6.7 : cette fois il Y A une étape de schéma, et un self-check qui condamnait vos volumes peut cesser
 
@@ -60,7 +86,7 @@ jamais, et le run ne vous dira rien de la raison pour laquelle il a bloqué ce q
 La portée se limite exactement à ce champ et au type qui le compose. Seul
 `config/crd/bases/crystalbackup.io_clusterbackups.yaml` a bougé ; aucune autre CRD n'a changé, rien
 n'a été renommé, rien n'a été supprimé, et aucun champ de `spec` nulle part n'a gagné ni perdu une
-validation. Appliquez les CRD avant le chart comme ci-dessus, avec `--version 0.6.7`.
+validation. Appliquez les CRD avant le chart comme ci-dessus, avec la version vers laquelle vous montez.
 
 Chaque entrée de `blockedReasons` est une **cause**, pas un namespace — `reason` (un token stable :
 `OwnChild`, `ForeignParentUID`, `DiscoveryProjection`, `UnstampedTerminalChild`,

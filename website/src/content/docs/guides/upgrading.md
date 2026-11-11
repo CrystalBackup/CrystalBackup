@@ -31,19 +31,44 @@ Apply the CRDs yourself, before the chart:
 
 ```bash
 # Pull the chart and take its CRDs. Use the version you are upgrading *to*;
-# 0.6.7 is the current release.
-helm pull oci://ghcr.io/crystalbackup/charts/crystal-backup --version 0.6.7 --untar
+# 0.6.8 is the current release.
+helm pull oci://ghcr.io/crystalbackup/charts/crystal-backup --version 0.6.8 --untar
 kubectl apply -f crystal-backup/crds/
 
 # Then upgrade the operator.
 helm upgrade crystal-backup \
   oci://ghcr.io/crystalbackup/charts/crystal-backup \
-  --version 0.6.7 \
+  --version 0.6.8 \
   --namespace crystal-backup-system
 ```
 
 `kubectl apply` on CRDs is additive and safe: it adds new fields and never drops stored
 objects.
+
+## 0.6.7 → 0.6.8: nothing to apply, and a repository a killed prune had wedged now recovers by itself
+
+**No CRD step.** The CRDs were regenerated, but only controller-gen's version annotation changed: no
+field was added, renamed or removed, and no validation moved. `helm upgrade` alone is enough.
+Applying the CRDs anyway, as above, is harmless.
+
+The behaviour change is the stale-lock reap. A prune killed after it took restic's exclusive lock
+left that lock behind, and restic never removes a stale lock by itself: every later prune failed on
+it. The operator's reap was meant to clear it. But the probe that measures `staleLocks` only ran
+between two maintenance operations, and a wedged repository almost never has a gap between two,
+since each failing prune is followed by the next within a second. From 0.6.8 the probe runs while an
+operation holds the lane. A repository in that state recovers within about an hour of the upgrade:
+
+- 30 minutes for the lock to go stale;
+- up to 15 minutes for the next probe;
+- the reap's jitter;
+- the unlock itself.
+
+Watch `status.staleLocks` on the `BackupRepository` go to 0. If one stays above 0 for longer than
+that, it is not this case.
+
+Everything else in this release is the toolchain and dependencies (Go 1.27.3, Kubernetes libraries
+0.37, controller-runtime 0.25, restic 0.19.1-r14, rclone 1.76.0). Nothing about selection,
+snapshots, movers, retention or restore moves, and no data is touched.
 
 ## 0.6.6 → 0.6.7: there IS a schema step this time, and a self-check that condemned your volumes may stop
 
@@ -57,7 +82,7 @@ what it blocked.
 The scope is exactly that one field and the type under it. Only
 `config/crd/bases/crystalbackup.io_clusterbackups.yaml` moved; no other CRD changed, nothing was
 renamed, nothing was removed, and no `spec` field anywhere gained or lost a validation. Apply the
-CRDs before the chart as above, with `--version 0.6.7`.
+CRDs before the chart as above, with the version you are upgrading to.
 
 Each entry of `blockedReasons` is one **cause**, not one namespace — `reason` (a stable token:
 `OwnChild`, `ForeignParentUID`, `DiscoveryProjection`, `UnstampedTerminalChild`,
