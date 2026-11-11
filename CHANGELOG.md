@@ -4,6 +4,123 @@ All notable changes to Crystal Backup. Versioning follows
 [adr/0014](spec/adr/0014-versioning-and-release.md): milestone `Mn` → minor `0.n.z` on
 major 0; `1.0.0` is a deliberate post-M9 API-stability decision.
 
+## 0.6.8 — A killed prune wedged its repository, and the one measurement that detects it was starved (2026-11-11)
+
+**Validated on real infrastructure: 92 of 93 crucible checks in 2h37m12s, then the one red check
+8 of 8 after a platform-only fix.** That is the whole suite, unfiltered, on a freshly built six-node
+RKE2 v1.36.6 + Rook v1.21.2 / Ceph Tentacle v20.2.5 cluster with real S3, against the `:dev`
+operator, mover and sync images built from this tree. Every product check passed. The one failure
+was the platform check `reports Ceph HEALTH_OK`. A single latency blip on `osd.0` during the seed
+raised `BLUESTORE_SLOW_OP_ALERT`, and Ceph keeps that alert for **24 hours** after the last slow op
+by default. The check's own comment assumed the alert cleared once the op completed. The crucible
+now lowers that lifetime to 120 s. Applied to the live cluster, Ceph went `HEALTH_OK` within
+seconds, and the `infra` label then passed 8 of 8. This is not a 93-of-93 verdict, and these notes
+do not round it up to one. Between that run and the tag, only the crucible's own tooling changed;
+no product code did.
+
+**Four campaigns, and the second of them found the product bug.**
+
+1. **Run 1:** 18 failures, all downstream of one cause. The new ceph-csi-drivers chart deploys no
+   `csi-snapshotter` for RBD when `snapshotPolicy` is unset, and Rook's values file leaves it
+   commented out.
+2. **Run 2:** 90 passed, 2 failed.
+   - One failure was a race in a test helper: it parked a DaemonSet that a terminating operator
+     reverted 116 ms later.
+   - The other was the killed-prune spec, which timed out at 45 minutes on a repository that never
+     recovered.
+3. **Run 3:** a targeted rerun with the operator's log followed. It showed why: the stale lock sat
+   in S3 for the whole window while `staleLocks` stayed at 0.
+4. **Run 4:** the verdict above.
+
+Two earlier attempts on the new platform never reached the suite. Rook 1.21 mints CSI keys that the
+Ubuntu 24.04 kernel cannot load, and nothing could mount (see *The qualification platform*).
+
+### A repository wedged by an orphaned lock could not detect it
+
+restic refuses an exclusive lock while **any** other lock exists, stale or not, and only
+`restic unlock` removes a stale lock. A prune killed after taking its lock therefore wedges the
+repository, and every later prune fails. The operator's stale-lock reap is the way out. The
+footprint probe counts `locks/` objects older than 30 minutes, and the reap submits an unlock
+between two ops.
+
+The probe sat behind the controller's "an op is in flight" early return. A wedged repository is
+almost always in flight: each prune waits out restic's lock retry and fails, and the next one is
+queued within the second. So the wedge starved the one measurement that detects it, and the reap
+never fired. On the crucible, a killed prune left its repository failing every prune for 45 minutes,
+on a lock that had been stale for 20 of them.
+
+The probe now runs before the in-flight return, as its own comment had always said it did.
+`TestProbeRunsWhileAnOpHoldsTheLane` fails without the reorder. Worst-case recovery after a kill is
+now about 60 minutes:
+
+- 30 minutes for the lock to go stale;
+- up to 15 minutes for the next probe;
+- up to 10 minutes for the reap's jitter;
+- the time the unlock itself takes.
+
+The killed-prune spec had passed for months by luck, whenever the kill landed before restic took
+its lock. It also documented a recovery path through restic that does not exist. Its comment is
+rewritten and its budget is now 75 minutes. Run 4 took the fast path again, in 2m53s, so the
+corrected path is proven by the unit test, not by a campaign.
+
+### Everything on its current release
+
+- **Go 1.27.3** builds every binary we compile. The language floor stays `go 1.26.0`, the floor
+  the Kubernetes client libraries require.
+  - vex-refresh counted fourteen reachable advisories against the published operator. The
+    operator, the mover and sync binaries now each report zero.
+- **Kubernetes libraries 0.37.2, controller-runtime 0.25.2, controller-tools 0.23.0.**
+  - prometheus client_golang 1.25 and otel 1.47 move too, with every other direct module on its
+    latest release.
+  - Indirect modules follow what the Kubernetes libraries pin rather than `go get -u`.
+  - controller-runtime 0.25 deprecates `Result{Requeue: true}`. All seven call sites now requeue
+    after one second. That is a backstop only: the write itself already re-runs the reconcile.
+- **restic 0.19.1-r14 and rclone 1.76.0**, both built on go-1.27.
+  - restic 0.19.1 is still the newest release. Its module overrides now match the set Wolfi
+    applies to its own r14, which closes the ten advisories reachable through restic's go.mod.
+  - rclone 1.76.0 needs no override and closes GO-2026-6303 in its SFTP server, the advisory that
+    turned sync 0.6.7 red.
+- **Build and CI.**
+  - Tools: golangci-lint 2.15, apko 1.4.18, melange 0.64.1, govulncheck 1.9.0, trivy 0.76.2, and
+    every GitHub Action on its newest release, pinned by SHA. Three actions were still floating tags.
+  - Two majors were deliberately not taken. Each changes what the project publishes rather than how
+    it builds:
+    - cosign 3 moves every attestation to OCI referrers, which the documented verify commands
+      depend on;
+    - helm 4 would push the chart.
+- **vex-refresh** no longer fails honest documents. It now proves the document's identity and its
+  effect separately, and its nightly summary lists the reachable advisories apart from the trivy
+  findings no VEX statement can address.
+- **The site** runs on Node 26 LTS, pnpm 12, Astro 7 and Starlight 0.42. The landing page's six
+  icons had never been styled, in production too, and now are.
+
+### The qualification platform
+
+The crucible qualified against last summer's storage. It now runs RKE2 v1.36.6, Rook 1.21.2,
+Ceph Tentacle v20.2.5, Longhorn 1.13.0, local-path v0.0.37 and external-snapshotter v8.7.0. Three
+things an administrator on these releases will meet as well:
+
+- **Rook ≥ 1.20 installs no CSI drivers by itself.** The `ceph-csi-drivers` chart creates them.
+  Set `drivers.rbd.snapshotPolicy` (and the CephFS one) to `volumeSnapshot` explicitly. Unset, the
+  RBD driver comes up with no snapshotter, and every `VolumeSnapshot` stays `readyToUse=false`.
+- **Rook 1.21 on a 6.8 kernel (Ubuntu 24.04 LTS)** mints CSI keys as `aes256k`, which the kernel
+  cannot load. Every krbd map and kernel CephFS mount fails with *"adding ceph secret key to kernel
+  failed: Invalid argument"*. `security.cephx.csi.keyType: aes` fixes it. The cost is three
+  `AUTH_INSECURE_*` health codes, which the crucible mutes by name and nothing else.
+- **`BLUESTORE_SLOW_OP_ALERT` lingers for 24 hours** after the last slow op unless
+  `bluestore_slow_ops_warn_lifetime` is lowered.
+
+The crucible's `down` had also been reporting "no crucible-* bucket left" on every teardown without
+ever checking. It prefixed a second `https://` to the endpoint, and the failed listing counted as
+zero buckets. It now lists on the right endpoint and says so when it cannot.
+
+### Upgrading
+
+**There is no CRD step.** The CRDs were regenerated, but only controller-gen's version annotation
+changed, not the schema. A `helm upgrade` is enough. Nothing about selection, snapshots, movers,
+retention or restore moves in this release, and no data is touched. A repository that a killed
+prune had wedged before the upgrade recovers by itself within the hour.
+
 ## 0.6.7 — Nine days of a report condemning volumes it was never allowed to look at (2026-08-22)
 
 **Validated on real infrastructure: 93 of 93 crucible checks, 0 failed, 0 skipped, in 2h40m25s** —

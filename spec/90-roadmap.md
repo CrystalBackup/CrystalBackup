@@ -761,6 +761,35 @@ verdict. The seed stays unpinned on purpose — the shuffle is this suite's only
 finding cross-container coupling, and it has now found two real defects that a fixed seed would have
 frozen into permanent green.
 
+**Status as of 0.6.8 (2026-11-11) — everything on its current release, and the bump paid for itself
+with a product bug.** The scope was deliberately narrow:
+
+- Go 1.27.3, Kubernetes libraries 0.37, controller-runtime 0.25, every direct module, and restic
+  0.19.1-r14 and rclone 1.76.0 rebuilt on go-1.27. Reachable advisories went to zero on all three
+  images.
+- Every build tool and action, and the site's stack.
+- The crucible's own platform, which had been qualifying against last summer's storage: RKE2
+  v1.36.6, Rook 1.21.2, Ceph Tentacle v20.2.5, Longhorn 1.13.0.
+
+The platform move cost three campaigns' worth of storage findings that any administrator on those
+releases will meet too:
+
+- a Rook 1.21 CSI key type that the 6.8 kernel cannot load;
+- an RBD driver with no snapshotter when `snapshotPolicy` is unset;
+- a BlueStore slow-op alert that lingers for a day.
+
+It also found the product bug. The killed-prune spec ran against a real stale lock for the first
+time, and the repository never recovered. The footprint probe that measures `staleLocks` sat behind
+the maintenance controller's in-flight return, and a wedged repository is always in flight. So the
+wedge starved the one measurement that detects it. That spec had passed for months on a fast path
+that never exercised the mechanism it was named for.
+
+**Validated: 92 of 93 crucible checks in 2h37m12s, then the red one 8 of 8 after a platform-only
+fix.** Every product check passed. The failure was Ceph's 24-hour BlueStore alert. Between that run
+and the tag, only the crucible's own tooling changed. The killed-prune spec took the fast path again
+on that run, so the reordered probe is proven by its unit test, not by a campaign. M6's other exit
+criteria are not advanced by this release.
+
 ## M7 — Reach: storage without snapshots, file-level restore, notifications (0.7)
 
 **Re-scoped 2026-08-02.** M7 previously stacked the CLI and the UI under one number; both now
