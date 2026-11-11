@@ -23,21 +23,32 @@ echo "Crucible destroyed."
 # swallowed its own failure, so the sentence was routinely false: 32 buckets had piled
 # up by 2026-08-02, 29 of them empty. Anything this script cannot confirm, it now
 # checks; anything it cannot check, it says plainly.
-remaining="$(aws s3 ls --endpoint-url "https://${S3_ENDPOINT}" 2>/dev/null |
-  awk '{print $3}' | grep -c '^crucible-' || true)"
+# crucible.env stores S3_ENDPOINT WITH its scheme, and is gone once a previous `down` ran —
+# so normalise both. The old check prefixed a second "https://", aws failed, the failure was
+# piped into `grep -c` and read as "0 buckets left": it reassured on every run, including
+# with a bucket still there.
+endpoint="${S3_ENDPOINT:-${TF_VAR_s3_endpoint:-fsn1.your-objectstorage.com}}"
+endpoint="https://${endpoint#https://}"
 
-if [[ "${remaining}" == "0" ]]; then
-  echo "No crucible-* bucket left on ${S3_ENDPOINT}."
+if ! listing="$(aws s3 ls --endpoint-url "${endpoint}" 2>&1)"; then
+  echo
+  echo "WARNING: could not list buckets on ${endpoint} — leftover crucible-* buckets NOT checked:"
+  echo "${listing}" | tail -3 | sed 's/^/  /'
+  exit 0
+fi
+leftovers="$(echo "${listing}" | awk '{print $3}' | grep '^crucible-' || true)"
+
+if [[ -z "${leftovers}" ]]; then
+  echo "No crucible-* bucket left on ${endpoint}."
 else
   echo
-  echo "WARNING: ${remaining} crucible-* bucket(s) still on ${S3_ENDPOINT}:"
-  aws s3 ls --endpoint-url "https://${S3_ENDPOINT}" 2>/dev/null |
-    awk '{print $3}' | grep '^crucible-' | sed 's/^/  /'
+  echo "WARNING: $(echo "${leftovers}" | wc -l | tr -d ' ') crucible-* bucket(s) still on ${endpoint}:"
+  echo "${leftovers}" | sed 's/^/  /'
   echo
   echo "Some may belong to OTHER lanes still running — check before deleting."
   echo "Hetzner is eventually consistent about a bucket's object count, so a"
   echo "DeleteBucket right after emptying can fail with BucketNotEmpty and succeed"
   echo "~30s later. To clear one:"
-  echo "  aws s3 rm s3://<bucket> --endpoint-url https://${S3_ENDPOINT} --recursive"
-  echo "  aws s3api delete-bucket --bucket <bucket> --endpoint-url https://${S3_ENDPOINT}"
+  echo "  aws s3 rm s3://<bucket> --endpoint-url ${endpoint} --recursive"
+  echo "  aws s3api delete-bucket --bucket <bucket> --endpoint-url ${endpoint}"
 fi

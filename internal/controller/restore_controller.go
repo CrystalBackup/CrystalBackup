@@ -147,7 +147,7 @@ func (r *RestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		if err := r.Update(ctx, &restore); err != nil {
 			return ctrl.Result{}, fmt.Errorf("add finalizer to Restore %s/%s: %w", restore.Namespace, restore.Name, err)
 		}
-		return ctrl.Result{Requeue: true}, nil
+		return ctrl.Result{RequeueAfter: requeueAfterOwnWrite}, nil
 	}
 
 	// Terminal restores are done for good; a stray watch event must not re-execute them.

@@ -2,7 +2,7 @@
 title: Installer avec Flux
 description: Gérer Crystal Backup depuis Git avec Flux — la mise à jour des CRDs qu'il faut demander, le prune qui détruit vos clés, et ce qui ne doit jamais être réconcilié.
 sourceFile: src/content/docs/start/install-flux.md
-sourceHash: 8403e49e1ea6e053810ceea35c9fbdf17b4ba482
+sourceHash: 6b910eb2c2358d6dac5b65656c171b8c4d6f705c
 ---
 
 C'est l'[install Helm](/CrystalBackup/fr/docs/start/install/) pilotée depuis Git. Le chart
@@ -120,7 +120,7 @@ spec:
   interval: 1h
   url: oci://ghcr.io/crystalbackup/charts/crystal-backup
   ref:
-    tag: "0.6.7"        # the pin. Bumping this IS the upgrade.
+    tag: "0.6.8"        # the pin. Bumping this IS the upgrade.
 ```
 
 :::note
@@ -151,7 +151,7 @@ Confirmez l'identité contre la release que vous épinglez réellement **avant**
 `OCIRepository` en panne :
 
 ```bash
-cosign verify ghcr.io/crystalbackup/charts/crystal-backup:0.6.7 \
+cosign verify ghcr.io/crystalbackup/charts/crystal-backup:0.6.8 \
   --certificate-oidc-issuer=https://token.actions.githubusercontent.com \
   --certificate-identity-regexp='^https://github.com/CrystalBackup/CrystalBackup/'
 ```
@@ -239,7 +239,7 @@ vendorez les CRDs dans votre repository Git, et appliquez-les depuis une `Kustom
 dont le `HelmRelease` `dependsOn`. Extrayez-les avec :
 
 ```bash
-helm pull oci://ghcr.io/crystalbackup/charts/crystal-backup --version 0.6.7 --untar
+helm pull oci://ghcr.io/crystalbackup/charts/crystal-backup --version 0.6.8 --untar
 ls crystal-backup/crds/
 ```
 

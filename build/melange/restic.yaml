@@ -17,19 +17,33 @@
 # linked into the binary. A package calling itself restic-0.19.1-r0 is flagged by every
 # advisory Wolfi records as fixed in a later epoch of 0.19.1, however clean the bytes are.
 #
-# Wolfi names 0.19.1-r3 as the release carrying the go1.25.13/go1.26.6 standard-library fixes
-# (CVE-2026-33818, CVE-2026-39821, CVE-2026-56853, CVE-2026-56858, CVE-2026-56859,
-# CVE-2026-56860, CVE-2026-56862 — net/url, net/http, crypto/tls, encoding/asn1, encoding/xml,
-# html/template), and THIS BUILD CARRIES THOSE SAME FIXES: the go-package below is go-1.26,
-# which Wolfi ships at 1.26.7. The epoch asserts an equivalence the pipeline actually
-# establishes. Wolfi's later 0.19.1-r4 and -r5 record no security fixes, so claiming them
-# would over-state what this build closes; r3 is the smallest honest number.
-# If the toolchain were ever moved back, this number would become a lie that silences a
-# scanner — the suppression adr/0013 refused. The two must move together.
+# `0.19.1-r14` is the epoch Wolfi's own security database names as carrying its latest fix, and
+# THIS BUILD CARRIES EVERY FIX WOLFI RECORDS UP TO IT — each one through the same module, at the
+# same version or a later one:
+#   * r3  — the go1.26.6 standard-library batch (CVE-2026-33818, CVE-2026-39821, CVE-2026-56853,
+#           CVE-2026-56858, CVE-2026-56859, CVE-2026-56860, CVE-2026-56862). Carried by the
+#           go-1.27 toolchain below (Wolfi ships 1.27.3).
+#   * r7  — GO-2026-6348, HTTP/2 DATA-frame heap exhaustion in google.golang.org/grpc (fixed
+#           1.83.1); r8 — GO-2026-6443, server panic on a missing :authority/Host (fixed 1.83.2).
+#           Carried by the grpc override (v1.85.0).
+#   * r9  — GO-2026-6505, endpoint URLs leaked in otel exporter logs (fixed 1.45.0). Carried by
+#           the go.opentelemetry.io/otel overrides (v1.47.0).
+#   * r11 — GO-2026-6603, -6610, -6611, -6612, -6617 in golang.org/x/net (fixed 0.60.0), plus the
+#           stdlib items of that batch. Carried by the x/net override (v0.62.0) and go-1.27.
+#   * r13 — CVE-2026-116587 / GHSA-mgcc-cww5-fp2q, JWK RSA-key DoS in go-jose/v4 (fixed 4.1.6).
+#           Carried by the go-jose override (v4.1.9).
+#   * r14 — GO-2026-6865, panic on two-block frames in github.com/klauspost/compress (fixed
+#           1.20.2). Carried by the compress override (v1.20.3) — the zstd every repository
+#           pack goes through, so this one is exercised by the crucible's fidelity gate.
+# Wolfi's r4-r6, r10 and r12 record no security fix, so there is nothing at those epochs to carry.
+# Verified rather than asserted: govulncheck v1.9.0 in source mode on the pinned tarball, with the
+# overrides below and go1.27.3, reports ZERO reachable advisories (ten without the overrides).
+# If the toolchain or any override were ever moved back, this number would become a lie that
+# silences a scanner — the suppression adr/0013 refused. They must move together.
 package:
   name: restic
   version: "0.19.1"
-  epoch: 3
+  epoch: 14
   description: "Fast, secure, efficient backup program — pinned engine for Crystal Backup movers"
   url: https://restic.net/
   copyright:
@@ -47,18 +61,19 @@ environment:
     repositories:
       - https://packages.wolfi.dev/os
     packages:
-      # The go toolchain (go-1.26, pinned below), build-base, busybox and
+      # The go toolchain (go-1.27, pinned below), build-base, busybox and
       # ca-certificates-bundle are added automatically by the go/build pipeline's
       # `needs.packages`; only the extras go here.
       - git # module-resolution fallback for any non-proxy dependency
-      - go-1.26 # needed BEFORE go/build too, for the x/text override step below
+      - go-1.27 # needed BEFORE go/build too, for the module override step below
   environment:
     CGO_ENABLED: "0"
     GOFLAGS: "-trimpath -mod=readonly"
     # Fail loudly instead of silently network-fetching a toolchain: keeps the build
     # hermetic/reproducible. restic's go.mod asks for `go 1.25.8`, which is a MINIMUM, not a
-    # match: a 1.26 toolchain builds it while compiling the code at the go1.25 language
-    # version the directive names, so the semantics do not shift under us. GOTOOLCHAIN=local
+    # match. The overrides below raise it to `go 1.26.0` (otel v1.47.0 requires it), and the
+    # go-1.27 toolchain builds the code at that language version, so the semantics are those
+    # of a released, supported minor rather than of whatever toolchain happens to run. GOTOOLCHAIN=local
     # only forbids *downloading* another toolchain — it does not require an exact minor.
     GOTOOLCHAIN: local
 
@@ -70,36 +85,50 @@ pipeline:
       expected-sha256: bb9b1a19040744d26d8a79be029d4e6b189c45ccc9d8831d7fe367d3c33df725
       strip-components: 1
 
-  - name: Override x/text and grpc past their reachable advisories
+  - name: Override the modules restic 0.19.1 still pins below their fixes
     runs: |
-      # GO-2026-5970 / CVE-2026-56852 — infinite loop in x/text/unicode/norm, fixed in
-      # 0.39.0 — is reachable through restic, and no restic release bumps past it yet
-      # (0.19.1 is the latest and still pins 0.37.0).
-      # GO-2026-6061 / GHSA-hrxh-6v49-42gf — xDS RBAC + HTTP/2 transport server in
-      # google.golang.org/grpc, fixed in 1.82.1 — likewise reachable through restic's
-      # pinned v1.81.1 (call traces via the GCS backend).
-      # Override both modules so the shipped binary is clean. Kept in LOCKSTEP with
-      # build/vex/generate-vex.sh, which analyses the same overrides so the VEX describes
-      # this binary, not the vanilla tarball.
+      # restic 0.19.1 is still the latest release and its go.mod has not moved since; ten
+      # advisories are REACHABLE through it on go1.27.3 (govulncheck, source mode):
+      #   GO-2026-5970  x/text v0.37.0          (fixed 0.39.0)
+      #   GO-2026-6061, GO-2026-6348  grpc v1.81.1    (fixed 1.82.1 / 1.83.1)
+      #   GO-2026-6505  otel/sdk v1.43.0        (fixed 1.45.0)
+      #   GO-2026-6603, -6610, -6611, -6612, -6617  x/net v0.55.0 (fixed 0.60.0)
+      #   GO-2026-6865  klauspost/compress v1.18.6 (fixed 1.20.2)
+      # The list below is the module set Wolfi overrides for its own restic-0.19.1-r14 — which is
+      # what the epoch above claims equivalence with — each taken at its latest RELEASE (never a
+      # -dev pseudo-version; grpc's @v/list carries one, so versions come from the proxy's
+      # @latest). Overriding the unreachable ones too (x/sync, x/sys, x/crypto, x/term, go-jose)
+      # is what makes "carries every fix up to r14" true rather than "carries every reachable one".
+      # Kept in LOCKSTEP with build/vex/generate-vex.sh, which analyses the same overrides so the
+      # VEX describes this binary, not the vanilla tarball.
       # The go/build step below runs with -mod=readonly; the module edit needs -mod=mod.
-      GOFLAGS=-mod=mod go get golang.org/x/text@v0.40.0 google.golang.org/grpc@v1.82.1
-      # tidy completes go.sum for the NEW graph (grpc 1.82.1 pulls x/sync/semaphore into the
-      # build closure); without it the -mod=readonly go/build step below fails on a missing
-      # go.sum entry.
+      GOFLAGS=-mod=mod go get \
+        go.opentelemetry.io/otel@v1.47.0 \
+        go.opentelemetry.io/otel/metric@v1.47.0 \
+        go.opentelemetry.io/otel/sdk@v1.47.0 \
+        go.opentelemetry.io/otel/sdk/metric@v1.47.0 \
+        go.opentelemetry.io/otel/trace@v1.47.0 \
+        google.golang.org/grpc@v1.85.0 \
+        golang.org/x/net@v0.62.0 \
+        golang.org/x/sync@v0.24.0 \
+        golang.org/x/sys@v0.49.0 \
+        golang.org/x/text@v0.43.0 \
+        golang.org/x/crypto@v0.58.0 \
+        golang.org/x/term@v0.47.0 \
+        github.com/go-jose/go-jose/v4@v4.1.9 \
+        github.com/klauspost/compress@v1.20.3
+      # tidy completes go.sum for the NEW graph; without it the -mod=readonly go/build step
+      # below fails on a missing go.sum entry.
       GOFLAGS=-mod=mod go mod tidy
 
   - name: Build restic (CLI)
     uses: go/build
     with:
-      # go-1.26 (Wolfi ships 1.26.7), NOT go-1.25. The seven standard-library advisories named
-      # in the epoch note above are fixed in go1.25.13 AND go1.26.6 — Go backports to the two
-      # most recent minors, so the 1.25 line does have a fix upstream. Wolfi has not packaged
-      # it: go-1.25 stops at 1.25.12-r1 (2026-07-22) and Go 1.25 went end-of-life when 1.27.0
-      # shipped, so a fixed go-1.25 is not coming. With GOTOOLCHAIN=local the build cannot
-      # fetch go1.25.13 itself, so go-1.26 is the only toolchain in the hermetic environment
-      # that closes all seven. Rejected: relaxing GOTOOLCHAIN to pull go1.25.13 over the
-      # network (breaks hermeticity for a line that is already EOL).
-      go-package: go-1.26
+      # go-1.27 (Wolfi ships 1.27.3-r0): the toolchain the operator and the sync's rclone are
+      # built with too, and the one the govulncheck verdict in the epoch note was obtained with.
+      # The analysis and the build must use the SAME standard library, or the verdict describes
+      # another binary.
+      go-package: go-1.27
       packages: ./cmd/restic
       output: restic
       # restic bakes its version into internal/global.Version (a compile-time const), so

@@ -108,7 +108,7 @@ func (r *BackupLocationReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		if err := r.Update(ctx, &loc); err != nil {
 			return ctrl.Result{}, fmt.Errorf("add finalizer to BackupLocation %s/%s: %w", loc.Namespace, loc.Name, err)
 		}
-		return ctrl.Result{Requeue: true}, nil
+		return ctrl.Result{RequeueAfter: requeueAfterOwnWrite}, nil
 	}
 
 	// The effective cluster ID composes the repository path, so nothing downstream can run

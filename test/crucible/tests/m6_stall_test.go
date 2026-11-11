@@ -149,9 +149,10 @@ const (
 	// not a race you can wait out.
 	//
 	// Setting the Driver CR's own nodePlugin affinity instead — the semantically correct knob —
-	// was rejected: that CR is written by rook-ceph-operator on every CephCluster reconcile, so a
-	// reconcile landing inside this spec's 45-minute window would silently un-inject the fault
-	// and make the spec flaky rather than red. Stopping the reconciler has no such window, and it
+	// was rejected: that CR has an owner that rewrites it — rook-ceph-operator on every CephCluster
+	// reconcile up to rook 1.19, the ceph-csi-drivers Helm release since rook 1.20 — so a write
+	// landing inside this spec's 45-minute window would silently un-inject the fault and make the
+	// spec flaky rather than red. Stopping the reconciler has no such window, and it
 	// is the pattern m6_precheck_test.go already uses on rook-ceph-operator for the same reason.
 	//
 	// Blast radius: this stops RECONCILIATION only. The RBD controller plugin (provisioner and

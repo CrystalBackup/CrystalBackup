@@ -20,7 +20,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # website/public/preflight.sh and website/public/snapshot-probe.sh are published for
       # administrators to download and run against their own clusters. This project signs its
@@ -32,7 +32,12 @@ jobs:
       # snapshot-probe.sh is the one that CREATES objects in the reader's cluster. Its header
       # tells them to verify the signature before running it, which is only worth saying if the
       # signature is actually there — so it is signed in the same loop, not as a follow-up.
-      - uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+        with:
+          # cosign stays on the v2 line on purpose: installer v4 defaults to cosign v3, whose new
+          # bundle format moves attestations from the legacy `.att` tag to OCI referrers, which the
+          # documented verify commands depend on. That move is its own deliberate change.
+          cosign-release: v2.6.5
 
       # Sign what is published, and refuse to publish a checksum that does not describe it. The
       # committed sidecars are regenerated and diffed by `make preflight-table-verify` in the
@@ -56,10 +61,10 @@ jobs:
       # build time, so the bundle must exist before the build or it never reaches the published
       # site — and its absence would be invisible, the deploy succeeding with an unsigned script.
       - name: Build Astro site
-        uses: withastro/action@v3
+        uses: withastro/action@a8b97df764791eb61fbf3338ef713b0e61ae05c5 # v6.1.4
         with:
           path: ./website
-          node-version: 24
+          node-version: 26
 
   deploy:
     needs: build
@@ -70,4 +75,4 @@ jobs:
     steps:
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

@@ -129,7 +129,7 @@ func (r *ClusterRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		if err := r.Update(ctx, &cr); err != nil {
 			return ctrl.Result{}, fmt.Errorf("add finalizer to ClusterRestore %s: %w", cr.Name, err)
 		}
-		return ctrl.Result{Requeue: true}, nil
+		return ctrl.Result{RequeueAfter: requeueAfterOwnWrite}, nil
 	}
 	if status.IsTerminalRestorePhase(cr.Status.Phase) {
 		return ctrl.Result{}, nil

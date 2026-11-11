@@ -13,7 +13,7 @@
 #
 # `mise run` with no task lists them all. Credentials come from <repo>/.secrets/
 # via scripts/load-env.sh; the suite's Go toolchain comes from the repo-root
-# mise.toml (Go 1.26.5).
+# mise.toml (Go 1.27.3).
 [tools]
 opentofu = "1.9"        # `tofu` — terraform-compatible, Apache-2.0
 ansible-core = "latest" # ansible-playbook (builtin modules only — no collections needed)

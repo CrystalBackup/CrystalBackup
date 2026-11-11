@@ -392,7 +392,7 @@ func (r *BackupReconciler) openFreezeWindow(ctx context.Context, backup *cbv1.Ba
 		return ctrl.Result{}, true, fmt.Errorf("record pre-backup hooks for Backup %s/%s: %w",
 			backup.Namespace, backup.Name, err)
 	}
-	return ctrl.Result{Requeue: true}, true, nil
+	return ctrl.Result{RequeueAfter: requeueAfterOwnWrite}, true, nil
 }
 
 // reasonReleasingAfterAbort is the Ready reason while an aborted quiesce is being undone. The

@@ -101,7 +101,8 @@ func ensureSummaryJSON(operation string, resticArgv []string) []string {
 	if slices.Contains(resticArgv, jsonFlag) {
 		return resticArgv
 	}
-	return append(resticArgv[:len(resticArgv):len(resticArgv)], jsonFlag)
+	// Clip, so the append can never write into the caller's backing array.
+	return append(slices.Clip(resticArgv), jsonFlag)
 }
 
 // buildResult is the shim's decision logic, isolated from the exec so it is unit-testable

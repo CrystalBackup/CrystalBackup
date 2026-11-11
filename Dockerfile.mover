@@ -8,7 +8,7 @@
 #   * `restic` on PATH                    (the shim execs `restic` — cmd/crystal-mover/main.go)
 #   * restic pinned to 0.19.1             (build/melange/restic.yaml)
 #   * glibc base, runs as root (uid 0)    (the mover POD's securityContext governs privilege)
-FROM golang:1.26 AS builder
+FROM golang:1.27 AS builder
 ARG TARGETOS
 ARG TARGETARCH
 
@@ -38,7 +38,7 @@ RUN echo "${RESTIC_SHA256}  /tmp/restic.tar.gz" | sha256sum -c - \
 
 # Minimal glibc base with a CA bundle (adr/0012 wants glibc, not musl). No shell/package
 # manager: the shim execs restic directly, restic talks to S3 on its own — nothing needs a shell.
-FROM gcr.io/distroless/base-debian12:latest
+FROM gcr.io/distroless/base-debian13:latest
 COPY --from=builder /out/crystal-mover /usr/bin/crystal-mover
 COPY --from=builder /out/restic /usr/bin/restic
 ENTRYPOINT ["/usr/bin/crystal-mover"]

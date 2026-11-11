@@ -37,9 +37,9 @@ permissions:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAMESPACE: crystalbackup
-  GO_VERSION: "1.26.6"
-  GOVULNCHECK_VERSION: "v1.6.0"
-  TRIVY_VERSION: "0.70.0"
+  GO_VERSION: "1.27.3"
+  GOVULNCHECK_VERSION: "v1.9.0"
+  TRIVY_VERSION: "0.76.2"
   # Support window (adr/0012): the N most recent releases keep a refreshed VEX. Older digests
   # stay signed and SBOM'd, but their VEX is a point-in-time statement that is no longer
   # maintained — stated plainly rather than implied by silence.
@@ -54,12 +54,12 @@ jobs:
       matrix: ${{ steps.resolve.outputs.matrix }}
       count: ${{ steps.resolve.outputs.count }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0 # tags carry the support window
 
       - name: Log in to GHCR (digest lookup)
-        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -120,23 +120,28 @@ jobs:
     steps:
       # The SOURCE at the tag that produced this digest — not main. A reachability analysis
       # is only meaningful against the code that actually shipped.
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ matrix.tag }}
 
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: false
 
-      - uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+        with:
+          # cosign stays on the v2 line on purpose: installer v4 defaults to cosign v3, whose new
+          # bundle format moves attestations from the legacy `.att` tag to OCI referrers, which the
+          # documented verify commands depend on. That move is its own deliberate change.
+          cosign-release: v2.6.5
 
       - uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567 # v0.3.1
         with:
           version: v${{ env.TRIVY_VERSION }}
 
       - name: Log in to GHCR
-        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -194,6 +199,25 @@ jobs:
       # matches nothing and silently reports every finding — a malformed or mis-keyed document
       # is indistinguishable from an honest one unless the effect is measured. Signing an
       # inert document would be worse than shipping none: it looks like a reassurance.
+      #
+      # Measuring the effect alone is not enough, and the first version of this step got that
+      # wrong: it read "filtered == baseline" as proof of a mis-keyed document, when the far
+      # more common cause is that the residual findings are not ours to speak about at all.
+      # govulncheck analyses the CrystalBackup source at this tag; the findings trivy reports
+      # against the restic and rclone apks are matched by PACKAGE name and version, so no
+      # reachability statement can suppress them — not even when the CVE identifier is the
+      # same one. A document with nothing to say about the residue is honest, not broken, and
+      # failing on it kept four jobs red for two weeks with a genuinely reachable advisory
+      # hiding behind the noise.
+      #
+      # So the proof is split in two, each half checked where it is actually decidable:
+      #   1. IDENTITY — the document must be keyed on a product purl the scanner expects for
+      #      this image. Checkable whatever the findings are, including on a clean image, and
+      #      it is the half that catches the re-keying in generate-vex.sh going wrong.
+      #   2. EFFECT — measured only over the advisories the document and the scan have in
+      #      COMMON. An empty intersection means there was nothing to suppress. A non-empty
+      #      one that suppresses nothing means matching failed below the product level (the
+      #      subcomponent purls) and is still a hard error.
       - name: Prove the VEX document actually applies
         if: steps.guard.outputs.proceed == 'true'
         run: |
@@ -204,20 +228,68 @@ jobs:
           STATEMENTS="$(jq -r '.statements | length' vex.json)"
           echo "baseline=${BASELINE_COUNT} filtered=${FILTERED} statements=${STATEMENTS}"
 
+          if [ "${STATEMENTS}" = "0" ]; then
+            echo "the analysis produced no statement — there is no document to prove"
+            exit 0
+          fi
+
+          # --- 1. Identity -----------------------------------------------------------------
+          # A scanner matches statements to findings by product purl, and an identifier that
+          # does not match is ignored WITHOUT error. This runs even when there is nothing to
+          # suppress, which is what keeps the anti-inert guarantee alive on a clean image
+          # instead of leaving it assumed.
+          trivy image "${IMAGE_REF}" --scanners vuln --format cyclonedx --quiet \
+            | jq -r '.metadata.component.purl // empty' > expected-purl.txt
+          [ -s expected-purl.txt ] || {
+            echo "::error title=No product identifier::the scanner reported no purl for ${IMAGE_REF}"
+            exit 1; }
+          jq -r '[.statements[].products[]."@id"] | unique | .[]' vex.json > doc-purls.txt
+          if ! grep -Fxqf expected-purl.txt doc-purls.txt; then
+            echo "::error title=VEX does not describe this image::the document carries no product identifier the scanner recognises."
+            echo "--- product identifiers in the document ---"
+            cat doc-purls.txt
+            echo "--- what the scanner expects ---"
+            cat expected-purl.txt
+            exit 1
+          fi
+          echo "identity: the document is keyed on the purl the scanner expects"
+
           if [ "${BASELINE_COUNT}" = "0" ]; then
             echo "nothing to suppress — the image is still clean against today's database"
             exit 0
           fi
 
-          if [ "${FILTERED}" = "${BASELINE_COUNT}" ] && [ "${STATEMENTS}" != "0" ]; then
-            echo "::error title=VEX has no effect::${STATEMENTS} statement(s) suppressed nothing on ${IMAGE_REF}."
-            echo "The document is almost certainly mis-keyed: a scanner matches statements by product"
-            echo "purl, and an identifier that does not match is ignored WITHOUT error."
-            echo "--- product identifiers in the document ---"
-            jq -r '[.statements[].products[]."@id"] | unique | .[]' vex.json
-            echo "--- what the scanner expects ---"
-            trivy image "${IMAGE_REF}" --scanners vuln --format cyclonedx --quiet \
-              | jq -r '.metadata.component.purl'
+          # --- 2. Effect, over the intersection only ---------------------------------------
+          # Sets, not counts: comparing counts could not tell "nothing in common" from
+          # "matching is broken". Only not_affected/fixed can suppress; an `affected` statement
+          # is MEANT to leave its finding standing (and fails the next step), so counting it
+          # here would invent a keying problem out of a reachability one. Aliases matter as
+          # much as the name — trivy reports CVE ids, govulncheck names GO ids.
+          jq -r '[.Results[]?.Vulnerabilities[]?.VulnerabilityID] | unique' baseline.json > baseline-ids.json
+          jq -r '[ .statements[]
+                   | select(.status == "not_affected" or .status == "fixed")
+                   | [.vulnerability.name] + (.vulnerability.aliases // []) ]
+                 | flatten | unique' vex.json > statement-ids.json
+          COMMON="$(jq -n --slurpfile b baseline-ids.json --slurpfile s statement-ids.json \
+                      '$b[0] - ($b[0] - $s[0])')"
+          COMMON_COUNT="$(printf '%s' "$COMMON" | jq -r 'length')"
+
+          if [ "${COMMON_COUNT}" = "0" ]; then
+            echo "::notice title=VEX has nothing to suppress here::the ${BASELINE_COUNT} residual finding(s) share no advisory with the ${STATEMENTS} statement(s)."
+            echo "Expected when the residue sits in third-party apks rather than in the CrystalBackup"
+            echo "source this analysis covers: those findings are matched by package name and version,"
+            echo "which a reachability statement structurally cannot address. The document is keyed"
+            echo "correctly (proven above) and still worth attesting."
+            jq -r '[.Results[]?.Vulnerabilities[]? | "  \(.VulnerabilityID)  \(.PkgName)@\(.InstalledVersion)"] | unique | .[]' baseline.json
+            exit 0
+          fi
+
+          if [ "${FILTERED}" = "${BASELINE_COUNT}" ]; then
+            echo "::error title=VEX has no effect::${COMMON_COUNT} advisory/advisories are covered by a statement, yet nothing was suppressed on ${IMAGE_REF}."
+            echo "The product purl matches, so the failure is below it — most likely the subcomponent"
+            echo "identifiers (generate-vex.sh unescapes %2F for exactly this reason)."
+            echo "--- covered by a statement and still reported ---"
+            printf '%s' "$COMMON" | jq -r '.[] | "  \(.)"'
             exit 1
           fi
           echo "VEX suppressed $(( BASELINE_COUNT - FILTERED )) of ${BASELINE_COUNT} finding(s)"
@@ -248,14 +320,73 @@ jobs:
           # stays auditable. Consumers verify and read the most recent.
           cosign attest --yes --type openvex --predicate vex.json "${IMAGE_REF}"
 
+      # The daily INVENTORY, not just a pass/fail. What a consumer scanning one of our digests
+      # sees is exactly this list, and a published digest cannot be repaired — so for as long as
+      # it stays in the support window this table is the answer to "what will my scanner show me,
+      # and what do I do about it". It is the source the advisory for those versions is written
+      # from, which is why it belongs somewhere durable and per-(image, version) rather than in a
+      # log line that scrolls past.
+      #
+      # `always()`: the inventory matters MOST on a red run — a reachable advisory or a residue
+      # that cannot be suppressed — which is exactly when a plain summary step would be skipped.
       - name: Summary
-        if: steps.guard.outputs.proceed == 'true'
+        if: always() && steps.guard.outputs.proceed == 'true'
         run: |
+          set -euo pipefail
           {
             echo "### ${{ matrix.component }} ${{ matrix.version }}"
             echo ""
             echo "- digest: \`${{ matrix.digest }}\`"
-            echo "- findings before VEX: ${BASELINE_COUNT}"
-            echo "- statements: $(jq -r '.statements | length' vex.json)"
-            echo "- reachable: 0"
           } >> "$GITHUB_STEP_SUMMARY"
+
+          # Recomputed from the files rather than read from the environment: this step now runs on
+          # failed jobs too, where the step that exports a count may never have reached its end.
+          # The old `reachable: 0` was a constant that was only ever true because the step could
+          # not run unless the reachability gate had already passed.
+          if [ ! -f baseline.json ]; then
+            echo "- the image was never scanned — nothing to inventory" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          BASE="$(jq -r '[.Results[]?.Vulnerabilities[]?.VulnerabilityID] | unique | length' baseline.json)"
+          echo "- findings before VEX: ${BASE}" >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -f vex.json ]; then
+            echo "- statements: $(jq -r '.statements | length' vex.json)" >> "$GITHUB_STEP_SUMMARY"
+            echo "- reachable: $(jq -r '[.statements[] | select(.status == "affected")] | length' vex.json)" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "- statements: (the document was never generated)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          # Two lists, kept apart on purpose. Trivy's findings are matched against the apk NAME and
+          # VERSION; govulncheck's are proven against the module graph. A CVE identifier can appear
+          # in both and still describe two different things, so merging them into one "reachable?"
+          # column would re-create precisely the confusion the proof step above exists to avoid.
+          if [ "${BASE}" != "0" ]; then
+            {
+              echo ""
+              echo "**Residual findings** — what a consumer's scanner reports on this digest:"
+              echo ""
+              echo "| finding | package |"
+              echo "| --- | --- |"
+            } >> "$GITHUB_STEP_SUMMARY"
+            jq -r '
+              [ .Results[]?.Vulnerabilities[]?
+                | {id: .VulnerabilityID, pkg: "\(.PkgName)@\(.InstalledVersion)"} ]
+              | group_by(.id)
+              | map({id: .[0].id, pkgs: (map(.pkg) | unique | sort | join(", "))})
+              | sort_by(.id)[]
+              | "| \(.id) | `\(.pkgs)` |"
+            ' baseline.json >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          if [ -f vex.json ] && [ "$(jq -r '[.statements[] | select(.status == "affected")] | length' vex.json)" != "0" ]; then
+            {
+              echo ""
+              echo "**Reachable advisories** — proven by govulncheck against the source at \`${{ matrix.tag }}\`."
+              echo "These call for a patch release, not a statement:"
+              echo ""
+            } >> "$GITHUB_STEP_SUMMARY"
+            jq -r '.statements[] | select(.status == "affected")
+                   | "- `\(.vulnerability.name)` (\(.vulnerability.aliases // [] | join(", "))) — \(.vulnerability.description)"' \
+              vex.json >> "$GITHUB_STEP_SUMMARY"
+          fi

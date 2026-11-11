@@ -428,13 +428,26 @@ func m6ScaleDeployment(namespace, name string, replicas int32) {
 
 	// Scaling DOWN must be observed, not merely requested: the whole point is that the component
 	// is gone before the backup runs, and a pod that is still terminating would still do its job.
+	//
+	// So the wait is on the PODS, not on status.replicas. That counter drops the moment the old
+	// pod is marked for deletion, i.e. while it is still inside its grace period, leader lease held
+	// and informers live. The stall spec parked the RBD node plugin 116 ms after this returned on
+	// status.replicas, the terminating ceph-csi operator saw the edit to a DaemonSet it owns and
+	// reverted it, and the spec timed out waiting for a park that had already been undone.
 	if replicas == 0 {
+		selector, err := metav1.LabelSelectorAsSelector(deploy.Spec.Selector)
+		Expect(err).NotTo(HaveOccurred(), "Deployment %s/%s has an unusable selector", namespace, name)
 		Eventually(func(g Gomega) {
-			var current appsv1.Deployment
-			g.Expect(k8s.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, &current)).To(Succeed())
-			g.Expect(current.Status.Replicas).To(BeZero(),
-				"Deployment %s/%s still has running pods", namespace, name)
-		}, 3*time.Minute, 5*time.Second).Should(Succeed())
+			var pods corev1.PodList
+			g.Expect(k8s.List(ctx, &pods, client.InNamespace(namespace),
+				client.MatchingLabelsSelector{Selector: selector})).To(Succeed())
+			names := make([]string, 0, len(pods.Items))
+			for i := range pods.Items {
+				names = append(names, pods.Items[i].Name)
+			}
+			g.Expect(names).To(BeEmpty(),
+				"Deployment %s/%s still has pods, terminating ones included", namespace, name)
+		}, 3*time.Minute, 2*time.Second).Should(Succeed())
 	}
 }
 

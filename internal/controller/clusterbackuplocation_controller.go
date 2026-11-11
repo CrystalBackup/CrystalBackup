@@ -256,7 +256,7 @@ func (r *ClusterBackupLocationReconciler) Reconcile(ctx context.Context, req ctr
 		if err := r.Update(ctx, &loc); err != nil {
 			return ctrl.Result{}, fmt.Errorf("add finalizer to ClusterBackupLocation %s: %w", loc.Name, err)
 		}
-		return ctrl.Result{Requeue: true}, nil
+		return ctrl.Result{RequeueAfter: requeueAfterOwnWrite}, nil
 	}
 
 	// Sibling-defaults election runs unconditionally, and never fail-fasts: M1 only flags a

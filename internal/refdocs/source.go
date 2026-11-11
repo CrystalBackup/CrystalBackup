@@ -126,7 +126,15 @@ var sweepSetFamilies = []string{metrics.NameOrphanReapStuck}
 // dependency for the identical reason, and it is still the narrow choice: the alternative is
 // typing fifty-three label sets and fifty-three help strings out a second time, which is the drift
 // this package exists to prevent.
-var descPattern = regexp.MustCompile(`^Desc\{fqName: "([^"]+)", help: (".*"), constLabels: \{[^}]*\}, variableLabels: \{([^}]*)\}\}$`)
+//
+// The `unit: "…"` segment is optional because client_golang 1.25 inserted it between help and
+// constLabels; before that the help capture ran straight into constLabels. With a greedy help
+// capture the new segment was swallowed into the help, and strconv.Unquote then refused the whole
+// thing — loudly, which is the failure mode this parser is meant to have. The help capture is lazy
+// so it stops at the first closing quote that is followed by the rest of the format, which still
+// lets a help string contain escaped quotes. The unit itself is not captured: no family here
+// declares one, and the reference page has no column for it.
+var descPattern = regexp.MustCompile(`^Desc\{fqName: "([^"]+)", help: (".*?"), (?:unit: "[^"]*", )?constLabels: \{[^}]*\}, variableLabels: \{([^}]*)\}\}$`)
 
 // Families returns every crystalbackup_ family the operator publishes, ordered by name.
 func Families() ([]Family, error) {

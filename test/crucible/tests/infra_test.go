@@ -88,9 +88,11 @@ var _ = Describe("Infrastructure", Label("infra"), func() {
 	It("reports Ceph HEALTH_OK (via the rook toolbox)", func() {
 		// Eventually, not a one-shot read: on ephemeral cloud VMs Ceph raises TRANSIENT warnings
 		// — "1 OSD(s) experiencing slow operations in BlueStore" failed a validation lane whose
-		// every product spec passed — and those clear on their own when the slow op completes. A
-		// bounded window separates that noise from a genuinely sick platform: persistent WARN
-		// (dead OSD, full disk, stuck PGs) stays WARN for the whole window and still fails.
+		// every product spec passed. That one does NOT clear when the slow op completes: it lingers
+		// for bluestore_slow_ops_warn_lifetime, 24 h by default, which is why ceph-cluster.yaml
+		// lowers it to 120 s. A bounded window then separates that noise from a genuinely sick
+		// platform: persistent WARN (dead OSD, full disk, stuck PGs, an OSD that keeps stalling)
+		// stays WARN for the whole window and still fails.
 		Eventually(func(g Gomega) {
 			out, err := exec.Command("kubectl", "-n", "rook-ceph",
 				"exec", "deploy/rook-ceph-tools", "--", "ceph", "health").CombinedOutput()

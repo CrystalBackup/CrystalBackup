@@ -138,8 +138,8 @@ E2E_MOVER_IMG ?= example.com/crystalbackup-mover:v0.0.0-e2e
 E2E_SYNC_IMG ?= example.com/crystalbackup-sync:v0.0.0-e2e
 # Pinned versions of the e2e data-path infrastructure, installed by
 # test/e2e/manifests/install-csi-snapshot.sh (external-snapshotter + csi-driver-host-path).
-EXTERNAL_SNAPSHOTTER_VERSION ?= v8.2.0
-CSI_DRIVER_HOSTPATH_VERSION ?= v1.15.0
+EXTERNAL_SNAPSHOTTER_VERSION ?= v8.7.0
+CSI_DRIVER_HOSTPATH_VERSION ?= v1.19.0
 
 .PHONY: setup-test-e2e
 setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
@@ -486,11 +486,11 @@ CRD_REF_DOCS ?= $(LOCALBIN)/crd-ref-docs
 PROMTOOL ?= $(LOCALBIN)/promtool
 
 ## Tool Versions
-KUSTOMIZE_VERSION ?= v5.8.1
-CONTROLLER_TOOLS_VERSION ?= v0.21.0
+KUSTOMIZE_VERSION ?= v5.8.3
+CONTROLLER_TOOLS_VERSION ?= v0.23.0
 # v0.2.0 is the floor that still builds on a current Go toolchain: v0.1.0 pins
 # golang.org/x/tools v0.19.0, whose tokeninternal package no longer compiles.
-CRD_REF_DOCS_VERSION ?= v0.2.0
+CRD_REF_DOCS_VERSION ?= v0.3.0
 
 #ENVTEST_VERSION is the controller-runtime version to use for setup-envtest, derived from go.mod
 ENVTEST_VERSION ?= $(shell v='$(call gomodver,sigs.k8s.io/controller-runtime)'; \
@@ -502,7 +502,7 @@ ENVTEST_K8S_VERSION ?= $(shell v='$(call gomodver,k8s.io/api)'; \
   [ -n "$$v" ] || { echo "Set ENVTEST_K8S_VERSION manually (k8s.io/api replace has no tag)" >&2; exit 1; }; \
   printf '%s\n' "$$v" | sed -E 's/^v?[0-9]+\.([0-9]+).*/1.\1/')
 
-GOLANGCI_LINT_VERSION ?= v2.12.2
+GOLANGCI_LINT_VERSION ?= v2.15.0
 .PHONY: kustomize
 kustomize: $(KUSTOMIZE) ## Download kustomize locally if necessary.
 $(KUSTOMIZE): $(LOCALBIN)
@@ -564,14 +564,14 @@ $(GOLANGCI_LINT): $(LOCALBIN)
 # Bumping PROMETHEUS_VERSION means replacing the four lines below with that release's own
 # sha256sums.txt entries. That is deliberate friction: a version bump that left stale digests
 # behind would fail loudly on the next fetch instead of silently accepting a different binary.
-PROMETHEUS_VERSION ?= 3.13.1
+PROMETHEUS_VERSION ?= 3.16.0
 
 # From https://github.com/prometheus/prometheus/releases/download/v$(PROMETHEUS_VERSION)/sha256sums.txt
 define prometheus_sha256sums
-bc6cef4bdbeb3d0974ac161684dd2a0c4d4e341a13a4a634917b1c09d0f33fc5  prometheus-$(PROMETHEUS_VERSION).darwin-amd64.tar.gz
-28d1f1224b2a22f84c801487fad4b3bd58f94a8cb58cf9340557e787030c9703  prometheus-$(PROMETHEUS_VERSION).darwin-arm64.tar.gz
-962b812371aff838d152b6ff2d56fdb7a6396f5542f48ebf73421b9721f0d103  prometheus-$(PROMETHEUS_VERSION).linux-amd64.tar.gz
-fbd8e5e0f6ad2e7d053e717739186caee4fd0cab2cf9335bfc86c292fe2a2bfe  prometheus-$(PROMETHEUS_VERSION).linux-arm64.tar.gz
+998fb3301c1d77452bdfc481f61353e2e4a3b16c97a6b725c2b7beee5464c8c2  prometheus-$(PROMETHEUS_VERSION).darwin-amd64.tar.gz
+f7c71b553316f822bdd860a3ea527ebefb2f8e944e5b7dfd419ae2653cf3ba01  prometheus-$(PROMETHEUS_VERSION).darwin-arm64.tar.gz
+68727009472a2c02e1ff7f062fd5b3e637285bffc8fc2d340c76fb449d6e0f34  prometheus-$(PROMETHEUS_VERSION).linux-amd64.tar.gz
+fd8571b8162f4020232d886f17340bcf92e1722985ae3b4c1d096157826c0fbe  prometheus-$(PROMETHEUS_VERSION).linux-arm64.tar.gz
 endef
 export prometheus_sha256sums
 

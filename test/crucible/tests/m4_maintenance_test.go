@@ -192,12 +192,22 @@ var _ = Describe("Milestone M4 — repository maintenance & verification", Label
 			Expect(readOut).To(ContainSubstring("["), "the --no-lock read returned no snapshot list:\n%s", readOut)
 
 			By("And the repository is not wedged: a prune succeeds")
-			// Deliberately agnostic about WHO cleared the lock. Two mechanisms can: restic treats a
-			// lock older than 30 minutes as stale and removes it on the next acquisition, and the
-			// operator's own reap fires once the probe (15 min) has seen it cross the same 30-minute
-			// threshold. Both land inside this window, and pinning the assertion on one of them would
-			// make the spec fail when the other got there first. The user-visible property is the
-			// same either way: the repository is not wedged.
+			// ONE mechanism clears the lock, and it is the operator's. restic does NOT remove a stale
+			// lock on acquisition: an exclusive lock is refused while ANY other lock exists, stale or
+			// not (restic 0.19.1, internal/restic/lock.go checkForOtherLocks), and only `restic unlock`
+			// removes stale ones. This comment used to claim otherwise, which is how the spec's budget
+			// came to assume two racing mechanisms when there was one.
+			//
+			// That one is a chain, and the budget is its worst case, measured from the kill:
+			//   30 min  until the orphaned lock's LastModified crosses s3stat.LockStaleAfter
+			//  +15 min  until the next footprint probe sees it (repositoryProbeInterval)
+			//  +10 min  until the prune holding the lane gives up — each one waits out restic's lock
+			//           retry on both of its pods; the reap is submitted only between ops
+			//   +a few  for the unlock, then the next prune
+			// ≈ 60 min after the kill. This step starts ~13 min after it, so 75 min leaves ~25 of
+			// headroom. The probe running WHILE an op holds the lane is load-bearing: before 0.6.8 it
+			// did not, the back-to-back failing prunes starved it, and this spec sat 45 minutes on a
+			// lock that had been stale for 20 of them (TestProbeRunsWhileAnOpHoldsTheLane).
 			Eventually(func(g Gomega) {
 				var live cbv1.BackupRepository
 				g.Expect(k8s.Get(ctx, client.ObjectKey{Name: repo.Name}, &live)).To(Succeed())
@@ -208,7 +218,7 @@ var _ = Describe("Milestone M4 — repository maintenance & verification", Label
 					}
 				}
 				g.Expect(succeeded).To(BeTrue(), "no prune has succeeded since the kill")
-			}, 45*time.Minute, 30*time.Second).Should(Succeed())
+			}, 75*time.Minute, 30*time.Second).Should(Succeed())
 		})
 	})
 

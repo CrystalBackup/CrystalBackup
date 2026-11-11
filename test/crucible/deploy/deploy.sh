@@ -19,11 +19,17 @@ REPO_ROOT="$(cd "${CRUCIBLE_DIR}/../.." && pwd)"
 # ---------------------------------------------------------------------------
 # Version pins — bump deliberately, together with the manifests.
 # ---------------------------------------------------------------------------
-SNAPSHOTTER_REF="${SNAPSHOTTER_REF:-v8.2.0}"
-ROOK_CHART_VERSION="${ROOK_CHART_VERSION:-v1.19.0}"
-LONGHORN_CHART_VERSION="${LONGHORN_CHART_VERSION:-1.10.0}"
-LOCAL_PATH_REF="${LOCAL_PATH_REF:-v0.0.30}"
-PROMETHEUS_OPERATOR_REF="${PROMETHEUS_OPERATOR_REF:-v0.93.0}"
+SNAPSHOTTER_REF="${SNAPSHOTTER_REF:-v8.7.0}"
+ROOK_CHART_VERSION="${ROOK_CHART_VERSION:-v1.21.2}"
+# Since Rook 1.20 the CSI drivers are run by the ceph-csi-operator and configured by this SEPARATE
+# chart; the rook-ceph chart only installs the operator and its CRDs. Pinned to the version the
+# rook-ceph chart of ROOK_CHART_VERSION depends on, and installed with the values file Rook ships at
+# that same tag, which keeps the historical driver names (rook-ceph.rbd.csi.ceph.com,
+# rook-ceph.cephfs.csi.ceph.com) that ceph-storage.yaml and the exposers key on.
+CEPH_CSI_DRIVERS_CHART_VERSION="${CEPH_CSI_DRIVERS_CHART_VERSION:-1.1.0}"
+LONGHORN_CHART_VERSION="${LONGHORN_CHART_VERSION:-1.13.0}"
+LOCAL_PATH_REF="${LOCAL_PATH_REF:-v0.0.37}"
+PROMETHEUS_OPERATOR_REF="${PROMETHEUS_OPERATOR_REF:-v0.95.1}"
 CEPH_HEALTH_TIMEOUT="${CEPH_HEALTH_TIMEOUT:-1800}" # seconds
 
 # Operator image override (no released image exists before the first v0.0.x tag;
@@ -80,6 +86,19 @@ helm upgrade --install rook-ceph rook-release/rook-ceph \
   --version "${ROOK_CHART_VERSION}" \
   --wait --timeout 10m
 
+step "ceph-csi drivers ${CEPH_CSI_DRIVERS_CHART_VERSION} (Rook >= 1.20 configures CSI here, not in rook-ceph)"
+helm repo add ceph-csi-operator https://ceph.github.io/ceph-csi-operator --force-update >/dev/null
+helm upgrade --install ceph-csi-drivers ceph-csi-operator/ceph-csi-drivers \
+  --namespace rook-ceph \
+  --version "${CEPH_CSI_DRIVERS_CHART_VERSION}" \
+  -f "https://raw.githubusercontent.com/rook/rook/${ROOK_CHART_VERSION}/deploy/charts/ceph-csi-drivers/values.yaml" \
+  --set drivers.rbd.snapshotPolicy=volumeSnapshot \
+  --set drivers.cephfs.snapshotPolicy=volumeSnapshot \
+  --wait --timeout 10m
+# snapshotPolicy is commented out in Rook's values file, and an unset policy deploys NO csi-snapshotter
+# sidecar: the RBD driver came up without one, every ceph-block VolumeSnapshot stayed readyToUse=false
+# forever, and a whole suite run timed out behind it. Set it explicitly for both drivers.
+
 step "CephCluster + pools + filesystem + toolbox"
 kubectl apply -f "${SCRIPT_DIR}/manifests/ceph-cluster.yaml"
 kubectl apply -f "${SCRIPT_DIR}/manifests/ceph-toolbox.yaml"
@@ -91,6 +110,17 @@ while true; do
   phase="$(kubectl -n rook-ceph get cephcluster rook-ceph -o jsonpath='{.status.phase}' 2>/dev/null || true)"
   echo "  cephcluster phase=${phase:-<none>} health=${health:-<none>}"
   [[ "${health}" == "HEALTH_OK" ]] && break
+  # AUTH_INSECURE_KEYS_ALLOWED / AUTH_INSECURE_KEYS_CREATABLE / AUTH_INSECURE_CLIENT_KEY_TYPE are
+  # the deliberate cost of `security.cephx.csi.keyType: aes` in manifests/ceph-cluster.yaml: kernel
+  # clients on the node image cannot load aes256k keys, so the CSI entities hold aes keys (the third
+  # code names exactly those four) and the monitors must keep accepting aes (the first two). Exactly
+  # those three codes are muted, by name; any other warning still keeps this loop waiting and fails
+  # the deploy.
+  if [[ "${health}" == "HEALTH_WARN" ]]; then
+    for code in AUTH_INSECURE_KEYS_ALLOWED AUTH_INSECURE_KEYS_CREATABLE AUTH_INSECURE_CLIENT_KEY_TYPE; do
+      kubectl -n rook-ceph exec deploy/rook-ceph-tools -- ceph health mute "${code}" >/dev/null 2>&1 || true
+    done
+  fi
   if ((SECONDS > deadline)); then
     echo "FATAL: Ceph did not reach HEALTH_OK within ${CEPH_HEALTH_TIMEOUT}s" >&2
     kubectl -n rook-ceph get cephcluster rook-ceph -o yaml | tail -40 >&2

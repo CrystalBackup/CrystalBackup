@@ -3,7 +3,7 @@
   "type": "module",
   "version": "0.0.0",
   "private": true,
-  "packageManager": "pnpm@10.33.2",
+  "packageManager": "pnpm@12.18.0",
   "scripts": {
     "dev": "astro dev",
     "build": "astro build",
@@ -11,13 +11,7 @@
     "check:i18n": "node tools/check-translations.mjs --self-test && node tools/check-translations.mjs"
   },
   "dependencies": {
-    "@astrojs/starlight": "^0.37.7",
-    "astro": "^5.0.0"
-  },
-  "pnpm": {
-    "onlyBuiltDependencies": [
-      "esbuild",
-      "sharp"
-    ]
+    "@astrojs/starlight": "^0.42.10",
+    "astro": "^7.4.7"
   }
 }

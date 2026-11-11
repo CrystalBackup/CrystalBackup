@@ -222,7 +222,7 @@ func (r *BackupRepositoryReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		if err := r.Update(ctx, &br); err != nil {
 			return ctrl.Result{}, fmt.Errorf("add finalizer to BackupRepository %s: %w", br.Name, err)
 		}
-		return ctrl.Result{Requeue: true}, nil
+		return ctrl.Result{RequeueAfter: requeueAfterOwnWrite}, nil
 	}
 
 	// Resolve the owning location, from EITHER plane: a cluster-scoped ClusterBackupLocation via

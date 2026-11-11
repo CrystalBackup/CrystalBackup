@@ -2,7 +2,7 @@
 title: Installer avec Helm
 description: Installation de l'operator Crystal Backup, des CRDs, du RBAC et des policies d'admission.
 sourceFile: src/content/docs/start/install.md
-sourceHash: 3e96ee64c6b329f90df49dfa641a8d21e2d9559d
+sourceHash: cbef669319ef37221046a5633322ae8ee48c76d3
 ---
 
 Le chart installe l'operator, les douze CRDs, le RBAC cluster-scoped, les policies
@@ -34,7 +34,7 @@ Le chart est publié comme artefact OCI sur GHCR.
 ```bash
 helm install crystal-backup \
   oci://ghcr.io/crystalbackup/charts/crystal-backup \
-  --version 0.6.7 \
+  --version 0.6.8 \
   --namespace crystal-backup-system
 ```
 
@@ -198,8 +198,8 @@ le mauvais donne une panne de métriques qui ressemble exactement à une install
 Lisez les règles d'abord :
 
 ```bash
-helm show readme oci://ghcr.io/crystalbackup/charts/crystal-backup --version 0.6.7
-helm pull oci://ghcr.io/crystalbackup/charts/crystal-backup --version 0.6.7 --untar
+helm show readme oci://ghcr.io/crystalbackup/charts/crystal-backup --version 0.6.8
+helm pull oci://ghcr.io/crystalbackup/charts/crystal-backup --version 0.6.8 --untar
 less crystal-backup/rules/crystalbackup.rules.yaml
 ```
 
@@ -218,7 +218,7 @@ moindre Prometheus.
 ```bash
 helm upgrade crystal-backup \
   oci://ghcr.io/crystalbackup/charts/crystal-backup \
-  --version 0.6.7 -n crystal-backup-system \
+  --version 0.6.8 -n crystal-backup-system \
   --reuse-values --set soak.enabled=true
 ```
 

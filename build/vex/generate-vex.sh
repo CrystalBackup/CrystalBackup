@@ -115,16 +115,27 @@ if [ "$COMPONENT" = "mover" ] || [ "$COMPONENT" = "sync" ]; then
 
   mkdir -p "${WORK}/restic-src"
   tar xzf "$TARBALL" -C "${WORK}/restic-src" --strip-components=1
-  # restic ${RESTIC_VERSION} pins golang.org/x/text v0.37.0, reachable for GO-2026-5970
-  # (CVE-2026-56852: infinite loop in x/text/unicode/norm, fixed in 0.39.0). The mover image
-  # builds restic with that module overridden past the fix (build/melange/restic.yaml); analyse
-  # the SAME override here so the VEX describes the restic that actually ships, not the vanilla
-  # tarball. Keep the x/text version in lockstep with the melange recipe.
-  # grpc: GO-2026-6061 (xDS RBAC + HTTP/2 transport server, fixed in 1.82.1) is REACHABLE
-  # through restic 0.19.1's pinned v1.81.1 (traces via the GCS backend) — same treatment,
-  # same lockstep.
+  # restic ${RESTIC_VERSION} still pins modules below ten REACHABLE advisories (x/text, grpc,
+  # otel/sdk, x/net, klauspost/compress — the full table is in build/melange/restic.yaml). The
+  # mover image builds restic with the Wolfi r14 module set overridden past those fixes; analyse
+  # the SAME overrides here so the VEX describes the restic that actually ships, not the vanilla
+  # tarball. Every version below is in LOCKSTEP with the melange recipe's `go get`.
   ( cd "${WORK}/restic-src" \
-      && GOFLAGS=-mod=mod go get golang.org/x/text@v0.40.0 google.golang.org/grpc@v1.82.1 \
+      && GOFLAGS=-mod=mod go get \
+           go.opentelemetry.io/otel@v1.47.0 \
+           go.opentelemetry.io/otel/metric@v1.47.0 \
+           go.opentelemetry.io/otel/sdk@v1.47.0 \
+           go.opentelemetry.io/otel/sdk/metric@v1.47.0 \
+           go.opentelemetry.io/otel/trace@v1.47.0 \
+           google.golang.org/grpc@v1.85.0 \
+           golang.org/x/net@v0.62.0 \
+           golang.org/x/sync@v0.24.0 \
+           golang.org/x/sys@v0.49.0 \
+           golang.org/x/text@v0.43.0 \
+           golang.org/x/crypto@v0.58.0 \
+           golang.org/x/term@v0.47.0 \
+           github.com/go-jose/go-jose/v4@v4.1.9 \
+           github.com/klauspost/compress@v1.20.3 \
       && GOFLAGS=-mod=mod go mod tidy \
       && govulncheck -format openvex ./cmd/restic ) > "${WORK}/restic.json"
   DOCS+=("${WORK}/restic.json")
@@ -132,16 +143,13 @@ fi
 
 # --- 2b. rclone, for the ONE image that ships it (sync) -----------------------------------
 # Same shape as the restic block and for the same reason: we build this binary, so we analyse the
-# source we build. The override matters as much here — rclone ${RCLONE_VERSION} pulls an x/image
-# whose VP8L decoder carries CVE-2026-46603 / GO-2026-6222 (fixed in 0.45.0). Keep the x/image
-# version in LOCKSTEP with build/melange/rclone.yaml; a drift here would produce a VEX describing
-# a binary nobody runs.
-#
-# The x/text and grpc overrides that used to be here are GONE, and deliberately so: rclone 1.75.0
-# pins x/text v0.40.0 and a grpc pseudo-version above 1.82.1 on its own, so forcing them would
-# assert a difference this build no longer makes. They remain in the restic block above because
-# restic 0.19.1 has NOT caught up. The two blocks are allowed to diverge; each must mirror its own
-# melange recipe, not the other one.
+# source we build. At rclone 1.76.0 there is NO override, and this block mirrors that: the x/image
+# and x/crypto overrides of the 1.75.0 line (GO-2026-6222, and GO-2026-6303 — reachable through the
+# SFTP server, the advisory that took vex-refresh red on the published sync 0.6.7) are obsolete,
+# because 1.76.0 pins x/image v0.47.0 and x/crypto v0.58.0 on its own. Forcing them would assert a
+# difference this build no longer makes. The restic and rclone blocks are allowed to diverge; each
+# must mirror its OWN melange recipe — re-add an override here in the same commit as in
+# build/melange/rclone.yaml, never in one of the two alone.
 if [ "$COMPONENT" = "sync" ]; then
   RECIPE="${REPO_ROOT}/build/melange/rclone.yaml"
   RCLONE_VERSION="$(sed -n 's/^  version: *"\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' "$RECIPE" | head -n1)"
@@ -168,8 +176,6 @@ if [ "$COMPONENT" = "sync" ]; then
   mkdir -p "${WORK}/rclone-src"
   tar xzf "$TARBALL" -C "${WORK}/rclone-src" --strip-components=1
   ( cd "${WORK}/rclone-src" \
-      && GOFLAGS=-mod=mod go get golang.org/x/image@v0.45.0 \
-      && GOFLAGS=-mod=mod go mod tidy \
       && govulncheck -format openvex . ) > "${WORK}/rclone.json"
   DOCS+=("${WORK}/rclone.json")
 fi

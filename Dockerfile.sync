@@ -17,7 +17,7 @@
 #                                          fails with "unable to open repository", which reads
 #                                          like a network fault rather than a missing binary)
 #   * restic pinned to 0.19.1             (build/melange/restic.yaml)
-FROM golang:1.26 AS builder
+FROM golang:1.27 AS builder
 ARG TARGETOS
 ARG TARGETARCH
 
@@ -54,8 +54,8 @@ RUN echo "${RESTIC_SHA256}  /tmp/restic.tar.gz" | sha256sum -c - \
 # carried advisories with no published fix (adr/0013). It does NOT have to match exactly (this image
 # never ships), but keeping it in step is what makes an e2e failure informative about the production
 # image rather than about a version nobody runs.
-ARG RCLONE_VERSION=1.75.0
-ARG RCLONE_SHA256=4e08746025d989a4bb1c9a51a7fbdb927e9df61216c9172fd344823aa6a8acd8
+ARG RCLONE_VERSION=1.76.0
+ARG RCLONE_SHA256=fa2b2e4ae56c4f1b91102285b736596e2a028be77cb2aaa5a0df53f3a7fc5902
 ADD https://github.com/rclone/rclone/releases/download/v${RCLONE_VERSION}/rclone-v${RCLONE_VERSION}.tar.gz /tmp/rclone.tar.gz
 RUN echo "${RCLONE_SHA256}  /tmp/rclone.tar.gz" | sha256sum -c - \
     && mkdir -p /tmp/rclone \
@@ -64,7 +64,7 @@ RUN echo "${RCLONE_SHA256}  /tmp/rclone.tar.gz" | sha256sum -c - \
     && CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
        go build -trimpath -ldflags="-s -w" -o /out/rclone .
 
-FROM gcr.io/distroless/base-debian12:latest
+FROM gcr.io/distroless/base-debian13:latest
 COPY --from=builder /out/crystal-mover /usr/bin/crystal-mover
 COPY --from=builder /out/restic /usr/bin/restic
 COPY --from=builder /out/rclone /usr/bin/rclone

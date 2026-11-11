@@ -20,15 +20,15 @@ mise run doc                 # serve the docs site (Astro dev server, website/)
 
 | Tool | Version | Used for |
 |---|---|---|
-| Go | 1.26.5 | operator toolchain |
-| kubebuilder | 4.15.0 | `kubebuilder create api/webhook` scaffolding |
-| node / pnpm | 24.18.0 / 10.33.2 | the docs website (`website/`) |
+| Go | 1.27.3 | operator toolchain |
+| kubebuilder | 4.16.0 | `kubebuilder create api/webhook` scaffolding |
+| node / pnpm | 26.13.0 / 12.18.0 | the docs website (`website/`) |
 
-> **Go version note.** The project targets **Go 1.26** (mise pin `1.26.5`); `go.mod` pins
-> `toolchain go1.26.5` and CI resolves the version from it (`actions/setup-go` with
-> `go-version-file: go.mod`). The Kubernetes 1.36 client libraries require Go ≥ 1.26, so 1.26 is a
+> **Go version note.** The project builds with **Go 1.27** (mise pin `1.27.3`); `go.mod` pins
+> `toolchain go1.27.3` and CI resolves the version from it (`actions/setup-go` with
+> `go-version-file: go.mod`). The Kubernetes 1.37 client libraries require Go ≥ 1.26, so 1.26 is a
 > hard floor. Keep the mise pin and the `go.mod` `toolchain` directive consistent — with
-> `GOTOOLCHAIN=auto`, any host Go ≥ 1.26.0 resolves to the pinned 1.26.5 at build time.
+> `GOTOOLCHAIN=auto`, any host Go ≥ 1.26.0 resolves to the pinned 1.27.3 at build time.
 
 ### Makefile-managed (installed into `./bin` on demand)
 
@@ -38,10 +38,10 @@ into `./bin` the first time it's needed (see the `## Tool Versions` block in
 
 | Tool | Version | Installed by |
 |---|---|---|
-| controller-gen | v0.21.0 | `make manifests`, `make generate` |
-| kustomize | v5.8.1 | `make build-installer`, `make deploy` |
+| controller-gen | v0.23.0 | `make manifests`, `make generate` |
+| kustomize | v5.8.3 | `make build-installer`, `make deploy` |
 | setup-envtest | derived from `go.mod` | `make test` (downloads the envtest apiserver/etcd) |
-| golangci-lint | v2.12.2 | `make lint` — **custom-built** with the `logcheck` plugin from [`../.custom-gcl.yml`](../.custom-gcl.yml) |
+| golangci-lint | v2.15.0 | `make lint` — **custom-built** with the `logcheck` plugin from [`../.custom-gcl.yml`](../.custom-gcl.yml) |
 
 ### Must be on your `PATH` (not managed by the repo)
 
