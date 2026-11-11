@@ -29,6 +29,14 @@ spec:
     cephx:
       csi:
         keyType: aes
+  # BLUESTORE_SLOW_OP_ALERT stays raised for bluestore_slow_ops_warn_lifetime after the LAST slow op,
+  # and Ceph's default is 86400 s: one latency blip on a shared cloud disk during the seed kept
+  # HEALTH_WARN for a day and failed the infra health check of a run whose 92 other checks passed.
+  # 120 s lets a one-off blip clear inside that check's 5-minute window, while an OSD that keeps
+  # stalling keeps re-raising the alert and still fails it. The threshold (1 op) is left alone.
+  cephConfig:
+    osd:
+      bluestore_slow_ops_warn_lifetime: "120"
   mon:
     count: 3
     allowMultiplePerNode: false
